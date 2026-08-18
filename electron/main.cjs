@@ -567,7 +567,12 @@ const NOTIF_MARGIN_TOP = 24
 
 function notificationUrl() {
   if (isDev) return `${DEV_URL}/#notifications`
-  return `file://${path.join(__dirname, '..', 'dist', 'index.html')}#notifications`
+  // Same `app://` scheme the main window loads (see the header comment): over
+  // `file://` the bundle's absolute `/assets/…` imports resolve outside the asar
+  // and 404, so the renderer never boots — meaning `notification:ready` never
+  // fires, every push queues in pendingPushes forever, and a packaged build
+  // shows no toasts and plays no chime at all.
+  return 'app://cumora/index.html#notifications'
 }
 
 function positionNotificationWindow() {
