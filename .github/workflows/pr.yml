@@ -100,6 +100,12 @@ jobs:
           node-version: '24'
           cache: 'npm'
       - run: npm ci
+      # `npm test` runs workers/**/*.test.ts too, and the email-gate
+      # worker has its own dependencies (postal-mime) that the root
+      # install doesn't pull in. Install them or those tests fail with
+      # "Cannot find module 'postal-mime'". Mirrors build.yml's quality job.
+      - name: Install Email Worker dependencies
+        run: npm ci --prefix workers/email-gate
       # `npm test` returns exit code 1 when the script is missing. We
       # want a soft no-op until tests exist — skip if there's no `test`
       # script in package.json. Once a test script is added, this job
