@@ -16,6 +16,12 @@
 export interface ParsedArgs {
   positional: string[]
   flags: Record<string, string | boolean>
+  /** Index into `positional` at which LITERAL args begin — everything the
+   *  caller placed after a POSIX `--` end-of-flags marker. The BYOA shim puts
+   *  `--file` / `--stdin` content there, so those args must be taken exactly as
+   *  they arrived: not re-read as flags, and not escape-expanded. Absent when
+   *  no `--` was present. */
+  literalFrom?: number
 }
 
 /**
@@ -31,12 +37,23 @@ export interface ParsedArgs {
  * what the bash tool / CLI shim assumes.
  *
  * Anything not starting with `--` lands in `positional`.
+ *
+ * A bare `--` is the POSIX end-of-flags marker: every remaining token is a
+ * positional even if it starts with `--`. The BYOA shim uses it to hand over
+ * `--file` / `--stdin` content, which routinely begins with `---` (a markdown
+ * rule, a YAML front-matter fence, a `--- a/file.ts` diff header).
  */
 export function parseArgs(args: string[]): ParsedArgs {
   const positional: string[] = []
   const flags: Record<string, string | boolean> = {}
+  let literalFrom: number | undefined
   for (let i = 0; i < args.length; i++) {
     const a = args[i]
+    if (a === '--') {
+      literalFrom = positional.length
+      for (let j = i + 1; j < args.length; j++) positional.push(args[j])
+      break
+    }
     if (a.startsWith('--')) {
       const key = a.slice(2)
       const eq = key.indexOf('=')
@@ -55,7 +72,28 @@ export function parseArgs(args: string[]): ParsedArgs {
       positional.push(a)
     }
   }
-  return { positional, flags }
+  // Only carry `literalFrom` when a `--` was actually seen, so the parsed shape
+  // is byte-for-byte what it always was for every existing call.
+  return literalFrom === undefined ? { positional, flags } : { positional, flags, literalFrom }
+}
+
+/**
+ * Join the positional args from `start` onward into one body string.
+ *
+ * Args that came through a shell get `unescapeChat` (the bash tool wraps a
+ * body in single quotes, so `\n` arrives as two literal characters). Args
+ * after a POSIX `--` do NOT: the shim reads `--file` / `--stdin` content
+ * locally and it travels as JSON, never touched by a shell — that is the whole
+ * point of those flags. Re-expanding escapes there would corrupt exactly the
+ * code snippets the file path exists to carry verbatim, turning a `\n` inside
+ * a string literal into a real line break.
+ */
+export function joinBodyArgs(parsed: ParsedArgs, start: number): string {
+  const literalFrom = parsed.literalFrom ?? parsed.positional.length
+  return parsed.positional
+    .slice(start)
+    .map((part, i) => (start + i >= literalFrom ? part : unescapeChat(part)))
+    .join(' ')
 }
 
 /**

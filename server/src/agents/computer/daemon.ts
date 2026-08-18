@@ -535,20 +535,27 @@ const CUMORA_SHIM = `#!/usr/bin/env node
   // is mangled by bash BEFORE this shim runs: backticks and $(...) get run as
   // commands and collapse to empty, quotes get eaten. So --file <path> /
   // --stdin let the body come from a file (written by the editor, no shell) or
-  // a pipe; we read it LOCALLY and splice it in as one argument that travels as
+  // a pipe; we read it LOCALLY and pass it as one argument that travels as
   // JSON and is never re-parsed by a shell, so code/quotes/$ survive verbatim.
+  //
+  // It goes LAST, behind a POSIX \`--\`, so the server takes it literally. Spliced
+  // in place it was still read as argv: a body starting with \`---\` (markdown
+  // rule, front-matter fence, diff header) parsed as a FLAG and the message was
+  // silently dropped, and escapes inside it were expanded a second time.
   var fs = require('fs')
+  var body = null
   var fi = argv.indexOf('--file')
   if (fi >= 0 && argv[fi + 1] !== undefined) {
-    try { argv.splice(fi, 2, fs.readFileSync(argv[fi + 1], 'utf8')) }
+    try { body = fs.readFileSync(argv[fi + 1], 'utf8') }
     catch (e) { console.error('cumora: cannot read --file ' + argv[fi + 1]); process.exit(70) }
+    argv.splice(fi, 2)
   }
   var si = argv.indexOf('--stdin')
   if (si >= 0) {
-    var s = ''
-    try { s = fs.readFileSync(0, 'utf8') } catch (e) {}
-    argv.splice(si, 1, s)
+    argv.splice(si, 1)
+    if (body === null) { try { body = fs.readFileSync(0, 'utf8') } catch (e) { body = '' } }
   }
+  if (body !== null) argv.push('--', body)
   const res = await fetch(url + '/cli', {
     method: 'POST',
     headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },

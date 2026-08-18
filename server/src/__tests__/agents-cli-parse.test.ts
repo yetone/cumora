@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { parseArgs, tokenize, unescapeChat } from '../agents/cli-parse.js'
+import { joinBodyArgs, parseArgs, tokenize, unescapeChat } from '../agents/cli-parse.js'
 
 // ── parseArgs — happy paths ──────────────────────────────────────────────
 
@@ -103,15 +103,13 @@ test('parseArgs: single dash stays positional; triple dash IS parsed as a flag (
   assert.deepEqual(r.flags, { '-weird': true })
 })
 
-test('parseArgs: bare `--` is parsed as a zero-length-key boolean flag', () => {
-  // POSIX-ish convention would treat `--` as "end of flags". We don't
-  // — `args[0].startsWith('--')` is true, key = ''.  Lock in current
-  // behaviour; no caller depends on `--` either way today.
+test('parseArgs: bare `--` ends flag parsing (POSIX end-of-flags)', () => {
+  // This used to parse as a zero-length-key flag (`flags[''] = <next token>`),
+  // which swallowed the token after it. The BYOA shim now uses `--` to hand
+  // over --file/--stdin content, so the POSIX meaning is the one that counts.
   const r = parseArgs(['--', 'positional-arg'])
-  // Current behaviour: key = '' (empty string), value comes from next
-  // non-`--` token. So flags[''] = 'positional-arg'.
-  assert.equal(r.flags[''], 'positional-arg')
-  assert.deepEqual(r.positional, [])
+  assert.equal(r.flags[''], undefined)
+  assert.deepEqual(r.positional, ['positional-arg'])
 })
 
 test('parseArgs: --key value where value contains spaces is fine — argv is already split', () => {
@@ -247,4 +245,63 @@ test('tokenize: unterminated quote consumes everything to EOL into one token', (
 
 test('tokenize: tab separator behaves like a space', () => {
   assert.deepEqual(tokenize('a\tb\tc'), ['a', 'b', 'c'])
+})
+
+// ── `--` end-of-flags (the BYOA --file / --stdin body path) ──────────────────
+// The shim reads --file/--stdin content locally and appends it after a POSIX
+// `--`. Before that marker existed the content was spliced in as a plain
+// positional, so a body starting with `---` parsed as a flag and the reply was
+// silently never posted.
+
+test('parseArgs: `--` ends flag parsing; a `--`-leading body stays positional', () => {
+  const r = parseArgs(['convo-1', '--', '--- a/src/foo.ts\n+++ b/src/foo.ts'])
+  assert.deepEqual(r.positional, ['convo-1', '--- a/src/foo.ts\n+++ b/src/foo.ts'])
+  assert.deepEqual(r.flags, {})
+  assert.equal(r.literalFrom, 1)
+})
+
+test('parseArgs: flags BEFORE `--` are still parsed', () => {
+  // Real shape: cumora reply <convo> --quote <id> -- <file body>
+  const r = parseArgs(['convo-1', '--quote', 'm-abc', '--', '---\ntitle: Status\n---'])
+  assert.deepEqual(r.positional, ['convo-1', '---\ntitle: Status\n---'])
+  assert.deepEqual(r.flags, { quote: 'm-abc' })
+  assert.equal(r.literalFrom, 1)
+})
+
+test('parseArgs: a flag-looking token AFTER `--` is not a flag', () => {
+  const r = parseArgs(['convo-1', '--', '--json'])
+  assert.deepEqual(r.positional, ['convo-1', '--json'])
+  assert.deepEqual(r.flags, {})
+})
+
+test('parseArgs: no `--` leaves literalFrom undefined', () => {
+  const r = parseArgs(['convo-1', 'hello'])
+  assert.equal(r.literalFrom, undefined)
+})
+
+// ── joinBodyArgs ─────────────────────────────────────────────────────────────
+
+test('joinBodyArgs: a shell-quoted body still gets escapes expanded', () => {
+  // The bash tool wraps the body in single quotes, so `\n` arrives literal.
+  const r = parseArgs(['convo-1', 'line one\\nline two'])
+  assert.equal(joinBodyArgs(r, 1), 'line one\nline two')
+})
+
+test('joinBodyArgs: a body after `--` is taken verbatim, escapes intact', () => {
+  // --file content never passed through a shell; expanding `\n` here would
+  // break the code snippets that flag exists to carry.
+  const src = 'console.log("a\\nb");'
+  const r = parseArgs(['convo-1', '--', src])
+  assert.equal(joinBodyArgs(r, 1), src)
+})
+
+test('joinBodyArgs: a verbatim body keeps Windows-style backslashes', () => {
+  const src = 'see C:\\\\Users\\\\dev for the build'
+  const r = parseArgs(['convo-1', '--', src])
+  assert.equal(joinBodyArgs(r, 1), src)
+})
+
+test('joinBodyArgs: joins multiple shell positionals with a space', () => {
+  const r = parseArgs(['convo-1', 'hello', 'world'])
+  assert.equal(joinBodyArgs(r, 1), 'hello world')
 })

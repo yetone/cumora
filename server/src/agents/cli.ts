@@ -46,7 +46,7 @@ async function agentCompany(agentId: string): Promise<string | null> {
 
 /* ============== argv parsing ============== */
 
-import { parseArgs, unescapeChat, tokenize, type ParsedArgs } from './cli-parse.js'
+import { parseArgs, unescapeChat, joinBodyArgs, tokenize, type ParsedArgs } from './cli-parse.js'
 export { tokenize }
 
 // resolveAs lives in ./cli-identity for test-isolation (zero-side-effect
@@ -1506,7 +1506,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
   const convoId = parsed.positional[0]
   // Strip any hallucinated <tool_call> XML on the way in too — defense in depth.
-  const body = unescapeChat(parsed.positional.slice(1).join(' '))
+  const body = joinBodyArgs(parsed, 1)
     .replace(/<tool_call>[\s\S]*?<\/tool_call>/gi, '')
     .replace(/<function_call>[\s\S]*?<\/function_call>/gi, '')
     .trim()
