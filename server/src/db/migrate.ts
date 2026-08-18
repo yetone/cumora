@@ -2101,8 +2101,36 @@ export async function ensureSchema(): Promise<void> {
     // lock). Best-effort + non-fatal — see the helper.
     await buildConcurrentIndexes(client)
   } finally {
-    client.release()
+    await releaseMigrationClient(client)
   }
+}
+
+/** The subset of a pooled client this helper needs — structural so a test can
+ *  hand it a fake without a live Postgres. */
+type MigrationClient = { query(sql: string): Promise<unknown>; release(): void }
+
+/**
+ * Hand the migration client back to the shared pool with its SESSION state wiped.
+ *
+ * ensureSchema deliberately turns OFF this session's `statement_timeout` and
+ * `idle_in_transaction_session_timeout` and sets `lock_timeout = '5s'`. All three
+ * are SESSION-scoped, and this client is an ordinary member of the 20-slot pool:
+ * `pg-pool`'s `release()` does not reset session state, and node-postgres sends
+ * the pool's timeouts only in the connection's STARTUP PACKET, so they are never
+ * re-applied on checkout. Without this reset, one pooled connection spends the
+ * rest of the process's life with the pool's runaway-query guards disabled — the
+ * very protection whose absence once let a single un-indexed query hold all 20
+ * slots and 503 the API (see db/pool.ts) — and with a 5s `lock_timeout` that
+ * aborts ordinary writes with `55P03` instead of waiting. Same "re-enter the pool
+ * with no leftover state" reasoning as the advisory unlock above.
+ *
+ * A failed RESET must never strand the slot, so we release either way; a
+ * genuinely broken connection is discarded by the pool on its own.
+ */
+export async function releaseMigrationClient(client: MigrationClient): Promise<void> {
+  try { await client.query('RESET ALL') }
+  catch { /* connection already unusable — releasing still returns the slot */ }
+  client.release()
 }
 
 /**
