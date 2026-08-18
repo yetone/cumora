@@ -93,11 +93,42 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # env.ts hard-requires OPENAI_API_KEY (process.exit(1) otherwise), and
-    # unit tests boot it. Provide a dummy so the boot passes — matches the
-    # value build.yml's quality job uses. No real key; unit tests never
-    # call a provider.
+    # `npm test` (server/src/__tests__ + workers) boots env.ts and opens
+    # Postgres/Redis connections, so this job needs the same service
+    # containers + env as build.yml's quality job — without them tests
+    # hang on ECONNREFUSED until the job times out. Dummy secrets only;
+    # unit tests never reach a real provider. (pgvector isn't needed here —
+    # build.yml runs `npm test` before enabling the extension.)
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: cumora
+          POSTGRES_PASSWORD: cumora
+          POSTGRES_DB: cumora_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cumora -d cumora_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
+      DATABASE_URL: postgres://cumora:cumora@localhost:5432/cumora_test
+      REDIS_URL: redis://localhost:6379
+      RESEND_API_KEY: ''
+      EMAIL_DOMAIN: cumora.local
+      EMAIL_INBOUND_HMAC_SECRET: ci-test-secret
+      AUTH_SECRET: ci-test-auth-secret
       OPENAI_API_KEY: ci-test-openai-key
     steps:
       - uses: actions/checkout@v4
