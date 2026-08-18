@@ -9,7 +9,7 @@ import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
 import { cn } from '@/lib/utils'
 import { isWindows } from '@/lib/runtime'
-import { api, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
+import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 
 const tabs = ['Profile', 'Usage', 'Computers', 'Projects', 'Trust & autonomy', 'Preferences'] as const
 type Tab = (typeof tabs)[number]
@@ -734,7 +734,7 @@ function ComputersTab() {
     setCopied(true)
   }
 
-  const origin = getServerOrigin()
+  const origin = getPairingServerOrigin()
   const serverFlag = origin ? ` --server ${origin}` : ''
   const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engine === 'codex' ? ' --engine codex' : ''}${asService ? ' --install-service' : ''}` : ''
   const list = Object.values(byId).sort((a, b) =>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, getServerOrigin } from '@/api/client'
+import { api, getPairingServerOrigin } from '@/api/client'
 import { useComputers } from '@/stores/computers'
 import { isWindows } from '@/lib/runtime'
 import { TitleBar } from '@/desktop/TitleBar'
@@ -35,7 +35,7 @@ export function Onboarding() {
     return () => window.clearTimeout(t)
   }, [copied])
 
-  const origin = getServerOrigin()
+  const origin = getPairingServerOrigin()
   const engineFlag = engine === 'codex' ? ' --engine codex' : ''
   const serviceFlag = asService ? ' --install-service' : ''
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''

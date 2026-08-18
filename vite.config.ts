@@ -10,6 +10,11 @@ const WS_TARGET = HTTP_TARGET.replace(/^http/, 'ws')
 
 export default defineConfig({
   plugins: [react()],
+  // The renderer uses relative URLs through the Vite proxy, but commands
+  // copied from the UI run outside that proxy and need the API origin.
+  define: {
+    'import.meta.env.VITE_CUMORA_DEV_API_TARGET': JSON.stringify(HTTP_TARGET),
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

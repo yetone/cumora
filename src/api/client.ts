@@ -9,6 +9,12 @@ import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
 
+// Vite's relative proxy keeps browser requests same-origin, but the pairing
+// command runs outside the browser and must address the API directly.
+const DEV_API_TARGET = import.meta.env.DEV
+  ? (import.meta.env.VITE_CUMORA_DEV_API_TARGET as string | undefined)?.replace(/\/+$/, '')
+  : undefined
+
 /** Resolve the API base. Three layers, highest priority first:
  *    1. localStorage['cumora.serverUrl'] — runtime override, settable
  *       from the dev console: `localStorage.setItem('cumora.serverUrl',
@@ -41,6 +47,13 @@ const API = `${SERVER_ORIGIN}/api`
  *  through the Vite proxy or same-origin." */
 export function getServerOrigin(): string {
   return SERVER_ORIGIN
+}
+
+/** Origin to embed in a local computer pairing command.
+ * In Vite dev the browser uses a relative proxy, so SERVER_ORIGIN is empty;
+ * the daemon still needs the API target rather than the renderer origin. */
+export function getPairingServerOrigin(): string {
+  return SERVER_ORIGIN || DEV_API_TARGET || ''
 }
 
 /** Persist a new server origin override and clear the existing session.

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { api, getServerOrigin, type AgentInput } from '@/api/client'
+import { api, getPairingServerOrigin, type AgentInput } from '@/api/client'
 import { isNativePlatform } from '@/lib/native'
 import { useParticipants } from '@/stores/participants'
 import { useComputers } from '@/stores/computers'
@@ -56,7 +56,7 @@ export function AgentEditor({ agent, onClose }: Props) {
   const selectedComputer = computerId ? computersById[computerId] : undefined
   const isByoa = !!selectedComputer && selectedComputer.kind !== 'cloud'
   const selectedComputerOffline = isByoa && selectedComputer.status !== 'online'
-  const origin = getServerOrigin()
+  const origin = getPairingServerOrigin()
   const repairCommand = repairCode
     ? `npx cumora@latest agent computer --pair ${repairCode}${origin ? ` --server ${origin}` : ''}`
     : ''
