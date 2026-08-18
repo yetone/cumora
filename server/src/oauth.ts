@@ -186,7 +186,7 @@ interface GoogleProfile { sub: string; email?: string; email_verified?: boolean;
 interface GitHubProfile { id: number; login: string; name?: string | null; email?: string | null; avatar_url?: string }
 interface GitHubEmail   { email: string; primary: boolean; verified: boolean }
 
-async function fetchProfile(p: Provider, accessToken: string): Promise<NormalizedProfile> {
+export async function fetchProfile(p: Provider, accessToken: string): Promise<NormalizedProfile> {
   const cfg = providerConfig(p)
   if (p === 'google') {
     const r = await fetch(cfg.userInfoUrl, { headers: { authorization: `Bearer ${accessToken}` } })
@@ -201,8 +201,11 @@ async function fetchProfile(p: Provider, accessToken: string): Promise<Normalize
     }
   }
   // GitHub: /user doesn't expose email when the user hides it. Hit /user/emails
-  // and pick `primary && verified`. Otherwise refuse — we need a real address
-  // for the user record + cross-provider auto-binding.
+  // and prefer `primary && verified`. A GitHub account can have its primary
+  // email unverified while a secondary address is verified (e.g. mid-way
+  // through changing their primary) — "verified" is what attests ownership
+  // for auto-linking, "primary" is just GitHub's own default-address pick,
+  // so fall back to any verified email rather than refusing outright.
   const [userR, emailsR] = await Promise.all([
     fetch(cfg.userInfoUrl, { headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json', 'user-agent': 'cumora' } }),
     fetch('https://api.github.com/user/emails', { headers: { authorization: `Bearer ${accessToken}`, accept: 'application/json', 'user-agent': 'cumora' } }),
@@ -211,11 +214,11 @@ async function fetchProfile(p: Provider, accessToken: string): Promise<Normalize
   if (!emailsR.ok) throw new Error(`github emails ${emailsR.status}`)
   const u = await userR.json() as GitHubProfile
   const emails = await emailsR.json() as GitHubEmail[]
-  const primary = emails.find((e) => e.primary && e.verified)
-  if (!primary) throw new Error('github account has no verified primary email')
+  const verified = emails.find((e) => e.primary && e.verified) ?? emails.find((e) => e.verified)
+  if (!verified) throw new Error('github account has no verified email')
   return {
     providerId: String(u.id),
-    email: primary.email.toLowerCase(),
+    email: verified.email.toLowerCase(),
     displayName: (u.name && u.name.trim()) || u.login,
     avatarUrl: u.avatar_url ?? null,
   }

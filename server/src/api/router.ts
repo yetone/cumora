@@ -685,13 +685,19 @@ api.get('/auth/callback/:provider', safe(async (req, res) => {
   if (!code || !state) {
     res.redirect(errorUrl(null, 'missing_code_or_state')); return
   }
-  const claimed = await consumeState(state)
-  if (!claimed || claimed.provider !== provider) {
-    res.redirect(errorUrl(null, 'bad_state')); return
-  }
   const ip = req.socket.remoteAddress ?? null
   const ua = (req.headers['user-agent'] as string | undefined) ?? null
+  // `claimed` is read in the catch block below, so it has to be declared
+  // outside the try — consumeState() itself can throw (e.g. a Redis
+  // hiccup) and previously did so *before* this try started, escaping to
+  // the router's generic unhandled-error page instead of the same
+  // graceful #error= redirect every other failure in this flow gets.
+  let claimed: Awaited<ReturnType<typeof consumeState>> = null
   try {
+    claimed = await consumeState(state)
+    if (!claimed || claimed.provider !== provider) {
+      res.redirect(errorUrl(null, 'bad_state')); return
+    }
     const url = await handleCallback({
       provider, code, returnUrl: claimed.returnUrl, ip, userAgent: ua,
       inviteToken: claimed.inviteToken,
@@ -701,7 +707,7 @@ api.get('/auth/callback/:provider', safe(async (req, res) => {
     const msg = e instanceof Error ? e.message : String(e)
     console.warn(`[auth] ${provider} callback failed:`, msg)
     await audit({ kind: 'login_failed', ip, userAgent: ua, detail: { provider, error: msg } })
-    res.redirect(errorUrl(claimed.returnUrl, msg.slice(0, 120)))
+    res.redirect(errorUrl(claimed?.returnUrl ?? null, msg.slice(0, 120)))
   }
 }))
 
