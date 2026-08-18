@@ -93,6 +93,12 @@ jobs:
     name: Unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # env.ts hard-requires OPENAI_API_KEY (process.exit(1) otherwise), and
+    # unit tests boot it. Provide a dummy so the boot passes — matches the
+    # value build.yml's quality job uses. No real key; unit tests never
+    # call a provider.
+    env:
+      OPENAI_API_KEY: ci-test-openai-key
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
