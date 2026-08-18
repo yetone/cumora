@@ -9,8 +9,9 @@ import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { getAdapter } from '../agents/computer/engine.js'
+import { getAdapter, resolveSpawn } from '../agents/computer/engine.js'
 
+const IS_WIN = process.platform === 'win32'
 const tempDirs: string[] = []
 
 afterEach(async () => {
@@ -88,4 +89,30 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   assert.equal(logs[0], 'Claude Code error: subscription expired')
   assert.equal(logs.length, 2)
   assert.match(logs[1] ?? '', /\[session\] engine process died .*exit 1/)
-})
+  })
+
+  // Regression: nvm-windows on Windows ships an extensionless POSIX shell-shim
+  // (`#!/bin/sh` wrapper) alongside the real `.cmd`. The OLD resolveSpawn iterated
+  // `['', ...PATHEXT]` → matched the shim first → returned `shell:false` → Node
+  // could not exec the shim and every BYOA turn died with ENOENT.
+  // See https://github.com/yetone/cumora/issues/5
+  test('resolveSpawn prefers .cmd over extensionless shim on Windows', { skip: !IS_WIN }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'cumora-resolve-'))
+    tempDirs.push(root)
+    const binDir = join(root, 'bin')
+    await mkdir(binDir)
+    // Both files exist — mirrors the standard nvm-windows layout.
+    await writeFile(join(binDir, 'claude'), '#!/bin/sh\nexit 0\n', 'utf8')
+    await writeFile(join(binDir, 'claude.cmd'), '@echo off\nexit /b 0\n', 'utf8')
+    process.env.PATH = `${binDir};${process.env.PATH ?? ''}`
+    const r = resolveSpawn('claude')
+    // NTFS is case-insensitive, and Windows resolves `claude.cmd` as `claude.CMD`
+    // — compare with a normalized basename so the test passes regardless of FS.
+    assert.equal(
+      r.command.toLowerCase().endsWith('claude.cmd'),
+      true,
+      `must pick the .cmd, not the shim — got ${r.command}`,
+    )
+    assert.equal(r.shell, true, '.cmd must run via the shell')
+    assert.equal(r.wantsStdinPrompt, true, '.cmd needs the big prompt via stdin')
+  })

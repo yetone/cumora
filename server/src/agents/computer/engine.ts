@@ -48,21 +48,39 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
  *    code 1". Resolve the real file on PATH and run a `.cmd`/`.bat` via
  *    shell:true. When the shell is needed,
  *    a big multi-line prompt must travel via STDIN, not argv (the shell can't carry
- *    it) → `wantsStdinPrompt`. */
-function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
+ *    it) → `wantsStdinPrompt`.
+ *
+ *  Windows + nvm-windows gotcha: global npm CLIs are shipped as an extensionless
+ *  POSIX shell-shim (`#!/bin/sh` wrapper) ALONGSIDE the real `.cmd`. The old loop
+ *  iterated `['', ...PATHEXT]`, hit the shim first, classified it as non-batch,
+ *  and returned `shell:false` → every Claude/Codex turn died with ENOENT.
+ *  Fix: prefer a real `.exe`/`.cmd`/`.bat` hit; only fall back to the shim with
+ *  `shell:true` when nothing else is on PATH. */
+// Exported for tests; the nvm-windows extensionless-shim regression (issue #5)
+// needs a stable handle to the resolver without going through spawn().
+export function resolveSpawn(bin: string): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
   if (!IS_WIN) return { command: bin, shell: false, wantsStdinPrompt: false }
   const exts = (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
   for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
-    for (const ext of ['', ...exts]) {
+    for (const ext of exts) {
       const candidate = join(dir, bin + ext)
       if (existsSync(candidate)) {
         const isBatch = /\.(cmd|bat)$/i.test(candidate)
-        return { command: candidate, shell: isBatch, wantsStdinPrompt: isBatch }
+        return { command: candidate, shell: true, wantsStdinPrompt: isBatch }
       }
     }
   }
-  // Not found on PATH — let the shell resolve it, and feed the prompt via stdin.
+  // Last resort: only an extensionless shim (nvm-windows) is on PATH. The shim
+  // itself is a `#!/bin/sh` wrapper and cannot be exec'd without a shell → force
+  // shell:true so Node routes the call through cmd.exe, which can find the
+  // .cmd via PATHEXT after the shim.
+  for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const shim = join(dir, bin)
+    if (existsSync(shim)) return { command: shim, shell: true, wantsStdinPrompt: true }
+  }
+  // Not found on PATH at all — let the shell resolve it, and feed the prompt via stdin.
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
