@@ -432,6 +432,60 @@ const CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceed
 // also scrub outgoing text (engine.ts stripLoneSurrogates) so we stop creating it.
 const POISONED_BODY_RE = /no (?:low|high) surrogate|unpaired surrogate|lone surrogate|surrogate in string|request body is not valid json/i
 
+// A STALE resume target: we passed `--resume <id>` and the engine says it has no
+// such session. Dropping the id is the right recovery — the next wake starts a
+// fresh session instead of re-failing against a target that no longer exists.
+//
+// Every branch pairs the noun with FAILURE wording. A bare mention of a session
+// or conversation proves nothing: the engine's own event stream is full of them
+// (see `engineDiagnosticProse`), so matching the noun alone turned every
+// mid-turn engine death into a "stale resume target" and threw away the session
+// id that exists to recover the interrupted turn.
+const STALE_RESUME_RE = new RegExp([
+  // "No conversation found with session ID: …", "no such session"
+  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)\b`,
+  // "Session not found", "conversation no longer exists", "thread has expired"
+  String.raw`\b(?:conversation|session|thread)(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|does not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
+  // "Invalid session id", "unknown conversation", "expired thread"
+  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)\b`,
+  // "could not resume", "unable to resume this conversation", "failed to resume"
+  String.raw`\b(?:could ?n(?:o|')?t|cannot|can't|unable to|failed to)\b[^\n]{0,24}?\bresume\b`,
+  // codex app-server's own wording
+  String.raw`\bthread/resume failed\b`,
+].join('|'), 'i')
+
+/** The human-readable part of an engine failure blob.
+ *
+ *  `failurePreview` (engine.ts) appends the tail of the engine's STDOUT to the
+ *  error text, and on the Claude path that stdout is stream-json: EVERY event
+ *  line carries a `"session_id"` field. Those lines are machine structure, not
+ *  diagnosis, so pattern-matching them as prose is what produced the false
+ *  "stale resume target" verdict on any mid-turn death. Keep an event line's
+ *  error text (that IS diagnosis) and drop everything else about it. */
+export function engineDiagnosticProse(err: string): string {
+  const out: string[] = []
+  for (const line of err.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('{')) { out.push(line); continue }
+    let ev: { is_error?: unknown; result?: unknown; error?: unknown }
+    try { ev = JSON.parse(trimmed) } catch { continue }
+    // `result` is prose only on a FAILED turn; on a successful one it's the
+    // agent's own answer, which must never be read as an engine diagnosis.
+    if (ev.is_error === true && typeof ev.result === 'string') out.push(ev.result)
+    if (typeof ev.error === 'string') out.push(ev.error)
+    else if (ev.error && typeof ev.error === 'object') {
+      const m = (ev.error as { message?: unknown }).message
+      if (typeof m === 'string') out.push(m)
+    }
+  }
+  return out.join('\n')
+}
+
+/** True when an engine error really says the `--resume` target is gone. */
+export function isStaleResumeError(err: string): boolean {
+  return STALE_RESUME_RE.test(engineDiagnosticProse(err))
+}
+
 function authFailureHint(engine: EngineId, detail: string): string {
   if (CONTEXT_OVERFLOW_RE.test(detail)) {
     return 'The agent filled up its context window. Its session has been reset automatically — just wake the agent again and it will start fresh.'
@@ -845,11 +899,14 @@ class AgentRunner {
    *      we drop it. This is hadResume-independent: even a single resumed session
    *      that's now too big must be abandoned.
    *   2. STALE / MISSING resume target — we tried to --resume a session the
-   *      engine no longer has. Only meaningful when we actually passed one. */
+   *      engine no longer has. Only meaningful when we actually passed one, and
+   *      only when the engine SAYS SO: a mid-turn crash (OOM, sleep, provider
+   *      hangup) leaves a resumable session, so it must NOT reset — that would
+   *      discard the context the interrupted turn was building. */
   private mustResetSession(err: string, hadResume: boolean): boolean {
     if (this.isContextOverflow(err)) return true
     if (this.isPoisonedTranscript(err)) return true
-    if (hadResume && /resume|session|conversation/i.test(err)) return true
+    if (hadResume && isStaleResumeError(err)) return true
     return false
   }
 
