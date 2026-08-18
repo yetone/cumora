@@ -183,3 +183,56 @@ test('a pipe line without a separator stays a paragraph and does not hang', () =
   assert.deepEqual(nodes[0], { type: 'paragraph', content: [{ type: 'text', text: '| not a table |' }] })
   assert.deepEqual(nodes[1], { type: 'paragraph', content: [{ type: 'text', text: 'plain text' }] })
 })
+
+// ── intraword underscores ────────────────────────────────────────────────────
+// CommonMark allows intraword emphasis with `*` but not with `_`. Getting this
+// wrong doesn't just add a stray italic: the underscores are consumed as
+// delimiters and permanently lost from the stored document.
+
+test('parseInlineMarkdown keeps snake_case identifiers intact', () => {
+  assert.deepEqual(parseInlineMarkdown('call user_id and order_id now'), [
+    { type: 'text', text: 'call user_id and order_id now' },
+  ])
+})
+
+test('parseInlineMarkdown keeps underscores inside a URL intact', () => {
+  assert.deepEqual(parseInlineMarkdown('see https://x.com/a_b_c now'), [
+    { type: 'text', text: 'see https://x.com/a_b_c now' },
+  ])
+})
+
+test('parseInlineMarkdown does not treat intraword __ as bold', () => {
+  assert.deepEqual(parseInlineMarkdown('foo__bar__baz'), [
+    { type: 'text', text: 'foo__bar__baz' },
+  ])
+})
+
+test('parseInlineMarkdown still italicizes a word-boundary _span_', () => {
+  assert.deepEqual(parseInlineMarkdown('_leading italic_ ok'), [
+    { type: 'text', text: 'leading italic', marks: [{ type: 'italic' }] },
+    { type: 'text', text: ' ok' },
+  ])
+})
+
+test('parseInlineMarkdown still bolds a word-boundary __span__', () => {
+  assert.deepEqual(parseInlineMarkdown('__bold__ here'), [
+    { type: 'text', text: 'bold', marks: [{ type: 'bold' }] },
+    { type: 'text', text: ' here' },
+  ])
+})
+
+test('parseInlineMarkdown still allows intraword emphasis with *', () => {
+  // Only `_` is restricted — `*` intraword emphasis stays legal.
+  assert.deepEqual(parseInlineMarkdown('foo*bar*baz'), [
+    { type: 'text', text: 'foo' },
+    { type: 'text', text: 'bar', marks: [{ type: 'italic' }] },
+    { type: 'text', text: 'baz' },
+  ])
+})
+
+test('parseInlineMarkdown italicizes _a_b_ across an inner underscore', () => {
+  // The inner `_` is intraword so it cannot close; the trailing one does.
+  assert.deepEqual(parseInlineMarkdown('_a_b_'), [
+    { type: 'text', text: 'a_b', marks: [{ type: 'italic' }] },
+  ])
+})

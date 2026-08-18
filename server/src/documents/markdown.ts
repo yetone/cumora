@@ -61,6 +61,42 @@ function findClosing(text: string, marker: string, from: number): number {
   return idx
 }
 
+// CommonMark allows intraword emphasis with `*` but NOT with `_`, because
+// underscores are load-bearing inside ordinary words: snake_case identifiers and
+// underscore-bearing URLs. Treating them as delimiters doesn't just add a stray
+// italic — it CONSUMES the underscores, so `user_id and order_id` is stored as
+// "user" + italic("id and order") + "id" and the characters are gone for good.
+const WORD_CHAR_RE = /[\p{L}\p{N}]/u
+
+function isWordChar(ch: string | undefined): boolean {
+  return ch !== undefined && WORD_CHAR_RE.test(ch)
+}
+
+/** Can a delimiter run starting at `i` OPEN an emphasis span? Only `_` is
+ *  restricted, and only inside a word — we look back past the whole run of
+ *  underscores so `foo__bar` is judged by the `o`, not by a sibling `_`. */
+function canOpenEmphasis(text: string, i: number): boolean {
+  if (text[i] !== '_') return true
+  let j = i - 1
+  while (j >= 0 && text[j] === '_') j -= 1
+  return !isWordChar(text[j])
+}
+
+/** Index of the delimiter that actually CLOSES an emphasis span, or -1.
+ *  A `_` run sitting inside a word can't close, so keep looking — that's what
+ *  lets `_a_b_` still italicize `a_b` the way CommonMark does. */
+function findEmphasisClose(text: string, marker: string, from: number): number {
+  if (marker[0] !== '_') return findClosing(text, marker, from)
+  let idx = text.indexOf(marker, from)
+  while (idx >= 0) {
+    let j = idx + marker.length
+    while (text[j] === '_') j += 1
+    if (!isWordChar(text[j])) return idx
+    idx = text.indexOf(marker, idx + marker.length)
+  }
+  return -1
+}
+
 function findLinkClose(text: string, openBracket: number): { closeParen: number; label: string; href: string } | null {
   const closeBracket = text.indexOf(']', openBracket + 1)
   if (closeBracket < 0 || text[closeBracket + 1] !== '(') return null
@@ -87,9 +123,9 @@ export function parseInlineMarkdown(text: string, marks?: ProseMirrorJsonMark[])
         continue
       }
     }
-    if (text.startsWith('**', i) || text.startsWith('__', i)) {
+    if ((text.startsWith('**', i) || text.startsWith('__', i)) && canOpenEmphasis(text, i)) {
       const marker = text.slice(i, i + 2)
-      const end = findClosing(text, marker, i + 2)
+      const end = findEmphasisClose(text, marker, i + 2)
       if (end > i + 2) {
         out.push(...parseInlineMarkdown(text.slice(i + 2, end), withMark(marks, { type: 'bold' })))
         i = end + 2
@@ -104,9 +140,9 @@ export function parseInlineMarkdown(text: string, marks?: ProseMirrorJsonMark[])
         continue
       }
     }
-    if ((text[i] === '*' || text[i] === '_') && text[i + 1] !== text[i]) {
+    if ((text[i] === '*' || text[i] === '_') && text[i + 1] !== text[i] && canOpenEmphasis(text, i)) {
       const marker = text[i]
-      const end = findClosing(text, marker, i + 1)
+      const end = findEmphasisClose(text, marker, i + 1)
       if (end > i + 1) {
         out.push(...parseInlineMarkdown(text.slice(i + 1, end), withMark(marks, { type: 'italic' })))
         i = end + 1
