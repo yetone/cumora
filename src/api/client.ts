@@ -1483,8 +1483,27 @@ class WsClient {
   private listeners = new Set<Listener>()
   private reconnectDelay = 500
   private intentionalClose = false
+  /** In-flight `connect()` de-dupe. The `this.ws` guard below cannot catch a
+   *  second caller: `this.ws` is not assigned until AFTER the ticket fetch
+   *  awaits, and boot fires five connects in the same tick
+   *  (bootMessagesStream / bootParticipants / bootConversations /
+   *  bootWhispers / bootComputers, each behind its own module-local `wsBound`
+   *  flag, so none of them suppresses another). Every socket they opened fanned
+   *  into this same `listeners` set, and since `message.delta` is applied by
+   *  ACCUMULATING onto the body, the streaming bubble rendered each chunk five
+   *  times while an agent typed. Concurrent callers ride the first attempt; the
+   *  memo clears once it settles, so a later connect still gets a fresh socket. */
+  private connecting: Promise<void> | null = null
 
-  async connect() {
+  connect(): Promise<void> {
+    const existing = this.connecting
+    if (existing) return existing
+    const p = this.connectImpl().finally(() => { this.connecting = null })
+    this.connecting = p
+    return p
+  }
+
+  private async connectImpl() {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return
     const token = getAuthToken()
     if (!token) return  // not signed in → don't even try
@@ -1509,19 +1528,27 @@ class WsClient {
       return
     }
     const url = `${wsOrigin()}/ws?t=${encodeURIComponent(ticket)}`
-    this.ws = new WebSocket(url)
-    this.ws.onopen = () => { this.reconnectDelay = 500 }
-    this.ws.onmessage = (ev) => {
+    const sock = new WebSocket(url)
+    this.ws = sock
+    sock.onopen = () => { this.reconnectDelay = 500 }
+    sock.onmessage = (ev) => {
       try {
         const data = JSON.parse(ev.data) as WsEvent
         this.listeners.forEach((l) => { l(data) })
       } catch { /* ignore */ }
     }
-    this.ws.onclose = () => {
+    sock.onclose = () => {
+      // Only the socket that is still CURRENT may clear the field. `reconnect()`
+      // closes the old socket and opens its replacement immediately, but the
+      // close event lands a tick later — nulling `this.ws` then would orphan a
+      // LIVE socket (`isOpen()`/`send()` start reporting closed while typing
+      // frames are silently dropped) and schedule a second one on top of it,
+      // putting us back to two sockets sharing one listener set.
+      if (this.ws !== sock) return
       this.ws = null
       if (!this.intentionalClose) this.scheduleReconnect()
     }
-    this.ws.onerror = () => { /* onclose follows */ }
+    sock.onerror = () => { /* onclose follows */ }
   }
 
   private scheduleReconnect() {
