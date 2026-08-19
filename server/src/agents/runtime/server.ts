@@ -22,11 +22,17 @@ import { buildTeamRosterText, getPersona } from '../personas.js'
 import { gatherAgentAgenda, classifyAgendaActionable, renderAgendaBrief, claimStallNudge, AGENDA_CLASSIFIER_ERROR } from '../agenda.js'
 import { consumeAgentTurnToken } from '../scheduler.js'
 import { touchAgentRun, recordTriage, type TriageSource } from '../observability.js'
+import type { LlmCallSource } from '../llm-ledger.js'
 import { buildRuntimeArgv } from './cli-argv.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { verifyAgentToken, type AgentRuntimeClaims } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+
+/** Ledger/triage `source` values a BYOA daemon may declare — one per local
+ *  engine. Anything else is coerced to 'byoa-claude' so a newer daemon can't
+ *  smuggle a free-form string into the rollup. */
+const BYOA_SOURCES: ReadonlySet<string> = new Set(['byoa-claude', 'byoa-codex', 'byoa-pi'])
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -371,7 +377,7 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
     daemonVersion?: string
   } | undefined
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
-  const source: TriageSource = (body?.source as TriageSource) ?? 'byoa-claude'
+  const source: TriageSource = BYOA_SOURCES.has(String(body?.source)) ? (body!.source as TriageSource) : 'byoa-claude'
   void recordTriage({
     agentId: c.sub,
     companyId: c.companyId,
@@ -409,11 +415,11 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 }))
 
 // Per-HOP trajectory for BYOA agents. The daemon's ClaudeSession /
-// CodexSession emits one EngineHopReport per assistant message (Claude) or
-// per turn-completed (Codex) and batches them into one POST per N hops or
-// every ~250ms (whichever first). This endpoint accepts a batch + inserts
-// one llm_calls row per hop with the appropriate source ('byoa-claude' |
-// 'byoa-codex'). Fire-and-forget; a DB hiccup must never break the wake.
+// CodexSession / PiSession emits one EngineHopReport per assistant message
+// (Claude, pi) or per turn-completed (Codex) and batches them into one POST per
+// N hops or every ~250ms (whichever first). This endpoint accepts a batch +
+// inserts one llm_calls row per hop with the appropriate source ('byoa-claude' |
+// 'byoa-codex' | 'byoa-pi'). Fire-and-forget; a DB hiccup must never break the wake.
 runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
   const body = req.body as {
     source?: string
@@ -433,7 +439,7 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       extras?: Record<string, unknown>
     }>
   } | undefined
-  const source = (body?.source === 'byoa-claude' || body?.source === 'byoa-codex') ? body.source : 'byoa-claude'
+  const source = BYOA_SOURCES.has(String(body?.source)) ? (body!.source as LlmCallSource) : 'byoa-claude'
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []
   if (hops.length === 0) { res.json({ ok: true, inserted: 0 }); return }

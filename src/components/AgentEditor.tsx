@@ -239,7 +239,7 @@ export function AgentEditor({ agent, onClose }: Props) {
           <Field
             label={isByoa ? 'Big-brain model (大脑)' : 'Model'}
             hint={isByoa
-              ? `Main reasoning model passed to the engine as --model. ${engine === 'codex' ? 'A model name (e.g. gpt-5.5, o3).' : "A Claude alias or full name (e.g. opus, sonnet, claude-sonnet-4-6)."} Blank = engine default.`
+              ? `Main reasoning model passed to the engine as --model. ${engine === 'codex' ? 'A model name (e.g. gpt-5.5, o3).' : engine === 'pi' ? 'A pi model pattern, ideally provider/id (e.g. anthropic/claude-sonnet-4-6, openai-codex/gpt-5.5); add :<level> to enable thinking.' : "A Claude alias or full name (e.g. opus, sonnet, claude-sonnet-4-6)."} Blank = engine default.`
               : 'Optional — leave blank to use the system default. Any OpenAI model name works (e.g. gpt-5.5, gpt-5.5-pro, gpt-5.5-mini).'}
           >
             <Input
@@ -257,7 +257,9 @@ export function AgentEditor({ agent, onClose }: Props) {
               label="Small-brain model (小脑)"
               hint={engine === 'codex'
                 ? 'Cheaper model for light auxiliary tasks (e.g. gpt-5.4-mini). Blank = same as big-brain.'
-                : "Cheaper/faster model for light auxiliary tasks — maps to Claude's ANTHROPIC_SMALL_FAST_MODEL. Blank = engine default."}
+                : engine === 'pi'
+                  ? 'Not used by pi (it has no separate fast-model knob); triage follows CUMORA_TRIAGE_MODEL on the computer. Blank = fine.'
+                  : "Cheaper/faster model for light auxiliary tasks — maps to Claude's ANTHROPIC_SMALL_FAST_MODEL. Blank = engine default."}
             >
               <Input
                 type="text"
@@ -272,7 +274,7 @@ export function AgentEditor({ agent, onClose }: Props) {
 
           <Field
             label="Runs on"
-            hint="Which computer executes this agent. Cumora Cloud is managed; a computer you've paired runs it on your local Claude Code or Codex."
+            hint="Which computer executes this agent. Cumora Cloud is managed; a computer you've paired runs it on your local Claude Code, Codex or pi."
           >
             <Select
               ariaLabel="Runs on"
@@ -305,7 +307,7 @@ export function AgentEditor({ agent, onClose }: Props) {
                   options={(selectedComputer.availableEngines.length
                     ? selectedComputer.availableEngines
                     : (['claude'] as EngineId[])
-                  ).map((en) => ({ value: en, label: en === 'claude' ? 'Claude Code' : en === 'codex' ? 'Codex' : en }))}
+                  ).map((en) => ({ value: en, label: en === 'claude' ? 'Claude Code' : en === 'codex' ? 'Codex' : en === 'pi' ? 'pi' : en }))}
                 />
               </div>
             )}
