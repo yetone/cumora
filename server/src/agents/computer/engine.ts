@@ -93,6 +93,7 @@ export interface EnginePersona {
   id: string
   name: string
   role: string | null
+  systemPrompt: string | null
 }
 
 export interface EngineRunArgs {
@@ -529,6 +530,7 @@ function extraArgs(envVar: string): string[] {
 const PERSONA_HEADER = (p: EnginePersona): string =>
   `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
   `You are **${p.name}**, a member of a team that collaborates in Cumora (a team chat).\n` +
+  (p.systemPrompt?.trim() ? `\n## Your style\n${p.systemPrompt.trim()}\n\n` : '\n') +
   `This directory is your private home and your working directory — it persists\n` +
   `across wakes and is yours alone. Its layout:\n` +
   `- \`CLAUDE.md\` (this file) — always loaded each wake; keep it short.\n` +
@@ -884,8 +886,11 @@ class ClaudeAdapter implements EngineAdapter {
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
     await mkdir(join(home, '.claude', 'skills'), { recursive: true })
-    const claudeMd = join(home, 'CLAUDE.md')
-    if (!(await exists(claudeMd))) await writeFile(claudeMd, PERSONA_HEADER(persona), 'utf8')
+    // Always (re)written from the DB's name/role/systemPrompt — this file is
+    // system-owned, not agent-editable, so it's safe to overwrite on every
+    // start()/restart (including the restart configMatches() triggers when
+    // the operator edits the agent's persona in Cumora).
+    await writeFile(join(home, 'CLAUDE.md'), PERSONA_HEADER(persona), 'utf8')
     // settings.json lets bash (hence the cumora shim) run without prompts in
     // this isolated home. Only written if absent so the user can customize.
     const settings = join(home, '.claude', 'settings.json')
@@ -1369,8 +1374,8 @@ class CodexAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    const agentsMd = join(home, 'AGENTS.md')
-    if (!(await exists(agentsMd))) await writeFile(agentsMd, PERSONA_HEADER(persona), 'utf8')
+    // See ClaudeAdapter.seedHome: system-owned, safe to overwrite every start.
+    await writeFile(join(home, 'AGENTS.md'), PERSONA_HEADER(persona), 'utf8')
   }
 
   run(args: EngineRunArgs): Promise<EngineRunResult> {

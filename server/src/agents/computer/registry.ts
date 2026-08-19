@@ -355,10 +355,10 @@ export async function mintAgentRuntimeToken(args: {
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
  *  agent behavior on every user's machine unless we pin here. */
 export async function listAgentsForComputer(computerId: string): Promise<
-  Array<{ id: string; name: string; role: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
 > {
-  const { rows } = await pool.query<{ id: string; name: string; role: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>(
-    `SELECT id, name, role, engine, model, fast_model AS "fastModel" FROM participants
+  const { rows } = await pool.query<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>(
+    `SELECT id, name, role, system_prompt AS "systemPrompt", engine, model, fast_model AS "fastModel" FROM participants
       WHERE computer_id = $1 AND kind = 'agent' AND departed_at IS NULL
       ORDER BY name ASC`,
     [computerId],

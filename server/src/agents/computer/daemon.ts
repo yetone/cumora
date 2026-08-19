@@ -300,6 +300,7 @@ interface AgentInfo {
   id: string
   name: string
   role: string | null
+  systemPrompt: string | null
   engine: EngineId | null
   model: string | null
   fastModel: string | null
@@ -963,7 +964,7 @@ class AgentRunner {
   }
 
   async start(): Promise<void> {
-    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role })
+    await this.adapter.seedHome(this.home, { id: this.agent.id, name: this.agent.name, role: this.agent.role, systemPrompt: this.agent.systemPrompt })
     await writeShim(this.binDir)
     await this.loadSessionId()
     void this.streamLoop()
@@ -1000,6 +1001,7 @@ class AgentRunner {
     return this.adapter.id === engine
       && this.agent.name === agent.name
       && this.agent.role === agent.role
+      && this.agent.systemPrompt === agent.systemPrompt
       && this.agent.model === agent.model
       && this.agent.fastModel === agent.fastModel
   }
