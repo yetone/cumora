@@ -215,6 +215,30 @@ Model selection: the per-agent `participants.model` / `fast_model`
 columns, else the deploy-level `CUMORA_DEFAULT_CLAUDE_MODEL` /
 `CUMORA_DEFAULT_CODEX_MODEL` pins.
 
+### Running against a custom provider
+
+Those pins are resolved server-side and name Anthropic / OpenAI models. If your
+local `claude` or `codex` is pointed at a **custom provider** (CC Switch and
+friends), it has never heard of `claude-opus-4-7`, so every turn fails with
+*"There's an issue with the selected model"* even though the CLI works fine in
+your terminal.
+
+Set `CUMORA_ENGINE_MODEL` on the daemon to fix it:
+
+| value | effect |
+| --- | --- |
+| unset | use the model Cumora pinned (default) |
+| `local` | pass **no** model at all — the CLI runs on whatever it is already configured for, and the small/fast pin is dropped too |
+| any model id | use that model instead of the pinned one |
+
+Pair it with `CUMORA_TRIAGE_MODEL` if your provider also lacks the small brain
+(`haiku` / `gpt-5.4-mini`); `cumora agent computer doctor` probes the same model
+that triage will use, so a green doctor means real wakes will work.
+
+```bash
+CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
+```
+
 ---
 
 ## Per-agent home (local state)

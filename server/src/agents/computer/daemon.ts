@@ -771,6 +771,48 @@ class HopReporter {
   }
 }
 
+/** CUMORA_ENGINE_MODEL value meaning "impose no model at all — use whatever
+ *  the local CLI is already configured for". */
+const ENGINE_MODEL_LOCAL = 'local'
+
+/** The model the LOCAL engine should run this agent's turns on.
+ *
+ *  Cumora pins a model per agent (participants.model, else the deploy-level
+ *  CUMORA_DEFAULT_* default) so a CLI upgrade can't silently change behaviour.
+ *  That pin is an Anthropic/OpenAI model id — which is simply wrong for a BYOA
+ *  operator whose `claude` points at a custom provider (CC Switch and friends):
+ *  the provider has never heard of e.g. `claude-opus-4-7`, so EVERY turn dies
+ *  with "There's an issue with the selected model". The pin is resolved
+ *  server-side, so on hosted Cumora the operator cannot change it, and their
+ *  only escape was CUMORA_CLAUDE_ARGS — which also disables the persistent
+ *  session and makes them hand-write the entire flag set.
+ *
+ *  CUMORA_ENGINE_MODEL overrides the pin daemon-side. The value `local` passes
+ *  NO model at all, so the CLI runs on whatever it is already configured for —
+ *  the same escape CUMORA_TRIAGE_MODEL already gives the small brain.
+ *
+ *  Exported for tests. */
+export function resolveEngineModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  const o = override?.trim()
+  if (!o) return configured ?? null
+  return o.toLowerCase() === ENGINE_MODEL_LOCAL ? null : o
+}
+
+/** The same knob governs the small-brain pin. `local` has to impose NOTHING:
+ *  otherwise ANTHROPIC_SMALL_FAST_MODEL would still name a model the custom
+ *  provider lacks, and the CLI's own quick calls would fail instead of the turn.
+ *  A concrete override only replaces the big-brain pin, so fast_model is left
+ *  alone there. */
+export function resolveEngineFastModel(
+  configured: string | null | undefined,
+  override: string | undefined,
+): string | null {
+  return override?.trim().toLowerCase() === ENGINE_MODEL_LOCAL ? null : (configured ?? null)
+}
+
 class AgentRunner {
   private token = ''
   private tokenExpiresAt = 0
@@ -1022,6 +1064,16 @@ class AgentRunner {
 
   /** Env handed to the engine subprocess: the `cumora` shim on PATH, wired to
    *  this agent's runtime URL + token. */
+  /** Big-brain model for the local engine, after the CUMORA_ENGINE_MODEL escape. */
+  private engineModel(): string | null {
+    return resolveEngineModel(this.agent.model, process.env.CUMORA_ENGINE_MODEL)
+  }
+
+  /** Small/fast-brain model for the local engine, after the same escape. */
+  private engineFastModel(): string | null {
+    return resolveEngineFastModel(this.agent.fastModel, process.env.CUMORA_ENGINE_MODEL)
+  }
+
   private engineEnv(): NodeJS.ProcessEnv {
     return {
       ...process.env,
@@ -1047,8 +1099,8 @@ class AgentRunner {
     this.engineSession = this.adapter.startSession({
       home: this.home,
       env: this.engineEnv(),
-      model: this.agent.model,
-      fastModel: this.agent.fastModel,
+      model: this.engineModel(),
+      fastModel: this.engineFastModel(),
       resumeSessionId: this.sessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
@@ -1544,7 +1596,7 @@ class AgentRunner {
         ? await session.send(prompt)
         : await this.adapter.run({
           home: this.home, prompt, env: this.engineEnv(),
-          model: this.agent.model, fastModel: this.agent.fastModel,
+          model: this.engineModel(), fastModel: this.engineFastModel(),
           resumeSessionId: this.sessionId, onLog: (line) => this.logEngineLine(line),
           // Same trajectory hook as the persistent-session path so the
           // one-shot fallback (or codex `exec` path) also lands hops in the
@@ -1914,8 +1966,8 @@ class AgentRunner {
               home: this.home,
               prompt,
               env: this.engineEnv(),
-              model: this.agent.model,
-              fastModel: this.agent.fastModel,
+              model: this.engineModel(),
+              fastModel: this.engineFastModel(),
               resumeSessionId,
               onLog: (line) => this.logEngineLine(line),
               onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),

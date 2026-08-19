@@ -522,6 +522,13 @@ function spawnCapture(
   })
 }
 
+/** The small/fast model the triage path actually runs on. `probe` must use the
+ *  SAME one or `doctor` reports a red small-brain for an operator whose custom
+ *  provider has no `haiku` — even though their triage is configured correctly. */
+function triageModel(fallback: string): string {
+  return process.env.CUMORA_TRIAGE_MODEL?.trim() || fallback
+}
+
 function extraArgs(envVar: string): string[] {
   const raw = process.env[envVar]
   return raw ? raw.split(/\s+/).filter(Boolean) : []
@@ -834,7 +841,7 @@ class ClaudeAdapter implements EngineAdapter {
     // → haiku (the cerebellum); 'big' → omit --model so Claude uses its DEFAULT
     // (the main reasoning brain). One token in, "OK" out — proves the binary runs
     // and that tier is authed/has quota, with NO tools/MCP/persona.
-    const model = args.tier === 'small' ? ['--model', 'haiku'] : []
+    const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const base = ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
@@ -1268,7 +1275,7 @@ class CodexAdapter implements EngineAdapter {
     // 'small' → gpt-5.4-mini (the cerebellum); 'big' → omit --model so Codex uses
     // its default model. `exec` non-interactive, no bypass/sandbox flags needed
     // for a tool-free one-token reply.
-    const model = args.tier === 'small' ? ['--model', 'gpt-5.4-mini'] : []
+    const model = args.tier === 'small' ? ['--model', triageModel('gpt-5.4-mini')] : []
     const { command, shell } = resolveSpawn(this.bin)
     const argv = ['exec', ...model, '--skip-git-repo-check', DOCTOR_PROMPT]
     return spawnCapture(command, argv, {
