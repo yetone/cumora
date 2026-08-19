@@ -20,7 +20,7 @@ export function Onboarding() {
   // Claude is the default; picking Codex appends `--engine codex`. We DON'T
   // append `--engine claude` so a Codex-only machine still auto-detects rather
   // than erroring on a Claude it doesn't have.
-  const [engine, setEngine] = useState<'claude' | 'codex'>('claude')
+  const [engine, setEngine] = useState<'claude' | 'codex' | 'pi'>('claude')
   // Default to installing the always-on service: it auto-starts on boot,
   // auto-restarts on crash, and auto-updates — so the user isn't tied to a
   // terminal that must stay open. Appends `--install-service` to the command.
@@ -36,7 +36,7 @@ export function Onboarding() {
   }, [copied])
 
   const origin = getPairingServerOrigin()
-  const engineFlag = engine === 'codex' ? ' --engine codex' : ''
+  const engineFlag = engine !== 'claude' ? ` --engine ${engine}` : ''
   const serviceFlag = asService ? ' --install-service' : ''
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
 
@@ -91,7 +91,7 @@ export function Onboarding() {
                 <div className="flex items-center gap-2.5 mb-2.5">
                   <span className="text-[12px] text-ink-500">Engine</span>
                   <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                    {([['claude', 'Claude Code'], ['codex', 'Codex']] as const).map(([id, label]) => (
+                    {([['claude', 'Claude Code'], ['codex', 'Codex'], ['pi', 'pi']] as const).map(([id, label]) => (
                       <button key={id} type="button" onClick={() => setEngine(id)}
                         className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                         style={engine === id

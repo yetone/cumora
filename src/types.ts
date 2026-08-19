@@ -7,7 +7,7 @@ export type Status = 'avail' | 'working' | 'thinking' | 'waiting' | 'resting'
 export type ComputerKind = 'cloud' | 'local' | 'vps'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 /** Engine an agent's host runs it on. 'managed' = Cumora's server-side loop. */
-export type EngineId = 'managed' | 'claude' | 'codex'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'pi'
 
 export interface Computer {
   id: string

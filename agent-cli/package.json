@@ -1,7 +1,7 @@
 {
   "name": "cumora",
   "version": "0.1.127",
-  "description": "Run your Cumora agents on your own machine or VPS, powered by your local Claude Code or Codex CLI (BYOA).",
+  "description": "Run your Cumora agents on your own machine or VPS, powered by your local Claude Code, Codex or pi CLI (BYOA).",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
     "cumora",
     "agent",
     "claude-code",
-    "codex"
+    "codex",
+    "pi"
   ],
   "scripts": {
     "build": "node build.mjs",

@@ -2,8 +2,8 @@
  * `cumora agent computer` — the BYOA daemon.
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
- * or more of their Cumora agents, using a local engine (Claude Code / Codex)
- * as each agent's brain. See docs/BYOA.md.
+ * or more of their Cumora agents, using a local engine (Claude Code / Codex /
+ * pi) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
  * anywhere:
@@ -556,6 +556,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'claude') {
     return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
   }
+  if (engine === 'pi') {
+    return 'Open pi on that computer and re-run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -566,6 +569,7 @@ function missingEngineMessage(): string {
     'Install and sign in to at least one of:',
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
+    '  - pi: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -577,7 +581,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code or Codex). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex or pi). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -765,8 +769,12 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
  *    - Auto-flush on every WINDOW_MS tick AND when buffer hits FLUSH_AT.
  *    - flush() can be awaited at "natural pauses" (turn end) to push the tail
  *      promptly without waiting for the timer. */
+/** Ledger source tag for a BYOA-emitted row: one per engine (the server's
+ *  LlmCallSource / TriageSource unions list the same ids). */
+type ByoaSource = `byoa-${EngineId}`
+
 interface PendingHop {
-  source: 'byoa-claude' | 'byoa-codex'
+  source: ByoaSource
   purpose: 'agent-turn' | 'inbox-triage' | 'compaction' | 'completion-verify' | 'steer-summary' | 'agenda' | 'synthetic-wake-gate'
   runId: string | null
   conversationId: string | null
@@ -816,7 +824,7 @@ class HopReporter {
     // Codex + Claude batches might intermix (the same reporter is used across
     // session lifetimes), so split by source — the server endpoint takes one
     // source per call (the row's `source` column is set from it).
-    const byHourceSource = new Map<'byoa-claude' | 'byoa-codex', PendingHop[]>()
+    const byHourceSource = new Map<ByoaSource, PendingHop[]>()
     for (const h of batch) {
       const arr = byHourceSource.get(h.source) ?? []
       arr.push(h); byHourceSource.set(h.source, arr)
@@ -983,7 +991,7 @@ class AgentRunner {
       if (typeof report.toolUses === 'number') extras.toolUses = report.toolUses
       if (typeof report.textChars === 'number') extras.textChars = report.textChars
       this.reporter.push({
-        source: this.adapter.id === 'claude' ? 'byoa-claude' : 'byoa-codex',
+        source: `byoa-${this.adapter.id}`,
         purpose,
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
@@ -1279,15 +1287,15 @@ class AgentRunner {
     await spawnPacer.gate()
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), TRIAGE_TIMEOUT_MS)
-    let res: { text: string; error?: string; usage?: EngineUsage }
+    let res: { text: string; error?: string; usage?: EngineUsage; model?: string | null }
     try {
       await mkdir(TRIAGE_DIR, { recursive: true })
       res = await this.adapter.classify({
         cwd: TRIAGE_DIR,
         prompt: `${payload.instructions}\n\n${payload.input}`,
         env: this.engineEnv(),
-        // Engine picks its own cheap default (claude→haiku, codex→gpt-5.4-mini);
-        // CUMORA_TRIAGE_MODEL overrides for either.
+        // Engine picks its own cheap default (claude→haiku, codex→gpt-5.4-mini,
+        // pi→its configured default model); CUMORA_TRIAGE_MODEL overrides for any.
         model: process.env.CUMORA_TRIAGE_MODEL,
         signal: controller.signal,
       })
@@ -1348,8 +1356,8 @@ class AgentRunner {
       const verdict = finalizeTriage(parsed, 'support-model-local')
       // Record the gate's cache-aware cost (fire-and-forget). A BYOA triage runs
       // LOCAL + cold-session — its input is uncached, the cost this ledger exists
-      // to weigh. usage is present for claude (json output), absent for codex.
-      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage)
+      // to weigh. usage is present for claude / pi (json output), absent for codex.
+      void this.recordTriageUsage(token, verdict.actionable, verdict.reason, res.usage, res.model)
       return verdict
     }
     if (payload.failClosed) {
@@ -1371,17 +1379,25 @@ class AgentRunner {
   }
 
   /** Triage model id for pricing (the local cerebellum: claude→haiku,
-   *  codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. */
+   *  codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. pi has no
+   *  fixed cerebellum id — its default model is whatever the user configured — so
+   *  without an override we fall back to the agent's own model as the best guess;
+   *  the engine's REPORTED model (see recordTriageUsage) wins when it has one. */
   private triageModel(): string {
-    return process.env.CUMORA_TRIAGE_MODEL || (this.adapter.id === 'claude' ? 'haiku' : 'gpt-5.4-mini')
+    if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
+    if (this.adapter.id === 'claude') return 'haiku'
+    if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    return this.agent.model ?? '<pi-default>'
   }
 
   /** Post one local-triage record to the cost ledger. Best-effort. `usage` is the
-   *  engine's raw breakdown (claude); undefined → recorded as unmeasured (codex). */
-  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage): Promise<void> {
+   *  engine's raw breakdown (claude / pi); undefined → recorded as unmeasured
+   *  (codex). `model` is the id the engine REPORTED running on (pi's json stream
+   *  names it); absent → the adapter's nominal triage model. */
+  private async recordTriageUsage(token: string, actionable: boolean, reason: string, usage?: EngineUsage, model?: string | null): Promise<void> {
     await runtimeBest(this.cfg.serverUrl, '/triage', token, {
       source: `byoa-${this.adapter.id}`,
-      model: this.triageModel(),
+      model: model || this.triageModel(),
       actionable,
       reason,
       usage: usage ? usageFromClaude(usage) : null,

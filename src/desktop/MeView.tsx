@@ -709,7 +709,7 @@ function ComputersTab() {
   const [copied, setCopied] = useState(false)
   // Engine for a NEWLY added computer's starter/assigned agents. Claude is the
   // default (no flag → daemon auto-detects); Codex appends `--engine codex`.
-  const [engine, setEngine] = useState<'claude' | 'codex'>('claude')
+  const [engine, setEngine] = useState<'claude' | 'codex' | 'pi'>('claude')
   // Default on: install the always-on service (auto-start/restart/update).
   // --install-service is macOS/Linux only (daemon throws on Windows) → off + hidden there.
   const [asService, setAsService] = useState(!isWindows)
@@ -736,7 +736,7 @@ function ComputersTab() {
 
   const origin = getPairingServerOrigin()
   const serverFlag = origin ? ` --server ${origin}` : ''
-  const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engine === 'codex' ? ' --engine codex' : ''}${asService ? ' --install-service' : ''}` : ''
+  const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engine !== 'claude' ? ` --engine ${engine}` : ''}${asService ? ' --install-service' : ''}` : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
 
@@ -861,7 +861,7 @@ function ComputersTab() {
             <div className="flex items-center gap-2.5 mb-2.5">
               <span className="text-[12px] text-ink-500">Engine</span>
               <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                {([['claude', 'Claude Code'], ['codex', 'Codex']] as const).map(([id, label]) => (
+                {([['claude', 'Claude Code'], ['codex', 'Codex'], ['pi', 'pi']] as const).map(([id, label]) => (
                   <button key={id} type="button" onClick={() => setEngine(id)}
                     className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                     style={engine === id

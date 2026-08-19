@@ -27,7 +27,7 @@ import {
   ensureCloudComputer, issuePairingCode, pairComputer, announceComputerOnline,
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
-  cloudComputerId, issueRepairCode,
+  cloudComputerId, issueRepairCode, PAIRABLE_ENGINES,
 } from '../agents/computer/registry.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
@@ -1098,7 +1098,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // and any adopted agent are created with. Fall back to Claude if unreported.
   try {
     if ((await companyTier(paired.companyId)) === 'free') {
-      const engine = (engines[0] === 'claude' || engines[0] === 'codex') ? engines[0] : 'claude'
+      const engine = engines[0] && PAIRABLE_ENGINES.has(engines[0]) ? engines[0] : 'claude'
       // Adopt only agents that are stranded on the managed Cumora Cloud (or
       // unassigned) onto the just-paired machine — earlier builds' boot backfill
       // wrongly seeded free starters on cloud, where free can't run them. Agents
