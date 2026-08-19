@@ -321,6 +321,62 @@ interface RuntimeInboxResponse {
   }>
 }
 
+// How many unread MESSAGE lines the pre-loaded wake digest may carry. It rides
+// in EVERY chat turn's prompt (see chatDelta), so it stays small.
+const DIGEST_MAX_MESSAGE_LINES = 40
+
+/** Render the pre-loaded unread digest for the wake prompt within
+ *  DIGEST_MAX_MESSAGE_LINES.
+ *
+ *  The budget is spent PER CONVERSATION rather than as one global "newest N
+ *  lines" tail, because `ackSeen` marks the WHOLE snapshot read: anything the
+ *  digest leaves out is marked read having never been shown, and since
+ *  mark-read pins each conversation's cursor at its NEWEST message it can never
+ *  resurface in a later wake. A global tail let a burst in one busy room evict —
+ *  and then ack away — every message of a quieter conversation, including a
+ *  human DM the agent could not even name afterwards. The cloud path avoids this
+ *  by giving every conversation with unread its own window (see loadContext).
+ *
+ *  Whatever the budget still cannot fit is announced IN PLACE with its exact
+ *  count and the command that reads it, so the engine can recover the rest
+ *  instead of never learning it existed. Conversations keep first-seen order and
+ *  their messages stay chronological; when everything fits, every unread line is
+ *  shown, exactly as before.
+ *
+ *  Exported for tests — pure, no server and no engine. */
+export function renderInboxDigest(
+  byConvo: Map<string, { head: string; msgs: string[] }>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): string {
+  if (byConvo.size === 0) return ''
+  // Water-fill quietest-first: each conversation takes at most an even share of
+  // what is LEFT, so a small conversation keeps all of its messages and the busy
+  // one absorbs the slack. When the total fits, this hands every conversation
+  // its full set (nothing omitted, nothing announced).
+  const keep = new Map<string, number>()
+  let lineBudget = budget
+  let unserved = byConvo.size
+  for (const [id, convo] of [...byConvo].sort((a, b) => a[1].msgs.length - b[1].msgs.length)) {
+    const n = Math.min(convo.msgs.length, Math.max(0, Math.floor(lineBudget / unserved)))
+    keep.set(id, n)
+    lineBudget -= n
+    unserved -= 1
+  }
+  const lines: string[] = []
+  for (const [id, convo] of byConvo) {
+    const shown = keep.get(id) ?? 0
+    lines.push(convo.head)
+    // Never drop unread in SILENCE — this turn is about to mark it read.
+    if (convo.msgs.length > shown) {
+      lines.push(`  … ${convo.msgs.length - shown} older unread message(s) not shown — \`cumora messages ${id} --tail ${convo.msgs.length}\` to read them`)
+    }
+    // slice(length - shown), NOT slice(-shown): slice(-0) is slice(0) and would
+    // print everything for a conversation budgeted to zero.
+    lines.push(...convo.msgs.slice(convo.msgs.length - shown))
+  }
+  return lines.join('\n')
+}
+
 interface RuntimeInboxTriageResponse {
   actionable?: boolean
   reason?: string
@@ -1298,16 +1354,17 @@ class AgentRunner {
   private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean }> {
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
     const seen = new Map<string, string>()
-    const lines: string[] = []
+    // Unread grouped BY CONVERSATION (first-seen order), each with the header
+    // (title + topic) the cloud agent's context also carries — so a BYOA agent
+    // always sees what the group is FOR (its topic), not just the messages.
+    // Grouped rather than one flat line list because the digest has a LINE
+    // BUDGET, and spending it per conversation is what stops a busy room from
+    // evicting — and `ackSeen` then burying — a quiet one. See renderInboxDigest.
+    const byConvo = new Map<string, { head: string; msgs: string[] }>()
     // `hasReal` = is ANY unread a genuine human/agent message (not a system
     // relay/status/membership notice)? The cost gate in runTurn uses this to
     // refuse to spend ANY model on a system-only (or empty) inbox.
     let hasReal = false
-    // Emit a per-conversation header (title + topic) the first time each convo
-    // appears, mirroring the cloud agent's context header — so a BYOA agent
-    // always sees what the group is FOR (its topic) while chatting, not just the
-    // messages.
-    const headered = new Set<string>()
     // rows are ordered created_at ASC, so the last row per conversation is its
     // newest unread message — exactly the cursor we want to advance to.
     for (const row of inbox?.rows ?? []) {
@@ -1318,13 +1375,14 @@ class AgentRunner {
       // engine (the cloud path special-cases these system rows the same way).
       const alarm = row.kind === 'system' && typeof row.body === 'string' ? this.parseAlarmPayload(row.body) : null
       if (row.kind !== 'system' || (alarm && (!alarm.assigneeId || alarm.assigneeId === this.agent.id))) hasReal = true
-      if (!headered.has(row.conversation_id)) {
-        headered.add(row.conversation_id)
+      let convo = byConvo.get(row.conversation_id)
+      if (!convo) {
         const kind = row.conversation_kind ? ` [${row.conversation_kind}]` : ''
         const title = row.conversation_title ? ` "${row.conversation_title}"` : ''
         let head = `# ${row.conversation_id}${kind}${title}`
         if (row.conversation_topic) head += `\n  Topic: ${row.conversation_topic}`
-        lines.push(head)
+        convo = { head, msgs: [] }
+        byConvo.set(row.conversation_id, convo)
       }
       const author = row.author_name ?? 'someone'
       const who = row.author_kind ? `${author} (${row.author_kind})` : author
@@ -1336,10 +1394,9 @@ class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      lines.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
     }
-    const digest = lines.length ? lines.slice(-40).join('\n') : ''
-    return { seen, digest, hasReal }
+    return { seen, digest: renderInboxDigest(byConvo), hasReal }
   }
 
   /** Advance this agent's read cursor over the conversations it just saw, so a
