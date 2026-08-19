@@ -218,3 +218,81 @@ test('a Codex session whose resume fallback also fails dies instead of wedging',
   ])
   assert.notEqual(second, 'HUNG', 'a later turn must settle rather than park forever')
 })
+
+// ── stream-json events split across pipe reads ──────────────────────────────
+// A pipe read chops stdout at an arbitrary byte offset, so a long event arrives
+// as two 'data' chunks. Parsing each chunk in isolation threw away both halves,
+// and the swallow-partial-lines catch made it silent: no ledger row, and the
+// turn's authoritative usage/model/session id lost.
+
+test('a stream-json event split across pipe chunks is still parsed', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-chunk-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir); await mkdir(home)
+
+  // One assistant event padded far past any pipe buffer, then the terminating
+  // result. Emitted with NO trailing newline on the last line, which is how the
+  // engines actually finish.
+  const fake = join(binDir, 'claude')
+  await writeFile(
+    fake,
+    '#!/usr/bin/env node\n' +
+    "const big = 'z'.repeat(400000)\n" +
+    "const assistant = { type: 'assistant', session_id: 'sess-chunked', message: { model: 'claude-sonnet-4-6', usage: { input_tokens: 11, output_tokens: 7 }, content: [{ type: 'text', text: big }] } }\n" +
+    "const result = { type: 'result', session_id: 'sess-chunked', usage: { input_tokens: 11, output_tokens: 7 }, model: 'claude-sonnet-4-6' }\n" +
+    "process.stdout.write(JSON.stringify(assistant) + '\\n')\n" +
+    "process.stdout.write(JSON.stringify(result))\n",
+    'utf8',
+  )
+  await chmod(fake, 0o755)
+
+  const hops: Array<{ model: string }> = []
+  const r = await getAdapter('claude').run({
+    home,
+    prompt: 'go',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    onLog: () => {},
+    onHopUsage: (h) => hops.push({ model: h.model }),
+    signal: new AbortController().signal,
+  })
+
+  assert.equal(r.exitCode, 0)
+  assert.equal(r.sessionId, 'sess-chunked', 'session id must survive a chunk split (else no --resume next wake)')
+  assert.equal(r.usage?.output_tokens, 7, "the result event's usage must survive")
+  assert.equal(r.model, 'claude-sonnet-4-6')
+  assert.equal(hops.length, 1, 'the assistant hop must reach the trajectory ledger exactly once')
+})
+
+test('a multi-byte character split across pipe chunks is not corrupted', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-utf8-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir); await mkdir(home)
+
+  // Pad so the event is long enough to be chopped, and fill it with multi-byte
+  // characters so a boundary is very likely to land mid-codepoint.
+  const fake = join(binDir, 'claude')
+  await writeFile(
+    fake,
+    '#!/usr/bin/env node\n' +
+    "const big = '中'.repeat(150000)\n" +
+    "const ev = { type: 'result', session_id: 'sess-utf8', usage: { input_tokens: 1, output_tokens: 2 }, model: 'm', note: big }\n" +
+    "process.stdout.write(JSON.stringify(ev) + '\\n')\n",
+    'utf8',
+  )
+  await chmod(fake, 0o755)
+
+  const r = await getAdapter('claude').run({
+    home,
+    prompt: 'go',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    onLog: () => {},
+    signal: new AbortController().signal,
+  })
+
+  assert.equal(r.sessionId, 'sess-utf8', 'a codepoint split mid-boundary must not corrupt the JSON')
+  assert.equal(r.usage?.output_tokens, 2)
+})

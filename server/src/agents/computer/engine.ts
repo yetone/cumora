@@ -23,6 +23,7 @@ import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -431,8 +432,26 @@ function spawnEngine(
     // emitted the hop, so latency_ms reflects actual time-on-the-wire.
     let hopStartedAt: number | null = null
     let hopIndex = 0
-    const pump = (stream: 'stdout' | 'stderr', buf: Buffer): void => {
-      for (const line of buf.toString('utf8').split('\n')) {
+    // A pipe read chops stdout at an arbitrary byte offset (~8KB on macOS, up to
+    // 64KB on Linux), so a long stream-json event — a Write/Edit tool_use carrying
+    // file content, or a big final `result` — arrives split across two 'data'
+    // events. Splitting each chunk on its own handed JSON.parse two halves, both
+    // of which throw and are swallowed by the catch below: the hop never reached
+    // the ledger and the turn's authoritative usage/model/session id were lost,
+    // silently. Carry the trailing partial line into the next chunk, exactly like
+    // ClaudeSession.onStdout already does for the persistent path. StringDecoder
+    // does the same job one level down, holding back a multi-byte character split
+    // across the boundary instead of emitting U+FFFD into the JSON.
+    const decoder: Record<'stdout' | 'stderr', StringDecoder> =
+      { stdout: new StringDecoder('utf8'), stderr: new StringDecoder('utf8') }
+    const carry: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' }
+    // `buf === null` means end-of-stream: flush whatever is held back, since the
+    // engine's last line often has no trailing newline.
+    const pump = (stream: 'stdout' | 'stderr', buf: Buffer | null): void => {
+      const text = buf === null ? decoder[stream].end() : decoder[stream].write(buf)
+      const lines = (carry[stream] + text).split('\n')
+      carry[stream] = buf === null ? '' : (lines.pop() ?? '')
+      for (const line of lines) {
         const cleaned = cleanLine(line)
         if (!cleaned) continue
         pushTail(stream === 'stderr' ? stderrTail : stdoutTail, cleaned)
@@ -473,6 +492,10 @@ function spawnEngine(
     child.on('error', (err) => { signal.removeEventListener('abort', onAbort); reject(err) })
     child.on('close', (code, signalName) => {
       signal.removeEventListener('abort', onAbort)
+      // Flush the held-back tail BEFORE resolving: the terminating `result`
+      // event is usually the last line, and it carries the turn's usage.
+      pump('stdout', null)
+      pump('stderr', null)
       const exitCode = code ?? (signalName ? 128 : 1)
       resolve({
         exitCode,
