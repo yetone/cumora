@@ -304,17 +304,43 @@ test('a multi-byte character split across pipe chunks is not corrupted', { skip:
 // goes on posting AS the agent while the replacement runner answers the same
 // messages — with the OLD persona the operator just changed.
 
+/** A fake engine shaped like a real one: it spawns a child that INHERITS its
+ *  stdio and outlives it, the way `claude` does for every Bash tool command.
+ *  That grandchild holds the stdout/stderr pipes open, so `close` may never fire
+ *  after the engine is killed — which is why the abort path must settle on
+ *  `exit`. Written in Node rather than shell so the process tree is identical on
+ *  every platform (bash execs the last command, dash forks it). */
+async function fakeEngineWithLingeringChild(root: string): Promise<string> {
+  const binDir = join(root, 'bin')
+  await mkdir(binDir, { recursive: true })
+  const bin = join(binDir, 'claude')
+  await writeFile(
+    bin,
+    '#!/usr/bin/env node\n' +
+    "require('child_process').spawn('sleep', ['120'], { stdio: 'inherit' })\n" +
+    'setTimeout(() => {}, 120000)\n',
+    'utf8',
+  )
+  await chmod(bin, 0o755)
+  return binDir
+}
+
+async function runFakeEngine(binDir: string, home: string, signal: AbortSignal) {
+  return getAdapter('claude').run({
+    home,
+    prompt: 'go',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    onLog: () => {},
+    signal,
+  })
+}
+
 test('an already-aborted signal kills the engine child immediately', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-abort-'))
   tempDirs.push(root)
-  const binDir = join(root, 'bin')
   const home = join(root, 'home')
-  await mkdir(binDir); await mkdir(home)
-
-  // A child that would run for a very long time if left alone.
-  const fake = join(binDir, 'claude')
-  await writeFile(fake, '#!/bin/sh\nsleep 120\n', 'utf8')
-  await chmod(fake, 0o755)
+  await mkdir(home)
+  const binDir = await fakeEngineWithLingeringChild(root)
 
   // The queued-turn case: the signal is ALREADY aborted by the time run() is
   // reached, so a listener registered afterwards would never fire.
@@ -322,14 +348,8 @@ test('an already-aborted signal kills the engine child immediately', { skip: IS_
   ac.abort()
 
   const r = await Promise.race([
-    getAdapter('claude').run({
-      home,
-      prompt: 'go',
-      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
-      onLog: () => {},
-      signal: ac.signal,
-    }),
-    delay(5000).then(() => 'ORPHANED' as const),
+    runFakeEngine(binDir, home, ac.signal),
+    delay(15_000).then(() => 'ORPHANED' as const),
   ])
   assert.notEqual(r, 'ORPHANED', 'the child outlived its aborted signal — it would keep posting as the agent')
   assert.notEqual((r as { exitCode: number }).exitCode, 0, 'a killed turn must not report success')
@@ -338,25 +358,16 @@ test('an already-aborted signal kills the engine child immediately', { skip: IS_
 test('aborting mid-run kills the engine child', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-abort2-'))
   tempDirs.push(root)
-  const binDir = join(root, 'bin')
   const home = join(root, 'home')
-  await mkdir(binDir); await mkdir(home)
-  const fake = join(binDir, 'claude')
-  await writeFile(fake, '#!/bin/sh\nsleep 120\n', 'utf8')
-  await chmod(fake, 0o755)
+  await mkdir(home)
+  const binDir = await fakeEngineWithLingeringChild(root)
 
   const ac = new AbortController()
-  const p = getAdapter('claude').run({
-    home,
-    prompt: 'go',
-    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
-    onLog: () => {},
-    signal: ac.signal,
-  })
+  const p = runFakeEngine(binDir, home, ac.signal)
   await delay(150)
   ac.abort()
-  const r = await Promise.race([p, delay(5000).then(() => 'ORPHANED' as const)])
-  assert.notEqual(r, 'ORPHANED', 'abort must terminate the child')
+  const r = await Promise.race([p, delay(15_000).then(() => 'ORPHANED' as const)])
+  assert.notEqual(r, 'ORPHANED', 'abort must terminate the turn even when a grandchild holds the stdio pipes')
   assert.notEqual((r as { exitCode: number }).exitCode, 0)
 })
 
