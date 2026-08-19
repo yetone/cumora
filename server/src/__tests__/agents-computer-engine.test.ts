@@ -296,3 +296,86 @@ test('a multi-byte character split across pipe chunks is not corrupted', { skip:
   assert.equal(r.sessionId, 'sess-utf8', 'a codepoint split mid-boundary must not corrupt the JSON')
   assert.equal(r.usage?.output_tokens, 2)
 })
+
+// ── one-shot engine children must die with their runner ─────────────────────
+// The persistent session is torn down by AgentRunner.stop(); the one-shot child
+// was not, because its AbortSignal came from a controller nothing ever aborted.
+// An orphan keeps a valid runtime token and the `cumora` shim on PATH, so it
+// goes on posting AS the agent while the replacement runner answers the same
+// messages — with the OLD persona the operator just changed.
+
+test('an already-aborted signal kills the engine child immediately', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-abort-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir); await mkdir(home)
+
+  // A child that would run for a very long time if left alone.
+  const fake = join(binDir, 'claude')
+  await writeFile(fake, '#!/bin/sh\nsleep 120\n', 'utf8')
+  await chmod(fake, 0o755)
+
+  // The queued-turn case: the signal is ALREADY aborted by the time run() is
+  // reached, so a listener registered afterwards would never fire.
+  const ac = new AbortController()
+  ac.abort()
+
+  const r = await Promise.race([
+    getAdapter('claude').run({
+      home,
+      prompt: 'go',
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+      onLog: () => {},
+      signal: ac.signal,
+    }),
+    delay(5000).then(() => 'ORPHANED' as const),
+  ])
+  assert.notEqual(r, 'ORPHANED', 'the child outlived its aborted signal — it would keep posting as the agent')
+  assert.notEqual((r as { exitCode: number }).exitCode, 0, 'a killed turn must not report success')
+})
+
+test('aborting mid-run kills the engine child', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-abort2-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir); await mkdir(home)
+  const fake = join(binDir, 'claude')
+  await writeFile(fake, '#!/bin/sh\nsleep 120\n', 'utf8')
+  await chmod(fake, 0o755)
+
+  const ac = new AbortController()
+  const p = getAdapter('claude').run({
+    home,
+    prompt: 'go',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    onLog: () => {},
+    signal: ac.signal,
+  })
+  await delay(150)
+  ac.abort()
+  const r = await Promise.race([p, delay(5000).then(() => 'ORPHANED' as const)])
+  assert.notEqual(r, 'ORPHANED', 'abort must terminate the child')
+  assert.notEqual((r as { exitCode: number }).exitCode, 0)
+})
+
+test('a normal run is unaffected by the abort wiring', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-noabort-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir); await mkdir(home)
+  const fake = join(binDir, 'claude')
+  await writeFile(fake, '#!/bin/sh\necho ok\nexit 0\n', 'utf8')
+  await chmod(fake, 0o755)
+
+  const r = await getAdapter('claude').run({
+    home,
+    prompt: 'go',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    onLog: () => {},
+    signal: new AbortController().signal,
+  })
+  assert.equal(r.exitCode, 0)
+})

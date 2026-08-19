@@ -883,6 +883,12 @@ export function resolveEngineFastModel(
 }
 
 class AgentRunner {
+  /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
+   *  engine child dies with its runner, the way the persistent session already
+   *  does. Without it those children were orphaned: they keep a valid runtime
+   *  token and the `cumora` shim on PATH, so they go on posting AS the agent
+   *  while the replacement runner independently answers the same messages. */
+  private readonly teardown = new AbortController()
   private token = ''
   private tokenExpiresAt = 0
   private home: string
@@ -1097,6 +1103,11 @@ class AgentRunner {
     this.beginStop()
     this.engineSession?.stop()
     this.engineSession = null
+    // Kill a one-shot engine child too. sync() tears a runner down on any
+    // config change (engine/model/persona) or unassign while the daemon keeps
+    // running, which is exactly where an orphan does damage: it would still be
+    // acting with the OLD persona the operator just replaced.
+    this.teardown.abort()
     // Drain any hops queued at shutdown so the ledger doesn't lose the tail
     // (e.g. the agent was mid-turn when the daemon restarts for an update).
     this.hopReporter?.stop()
@@ -1672,7 +1683,7 @@ class AgentRunner {
           // one-shot fallback (or codex `exec` path) also lands hops in the
           // universal ledger.
           onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-          signal: new AbortController().signal,
+          signal: this.teardown.signal,
         })
       if (session?.sessionId) this.setSessionId(session.sessionId)
       if (session && !session.alive) this.engineSession = null
@@ -1977,7 +1988,6 @@ class AgentRunner {
         // maybeAgendaTurn for the same hook).
         this.currentRunId = run?.runId ?? null
         const stopRunBeat = this.beatRun(token, run?.runId)
-        const controller = new AbortController()
         let exitCode = 0
         let engineError: string | null = null
         let turnUsage: EngineUsage | undefined
@@ -2041,7 +2051,7 @@ class AgentRunner {
               resumeSessionId,
               onLog: (line) => this.logEngineLine(line),
               onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-              signal: controller.signal,
+              signal: this.teardown.signal,
             })
             if (result.sessionId) this.setSessionId(result.sessionId)
           }

@@ -421,6 +421,11 @@ function spawnEngine(
     }
     const onAbort = (): void => { child.kill('SIGTERM') }
     signal.addEventListener('abort', onAbort, { once: true })
+    // A listener registered AFTER the abort event never fires. A turn that was
+    // still queued behind the concurrency gate when its runner was stopped would
+    // otherwise spawn a child nothing owns — with a live runtime token and the
+    // `cumora` shim on PATH.
+    if (signal.aborted) onAbort()
 
     const stderrTail: string[] = []
     const stdoutTail: string[] = []
@@ -490,12 +495,11 @@ function spawnEngine(
     child.stdout?.on('data', (buf: Buffer) => pump('stdout', buf))
     child.stderr?.on('data', (buf: Buffer) => pump('stderr', buf))
     child.on('error', (err) => { signal.removeEventListener('abort', onAbort); reject(err) })
-    child.on('close', (code, signalName) => {
+    let settled = false
+    const settle = (code: number | null, signalName: NodeJS.Signals | null): void => {
+      if (settled) return
+      settled = true
       signal.removeEventListener('abort', onAbort)
-      // Flush the held-back tail BEFORE resolving: the terminating `result`
-      // event is usually the last line, and it carries the turn's usage.
-      pump('stdout', null)
-      pump('stderr', null)
       const exitCode = code ?? (signalName ? 128 : 1)
       resolve({
         exitCode,
@@ -504,7 +508,22 @@ function spawnEngine(
         usage,
         model,
       })
+    }
+    // Normal end: wait for 'close', so the last of stdout is parsed. Flush the
+    // held-back tail BEFORE resolving: the terminating `result` event is
+    // usually the last line, and it carries the turn's usage.
+    child.on('close', (code, signalName) => {
+      if (!settled) { pump('stdout', null); pump('stderr', null) }
+      settle(code, signalName)
     })
+    // Torn-down end: 'close' waits for every inherited stdio pipe to reach EOF,
+    // and the engine's OWN children (Bash tool commands) hold those pipes — a
+    // grandchild that outlives the kill keeps them open, so 'close' may never
+    // fire at all. Once we've aborted, the turn is being discarded and its
+    // remaining output is moot, so settle on 'exit' instead. Without this the
+    // daemon's shutdown drain waits forever on a turn it already killed, and
+    // `busy` plus the big-brain slot are never released.
+    child.on('exit', (code, signalName) => { if (signal.aborted) settle(code, signalName) })
   })
 }
 
