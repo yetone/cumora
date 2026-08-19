@@ -574,7 +574,10 @@ async function saveConfig(cfg: DaemonConfig): Promise<void> {
 // A tiny Node executable named `cumora` that the engine calls via bash. It
 // POSTs argv to the server's /runtime/cli, which runs the full CLI server-
 // side with the agent's identity pinned by the JWT. No curl/jq dependency.
-const CUMORA_SHIM = `#!/usr/bin/env node
+//
+// Exported for tests: the output-truncation regression below is only observable
+// by running the real shim text against a real pipe.
+export const CUMORA_SHIM = `#!/usr/bin/env node
 'use strict'
 ;(async () => {
   const url = process.env.CUMORA_AGENT_RUNTIME_URL
@@ -622,8 +625,18 @@ const CUMORA_SHIM = `#!/usr/bin/env node
     process.exit(70)
   }
   const data = await res.json()
-  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n')
-  process.exit(typeof data.exitCode === 'number' ? data.exitCode : 0)
+  const code = typeof data.exitCode === 'number' ? data.exitCode : 0
+  // Exit from the write CALLBACK, not the next statement: stdout on a PIPE is
+  // ASYNC, so process.exit() kills us with the tail still buffered. The engine
+  // always runs this shim with stdout piped, so a big result (cumora messages
+  // --tail 30, cumora inbox --json) silently arrived truncated at the pipe
+  // buffer — 64KB, or 8KB on the socketpair a stdio:'pipe' parent hands us —
+  // with exit 0 and empty stderr, so nothing signalled the loss and --json
+  // output simply failed to parse. Exiting IN the callback also keeps a reader
+  // that closed early (| head) an exit-0 like before, instead of the unhandled
+  // EPIPE crash a bare process.exitCode would produce.
+  if (typeof data.text === 'string' && data.text) process.stdout.write(data.text + '\\n', () => process.exit(code))
+  else process.exit(code)
 })().catch((e) => { console.error('cumora:', (e && e.message) || e); process.exit(70) })
 `
 
