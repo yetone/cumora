@@ -110,7 +110,7 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
   await chmod(fakeGrok, 0o755)
 
   const adapter = getAdapter('grok')
-  await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer' })
+  await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer', systemPrompt: null })
   const agentsMd = await readFile(join(home, 'AGENTS.md'), 'utf8')
   assert.match(agentsMd, /Iris/)
 
