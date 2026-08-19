@@ -2,7 +2,7 @@
  * EngineAdapter — the pluggable "brain" for a BYOA agent.
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
- * on the user's machine: Claude Code or Codex. The daemon (daemon.ts) hands
+ * on the user's machine: Claude Code, Codex, or Grok Build. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * isolated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -14,14 +14,14 @@
  * NOTE on engine flags: the exact non-interactive / permission flags differ
  * across engine versions. We pick sensible defaults for an isolated,
  * user-owned runner and let the user override via env
- * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS, space-split). Correctness of the
+ * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS, space-split). Correctness of the
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
 import { stripLoneSurrogates } from '../text-safety.js'
 
@@ -84,10 +84,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex'
+export type EngineId = 'claude' | 'codex' | 'grok'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok']
 
 export interface EnginePersona {
   id: string
@@ -1404,9 +1404,423 @@ class CodexAdapter implements EngineAdapter {
   }
 }
 
+/** Official Grok Build install lives at ~/.grok/bin even when that dir is
+ *  not on the daemon's PATH (launchd / login-shell mismatch). PATH wins. */
+function resolveGrokBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const candidate = join(dir, IS_WIN ? 'grok.exe' : 'grok')
+    if (existsSync(candidate)) return candidate
+    if (IS_WIN && existsSync(join(dir, 'grok'))) return join(dir, 'grok')
+  }
+  const homeBin = join(homedir(), '.grok', 'bin', IS_WIN ? 'grok.exe' : 'grok')
+  return existsSync(homeBin) ? homeBin : null
+}
+
+type AcpMsg = {
+  jsonrpc?: string
+  id?: number
+  method?: string
+  result?: { sessionId?: unknown }
+  error?: { message?: unknown }
+  params?: Record<string, unknown>
+}
+
+/** Persistent Grok Build session over ACP stdio (`grok agent --always-approve stdio`).
+ *  Handshake: initialize → session/new|load → session/prompt per wake.
+ *  Mid-turn steer is not in the ACP surface Grok exposes — steer() is a no-op
+ *  and the daemon's next-wake coalescing carries the ping instead. */
+class GrokSession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private outBuf = ''
+  private sid: string | null
+  private exited = false
+  private exitCode = 0
+  private reqId = 0
+  private initializeId: number | null = null
+  private sessionReqId: number | null = null
+  private sessionWasLoad = false
+  private readonly sessionNewParams: Record<string, unknown>
+  private ready = false
+  private pending: { resolve: (r: EngineRunResult) => void; id: number; startedAt: number } | null = null
+  private queuedPrompt: string | null = null
+  private steerWarned = false
+  private readonly model: string | null
+  readonly carriesStandingPrompt: boolean
+
+  constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.sid = opts.resumeSessionId ?? null
+    this.model = opts.model ?? null
+    this.carriesStandingPrompt = !!opts.standingPrompt
+    const meta: Record<string, unknown> = { yoloMode: true }
+    if (opts.standingPrompt) meta.rules = opts.standingPrompt
+    this.sessionNewParams = { cwd: home, mcpServers: [], _meta: meta }
+    this.sessionWasLoad = !!opts.resumeSessionId
+    const grokEnv: NodeJS.ProcessEnv = { ...env, GROK_DISABLE_AUTOUPDATER: env.GROK_DISABLE_AUTOUPDATER ?? '1' }
+    this.child = spawn(bin, spawnArgs, { cwd: home, env: grokEnv, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
+    this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
+    this.child.stderr?.on('data', (b: Buffer) => {
+      for (const raw of b.toString('utf8').split('\n')) {
+        const l = cleanLine(raw)
+        if (l) this.onLog(l)
+      }
+    })
+    this.child.on('error', (err) => this.die(1, err.message))
+    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    queueMicrotask(() => {
+      this.initializeId = this.req('initialize', {
+        protocolVersion: 1,
+        clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+      })
+    })
+  }
+
+  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.sid }
+
+  send(prompt: string): Promise<EngineRunResult> {
+    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
+    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid })
+    return new Promise<EngineRunResult>((resolve) => {
+      this.pending = { resolve, id: 0, startedAt: Date.now() }
+      if (this.ready && this.sid) this.startPrompt(prompt)
+      else this.queuedPrompt = prompt
+    })
+  }
+
+  steer(_text: string): void {
+    // ACP session/prompt is one-in-flight. A mid-turn inject would cancel the
+    // running turn. The daemon coalesces the ping onto the next wake instead.
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.onLog('[grok] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    }
+  }
+
+  stop(): void {
+    this.exited = true
+    try { this.child.stdin?.end() } catch { /* ignore */ }
+    try { this.child.kill('SIGTERM') } catch { /* ignore */ }
+  }
+
+  private nextId(): number { this.reqId += 1; return this.reqId }
+  private req(method: string, params: Record<string, unknown>): number {
+    const id = this.nextId()
+    try { this.child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n') } catch { /* die() */ }
+    return id
+  }
+
+  private startPrompt(prompt: string): void {
+    if (!this.sid || !this.pending) return
+    const id = this.req('session/prompt', {
+      sessionId: this.sid,
+      prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+    })
+    this.pending.id = id
+  }
+
+  private onStdout(buf: Buffer): void {
+    this.outBuf += buf.toString('utf8')
+    let nl: number
+    while ((nl = this.outBuf.indexOf('\n')) >= 0) {
+      const line = this.outBuf.slice(0, nl)
+      this.outBuf = this.outBuf.slice(nl + 1)
+      const t = line.trim()
+      if (!t.startsWith('{')) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      let msg: AcpMsg | null = null
+      try { msg = JSON.parse(t) as AcpMsg } catch { msg = null }
+      if (!msg) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      this.handle(msg)
+    }
+  }
+
+  private handle(msg: AcpMsg): void {
+    if (msg.id !== undefined && msg.id === this.initializeId) {
+      this.initializeId = null
+      if (msg.error) { this.failPending(String(msg.error.message || 'grok initialize failed')); return }
+      if (this.sessionWasLoad && this.sid) {
+        this.sessionReqId = this.req('session/load', { sessionId: this.sid, ...this.sessionNewParams })
+      } else {
+        this.sessionReqId = this.req('session/new', this.sessionNewParams)
+      }
+      return
+    }
+    if (msg.error && msg.id !== undefined && msg.id === this.sessionReqId) {
+      if (this.sessionWasLoad) {
+        this.onLog(`[grok] session/load failed (${String(msg.error.message || '')}) — starting a fresh session`)
+        this.sessionWasLoad = false
+        this.sid = null
+        this.sessionReqId = this.req('session/new', this.sessionNewParams)
+        return
+      }
+      this.failPending(String(msg.error.message || 'grok session start failed'))
+      return
+    }
+    if (msg.id !== undefined && msg.id === this.sessionReqId && msg.result) {
+      const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : this.sid
+      this.sessionReqId = null
+      if (typeof sid === 'string' && sid) this.sid = sid
+      this.ready = true
+      if (this.queuedPrompt && this.pending) {
+        const p = this.queuedPrompt
+        this.queuedPrompt = null
+        this.startPrompt(p)
+      }
+      return
+    }
+    if (msg.method === 'session/update') {
+      const update = (msg.params?.update ?? msg.params?.sessionUpdate) as Record<string, unknown> | undefined
+      const kind = typeof update?.sessionUpdate === 'string' ? update.sessionUpdate
+        : typeof update?.sessionUpdate === 'undefined' && typeof (msg.params as { sessionUpdate?: unknown } | undefined)?.sessionUpdate === 'string'
+          ? String((msg.params as { sessionUpdate?: unknown }).sessionUpdate)
+          : null
+      const u = (update ?? msg.params ?? {}) as Record<string, unknown>
+      const k = kind ?? (typeof u.sessionUpdate === 'string' ? u.sessionUpdate : null)
+      if (k === 'tool_call' && typeof u.title === 'string') this.onLog(`[grok] tool ${u.title}`)
+      else if (k === 'agent_message_chunk') {
+        const content = u.content as { text?: unknown } | undefined
+        if (typeof content?.text === 'string' && content.text.trim()) {
+          this.onLog(`[grok] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+        }
+      }
+      return
+    }
+    if (this.pending && msg.id !== undefined && msg.id === this.pending.id) {
+      if (msg.error) { this.failPending(String(msg.error.message || 'grok prompt failed')); return }
+      const usage = extractAcpUsage(msg.result)
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model: this.model || 'grok',
+            usage: usage ?? {},
+            latencyMs: Date.now() - this.pending.startedAt,
+            hopIndex: 1,
+          })
+        } catch { /* never break the stream */ }
+      }
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.model })
+      return
+    }
+    if (msg.error && msg.id !== undefined) {
+      this.failPending(String(msg.error.message || 'grok acp request failed'))
+    }
+  }
+
+  private failPending(error: string): void {
+    if (this.pending) {
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: 1, error, sessionId: this.sid })
+    } else {
+      this.onLog(`[grok] ${error}`)
+    }
+  }
+
+  private die(code: number, why: string): void {
+    const alreadyDown = this.exited
+    this.exited = true
+    this.exitCode = code
+    if (!alreadyDown) {
+      this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    if (this.pending) {
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: code, error: why, sessionId: this.sid })
+    }
+  }
+}
+
+function extractAcpUsage(result: unknown): EngineUsage | undefined {
+  if (!result || typeof result !== 'object') return undefined
+  const r = result as Record<string, unknown>
+  const raw = (r.usage ?? (r._meta as Record<string, unknown> | undefined)?.usage) as Record<string, unknown> | undefined
+  if (!raw || typeof raw !== 'object') return undefined
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+  const usage: EngineUsage = {
+    input_tokens: num(raw.input_tokens) ?? num(raw.inputTokens),
+    output_tokens: num(raw.output_tokens) ?? num(raw.outputTokens),
+    cache_read_input_tokens: num(raw.cache_read_input_tokens) ?? num(raw.cacheReadInputTokens),
+    cache_creation_input_tokens: num(raw.cache_creation_input_tokens) ?? num(raw.cacheCreationInputTokens),
+  }
+  if (usage.input_tokens == null && usage.output_tokens == null) return undefined
+  return usage
+}
+
+class GrokAdapter implements EngineAdapter {
+  readonly id = 'grok' as const
+  readonly bin = 'grok'
+
+  private command(env?: NodeJS.ProcessEnv): string {
+    return resolveGrokBin(env) ?? this.bin
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    const model = ['--model', args.model || 'grok-4.5']
+    const command = this.command(args.env)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const usingJson = flags.length === 0
+    const base = flags.length
+      ? [...flags, '-p']
+      : ['-p', ...model, '--output-format', 'json', '--always-approve', '--no-auto-update']
+    const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
+    const res = await spawnCapture(command, argv, {
+      cwd: args.cwd,
+      env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
+      signal: args.signal,
+      onLog: args.onLog,
+      shell,
+      stdinText: wantsStdinPrompt ? args.prompt : undefined,
+    })
+    if (res.error || !usingJson) return res
+    try {
+      const obj = JSON.parse(res.text) as { text?: unknown; usage?: EngineUsage }
+      return {
+        text: typeof obj.text === 'string' ? obj.text : res.text,
+        usage: obj.usage && typeof obj.usage === 'object' ? obj.usage : undefined,
+      }
+    } catch {
+      return res
+    }
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    const model = args.tier === 'small' ? ['--model', 'grok-4.5'] : []
+    const command = this.command(args.env)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const base = ['-p', ...model, '--output-format', 'json', '--always-approve', '--no-auto-update']
+    const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
+    return spawnCapture(command, argv, {
+      cwd: args.cwd,
+      env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
+      signal: args.signal,
+      shell,
+      stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
+    })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // Same gates as startSession: custom args / opt-out / Windows collapse to
+    // one-shot `grok -p`, which probe() already covers.
+    if (extraArgs('CUMORA_GROK_ARGS').length || process.env.CUMORA_GROK_NO_ACP === '1' || IS_WIN) {
+      return { ok: true, detail: '', skipped: true }
+    }
+    const command = this.command(args.env)
+    return new Promise<EngineWakeProbeResult>((resolve) => {
+      let settled = false
+      const finish = (r: EngineWakeProbeResult) => {
+        if (settled) return
+        settled = true
+        try { child.stdin?.end() } catch { /* ignore */ }
+        try { child.kill('SIGTERM') } catch { /* ignore */ }
+        resolve(r)
+      }
+      const child = spawn(command, ['agent', '--always-approve', '--no-leader', 'stdio'], {
+        cwd: args.cwd,
+        env: { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: false,
+      })
+      const onAbort = () => finish({ ok: false, detail: 'aborted (timeout)' })
+      if (args.signal.aborted) { onAbort(); return }
+      args.signal.addEventListener('abort', onAbort, { once: true })
+      let buf = ''
+      let stderrTail = ''
+      const initId = 1
+      const sessionId = 2
+      let initialized = false
+      const writeRpc = (msg: object) => {
+        try { child.stdin?.write(JSON.stringify(msg) + '\n') } catch { /* die */ }
+      }
+      writeRpc({
+        jsonrpc: '2.0', id: initId, method: 'initialize',
+        params: { protocolVersion: 1, clientInfo: { name: 'cumora-doctor', version: '1.0.0' }, clientCapabilities: {} },
+      })
+      child.stdout?.on('data', (b: Buffer) => {
+        buf += b.toString('utf8')
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line.startsWith('{')) continue
+          let msg: AcpMsg
+          try { msg = JSON.parse(line) as AcpMsg } catch { continue }
+          if (msg.error?.message) {
+            finish({ ok: false, detail: `acp rejected handshake: ${String(msg.error.message).slice(0, 240)}` })
+            return
+          }
+          if (!initialized && msg.id === initId && msg.result) {
+            initialized = true
+            writeRpc({
+              jsonrpc: '2.0', id: sessionId, method: 'session/new',
+              params: { cwd: args.cwd, mcpServers: [], _meta: { yoloMode: true } },
+            })
+            continue
+          }
+          if (initialized && msg.id === sessionId && msg.result) {
+            finish({ ok: true, detail: '' })
+            return
+          }
+        }
+      })
+      child.stderr?.on('data', (b: Buffer) => {
+        const tail = stderrTail + b.toString('utf8')
+        stderrTail = tail.length > 2000 ? tail.slice(-2000) : tail
+      })
+      child.on('error', (err) => finish({ ok: false, detail: `spawn error: ${err.message}` }))
+      child.on('close', (code, sig) => {
+        if (settled) return
+        const stage = !initialized ? 'before initialize ack' : 'before session/new ack'
+        const exit = sig ? `terminated by ${sig}` : `exit ${code}`
+        finish({ ok: false, detail: `grok agent stdio died ${stage} (${exit}): ${salientError(stderrTail) || 'no stderr'}` })
+      })
+    })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    const agentsMd = join(home, 'AGENTS.md')
+    if (!(await exists(agentsMd))) await writeFile(agentsMd, PERSONA_HEADER(persona), 'utf8')
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_GROK_ARGS')
+    const model = args.model ? ['--model', args.model] : []
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    const command = this.command(args.env)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const base = flags.length
+      ? [...flags, ...resume, '-p']
+      : ['-p', ...resume, ...model, '--output-format', 'streaming-messages-json', '--always-approve', '--no-auto-update']
+    const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
+    const env: NodeJS.ProcessEnv = { ...args.env, GROK_DISABLE_AUTOUPDATER: args.env.GROK_DISABLE_AUTOUPDATER ?? '1' }
+    return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    if (extraArgs('CUMORA_GROK_ARGS').length) return null
+    if (process.env.CUMORA_GROK_NO_ACP === '1') return null
+    // JSON-RPC over a Windows .cmd shim is the same trap Codex hits — exec
+    // (`grok -p`) is the safe path there.
+    if (IS_WIN) return null
+    const model = args.model ? ['--model', args.model] : []
+    return new GrokSession(this.command(args.env), ['agent', '--always-approve', '--no-leader', ...model, 'stdio'], args.home, args.env, args)
+  }
+}
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
+  grok: new GrokAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -1416,7 +1830,11 @@ export function getAdapter(id: EngineId): EngineAdapter {
 /** Probe which engines are installed on this machine. */
 export async function detectEngines(): Promise<EngineId[]> {
   const ids = Object.keys(ADAPTERS) as EngineId[]
-  const present = await Promise.all(ids.map(async (id) => ((await binOnPath(ADAPTERS[id].bin)) ? id : null)))
+  const present = await Promise.all(ids.map(async (id) => {
+    if (await binOnPath(ADAPTERS[id].bin)) return id
+    if (id === 'grok' && resolveGrokBin()) return id
+    return null
+  }))
   return present.filter((x): x is EngineId => x !== null)
 }
 
@@ -1460,7 +1878,7 @@ export interface EngineHealth {
   big: BrainHealth | null
   small: BrainHealth | null
   /** Wake-path protocol health (codex app-server JSON-RPC handshake; claude
-   *  persistent-session flag set). Separate signal from big/small because the
+   *  persistent-session flag set; grok ACP stdio handshake). Separate signal from big/small because the
    *  failure modes are different — those are auth/quota; this is protocol/CLI
    *  version compatibility. */
   wake: WakeHealth | null
@@ -1494,7 +1912,7 @@ export async function runEngineDoctor(opts?: {
   const ids = Object.keys(ADAPTERS) as EngineId[]
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
-    const path = await resolveBinPath(adapter.bin)
+    const path = (await resolveBinPath(adapter.bin)) ?? (id === 'grok' ? resolveGrokBin(env) : null)
     if (!path) return { id, installed: false, path: null, big: null, small: null, wake: null }
     const probeTier = async (tier: 'big' | 'small'): Promise<BrainHealth> => {
       const controller = new AbortController()

@@ -167,7 +167,7 @@ const SOURCE_FILTERS: Array<{ key: SourceFilter; label: string }> = [
   { key: 'cloud', label: 'Cloud' },
   { key: 'byoa',  label: 'BYOA' },
 ]
-const isByoaSource = (s: string): boolean => s === 'byoa-claude' || s === 'byoa-codex'
+const isByoaSource = (s: string): boolean => s === 'byoa-claude' || s === 'byoa-codex' || s === 'byoa-grok'
 
 // ─── Component ───────────────────────────────────────────────────────────
 

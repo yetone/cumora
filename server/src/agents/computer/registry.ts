@@ -20,7 +20,7 @@ import { publish, CH_STATUS } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -45,7 +45,7 @@ export async function announceComputerOnline(computerId: string, companyId: stri
 }
 
 /** Engines a paired (non-cloud) computer is allowed to advertise. */
-const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex'])
+const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok'])
 
 export interface ComputerRow {
   id: string
@@ -365,9 +365,10 @@ export async function listAgentsForComputer(computerId: string): Promise<
   )
   const claudeDefault = process.env.CUMORA_DEFAULT_CLAUDE_MODEL?.trim() || null
   const codexDefault = process.env.CUMORA_DEFAULT_CODEX_MODEL?.trim() || null
+  const grokDefault = process.env.CUMORA_DEFAULT_GROK_MODEL?.trim() || null
   return rows.map((r) => {
     if (r.model) return r
-    const dflt = r.engine === 'codex' ? codexDefault : r.engine === 'claude' ? claudeDefault : null
+    const dflt = r.engine === 'codex' ? codexDefault : r.engine === 'claude' ? claudeDefault : r.engine === 'grok' ? grokDefault : null
     return dflt ? { ...r, model: dflt } : r
   })
 }

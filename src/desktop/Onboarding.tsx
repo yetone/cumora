@@ -20,7 +20,7 @@ export function Onboarding() {
   // Claude is the default; picking Codex appends `--engine codex`. We DON'T
   // append `--engine claude` so a Codex-only machine still auto-detects rather
   // than erroring on a Claude it doesn't have.
-  const [engine, setEngine] = useState<'claude' | 'codex'>('claude')
+  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok'>('claude')
   // Default to installing the always-on service: it auto-starts on boot,
   // auto-restarts on crash, and auto-updates — so the user isn't tied to a
   // terminal that must stay open. Appends `--install-service` to the command.
@@ -74,7 +74,7 @@ export function Onboarding() {
               <>
                 <div className="text-[13px] text-ink-600 mb-4">
                   On the machine you want to host your agents, you'll run one command. It needs
-                  <span className="font-mono"> claude</span> or <span className="font-mono">codex</span> installed.
+                  <span className="font-mono"> claude</span>, <span className="font-mono">codex</span>, or <span className="font-mono">grok</span> installed.
                 </div>
                 {err && <div className="text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2 mb-3">{err}</div>}
                 <button onClick={getCode} disabled={busy}
@@ -91,7 +91,7 @@ export function Onboarding() {
                 <div className="flex items-center gap-2.5 mb-2.5">
                   <span className="text-[12px] text-ink-500">Engine</span>
                   <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                    {([['claude', 'Claude Code'], ['codex', 'Codex']] as const).map(([id, label]) => (
+                    {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build']] as const).map(([id, label]) => (
                       <button key={id} type="button" onClick={() => setEngine(id)}
                         className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                         style={engine === id
@@ -101,7 +101,7 @@ export function Onboarding() {
                       </button>
                     ))}
                   </div>
-                  <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on either engine</span>
+                  <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on any detected engine</span>
                 </div>
                 {isWindows ? (
                   <div className="mb-2.5 text-[12px] text-ink-600">

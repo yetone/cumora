@@ -695,7 +695,7 @@ function SkypeSoundSection() {
   )
 }
 
-const ENGINE_LABEL: Record<string, string> = { managed: 'Cumora', claude: 'Claude Code', codex: 'Codex' }
+const ENGINE_LABEL: Record<string, string> = { managed: 'Cumora', claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build' }
 const KIND_ICON: Record<string, string> = { cloud: '☁', local: '💻', vps: '🖥' }
 const STATUS_COLOR: Record<string, string> = { online: '#3BB273', busy: '#E6A23C', offline: 'var(--ink-300)' }
 
@@ -709,7 +709,7 @@ function ComputersTab() {
   const [copied, setCopied] = useState(false)
   // Engine for a NEWLY added computer's starter/assigned agents. Claude is the
   // default (no flag → daemon auto-detects); Codex appends `--engine codex`.
-  const [engine, setEngine] = useState<'claude' | 'codex'>('claude')
+  const [engine, setEngine] = useState<'claude' | 'codex' | 'grok'>('claude')
   // Default on: install the always-on service (auto-start/restart/update).
   // --install-service is macOS/Linux only (daemon throws on Windows) → off + hidden there.
   const [asService, setAsService] = useState(!isWindows)
@@ -856,12 +856,12 @@ function ComputersTab() {
               Run this on the machine you want to host agents:
             </div>
             <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display">
-              Needs <span className="font-mono not-italic">claude</span> or <span className="font-mono not-italic">codex</span> installed. The computer names itself after that machine and appears here once paired. This token stays valid.
+              Needs <span className="font-mono not-italic">claude</span>, <span className="font-mono not-italic">codex</span>, or <span className="font-mono not-italic">grok</span> installed. The computer names itself after that machine and appears here once paired. This token stays valid.
             </div>
             <div className="flex items-center gap-2.5 mb-2.5">
               <span className="text-[12px] text-ink-500">Engine</span>
               <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                {([['claude', 'Claude Code'], ['codex', 'Codex']] as const).map(([id, label]) => (
+                {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build']] as const).map(([id, label]) => (
                   <button key={id} type="button" onClick={() => setEngine(id)}
                     className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
                     style={engine === id
@@ -871,7 +871,7 @@ function ComputersTab() {
                   </button>
                 ))}
               </div>
-              <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on either engine</span>
+              <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on any detected engine</span>
             </div>
             {isWindows ? (
               <div className="mb-2.5 text-[12px] text-ink-600">

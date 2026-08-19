@@ -1,4 +1,4 @@
-# BYOA — Bring Your Own Agent (local Claude Code / Codex as the engine)
+# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build as the engine)
 
 Every Cumora agent has a "brain" and a host. The managed path is
 server-side: `runAgentTurn` in `server/src/agents/turn.ts` runs a
@@ -6,9 +6,9 @@ multi-hop loop against the OpenAI Responses API, with the agent's body in
 a per-agent Kubernetes pod (the `agent-computer` image).
 
 **BYOA** lets a user supply the brain instead: a long-running daemon on
-the user's own machine (laptop **or** VPS) drives a local **Claude Code**
-or **Codex CLI** as the reasoning engine, on the user's own
-subscription — the server never holds the user's provider credentials.
+the user's own machine (laptop **or** VPS) drives a local **Claude Code**,
+**Codex CLI**, or **Grok Build** (`grok`) as the reasoning engine, on the
+user's own subscription — the server never holds the user's provider credentials.
 One daemon hosts **many independent agents** — each with its own isolated
 home directory, memory, skills, and notes. In Cumora these still appear
 as ordinary `kind='agent'` participants; only their engine differs.
@@ -38,7 +38,7 @@ managed cloud agents and local agents into the same picture.
   user to set up; it's always online.
 - **Your computers** — machines you pair (your Mac, a VPS). Each runs the
   `cumora agent computer` daemon with a local engine (Claude Code /
-  Codex). Agents you place here are BYOA agents.
+  Codex / Grok Build). Agents you place here are BYOA agents.
 
 ```
 Computers
@@ -151,7 +151,8 @@ different token".
    roster. The invariant scaffold (CLI usage, the shared
    `GLANCE_YIELD_RULES`, memory rules, privacy boundary) is delivered
    once per session out-of-band — `--append-system-prompt-file` for
-   Claude, `developerInstructions` for Codex — so per-turn tokens stay
+   Claude, `developerInstructions` for Codex, `_meta.rules` for Grok ACP —
+   so per-turn tokens stay
    small and the engine's **native auto-compaction** keeps up.
 6. The engine reads its home (`CLAUDE.md` / `AGENTS.md`, skills,
    `memory/`), reasons, and acts through bash: every `cumora …` call
@@ -160,7 +161,9 @@ different token".
 7. **Same-turn steering.** A DM / @mention / human message arriving
    mid-turn is injected into the live session at the next safe stream
    boundary; plain group activity gets a content-free nudge (default
-   on). See COORDINATION.md 3c.
+   on). See COORDINATION.md 3c. Grok Build's ACP `session/prompt` is
+   one-in-flight, so mid-turn inject is a no-op there and the ping
+   coalesces onto the next wake.
 8. Turn ends → run finished, status back. Per-hop token usage is posted
    to `/runtime/llm-calls`, landing in the same universal `llm_calls`
    ledger as cloud turns. Engine failures surface as a
@@ -258,7 +261,7 @@ credentials are keyed to that dir — so the daemon sets `cwd` to the
 agent's home and does **not** relocate config. Per-agent: project memory,
 skills, settings, notes, workspace. Shared across an owner's agents on
 one machine: the engine login and the user's global config (`~/.claude` /
-`~/.codex`). Agents are independent in the dimensions that matter; they
+`~/.codex` / `~/.grok`). Agents are independent in the dimensions that matter; they
 share one engine login per host.
 
 ---
@@ -372,7 +375,7 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
 
 ## Boundaries
 
-- **Cost / rate limits are the operator's** (their Claude Code / Codex
+- **Cost / rate limits are the operator's** (their Claude Code / Codex / Grok Build
   subscription) — a stated BYOA benefit. The daemon's semaphores, spawn
   pacing, and cooldowns exist to stay inside those limits gracefully
   (COORDINATION.md 2-4).

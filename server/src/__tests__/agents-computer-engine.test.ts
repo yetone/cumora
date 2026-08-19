@@ -3,12 +3,12 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine.test.ts
  */
-import { mkdtemp, mkdir, writeFile, chmod, rm } from 'node:fs/promises'
+import assert from 'node:assert/strict'
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, test } from 'node:test'
-import assert from 'node:assert/strict'
+import { setTimeout as delay } from 'node:timers/promises'
 import { getAdapter, resolveSpawn } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -90,6 +90,44 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   assert.equal(logs.length, 2)
   assert.match(logs[1] ?? '', /\[session\] engine process died .*exit 1/)
   })
+
+test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-engine-grok-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir)
+  await mkdir(home)
+  const fakeGrok = join(binDir, 'grok')
+  await writeFile(
+    fakeGrok,
+    '#!/bin/sh\n' +
+    'echo \'{"type":"system","subtype":"init","session_id":"sess-grok-1","model":"grok-4.6"}\'\n' +
+    'echo \'{"type":"result","subtype":"success","session_id":"sess-grok-1","usage":{"input_tokens":3,"output_tokens":1},"result":"OK"}\'\n' +
+    'exit 0\n',
+    'utf8',
+  )
+  await chmod(fakeGrok, 0o755)
+
+  const adapter = getAdapter('grok')
+  await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer' })
+  const agentsMd = await readFile(join(home, 'AGENTS.md'), 'utf8')
+  assert.match(agentsMd, /Iris/)
+
+  const result = await adapter.run({
+    home,
+    prompt: 'wake',
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    model: null,
+    fastModel: null,
+    onLog: () => { /* unused */ },
+    signal: new AbortController().signal,
+  })
+
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.sessionId, 'sess-grok-1')
+  assert.equal(result.model, 'grok-4.6')
+})
 
   // Regression: nvm-windows on Windows ships an extensionless POSIX shell-shim
   // (`#!/bin/sh` wrapper) alongside the real `.cmd`. The OLD resolveSpawn iterated

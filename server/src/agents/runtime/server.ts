@@ -413,7 +413,7 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
 // per turn-completed (Codex) and batches them into one POST per N hops or
 // every ~250ms (whichever first). This endpoint accepts a batch + inserts
 // one llm_calls row per hop with the appropriate source ('byoa-claude' |
-// 'byoa-codex'). Fire-and-forget; a DB hiccup must never break the wake.
+// 'byoa-codex' | 'byoa-grok'). Fire-and-forget; a DB hiccup must never break the wake.
 runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
   const body = req.body as {
     source?: string
@@ -433,7 +433,7 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       extras?: Record<string, unknown>
     }>
   } | undefined
-  const source = (body?.source === 'byoa-claude' || body?.source === 'byoa-codex') ? body.source : 'byoa-claude'
+  const source = (body?.source === 'byoa-claude' || body?.source === 'byoa-codex' || body?.source === 'byoa-grok') ? body.source : 'byoa-claude'
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []
   if (hops.length === 0) { res.json({ ok: true, inserted: 0 }); return }

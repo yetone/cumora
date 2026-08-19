@@ -499,6 +499,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'claude') {
     return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
   }
+  if (engine === 'grok') {
+    return 'Open Grok Build on that computer and run `grok login`, or set XAI_API_KEY, then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -509,6 +512,7 @@ function missingEngineMessage(): string {
     'Install and sign in to at least one of:',
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
     '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
+    '  - Grok Build: install the `grok` CLI, then run `grok login` once',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -520,7 +524,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code or Codex). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, or Grok Build). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -695,8 +699,16 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
  *    - Auto-flush on every WINDOW_MS tick AND when buffer hits FLUSH_AT.
  *    - flush() can be awaited at "natural pauses" (turn end) to push the tail
  *      promptly without waiting for the timer. */
+type ByoaSource = 'byoa-claude' | 'byoa-codex' | 'byoa-grok'
+
+function byoaSourceOf(id: EngineId): ByoaSource {
+  if (id === 'claude') return 'byoa-claude'
+  if (id === 'codex') return 'byoa-codex'
+  return 'byoa-grok'
+}
+
 interface PendingHop {
-  source: 'byoa-claude' | 'byoa-codex'
+  source: ByoaSource
   purpose: 'agent-turn' | 'inbox-triage' | 'compaction' | 'completion-verify' | 'steer-summary' | 'agenda' | 'synthetic-wake-gate'
   runId: string | null
   conversationId: string | null
@@ -746,7 +758,7 @@ class HopReporter {
     // Codex + Claude batches might intermix (the same reporter is used across
     // session lifetimes), so split by source — the server endpoint takes one
     // source per call (the row's `source` column is set from it).
-    const byHourceSource = new Map<'byoa-claude' | 'byoa-codex', PendingHop[]>()
+    const byHourceSource = new Map<ByoaSource, PendingHop[]>()
     for (const h of batch) {
       const arr = byHourceSource.get(h.source) ?? []
       arr.push(h); byHourceSource.set(h.source, arr)
@@ -871,7 +883,7 @@ class AgentRunner {
       if (typeof report.toolUses === 'number') extras.toolUses = report.toolUses
       if (typeof report.textChars === 'number') extras.textChars = report.textChars
       this.reporter.push({
-        source: this.adapter.id === 'claude' ? 'byoa-claude' : 'byoa-codex',
+        source: byoaSourceOf(this.adapter.id),
         purpose,
         runId: this.currentRunId,
         conversationId: this.lastWakeConvo,
@@ -1248,9 +1260,10 @@ class AgentRunner {
   }
 
   /** Triage model id for pricing (the local cerebellum: claude→haiku,
-   *  codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. */
+   *  grok→grok-4.5, codex→gpt-5.4-mini), honoring a CUMORA_TRIAGE_MODEL override. */
   private triageModel(): string {
-    return process.env.CUMORA_TRIAGE_MODEL || (this.adapter.id === 'claude' ? 'haiku' : 'gpt-5.4-mini')
+    return process.env.CUMORA_TRIAGE_MODEL
+      || (this.adapter.id === 'claude' ? 'haiku' : this.adapter.id === 'grok' ? 'grok-4.5' : 'gpt-5.4-mini')
   }
 
   /** Post one local-triage record to the cost ledger. Best-effort. `usage` is the

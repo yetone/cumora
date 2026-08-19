@@ -3,7 +3,7 @@ import { pool } from '../db/pool.js'
 import { effectiveCostUsd, priceFor, modelPriceTable, EMPTY_USAGE, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
-export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex'
+export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok'
 export type AgentEventLevel = 'debug' | 'info' | 'warn' | 'error'
 
 const MAX_STRING_CHARS = 24_000
