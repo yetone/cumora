@@ -213,6 +213,8 @@ export interface Message {
     kind: 'img' | 'pdf' | 'file' | 'fig'
     /** real assets carry a URL; mock/legacy data may not */
     url?: string
+    /** Storage key used to refresh expiring signed URLs. */
+    key?: string
     mime?: string
     size?: number
     /** legacy descriptor — fallback when no real file is present (e.g. mock data) */
@@ -248,9 +250,9 @@ export interface Message {
    *  the server round-trip; never returned from the API. */
   pending?: boolean
   failed?: boolean
-  /** Stable identity that survives the temp-id → real-id rename so React
-   *  keeps the same DOM node (avoids re-firing the entry animation). Set on
-   *  optimistic insert; carried onto the server echo in `applyEvent`. */
+  /** The request may have committed, but neither HTTP nor WS confirmed it. */
+  unconfirmed?: boolean
+  /** Stable idempotency key that also survives the temp-id → real-id rename. */
   clientId?: string
 }
 

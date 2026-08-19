@@ -29,10 +29,13 @@ CREATE TABLE IF NOT EXISTS messages (
   reactions       JSONB,
   tool            JSONB,
   attachment      JSONB,
+  client_id       TEXT,
   created_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(conversation_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_messages_convo_created ON messages(conversation_id, created_at);
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT;
 
 -- Reply-to / quote target. Soft self-FK (no ON DELETE CASCADE) so deleting
 -- the original leaves replies as orphans rendered as "[deleted]" stubs
@@ -2078,6 +2081,7 @@ export async function ensureSchema(): Promise<void> {
         CREATE UNIQUE INDEX IF NOT EXISTS participants_agent_id_unique
           ON participants(id) WHERE kind = 'agent'
       `)
+      await ensureMessageClientIdIndex(client)
 
         console.log('[db] schema ensured')
       } catch (e) {
@@ -2130,6 +2134,13 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
         AND (SELECT count(*) FROM information_schema.columns
                WHERE table_name = 'participants' AND column_name = 'company_id') > 0
         AND (SELECT count(*) FROM pg_class WHERE relname = 'participants_agent_id_unique') > 0
+        AND (SELECT count(*) FROM information_schema.columns
+               WHERE table_name = 'messages' AND column_name = 'client_id') > 0
+        AND EXISTS (
+          SELECT 1 FROM pg_class c
+          JOIN pg_index i ON i.indexrelid = c.oid
+          WHERE c.relname = 'uniq_messages_client_id' AND i.indisvalid
+        )
         -- llm_calls is the universal sub2api ledger added in the observability
         -- rollout (29155c5). Without this sentinel, a 40P01 deadlock on the big
         -- DDL batch would take the "already current" shortcut and silently
@@ -2154,6 +2165,26 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
     return rows[0]?.ok === true
   } catch {
     return false
+  }
+}
+
+/** Correctness index for message idempotency. Build it concurrently so adding
+ *  the feature cannot block writes to the hot messages table. */
+async function ensureMessageClientIdIndex(client: import('pg').PoolClient): Promise<void> {
+  const { rows } = await client.query<{ indisvalid: boolean }>(
+    `SELECT i.indisvalid FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+      WHERE c.relname = 'uniq_messages_client_id'`,
+  )
+  if (rows[0]?.indisvalid) return
+  await client.query("SET lock_timeout = '0'")
+  try {
+    if (rows[0]) await client.query('DROP INDEX CONCURRENTLY IF EXISTS uniq_messages_client_id')
+    await client.query(`CREATE UNIQUE INDEX CONCURRENTLY uniq_messages_client_id
+      ON messages(conversation_id, author_id, client_id)
+      WHERE client_id IS NOT NULL`)
+  } finally {
+    await client.query("SET lock_timeout = '5s'")
   }
 }
 

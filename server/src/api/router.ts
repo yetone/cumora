@@ -3120,6 +3120,7 @@ api.get('/conversations/:id/messages', async (req, res) => {
       `SELECT
           m.id, m.conversation_id AS "conversationId",
           m.author_id AS "authorId", m.kind, m.body, m.sequence,
+          m.client_id AS "clientId",
           m.tool, m.attachment, m.poll,
           -- Per-option vote tallies for polls. Empty array for non-poll
           -- rows. voterIds is sorted so the client can diff cheaply across
@@ -3314,14 +3315,41 @@ api.post('/conversations/:id/messages', async (req, res) => {
     ? rawQuotedId
     : null
 
-  // Optional client-supplied dedup key. Echoed back on CH_MESSAGE_NEW so the
-  // renderer can recognize its own optimistic bubble when the WS event races
-  // the POST response. Length-capped so a malformed client can't bloat the
-  // payload — opaque to the server otherwise.
+  // Optional client-supplied idempotency key. Persisted so retries and
+  // reconnect fetches can reconcile the original optimistic bubble.
   const rawClientId = req.body?.clientId
-  const clientId = typeof rawClientId === 'string' && rawClientId.length > 0 && rawClientId.length <= 80
-    ? rawClientId
-    : null
+  if (rawClientId != null && (typeof rawClientId !== 'string' || rawClientId.length === 0 || rawClientId.length > 80)) {
+    res.status(400).json({ error: 'invalid clientId' })
+    return
+  }
+  const clientId = typeof rawClientId === 'string' ? rawClientId : null
+
+  let deliveryMessageId: string | undefined
+  let responseFinished = false
+  const logDelivery = (phase: string, extra?: Record<string, unknown>) => {
+    console.log('[message-delivery]', JSON.stringify({
+      phase,
+      conversationId: id,
+      authorId: me,
+      clientId: clientId ?? undefined,
+      messageId: deliveryMessageId,
+      ...extra,
+    }))
+  }
+  logDelivery('request.received')
+  res.once('finish', () => {
+    responseFinished = true
+    logDelivery('response.finished', { status: res.statusCode })
+  })
+  res.once('close', () => {
+    if (!responseFinished) {
+      logDelivery('response.closed', {
+        status: res.headersSent ? res.statusCode : undefined,
+        headersSent: res.headersSent,
+        writableFinished: res.writableFinished,
+      })
+    }
+  })
 
   const { rows: convoRows } = await pool.query<{ members: string[]; kind: string }>(
     `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2`,
@@ -3407,6 +3435,8 @@ api.post('/conversations/:id/messages', async (req, res) => {
     }
   }
 
+  // Retrying a message, or sending it twice at the same time, can leave a gap
+  // in sequence numbers. They only sort messages, so gaps are safe.
   const seqResult = await pool.query<{ seq: number }>(
     `INSERT INTO conversation_counters (conversation_id, next_sequence)
      VALUES ($1, 2)
@@ -3416,13 +3446,46 @@ api.post('/conversations/:id/messages', async (req, res) => {
   )
   const sequence = seqResult.rows[0]?.seq ?? 1
 
-  const messageId = `m-${randomUUID()}`
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id)
-     VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8)`,
-    [messageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant],
+  const proposedMessageId = `m-${randomUUID()}`
+  const inserted = await pool.query<{ id: string; sequence: number }>(
+    `INSERT INTO messages
+       (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id)
+     VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9)
+     ON CONFLICT (conversation_id, author_id, client_id) WHERE client_id IS NOT NULL
+     DO NOTHING
+     RETURNING id, sequence`,
+    [proposedMessageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant, clientId],
   )
+  const persisted = inserted.rows[0] ?? (clientId
+    ? (await pool.query<{ id: string; sequence: number }>(
+        `SELECT id, sequence FROM messages
+          WHERE conversation_id = $1 AND author_id = $2 AND client_id = $3`,
+        [id, me, clientId],
+      )).rows[0]
+    : undefined)
+  if (!persisted) throw new Error('message insert returned no row')
+  const messageId = persisted.id
+  const persistedSequence = persisted.sequence
+  deliveryMessageId = messageId
+  if (!inserted.rows[0]) {
+    logDelivery('message.reused', { sequence: persistedSequence })
+    res.status(202).json({ id: messageId, sequence: persistedSequence })
+    return
+  }
+  logDelivery('message.committed', { sequence: persistedSequence })
   await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [id])
+
+  // Test-only fault injection: reproduce a connection disappearing after
+  // persistence but before either HTTP or WebSocket acknowledgement.
+  if (
+    env.NODE_ENV !== 'production'
+    && process.env.CUMORA_TEST_MESSAGE_FAULTS === '1'
+    && req.get('x-cumora-test-message-fault') === 'after-commit-drop-ack'
+  ) {
+    logDelivery('fault.after_commit_drop_ack')
+    res.destroy()
+    return
+  }
 
   // Drop the message into the bus. The mailbox scheduler (subscribed to
   // CH_MESSAGE_NEW) wakes every agent member and lets each decide for itself
@@ -3434,13 +3497,14 @@ api.post('/conversations/:id/messages', async (req, res) => {
     companyId: tenant,
     message: {
       id: messageId, conversationId: id, authorId: me,
-      kind: 'text', body, sequence, at: new Date().toISOString(),
+      kind: 'text', body, sequence: persistedSequence, at: new Date().toISOString(),
       attachment: attachment ?? undefined,
       quotedMessageId: resolvedQuotedId ?? undefined,
       quoted: quotedSummary ?? undefined,
       clientId: clientId ?? undefined,
     },
   })
+  logDelivery('ws.published')
 
   // Fan out APNs to recipients who aren't currently looking at the app
   // (NotificationToasts handles those). Fire-and-forget — push delivery
@@ -3478,7 +3542,7 @@ api.post('/conversations/:id/messages', async (req, res) => {
 
   res.status(202).json({
     id: messageId,
-    sequence,
+    sequence: persistedSequence,
     quotedMessageId: resolvedQuotedId ?? undefined,
     quoted: quotedSummary ?? undefined,
   })

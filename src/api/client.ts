@@ -93,6 +93,13 @@ export function setDevModeEnabled(enabled: boolean): void {
   else localStorage.removeItem(DEVTOOLS_KEY)
 }
 
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 export async function http<T>(path: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = { 'content-type': 'application/json' }
   const token = getAuthToken()
@@ -122,7 +129,7 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
         } catch { detail = text.slice(0, 200) }
       }
     } catch { /* ignore */ }
-    throw new Error(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`)
+    throw new ApiError(detail ? `${detail} (${res.status})` : `${res.status} ${res.statusText}`, res.status)
   }
   return res.json() as Promise<T>
 }
@@ -1022,10 +1029,9 @@ export const api = {
     body: string,
     attachment?: ApiAttachment | null,
     quotedMessageId?: string | null,
-    /** Optional client-supplied dedup key (the optimistic bubble's tempId).
-     *  Server echoes it on CH_MESSAGE_NEW so the renderer can match the WS
-     *  echo to its still-temp local bubble even when the WS event arrives
-     *  before this POST resolves. */
+    /** Optional client-supplied idempotency key (the optimistic bubble's
+     *  tempId). The server persists it and returns the original message when
+     *  the same send is retried. */
     clientId?: string | null,
   ) =>
     http<{ id: string; sequence: number }>(`/conversations/${encodeURIComponent(conversationId)}/messages`, {

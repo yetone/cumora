@@ -1786,15 +1786,9 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
         )}
         {msg.attachment && <AttachmentCard msg={msg} />}
 
-        {msg.failed && (
-          // Failed-to-send row: text + Retry + Dismiss buttons. The
-          // bubble's id is still the optimistic tempId (the server
-          // never persisted it), which is the key both store helpers
-          // use. Retry re-runs sendUserMessage with the original body /
-          // attachment / quote; Dismiss just drops the bubble locally
-          // so it stops clogging the bottom of the conversation.
+        {(msg.failed || msg.unconfirmed) && (
           <div className="mt-1 flex items-center gap-2 text-[11px] text-coral-deep">
-            <span>Failed to send</span>
+            <span>{msg.unconfirmed ? 'Delivery not confirmed' : 'Failed to send'}</span>
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); void retryFailedMessage(msg.conversationId, msg.id) }}

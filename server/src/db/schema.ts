@@ -1,4 +1,5 @@
-import { pgTable, text, integer, timestamp, jsonb, boolean, index } from 'drizzle-orm/pg-core'
+import { sql } from 'drizzle-orm'
+import { pgTable, text, integer, timestamp, jsonb, boolean, index, uniqueIndex } from 'drizzle-orm/pg-core'
 
 export const conversations = pgTable('conversations', {
   id: text('id').primaryKey(),
@@ -25,6 +26,7 @@ export const messages = pgTable(
     reactions: jsonb('reactions').$type<Array<{ emoji: string; count: number; mine?: boolean }> | null>(),
     tool: jsonb('tool').$type<Record<string, unknown> | null>(),
     attachment: jsonb('attachment').$type<Record<string, unknown> | null>(),
+    clientId: text('client_id'),
     poll: jsonb('poll').$type<PollPayload | null>(),
     // Reply-to / quote target: id of another message in THIS conversation that
     // this message is quoting. Soft FK to messages.id with ON DELETE SET NULL
@@ -37,6 +39,9 @@ export const messages = pgTable(
     convoSeqIdx: index('idx_messages_convo_seq').on(table.conversationId, table.sequence),
     convoCreatedIdx: index('idx_messages_convo_created').on(table.conversationId, table.createdAt),
     quotedIdx: index('idx_messages_quoted').on(table.quotedMessageId),
+    clientIdIdx: uniqueIndex('uniq_messages_client_id')
+      .on(table.conversationId, table.authorId, table.clientId)
+      .where(sql`${table.clientId} IS NOT NULL`),
   }),
 )
 

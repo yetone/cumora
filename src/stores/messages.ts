@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { Message, ReactionEntry } from '@/types'
-import { api, ws, type WsEvent, type ApiMessage } from '@/api/client'
+import { api, ApiError, ws, type WsEvent, type ApiMessage } from '@/api/client'
 import { useApp } from '@/stores/app'
 import { getMeId } from '@/stores/auth'
 
@@ -311,8 +311,7 @@ function mergeFetchedMessages(current: Message[] | undefined, incoming: Message[
   const merged = incoming.map((m) => {
     const prev = currentById.get(m.id)
     // Keep the local optimistic key stable after a fetch returns the same
-    // persisted row. The API snapshot is authoritative for message content,
-    // but `clientId` is a renderer-only identity.
+    // persisted row. Older servers may omit clientId from the snapshot.
     return prev?.clientId && !m.clientId ? { ...m, clientId: prev.clientId } : m
   })
 
@@ -494,6 +493,12 @@ export const useMessages = create<MessagesState>((set, get) => ({
         // list key (m.clientId ?? m.id) stays stable across the replacement
         // — otherwise the row remounts and re-animates.
         const merged: Message = prior?.clientId ? { ...m, clientId: prior.clientId } : m
+        if (prior?.clientId) {
+          console.info('[message-delivery]', {
+            phase: 'client.confirmed', via: 'ws', status: 'sent',
+            clientId: prior.clientId, messageId: m.id,
+          })
+        }
         const without = existing.filter((x) => x !== prior && x.id !== m.id)
         let next = [...without, merged].sort((a, b) => {
           const sa = (a as { sequence?: number }).sequence ?? 0
@@ -612,11 +617,19 @@ function newTempId(): string {
   return `temp-${rnd}`
 }
 
+function isDefinitiveSendFailure(error: unknown): boolean {
+  return error instanceof ApiError
+    && error.status >= 400
+    && error.status < 500
+    && ![408, 425, 429].includes(error.status)
+}
+
 export async function sendUserMessage(
   convoId: string,
   body: string,
   attachment?: import('@/api/client').ApiAttachment | null,
   quotedMessageId?: string | null,
+  clientId = newTempId(),
 ): Promise<void> {
   const v = body.trim()
   if (!v && !attachment) return
@@ -649,7 +662,7 @@ export async function sendUserMessage(
     }
   }
 
-  const tempId = newTempId()
+  const tempId = clientId
   const optimistic: Message = {
     id: tempId,
     clientId: tempId,
@@ -663,6 +676,7 @@ export async function sendUserMessage(
           name: attachment.name,
           kind: attachment.kind,
           url: attachment.url,
+          key: attachment.key,
           mime: attachment.mime,
           size: attachment.size,
         }
@@ -684,7 +698,7 @@ export async function sendUserMessage(
   }))
 
   try {
-    const { id: realId } = await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, tempId)
+    const { id: realId } = await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, clientId)
     // Reconcile the temp bubble with the server. Either the WS `message.new`
     // already raced ahead of us (real id already in the list → drop the temp)
     // or it hasn't (rename temp → real id so the eventual WS event dedupes
@@ -695,26 +709,33 @@ export async function sendUserMessage(
       const next = realExists
         ? list.filter((m) => m.id !== tempId)
         : list.map((m) =>
-            m.id === tempId ? { ...m, id: realId, pending: false } : m,
+            m.id === tempId ? { ...m, id: realId, pending: false, failed: false, unconfirmed: false } : m,
           )
       return { byConvo: { ...s.byConvo, [convoId]: next } }
     })
+    console.info('[message-delivery]', {
+      phase: 'client.confirmed', via: 'http', status: 'sent', clientId, messageId: realId,
+    })
   } catch (err) {
     console.warn('[messages] send failed', err)
+    const failed = isDefinitiveSendFailure(err)
     useMessages.setState((s) => {
       const list = s.byConvo[convoId] ?? []
       const next = list.map((m) =>
-        m.id === tempId ? { ...m, pending: false, failed: true } : m,
+        m.id === tempId ? { ...m, pending: false, failed, unconfirmed: !failed } : m,
       )
       return { byConvo: { ...s.byConvo, [convoId]: next } }
+    })
+    console.info('[message-delivery]', {
+      phase: failed ? 'client.failed' : 'client.unconfirmed',
+      via: 'http', status: failed ? 'failed' : 'unconfirmed',
+      clientId, httpStatus: err instanceof ApiError ? err.status : undefined,
     })
   }
 }
 
-/** Drop a failed-to-send optimistic bubble from the local list. The
- *  message never reached the server so no rollback is needed there;
- *  this is purely a UI clean-up so the bubble doesn't linger forever
- *  at the bottom of the conversation. */
+/** Drop a failed or unconfirmed optimistic bubble from the local list. An
+ *  unconfirmed row may reappear on the next fetch if it reached the server. */
 export function discardFailedMessage(convoId: string, tempId: string): void {
   useMessages.setState((s) => {
     const list = s.byConvo[convoId]
@@ -725,28 +746,21 @@ export function discardFailedMessage(convoId: string, tempId: string): void {
   })
 }
 
-/** Retry a failed-to-send optimistic bubble. We remove the failed
- *  bubble, then resubmit the same body / attachment / quote pointer
- *  via `sendUserMessage`, which paints a fresh optimistic bubble at the
- *  tail of the list. If the retry also fails, that fresh bubble ends
- *  up in the failed state and the user can retry again. */
+/** Retry with the original clientId so the server can return an already
+ *  committed message instead of creating a duplicate. */
 export async function retryFailedMessage(convoId: string, tempId: string): Promise<void> {
   const list = useMessages.getState().byConvo[convoId] ?? []
   const msg = list.find((m) => m.id === tempId)
   if (!msg) return
   const body = msg.body ?? ''
   const att = msg.attachment
-  // The optimistic bubble carried a denormalized attachment shape that
-  // mirrors ApiAttachment minus `key` (we never stashed it on the
-  // bubble). For retry that's fine — the server resolves the row by
-  // url + name + mime + size, and `key` is only used as an internal
-  // optimization marker.
   const retryAttachment: import('@/api/client').ApiAttachment | null = att
-    ? { url: att.url ?? '', name: att.name, kind: att.kind, mime: att.mime, size: att.size }
+    ? { url: att.url ?? '', name: att.name, kind: att.kind, key: att.key, mime: att.mime, size: att.size }
     : null
   const quotedId = msg.quotedMessageId ?? null
+  const clientId = msg.clientId ?? tempId
   discardFailedMessage(convoId, tempId)
-  await sendUserMessage(convoId, body, retryAttachment, quotedId)
+  await sendUserMessage(convoId, body, retryAttachment, quotedId, clientId)
 }
 
 export async function toggleReaction(messageId: string, emoji: string): Promise<void> {
