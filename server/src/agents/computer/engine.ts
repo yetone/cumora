@@ -1005,6 +1005,9 @@ class CodexSession implements EngineSession {
   // thread params WITHOUT threadId — reused to start a FRESH thread if a resume fails.
   private readonly baseThreadParams: Record<string, unknown>
   private ready = false
+  // Why the handshake died, when it did — so a send() landing after the teardown
+  // reports the real cause instead of a generic "process gone".
+  private handshakeError: string | null = null
   private pending: { resolve: (r: EngineRunResult) => void } | null = null
   private queuedPrompt: string | null = null
   private activeTurnId: string | null = null
@@ -1045,7 +1048,7 @@ class CodexSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId })
-    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.threadId })
+    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId })
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -1227,6 +1230,18 @@ class CodexSession implements EngineSession {
   private failPending(error: string): void {
     if (this.pending) this.settle(error)
     else this.onLog(`[codex] ${error}`)
+    // A failure BEFORE the thread ever opened kills the SESSION, not just this
+    // turn. The handshake is one-shot — threadReq is consumed at the initialize
+    // ack, and only a failed thread/resume re-issues a thread/start — so `ready`
+    // can never flip afterwards, and every later send() would park its prompt in
+    // queuedPrompt with nothing left able to drain it (the daemon awaits that
+    // promise forever, so the agent goes silently and permanently dead and its
+    // big-brain slot never comes back). The app-server SURVIVES rejecting the
+    // handshake (a malformed ~/.codex/config.toml, a model this account can't
+    // use, protocol drift), so `alive` would keep advertising a usable session
+    // and the daemon would reuse the zombie on every wake. Tear it down instead:
+    // a !alive session is dropped and the next wake spawns a clean one.
+    if (!this.ready) { this.handshakeError = error; this.stop() }
   }
   private die(code: number, why: string): void {
     const alreadyDown = this.exited
