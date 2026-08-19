@@ -39,7 +39,7 @@ You need Postgres and Redis (Homebrew services are fine):
 createdb -h localhost cumora
 export OPENAI_API_KEY=sk-...
 
-npm install
+npm run setup          # install root + Email Worker dependencies
 npm run dev:all       # Vite renderer on :5180 + API server on :5181
 ```
 

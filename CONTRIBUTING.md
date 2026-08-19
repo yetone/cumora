@@ -16,9 +16,13 @@ running locally.
 createdb -h localhost cumora
 export OPENAI_API_KEY=sk-...        # the only hard-required env var
 
-npm install
+npm run setup                     # root + Email Worker dependencies
 npm run dev:all                     # Vite renderer on :5180 + API server on :5181
 ```
+
+Use `npm run setup` rather than a root-only `npm install`: the root test
+command also runs `workers/email-gate` tests, whose dependencies live in the
+Worker's separate `package.json`.
 
 Open http://localhost:5180 for the web app, or `npm run electron:dev` for the
 desktop shell. The database schema is created idempotently on boot and seeded
