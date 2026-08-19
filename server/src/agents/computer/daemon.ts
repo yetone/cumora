@@ -26,7 +26,7 @@ import { execFile, spawn } from 'node:child_process'
 import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
-import { parseSseStream } from '../runtime/sse-parse.js'
+import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { detectEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
@@ -2029,6 +2029,7 @@ class AgentRunner {
   private async streamLoop(): Promise<void> {
     let backoff = 1000
     while (!this.stopped) {
+      let connectedAt: number | null = null
       try {
         const token = await this.ensureToken()
         const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
@@ -2036,7 +2037,7 @@ class AgentRunner {
         })
         if (!res.ok || !res.body) throw new Error(`wake-stream HTTP ${res.status}`)
         console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
-        backoff = 1000
+        connectedAt = Date.now()
         this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up
         for await (const evt of parseSseStream(res.body as unknown as AsyncIterable<unknown>)) {
           if (this.stopped) break
@@ -2065,13 +2066,25 @@ class AgentRunner {
           }
           // 'ready' is a no-op keepalive.
         }
+        // The stream ended WITHOUT throwing — a clean server-side close. This
+        // used to fall straight back to the loop head and re-fetch with ZERO
+        // delay, re-firing reconnect-catchup every pass: measured at ~15k
+        // requests/second against the API from the operator's own machine.
+        if (!this.stopped) {
+          console.warn(`[computer] ${this.agent.id} wake-stream closed by server · retry in ${backoff}ms`)
+        }
       } catch (err) {
         if (this.stopped) break
         const _cause = (err as { cause?: { code?: string; message?: string } } | null)?.cause
         console.warn(`[computer] ${this.agent.id} stream error: ${err instanceof Error ? err.message : err}${_cause ? ` cause=${_cause.code ?? _cause.message ?? JSON.stringify(_cause)}` : ''} · retry in ${backoff}ms`)
-        await new Promise((r) => setTimeout(r, backoff))
-        backoff = Math.min(backoff * 2, 30_000)
       }
+      if (this.stopped) break
+      // BOTH exits back off. Reset the ladder only after a connection that
+      // actually stayed up — a 200 that closes immediately must not reset it, or
+      // the delay can never grow away from a pathological endpoint.
+      if (wakeStreamWasStable(connectedAt === null ? null : Date.now() - connectedAt)) backoff = 1000
+      await new Promise((r) => setTimeout(r, backoff))
+      backoff = Math.min(backoff * 2, 30_000)
     }
   }
 }

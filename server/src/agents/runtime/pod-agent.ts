@@ -33,7 +33,7 @@ import { runAgentTurn, type AgentTurnOptions } from '../turn.js'
 import { runtime } from './select.js'
 import { notifyAlert } from '../../alerting.js'
 import { pushSteer } from '../steer.js'
-import { parseSseStream } from './sse-parse.js'
+import { parseSseStream, wakeStreamWasStable } from './sse-parse.js'
 import { decidePodExit } from './pod-agent-exit.js'
 
 interface RunnerState {
@@ -378,15 +378,22 @@ async function main(): Promise<void> {
   // restart, transient network blip) shouldn't kill the Pod.
   let backoffMs = 500
   while (!state.shuttingDown) {
+    const startedAt = Date.now()
     try {
       await connectStream(agentId, url, token)
-      console.log('[pod-agent] wake-stream closed by server, reconnecting')
-      backoffMs = 500
+      // A clean close used to reconnect with NO delay at all and reset the
+      // ladder, so an endpoint that accepts and immediately ends the stream span
+      // the loop as fast as fetch could go.
+      console.log(`[pod-agent] wake-stream closed by server · retry in ${backoffMs}ms`)
     } catch (err) {
       console.warn(`[pod-agent] wake-stream error: ${err instanceof Error ? err.message : String(err)} · retry in ${backoffMs}ms`)
-      await new Promise<void>((r) => setTimeout(r, backoffMs))
-      backoffMs = Math.min(backoffMs * 2, 30_000)
     }
+    if (state.shuttingDown) break
+    // Reset the ladder only after a connection that actually stayed up; merely
+    // connecting is not evidence of health.
+    if (wakeStreamWasStable(Date.now() - startedAt)) backoffMs = 500
+    await new Promise<void>((r) => setTimeout(r, backoffMs))
+    backoffMs = Math.min(backoffMs * 2, 30_000)
   }
 }
 

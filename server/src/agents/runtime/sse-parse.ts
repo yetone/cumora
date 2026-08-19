@@ -48,3 +48,19 @@ export async function* parseSseStream(body: AsyncIterable<unknown>): AsyncGenera
     }
   }
 }
+
+/** How long a wake-stream must stay up before its reconnect ladder resets.
+ *
+ *  Merely CONNECTING must not reset the ladder. A wake-stream can end CLEANLY —
+ *  wake-bus's backpressure guard calls `res.end()` on a backed-up subscriber,
+ *  and any edge in front of the API can terminate a chunked 200 the same way —
+ *  so an endpoint that accepts and immediately closes would reset the delay on
+ *  every pass and the backoff could never grow. */
+export const STREAM_STABLE_MS = 60_000
+
+/** True when the wake-stream connection that just ended had been up long enough
+ *  to count as healthy, so the caller may reset its reconnect delay.
+ *  `upForMs` is null when the connection never opened at all. */
+export function wakeStreamWasStable(upForMs: number | null): boolean {
+  return upForMs !== null && upForMs >= STREAM_STABLE_MS
+}
