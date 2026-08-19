@@ -600,17 +600,75 @@ function getDockCleanIcon() {
   return dockCleanIcon
 }
 
+/** Paint the unread dot straight into an app-icon bitmap, in place.
+ *
+ *  Same raw-bitmap route as the tray below, for the same reason its comment
+ *  gives: `nativeImage.createFromDataURL` only decodes raster formats Chromium
+ *  knows (PNG/JPEG/WebP/GIF), so the SVG this used to build produced an EMPTY
+ *  image — `isEmpty()` true at 0x0. That tripped the `!img.isEmpty()` guard in
+ *  setDockUnreadDot, which skipped `setIcon` entirely, so the dock never showed
+ *  any unread indicator while the tray (already on bitmaps) did.
+ *
+ *  Buffer layout is BGRA with PREMULTIPLIED alpha (Chromium's N32). Blending
+ *  `c*a + dst*(1-a)` on all four channels preserves that invariant, since a
+ *  premultiplied channel never exceeds its alpha.
+ *
+ *  Dot geometry stays in the existing 1024-unit design space and is scaled to
+ *  whatever the icon's real pixel size is, so DOCK_UNREAD_DOT keeps its
+ *  meaning. */
+function paintDockUnreadDot(buf, width, height) {
+  const s = Math.min(width, height) / DOCK_ICON_SIZE
+  const dot = DOCK_UNREAD_DOT
+  const cx = dot.cx * s
+  const cy = dot.cy * s
+  const rIn = dot.r * s
+  const rOut = (dot.r + dot.stroke / 2) * s
+  const SS = 4  // 4x4 supersample — the same cheap anti-aliasing the tray uses
+  const n = SS * SS
+  const blend = (i, b, g, r, a) => {
+    if (a <= 0) return
+    const inv = 1 - a
+    buf[i] = Math.round(b * a + buf[i] * inv)
+    buf[i + 1] = Math.round(g * a + buf[i + 1] * inv)
+    buf[i + 2] = Math.round(r * a + buf[i + 2] * inv)
+    buf[i + 3] = Math.round(255 * a + buf[i + 3] * inv)
+  }
+  const x0 = Math.max(0, Math.floor(cx - rOut - 1))
+  const x1 = Math.min(width - 1, Math.ceil(cx + rOut + 1))
+  const y0 = Math.max(0, Math.floor(cy - rOut - 1))
+  const y1 = Math.min(height - 1, Math.ceil(cy + rOut + 1))
+  for (let y = y0; y <= y1; y++) {
+    for (let x = x0; x <= x1; x++) {
+      let covIn = 0
+      let covOut = 0
+      for (let sy = 0; sy < SS; sy++) {
+        for (let sx = 0; sx < SS; sx++) {
+          const dx = x + (sx + 0.5) / SS - cx
+          const dy = y + (sy + 0.5) / SS - cy
+          const d2 = dx * dx + dy * dy
+          if (d2 <= rOut * rOut) covOut += 1
+          if (d2 <= rIn * rIn) covIn += 1
+        }
+      }
+      if (covOut === 0) continue
+      const i = (y * width + x) * 4
+      // White halo first, then the red dot on top — same z-order as before.
+      blend(i, 255, 255, 255, (covOut / n) * 0.96)
+      blend(i, 0x30, 0x3b, 0xff, covIn / n)
+    }
+  }
+}
+
 function getDockUnreadIcon() {
   if (dockUnreadIcon) return dockUnreadIcon
-  const base64 = fs.readFileSync(ICON_PATH).toString('base64')
-  const dot = DOCK_UNREAD_DOT
-  const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="${DOCK_ICON_SIZE}" height="${DOCK_ICON_SIZE}" viewBox="0 0 ${DOCK_ICON_SIZE} ${DOCK_ICON_SIZE}">
-      <image href="data:image/png;base64,${base64}" width="${DOCK_ICON_SIZE}" height="${DOCK_ICON_SIZE}"/>
-      <circle cx="${dot.cx}" cy="${dot.cy}" r="${dot.r + dot.stroke / 2}" fill="#ffffff" opacity="0.96"/>
-      <circle cx="${dot.cx}" cy="${dot.cy}" r="${dot.r}" fill="#ff3b30"/>
-    </svg>`
-  dockUnreadIcon = nativeImage.createFromDataURL(`data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`)
+  const base = nativeImage.createFromPath(ICON_PATH)
+  const { width, height } = base.getSize()
+  // No icon on disk (or an undecodable one) — hand back the empty image and let
+  // setDockUnreadDot's isEmpty() guard skip the update, exactly as before.
+  if (!width || !height) return base
+  const buf = base.toBitmap()
+  paintDockUnreadDot(buf, width, height)
+  dockUnreadIcon = nativeImage.createFromBitmap(buf, { width, height })
   return dockUnreadIcon
 }
 
