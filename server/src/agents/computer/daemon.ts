@@ -2585,12 +2585,32 @@ async function restartService(): Promise<void> {
  *  removed from the supervisor so KeepAlive/Restart won't relaunch it; the
  *  plist/unit stays on disk, so `--restart` brings it back. (To remove it
  *  entirely, use `--uninstall-service`.) */
+
+/** One-shot CLI invocations: these do a thing and exit, so they are never the
+ *  long-running daemon we mean to stop. Anchored to the `--` so the words can't
+ *  match incidentally elsewhere in the command line. */
+const ONE_SHOT_FLAG_RE =
+  /--(stop|status|restart|logs|version|install-service|uninstall-service|pair)\b/
+
+/** Is this `ps`-reported command line a long-running BYOA daemon that `--stop`
+ *  should kill? True only for `agent computer` with no one-shot flag.
+ *
+ *  The npx *wrapper* used to be excluded here too, but that exclusion was both
+ *  wrong and unnecessary: `npx -y cumora@latest agent computer --server …` is
+ *  exactly how the LaunchAgent (and the docs) start a real daemon, and self/parent
+ *  protection is already handled by dropping process.pid / process.ppid from the
+ *  candidate set. Killing the wrapper's child is what actually stops the daemon,
+ *  and the wrapper exits with it. */
+export function isStoppableDaemonCommand(cmd: string): boolean {
+  return /agent computer/.test(cmd) && !ONE_SHOT_FLAG_RE.test(cmd)
+}
+
 /** Kill any RUNNING daemon process — the supervised one (after the service is
  *  uninstalled), a foreground one, or a stray/orphaned one. Sources: the pid the
  *  daemon records in running.json, plus a `pgrep` sweep for "agent computer". We
  *  verify each candidate's command line really is a long-running daemon (and is
- *  NOT this --stop command, its npx wrapper, or another one-shot CLI) before
- *  killing — SIGTERM, then SIGKILL anything that ignores it. Best-effort. */
+ *  NOT this --stop command or another one-shot CLI) before killing — SIGTERM,
+ *  then SIGKILL anything that ignores it. Best-effort. */
 async function killRunningDaemons(): Promise<void> {
   const candidates = new Set<number>()
   try {
@@ -2610,9 +2630,10 @@ async function killRunningDaemons(): Promise<void> {
     try {
       const { stdout } = await execFileP('ps', ['-p', String(pid), '-o', 'command='])
       const cmd = stdout.trim()
-      // A genuine long-running daemon: "agent computer" with NO one-shot flag,
-      // and not the npx wrapper — so we never kill ourselves or a sibling CLI.
-      if (/agent computer/.test(cmd) && !/--(stop|status|restart|logs|version|install-service|uninstall-service|pair)\b|\bnpx\b/.test(cmd)) {
+      // A genuine long-running daemon: "agent computer" with NO one-shot flag —
+      // so we never kill a sibling one-shot CLI. (Ourselves and our parent are
+      // already out of `candidates`.)
+      if (isStoppableDaemonCommand(cmd)) {
         victims.push(pid)
       }
     } catch { /* gone */ }
