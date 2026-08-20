@@ -494,7 +494,7 @@ async function resolveDisplayName(id: string, companyId: string): Promise<string
 }
 
 export function attachWebSocket(httpServer: Server) {
-  const wss = new WebSocketServer({ server: httpServer, path: '/ws' })
+  const wss = new WebSocketServer({ server: httpServer, path: '/ws', maxPayload: 4 * 1024 * 1024 })
 
   wss.on('connection', async (ws, req) => {
     const ip = req.socket.remoteAddress
