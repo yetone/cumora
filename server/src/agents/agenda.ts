@@ -330,14 +330,42 @@ export async function gatherAgentAgenda(
 /** Render the agenda as a compact text block for the classifier. We
  *  intentionally do not include the full description body — the
  *  classifier only needs to decide go/no-go, and the brain will see
- *  the full card via the `kanban` CLI on actual wake. */
+ *  the full card via the `kanban` CLI on actual wake.
+ *
+ *  Prefix-cache order (providers cache the longest unchanged prefix):
+ *    1. cards (change only when a card row changes)
+ *    2. stall identity + recent messages (change only on new chat)
+ *    3. calendar slot (slides as wall-clock crosses 30m/15m windows)
+ *  Wall-clock "Nm silent" is kept in a final timing section. That preserves
+ *  the original recency signal while preventing a ticking value from
+ *  invalidating the stable agenda prefix on every heartbeat. */
+function byId<T extends { id: string }>(a: T, b: T): number {
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
+}
+
 function renderAgendaForClassifier(agenda: AgentAgenda): string {
   const lines: string[] = []
-  if (agenda.cards.length > 0) {
-    lines.push(`Kanban cards (${agenda.cards.length}):`)
-    for (const c of agenda.cards) {
+  // Sort by id so inserting/updating one row does not reshuffle the rest and
+  // bust the prefix cache of every later line. Selection (most-recent LIMIT)
+  // still happens in SQL; this is display order only.
+  const cards = [...agenda.cards].sort(byId)
+  const stalls = [...agenda.stalls].sort((a, b) => (
+    a.conversationId < b.conversationId ? -1 : a.conversationId > b.conversationId ? 1 : 0
+  ))
+  if (cards.length > 0) {
+    lines.push(`Kanban cards (${cards.length}):`)
+    for (const c of cards) {
       const tag = c.assignee_id ? 'assigned' : 'mentioned'
       lines.push(`- [${tag}] "${c.title}" in ${c.board_title} / ${c.column_title} (id=${c.id}, updated ${c.updated_at})`)
+    }
+  }
+  if (stalls.length > 0) {
+    if (lines.length > 0) lines.push('')
+    lines.push(`Conversations you're in that have gone quiet (${stalls.length}) — judge each: genuinely WAITING on someone, or already CONCLUDED/wound down?`)
+    for (const s of stalls) {
+      const who = s.lastAuthorIsSelf ? 'YOU spoke last, no reply since' : `${s.lastAuthorName} spoke last, you haven't responded`
+      lines.push(`- [${s.kind}] ${s.title ?? s.conversationId} (${s.conversationId}) — ${who}. Last few messages:`)
+      for (const ln of (s.recentTail || s.lastBody).split('\n')) lines.push(`    ${ln}`)
     }
   }
   if (agenda.events.length > 0) {
@@ -348,14 +376,10 @@ function renderAgendaForClassifier(agenda: AgentAgenda): string {
       lines.push(`- "${e.title}" at ${e.start_at}${prompt}`)
     }
   }
-  if (agenda.stalls.length > 0) {
+  if (stalls.length > 0) {
     if (lines.length > 0) lines.push('')
-    lines.push(`Conversations you're in that have gone quiet (${agenda.stalls.length}) — judge each: genuinely WAITING on someone, or already CONCLUDED/wound down?`)
-    for (const s of agenda.stalls) {
-      const who = s.lastAuthorIsSelf ? 'YOU spoke last, no reply since' : `${s.lastAuthorName} spoke last, you haven't responded`
-      lines.push(`- [${s.kind}] ${s.title ?? s.conversationId} — ${who}, ${s.minutesSilent}m silent. Last few messages:`)
-      for (const ln of (s.recentTail || s.lastBody).split('\n')) lines.push(`    ${ln}`)
-    }
+    lines.push('Current stall timing:')
+    for (const s of stalls) lines.push(`- ${s.conversationId}: ${s.minutesSilent}m silent`)
   }
   if (lines.length === 0) return '(empty)'
   return lines.join('\n')
@@ -406,6 +430,8 @@ Decide "actionable: true" only when at least one item is concrete, fresh, AND cl
 - cards already in a done/archive-style column
 - events that are personal markers (no agent_prompt)
 - duplicates of work the agent has obviously already started
+
+ORDERING: list order is for prompt-cache stability, not priority. Judge urgency from each card's updated timestamp, each event's start time, and each stalled conversation's current silence duration and message content.
 
 STALLED CONVERSATIONS: for each, READ the recent messages shown and judge whether it is genuinely WAITING or already CONCLUDED. actionable=true ONLY when the recent messages show a CONCRETE unanswered ask directed at someone, or an explicitly in-progress step plainly waiting on a next move. It is NOT actionable (false) when the thread has CONCLUDED or socially CLOSED — participants exchanging wrap-up / closing / acknowledgement remarks, a conclusion or result already reached, nothing pending and no one waiting on a specific next step — no matter how "quiet" it now is. A merely quiet conversation is NOT a stall; "someone spoke last and I didn't reply" is NOT by itself a reason (most messages need no reply). Resurrecting a finished conversation with a late reply is a failure — when in doubt that it's truly still waiting, choose false.
 
