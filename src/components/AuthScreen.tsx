@@ -12,7 +12,7 @@
  * per-server.
  */
 import { useState, useEffect } from 'react'
-import { api, getServerOrigin, setServerOrigin } from '@/api/client'
+import { api, getPairingServerOrigin, getServerOrigin, setServerOrigin } from '@/api/client'
 import { isCapacitorIOS, isElectron } from '@/lib/runtime'
 import { isNativePlatform, nativePlatform, runAppleSignIn, runOAuth } from '@/lib/native'
 import { useAuth } from '@/stores/auth'
@@ -95,7 +95,10 @@ export function AuthScreen() {
       // — the loopback HTTP server in main.cjs serves a styled
       // "Signed in" page that POSTs the fragment back to the main
       // process, which IPCs the renderer (see AuthGate's onToken).
-      const origin = getServerOrigin() || 'https://api.cumora.ai'
+      // getServerOrigin() is '' in dev (relative, for the Vite proxy) —
+      // use the pairing origin so local dev opens the local server instead
+      // of falling through to production.
+      const origin = getPairingServerOrigin() || 'https://api.cumora.ai'
       // Arm a single-use nonce and thread it through the return URL. The server
       // round-trips it back onto /auth/done, the loopback page carries it into
       // the cumora:// deep link, and main accepts the token only if the nonce
@@ -119,7 +122,9 @@ export function AuthScreen() {
       // (our WebAuthPlugin). It hands the final cumora://auth#... callback
       // straight back to us — no SFSafariViewController, no broken 302
       // redirect to a custom URL scheme.
-      const origin = getServerOrigin() || 'https://api.cumora.ai'
+      // See the Electron branch above — same reasoning for preferring the
+      // pairing origin over getServerOrigin() in dev.
+      const origin = getPairingServerOrigin() || 'https://api.cumora.ai'
       const ret = encodeURIComponent('cumora://auth')
       void (async () => {
         try {
