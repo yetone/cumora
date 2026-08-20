@@ -17,8 +17,8 @@ export function Onboarding() {
   const [err, setErr] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   // The engine the starter team (and agents later assigned here) will run on.
-  // Claude is the default; picking Codex appends `--engine codex`. We DON'T
-  // append `--engine claude` so a Codex-only machine still auto-detects rather
+  // Claude is the default; ANY other pick must be named explicitly. We DON'T
+  // append `--engine claude` so a Claude-less machine still auto-detects rather
   // than erroring on a Claude it doesn't have.
   const [engine, setEngine] = useState<'claude' | 'codex' | 'grok'>('claude')
   // Default to installing the always-on service: it auto-starts on boot,
@@ -36,7 +36,10 @@ export function Onboarding() {
   }, [copied])
 
   const origin = getPairingServerOrigin()
-  const engineFlag = engine === 'codex' ? ' --engine codex' : ''
+  // Every non-default engine, not just Codex: without the flag the daemon
+  // auto-detects and the server takes engines[0] as this computer's DEFAULT, so
+  // picking Grok on a machine that also has Claude silently paired it to Claude.
+  const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
   const serviceFlag = asService ? ' --install-service' : ''
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
 

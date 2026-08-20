@@ -708,7 +708,8 @@ function ComputersTab() {
   const [code, setCode] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   // Engine for a NEWLY added computer's starter/assigned agents. Claude is the
-  // default (no flag → daemon auto-detects); Codex appends `--engine codex`.
+  // default (no flag → daemon auto-detects); every other pick is named
+  // explicitly, or the daemon auto-detects and engines[0] silently wins.
   const [engine, setEngine] = useState<'claude' | 'codex' | 'grok'>('claude')
   // Default on: install the always-on service (auto-start/restart/update).
   // --install-service is macOS/Linux only (daemon throws on Windows) → off + hidden there.
@@ -736,7 +737,8 @@ function ComputersTab() {
 
   const origin = getPairingServerOrigin()
   const serverFlag = origin ? ` --server ${origin}` : ''
-  const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engine === 'codex' ? ' --engine codex' : ''}${asService ? ' --install-service' : ''}` : ''
+  const engineFlag = engine === 'claude' ? '' : ` --engine ${engine}`
+  const pairCommand = code ? `npx cumora@latest agent computer --pair ${code}${serverFlag}${engineFlag}${asService ? ' --install-service' : ''}` : ''
   const list = Object.values(byId).sort((a, b) =>
     (a.kind === 'cloud' ? 0 : 1) - (b.kind === 'cloud' ? 0 : 1) || a.name.localeCompare(b.name))
 
