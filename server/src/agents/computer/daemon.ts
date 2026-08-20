@@ -427,10 +427,27 @@ function parseArgs(argv: string[]): {
 
 // ─── HTTP helpers ───────────────────────────────────────────────────────
 
+/** Wall-clock cap on every SHORT request/response call to the server (status,
+ *  runs, token mint, heartbeat, agent sync).
+ *
+ *  Without this, a request that never answers — a half-open socket surviving a
+ *  laptop sleep/network switch, a hung proxy, a pod that accepted the connection
+ *  and stopped — parks the turn forever: `catch` only sees throws, never a
+ *  promise that simply doesn't settle. The turn's `finally { this.busy = false }`
+ *  never runs, so the agent stays permanently `busy`, every later wake collapses
+ *  to `turn busy — coalescing`, and the heartbeat interval stops going out until
+ *  the server marks the whole computer offline. One stalled socket takes down
+ *  every agent on the machine.
+ *
+ *  Deliberately NOT applied to the wake-stream (an intentionally long-lived SSE
+ *  connection, which has its own idle/backoff handling) or the npm version check. */
+const HTTP_TIMEOUT_MS = Math.max(1_000, Number(process.env.CUMORA_HTTP_TIMEOUT_MS ?? 20_000))
+
 async function api<T>(serverUrl: string, path: string, init: RequestInit): Promise<T> {
   const res = await fetch(`${serverUrl}${path}`, {
     ...init,
     headers: { 'Content-Type': 'application/json', ...(init.headers ?? {}) },
+    signal: init.signal ?? AbortSignal.timeout(HTTP_TIMEOUT_MS),
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
@@ -440,7 +457,9 @@ async function api<T>(serverUrl: string, path: string, init: RequestInit): Promi
 }
 
 /** Fire-and-forget runtime call (status / runs). Never throws — observability
- *  must never break the agent loop. */
+ *  must never break the agent loop. The timeout is what makes that promise hold
+ *  for a server that stops answering rather than refusing (see HTTP_TIMEOUT_MS):
+ *  an abort throws, so it lands in the catch and the turn proceeds. */
 async function runtimeBest(
   serverUrl: string, path: string, token: string, body: unknown,
 ): Promise<unknown> {
@@ -449,6 +468,7 @@ async function runtimeBest(
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     return res.ok ? await res.json().catch(() => null) : null
   } catch { return null }
@@ -461,6 +481,7 @@ async function runtimeGet<T>(
     const res = await fetch(`${serverUrl}/runtime${path}`, {
       method: 'GET',
       headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
     })
     return res.ok ? await res.json().catch(() => null) as T | null : null
   } catch { return null }
@@ -2345,6 +2366,9 @@ async function doRun(serverOverride?: string): Promise<void> {
       await fetch(`${cfg.serverUrl}/api/computers/heartbeat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${cfg.deviceToken}` },
+        // A heartbeat that never answers must not outlive its own interval, or
+        // the beats queue up behind a dead socket and the computer reads offline.
+        signal: AbortSignal.timeout(HTTP_TIMEOUT_MS),
         // `supervised` tells the server HOW this daemon runs (service vs. a
         // foreground command), so the app's upgrade banner can show the right
         // update instructions for this machine.
