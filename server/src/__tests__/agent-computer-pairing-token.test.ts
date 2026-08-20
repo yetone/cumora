@@ -57,7 +57,7 @@ test('company add token is persistent and reattaches an existing host by name', 
   const paired = await registry.pairComputer({
     code: 'company-token',
     hostName: 'MacBook Air',
-    engines: ['claude', 'bogus'],
+    engines: ['claude', 'cursor', 'bogus'],
     deferBroadcast: true,
   })
   assert.equal(paired?.computerId, 'comp-existing')
@@ -65,7 +65,7 @@ test('company add token is persistent and reattaches an existing host by name', 
 
   const update = calls.find((c) => /UPDATE computers\s+SET credential_hash/.test(c.sql))
   assert.ok(update, 'existing computer should be updated instead of inserting a duplicate')
-  assert.equal(update.params[1], JSON.stringify(['claude']))
+  assert.equal(update.params[1], JSON.stringify(['claude', 'cursor']))
   assert.equal(calls.some((c) => /INSERT INTO computers/.test(c.sql)), false)
 })
 

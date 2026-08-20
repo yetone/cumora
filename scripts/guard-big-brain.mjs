@@ -37,7 +37,7 @@ const ALLOW = {
   // The BYOA big-brain engine spawn (adapter.run) lives ONLY in the daemon,
   // where it is gated by the local triage (handler='big').
   adapterRun: ['server/src/agents/computer/daemon.ts'],
-  // The engine adapter is the ONLY place that spawns the claude/codex binary
+  // The engine adapter is the ONLY place that spawns a supported engine binary
   // (and it splits classify=small vs run=big internally).
   engineSpawn: ['server/src/agents/computer/engine.ts'],
 }
@@ -79,9 +79,9 @@ export function lineViolations(rel, raw) {
   if (/\.run\s*\(\s*\{/.test(code) && /adapter\.run|this\.adapter\.run/.test(code) && !ALLOW.adapterRun.includes(rel)) {
     out.push('big-brain engine spawn (adapter.run) outside the gated daemon path')
   }
-  // R4 — the claude/codex binary spawned directly, outside the engine adapter.
-  if (/(?:spawn|execFile\w*|exec)\s*\(\s*['"`](claude|codex)['"`]/.test(code) && !ALLOW.engineSpawn.includes(rel)) {
-    out.push('claude/codex binary spawned outside the engine adapter (bypasses the classify=small / run=big split)')
+  // R4 — a supported engine binary spawned directly, outside the adapter.
+  if (/(?:spawn|execFile\w*|exec)\s*\(\s*['"`](claude|codex|grok|cursor-agent)['"`]/.test(code) && !ALLOW.engineSpawn.includes(rel)) {
+    out.push('engine binary spawned outside the engine adapter (bypasses the classify=small / run=big split)')
   }
   return out
 }

@@ -1,4 +1,4 @@
-# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build as the engine)
+# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build / Cursor Agent as the engine)
 
 Every Cumora agent has a "brain" and a host. The managed path is
 server-side: `runAgentTurn` in `server/src/agents/turn.ts` runs a
@@ -7,7 +7,7 @@ a per-agent Kubernetes pod (the `agent-computer` image).
 
 **BYOA** lets a user supply the brain instead: a long-running daemon on
 the user's own machine (laptop **or** VPS) drives a local **Claude Code**,
-**Codex CLI**, or **Grok Build** (`grok`) as the reasoning engine, on the
+**Codex CLI**, **Grok Build** (`grok`), or **Cursor Agent** (`cursor-agent`) as the reasoning engine, on the
 user's own subscription — the server never holds the user's provider credentials.
 One daemon hosts **many independent agents** — each with its own isolated
 home directory, memory, skills, and notes. In Cumora these still appear
@@ -38,7 +38,7 @@ managed cloud agents and local agents into the same picture.
   user to set up; it's always online.
 - **Your computers** — machines you pair (your Mac, a VPS). Each runs the
   `cumora agent computer` daemon with a local engine (Claude Code /
-  Codex / Grok Build). Agents you place here are BYOA agents.
+  Codex / Grok Build / Cursor Agent). Agents you place here are BYOA agents.
 
 ```
 Computers
@@ -111,14 +111,14 @@ with rate-limit adaptation, and same-turn steering.
               │   wake → debounce/coalesce → triage (small brain)       │
               │        → persistent EngineSession turn                  │
               │   claude --input/output-format stream-json …            │
-              │   codex app-server --listen stdio:// (JSON-RPC)         │
+              │   codex app-server / grok ACP / cursor-agent one-shot   │
               │   bash → cumora shim → POST /runtime/cli (per-agent JWT)│
               └─────────────────────────────────────────────────────────┘
 ```
 
 **One computer, many agents.** Each agent gets one wake-stream
-subscription, one persistent engine session, and one isolated on-disk
-home. Agents never share state — isolation is "different directory +
+subscription, one engine context (persistent process where supported, resumable
+session id otherwise), and one isolated on-disk home. Agents never share state — isolation is "different directory +
 different token".
 
 ---
@@ -144,16 +144,16 @@ different token".
 4. The daemon opens a run (`POST /runtime/runs`, heartbeat every 60s,
    `finish` at the end), sets status `thinking`, and keeps a typing
    indicator alive in the woken conversation.
-5. **The turn.** The engine's persistent session receives a compact
+5. **The turn.** The engine receives a compact
    delta: "triage already said this is real — act", the current UTC
    clock, the triage note, a pre-fetched unread digest (with a "glance
    before posting" nudge), a `memory/MEMORY.md` digest, and the team
    roster. The invariant scaffold (CLI usage, the shared
    `GLANCE_YIELD_RULES`, memory rules, privacy boundary) is delivered
-   once per session out-of-band — `--append-system-prompt-file` for
-   Claude, `developerInstructions` for Codex, `_meta.rules` for Grok ACP —
-   so per-turn tokens stay
-   small and the engine's **native auto-compaction** keeps up.
+   once per persistent session out-of-band — `--append-system-prompt-file`
+   for Claude, `developerInstructions` for Codex, `_meta.rules` for Grok
+   ACP. Cursor has no persistent protocol in the tested CLI version, so the
+   daemon inlines the standing prompt into each one-shot wake.
 6. The engine reads its home (`CLAUDE.md` / `AGENTS.md`, skills,
    `memory/`), reasons, and acts through bash: every `cumora …` call
    flows through the shim to `/runtime/cli` with identity pinned by the
@@ -162,8 +162,8 @@ different token".
    mid-turn is injected into the live session at the next safe stream
    boundary; plain group activity gets a content-free nudge (default
    on). See COORDINATION.md 3c. Grok Build's ACP `session/prompt` is
-   one-in-flight, so mid-turn inject is a no-op there and the ping
-   coalesces onto the next wake.
+   one-in-flight, and Cursor has no persistent stdio session, so mid-turn
+   inject is a no-op for those engines and the ping coalesces onto the next wake.
 8. Turn ends → run finished, status back. Per-hop token usage is posted
    to `/runtime/llm-calls`, landing in the same universal `llm_calls`
    ledger as cloud turns. Engine failures surface as a
@@ -180,12 +180,12 @@ from their own agenda — Kanban cards and due calendar slots — via
 ## Engine integration
 
 `server/src/agents/computer/engine.ts` defines one `EngineAdapter` per
-engine (`claude`, `codex`). The **primary** path is a persistent
-per-agent session; one-shot `run()` is the fallback.
+engine (`claude`, `codex`, `grok`, `cursor`). Persistent per-agent sessions
+are preferred when the CLI exposes one; Cursor uses one-shot `run()` for every wake.
 
 ```ts
 interface EngineAdapter {
-  id: 'claude' | 'codex'
+  id: 'claude' | 'codex' | 'grok' | 'cursor'
   seedHome(home, persona)          // lay out CLAUDE.md/AGENTS.md, skills, dirs
   startSession?(args): EngineSession | null   // persistent session (primary)
   run(args): Promise<…>            // one-shot fallback
@@ -200,28 +200,27 @@ interface EngineSession {
 }
 ```
 
-| Concern | Claude Code | Codex CLI |
-| --- | --- | --- |
-| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]`; turns are stream-json messages on stdin | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`); requires a git repo in the home (the daemon inits a throwaway one) |
-| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` |
-| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` |
-| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure |
-| Memory / persona file | `CLAUDE.md` | `AGENTS.md` |
-| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` |
+| Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent |
+| --- | --- | --- | --- | --- |
+| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]` | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`) | `grok agent --always-approve --no-leader … stdio`, driven over ACP | none in Cursor Agent `2026.08.11-e8db854` |
+| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` | ACP `_meta.rules` | inlined into each wake |
+| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` | `grok -p … --output-format streaming-messages-json` | `cursor-agent -p --output-format stream-json --force --trust [--resume <id>]` |
+| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure | `CUMORA_GROK_ARGS` set, `CUMORA_GROK_NO_ACP=1`, or Windows | always one-shot; `CUMORA_CURSOR_ARGS` overrides flags |
+| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` |
+| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` | `grok -p --model grok-4.5 --output-format json` | `cursor-agent --mode ask -p --output-format stream-json --trust` |
 
 Sessions carry a resume id (`~/.cumora/sessions/<agentId>.session`); a
 failed resume falls back to a fresh thread instead of wedging the agent.
 Engines run headless with their permission prompts disabled, scoped to
 the agent's isolated home. On Windows the daemon resolves the real
-`claude`/`codex` `.cmd` shims and routes large prompts via stdin.
+`claude`/`codex`/`grok`/`cursor-agent` `.cmd` shims and routes large prompts via stdin.
 Model selection: the per-agent `participants.model` / `fast_model`
-columns, else the deploy-level `CUMORA_DEFAULT_CLAUDE_MODEL` /
-`CUMORA_DEFAULT_CODEX_MODEL` pins.
+columns, else the matching deploy-level `CUMORA_DEFAULT_*_MODEL` pin.
 
 ### Running against a custom provider
 
 Those pins are resolved server-side and name Anthropic / OpenAI models. If your
-local `claude` or `codex` is pointed at a **custom provider** (CC Switch and
+local engine CLI is pointed at a **custom provider** (CC Switch and
 friends), it has never heard of `claude-opus-4-7`, so every turn fails with
 *"There's an issue with the selected model"* even though the CLI works fine in
 your terminal.
@@ -256,6 +255,7 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
     CLAUDE.md  (or AGENTS.md)      ← static persona header, written once
     .cumora-standing-prompt.md     ← the per-session operational prompt
     .claude/skills/<name>/SKILL.md ← this agent's skills (Claude)
+    .cursor/skills/                 ← Cursor-native skill directory
     .claude/settings.json          ← permissions (allow Bash)
     bin/cumora                     ← the shim (see below); bin/.runtime-token
     memory/MEMORY.md               ← the agent's durable memory index
@@ -285,8 +285,8 @@ credentials are keyed to that dir — so the daemon sets `cwd` to the
 agent's home and does **not** relocate config. Per-agent: project memory,
 skills, settings, notes, workspace. Shared across an owner's agents on
 one machine: the engine login and the user's global config (`~/.claude` /
-`~/.codex` / `~/.grok`). Agents are independent in the dimensions that matter; they
-share one engine login per host.
+`~/.codex` / `~/.grok`, or Cursor's login store). Agents are independent in
+all project state and share one engine login per host.
 
 ---
 
@@ -299,7 +299,7 @@ CREATE TABLE computers (
   owner_user_id     TEXT,            -- null for the managed Cumora Cloud row
   name              TEXT NOT NULL,   -- "Cumora Cloud", "MacBook Pro", …
   kind              TEXT NOT NULL,   -- 'cloud' | 'local' | 'vps'
-  available_engines JSONB,           -- ['claude','codex'] (daemon-detected)
+  available_engines JSONB,           -- ['claude','codex','grok','cursor'] (daemon-detected)
   status            TEXT NOT NULL,   -- 'online' | 'offline' | 'busy'
   last_seen_at      TIMESTAMP,
   credential_hash   TEXT,            -- SHA256 of the device token
@@ -312,7 +312,7 @@ CREATE TABLE computers (
 
 -- participants carry their host + engine + models
 --   computer_id  TEXT   (FK → computers.id)
---   engine       TEXT   ('managed' | 'claude' | 'codex')
+--   engine       TEXT   ('managed' | 'claude' | 'codex' | 'grok' | 'cursor')
 --   model        TEXT   (big-brain override)
 --   fast_model   TEXT   (small-brain override)
 ```
@@ -399,8 +399,8 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
 
 ## Boundaries
 
-- **Cost / rate limits are the operator's** (their Claude Code / Codex / Grok Build
-  subscription) — a stated BYOA benefit. The daemon's semaphores, spawn
+- **Cost / rate limits are the operator's** (their Claude Code / Codex / Grok Build /
+  Cursor subscription) — a stated BYOA benefit. The daemon's semaphores, spawn
   pacing, and cooldowns exist to stay inside those limits gracefully
   (COORDINATION.md 2-4).
 - **Local inner state is not mirrored to the server.** Memory, notes,

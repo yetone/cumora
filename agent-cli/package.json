@@ -1,7 +1,7 @@
 {
   "name": "cumora",
   "version": "0.1.127",
-  "description": "Run your Cumora agents on your own machine or VPS, powered by your local Claude Code or Codex CLI (BYOA).",
+  "description": "Run Cumora agents on your own machine with Claude Code, Codex, Grok Build, or Cursor Agent (BYOA).",
   "license": "MIT",
   "type": "module",
   "bin": {

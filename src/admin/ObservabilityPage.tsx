@@ -157,7 +157,7 @@ const REFRESH_INTERVALS: Array<{ label: string; ms: number }> = [
 // filter is here so the operator can isolate either side when investigating
 // a spike: "did cloud cost spike, or just BYOA token usage?"
 
-// One BYOA pill covering BOTH engines (byoa-claude + byoa-codex). The rollup
+// One BYOA pill covering every local engine. The rollup
 // table still shows them as separate rows (different engine/model); this is
 // just the filter — the operator rarely wants to isolate a single BYOA engine,
 // and "Cloud vs BYOA" is the split that matters.
@@ -167,7 +167,7 @@ const SOURCE_FILTERS: Array<{ key: SourceFilter; label: string }> = [
   { key: 'cloud', label: 'Cloud' },
   { key: 'byoa',  label: 'BYOA' },
 ]
-const isByoaSource = (s: string): boolean => s === 'byoa-claude' || s === 'byoa-codex' || s === 'byoa-grok'
+const isByoaSource = (s: string): boolean => s.startsWith('byoa-')
 
 // ─── Component ───────────────────────────────────────────────────────────
 

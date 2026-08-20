@@ -401,7 +401,7 @@ export interface ApiAgentRun {
 }
 
 // ── Triage cost-effectiveness ledger ──
-export type ApiTriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok'
+export type ApiTriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'
 
 export interface ApiTriageAgentRow {
   agentId: string

@@ -48,10 +48,11 @@ test('R3 — adapter.run() outside the daemon is caught; inside it is allowed', 
   assert.deepEqual(lineViolations('server/src/agents/computer/daemon.ts', `await this.adapter.run({ model, input })`), [])
 })
 
-test('R4 — spawning the claude/codex binary outside the engine adapter is caught', () => {
-  assert.ok(lineViolations('server/src/agents/tools.ts', `spawn('claude', args)`).length > 0)
-  assert.ok(lineViolations('server/src/agents/tools.ts', `execFile('codex', args)`).length > 0)
-  assert.deepEqual(lineViolations('server/src/agents/computer/engine.ts', `spawn('claude', args)`), [])
+test('R4 — spawning a supported engine binary outside the engine adapter is caught', () => {
+  for (const bin of ['claude', 'codex', 'grok', 'cursor-agent']) {
+    assert.ok(lineViolations('server/src/agents/tools.ts', `spawn('${bin}', args)`).length > 0, bin)
+  }
+  assert.deepEqual(lineViolations('server/src/agents/computer/engine.ts', `spawn('cursor-agent', args)`), [])
 })
 
 test('commented-out examples do not trip the guard', () => {

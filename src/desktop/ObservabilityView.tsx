@@ -631,9 +631,9 @@ function StatCard({ label, value, sub, tone }: {
  *  (haiku/mini = cerebellum/small; everything else = main/big). */
 function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cachedInPer1M: number; outPer1M: number; estimated: boolean }[] }) {
   if (rows.length === 0) return null
-  // Each engine's cerebellum: claude→haiku, codex→gpt-5.4-mini, grok→grok-4.5
-  // (see the daemon's triageModel). Without grok-4.5 here every Grok triage hop
-  // renders as "big brain" and the brain-tier split reads wrong.
+  // Fixed cerebellum aliases: claude→haiku, codex→gpt-5.4-mini,
+  // grok→grok-4.5. Cursor has no fixed cheap alias and reports the model its
+  // account selected, so it is classified by that model id.
   const isSmall = (m: string) => /haiku|mini|grok-4\.5/i.test(m)
   return (
     <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
@@ -817,7 +817,7 @@ function TriageEconomicsPanel(props: {
 
             {data.byoaShare > 0 && (
               <div className="rounded-[10px] border border-gold bg-cloud px-3.5 py-2.5 text-[11px] leading-[1.6] text-gold-deep">
-                <b>{fmtPct(data.byoaShare)} of these run on BYOA</b> (your own Claude/Codex). If that's a flat-rate plan (e.g. Claude Max), these dollars are <b>meter-equivalent</b> — what the same tokens would cost on the pay-as-you-go API, <b>NOT your real bill</b> (which is ≈ $0 marginal until you hit your plan's rate limit). For a flat-rate plan the real, plan-independent cost is the <b>tokens / quota</b>, not the $. The $ is still a faithful RELATIVE measure of triage-vs-turn.
+                <b>{fmtPct(data.byoaShare)} of these run on BYOA</b> (your own local engine). If that's a flat-rate plan (e.g. Claude Max), these dollars are <b>meter-equivalent</b> — what the same tokens would cost on the pay-as-you-go API, <b>NOT your real bill</b> (which is ≈ $0 marginal until you hit your plan's rate limit). For a flat-rate plan the real, plan-independent cost is the <b>tokens / quota</b>, not the $. The $ is still a faithful RELATIVE measure of triage-vs-turn.
               </div>
             )}
 

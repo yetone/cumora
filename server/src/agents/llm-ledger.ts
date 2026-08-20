@@ -29,7 +29,7 @@
  *      different timing. The CI guard's allowlist documents these exceptions.
  *
  * What this is NOT for:
- *   - BYOA-local LLM calls (the operator's paired claude / codex CLI). Those
+ *   - BYOA-local LLM calls (the operator's paired engine CLI). Those
  *     are billed against the operator's own subscription, not Cumora's sub2api,
  *     and are already accounted for in `agent_triages` (BYOA triage rows) +
  *     `agent_runs` (BYOA turn rows) with `source='byoa-*'`. Putting them into
@@ -71,7 +71,7 @@ export type LlmCallPurpose =
   | 'agent-image'
 
 export type LlmCallStatus = 'ok' | 'rate_limited' | 'timeout' | 'failed'
-export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok'
+export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor'
 
 /** Context bound to a tracked client. Every LLM call it makes carries this
  *  shape into the ledger. `purpose` is mandatory; everything else scopes the

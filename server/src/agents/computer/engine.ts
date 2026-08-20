@@ -2,7 +2,7 @@
  * EngineAdapter — the pluggable "brain" for a BYOA agent.
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
- * on the user's machine: Claude Code, Codex, or Grok Build. The daemon (daemon.ts) hands
+ * on the user's machine: Claude Code, Codex, Grok Build, or Cursor Agent. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * isolated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -14,7 +14,8 @@
  * NOTE on engine flags: the exact non-interactive / permission flags differ
  * across engine versions. We pick sensible defaults for an isolated,
  * user-owned runner and let the user override via env
- * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS, space-split). Correctness of the
+ * (CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS /
+ *  CUMORA_CURSOR_ARGS, space-split). Correctness of the
  * loop does not depend on the structured output — the agent acts via the
  * `cumora` tool regardless of how we parse stdout.
  */
@@ -44,7 +45,7 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
 
 /** How to spawn a CLI bin cross-platform.
  *  - POSIX: spawn the bare bin with shell:false — unchanged, zero-risk.
- *  - Windows: `claude`/`codex` are usually `.cmd` shims that Node CANNOT run with
+ *  - Windows: engine CLIs are usually `.cmd` shims that Node CANNOT run with
  *    shell:false (CreateProcess can't execute a batch file) → "process exited with
  *    code 1". Resolve the real file on PATH and run a `.cmd`/`.bat` via
  *    shell:true. When the shell is needed,
@@ -54,7 +55,7 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
  *  Windows + nvm-windows gotcha: global npm CLIs are shipped as an extensionless
  *  POSIX shell-shim (`#!/bin/sh` wrapper) ALONGSIDE the real `.cmd`. The old loop
  *  iterated `['', ...PATHEXT]`, hit the shim first, classified it as non-batch,
- *  and returned `shell:false` → every Claude/Codex turn died with ENOENT.
+ *  and returned `shell:false` → every engine turn died with ENOENT.
  *  Fix: prefer a real `.exe`/`.cmd`/`.bat` hit; only fall back to the shim with
  *  `shell:true` when nothing else is on PATH. */
 // Exported for tests; the nvm-windows extensionless-shim regression (issue #5)
@@ -85,10 +86,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor']
 
 export interface EnginePersona {
   id: string
@@ -174,6 +175,8 @@ export interface EngineClassifyResult {
   /** Token usage for this triage call (Claude json output). Undefined when the
    *  engine emits none (e.g. codex / text-only output). */
   usage?: EngineUsage
+  /** The model id the engine actually ran, when its output reports one. */
+  model?: string | null
 }
 
 /** A `doctor` liveness probe for ONE brain tier of an engine: spawn it on the
@@ -576,20 +579,25 @@ function extraArgs(envVar: string): string[] {
   return raw ? raw.split(/\s+/).filter(Boolean) : []
 }
 
-const PERSONA_HEADER = (p: EnginePersona): string =>
-  `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
+const PERSONA_HEADER = (
+  p: EnginePersona,
+  opts: { personaFile?: string; skillsDir?: string } = {},
+): string => {
+  const personaFile = opts.personaFile ?? 'CLAUDE.md'
+  const skillsDir = opts.skillsDir ?? '.claude/skills/'
+  return `# ${p.name}${p.role ? ` — ${p.role}` : ''}\n\n` +
   `You are **${p.name}**, a member of a team that collaborates in Cumora (a team chat).\n` +
   (p.systemPrompt?.trim() ? `\n## Your style\n${p.systemPrompt.trim()}\n\n` : '\n') +
   `This directory is your private home and your working directory — it persists\n` +
   `across wakes and is yours alone. Its layout:\n` +
-  `- \`CLAUDE.md\` (this file) — always loaded each wake; keep it short.\n` +
+  `- \`${personaFile}\` (this file) — always loaded each wake; keep it short.\n` +
   `- \`memory/\` — your durable memory. There is NO hidden memory store: to remember\n` +
   `  something across wakes you MUST write it to a file here (e.g. \`memory/<topic>.md\`)\n` +
   `  and add a one-line pointer in \`memory/MEMORY.md\`. Saying "I'll remember" without\n` +
   `  writing a file means you will NOT remember. At the start of each wake, read\n` +
   `  \`memory/MEMORY.md\` (and the files it points to) to recall what you know.\n` +
   `- \`notes/\` — scratch notes and drafts.\n` +
-  `- \`.claude/skills/\` — your skills.\n` +
+  `- \`${skillsDir}\` — your skills.\n` +
   `- \`workspace/\` — **put all project files and scratch here**: git clones, builds,\n` +
   `  downloads, temp files. Always \`cd workspace\` (or use \`workspace/…\` paths) for\n` +
   `  that work — do NOT clutter your home root with project files.\n\n` +
@@ -616,6 +624,7 @@ const PERSONA_HEADER = (p: EnginePersona): string =>
   `  about a person or role you don't already know.\n` +
   `- \`cumora whoami\` — your identity\n\n` +
   `Be a real teammate with your own voice — not a generic assistant.\n`
+}
 
 /** A persistent Claude Code process for ONE agent (see EngineSession). Spawned in
  *  stream-json I/O mode (`-p --input-format stream-json --output-format stream-json`):
@@ -1900,10 +1909,364 @@ class GrokAdapter implements EngineAdapter {
   }
 }
 
+// ─── cursor ───────────────────────────────────────────────────────────────
+//
+// Cursor Agent (the `cursor-agent` CLI bundled with Cursor, 2026.08.11-e8db854)
+// is a ONE-SHOT engine: this version exposes no persistent stdio protocol, so
+// there is no startSession — every wake spawns a fresh process and continuity
+// comes from `--resume <session_id>`, which re-opens the SAME session id in the
+// next one-shot process. The daemon's generic one-shot run() path IS the wake
+// path; probeWake() therefore always reports `skipped` (probe() already
+// exercises the exact spawn a wake uses).
+//
+//   cursor-agent -p --output-format stream-json --force --trust \
+//     [--model X] [--resume <id>] <prompt>
+//
+// The stream: a `system/init` event (session id + model), user/assistant/
+// thinking events, and a terminal `result` event carrying the turn's usage.
+// Two contract quirks that shape this adapter:
+//   - A stream may report `is_error:true` with process exit 0 — that is a
+//     FAILED turn (model unavailable, …), so the stream decides, not the exit
+//     code, so the stream result is authoritative.
+//   - usage reports uncached input and cache reads as separate fields, matching
+//     Cursor's bundled `TokenUsage` schema; map them directly without folding.
+// Triage/probe use the READ-ONLY `--mode ask` variant and never `--force`.
+
+/** Cursor's result-event usage (OpenAI-ish camelCase). Its bundled TokenUsage
+ *  schema carries uncached input and cache reads as separate counters. */
+interface CursorUsage { inputTokens?: number; outputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+
+/** The subset of Cursor's stream-json we act on. Everything else is logged and
+ *  ignored, so a new event type in a future Cursor never breaks a turn. */
+interface CursorEvent {
+  type?: unknown
+  subtype?: unknown
+  session_id?: unknown
+  model?: unknown
+  is_error?: unknown
+  result?: unknown
+  usage?: CursorUsage
+  message?: { role?: unknown; content?: unknown }
+}
+
+/** Normalize Cursor's disjoint usage counters into EngineUsage;
+ *  cacheWrite maps to cache_creation. */
+function cursorUsageToEngineUsage(u: CursorUsage | undefined): EngineUsage | undefined {
+  if (!u || typeof u !== 'object') return undefined
+  const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0)
+  return {
+    input_tokens: num(u.inputTokens),
+    output_tokens: num(u.outputTokens),
+    cache_read_input_tokens: num(u.cacheReadTokens),
+    cache_creation_input_tokens: num(u.cacheWriteTokens),
+  }
+}
+
+/** Concatenate the text items of a Cursor message content array (same
+ *  `{type:'text', text}` item shape Claude uses). */
+function cursorTextOf(content: unknown): string {
+  if (!Array.isArray(content)) return ''
+  let out = ''
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue
+    const it = item as { type?: unknown; text?: unknown }
+    if (it.type === 'text' && typeof it.text === 'string') out += it.text
+  }
+  return out
+}
+
+/** Folds Cursor's stream-json into what the daemon wants from a turn: the
+ *  session id (every event repeats it — resume keeps continuity across the
+ *  per-wake processes), the model from `system/init` (or the pin when the
+ *  stream never names one), the normalized turn usage, the concatenated
+ *  assistant text (triage reads it), and the result event's error. ONE
+ *  turn-level EngineHopReport fires at the `result` event — Cursor reports
+ *  usage once per turn, so emitting per assistant message would double-count. */
+class CursorTurnTracker {
+  sessionId: string | null = null
+  model: string | null
+  usage: EngineUsage | undefined
+  text = ''
+  error: string | null = null
+  sawResult = false
+  private startedAt: number | null = null
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (r: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  /** Feed one event. Returns true when the event terminates the turn. */
+  observe(ev: CursorEvent): boolean {
+    if (typeof ev.session_id === 'string' && ev.session_id) this.sessionId = ev.session_id
+    if (ev.type === 'system' && ev.subtype === 'init') {
+      // init's model is what Cursor actually opened the session on — it wins
+      // over the pin (which is only what we asked for).
+      if (typeof ev.model === 'string' && ev.model) this.model = ev.model
+      if (this.startedAt == null) this.startedAt = Date.now()
+      return false
+    }
+    if (ev.type === 'assistant') {
+      this.text += cursorTextOf(ev.message?.content)
+      return false
+    }
+    if (ev.type === 'result') {
+      this.sawResult = true
+      this.usage = cursorUsageToEngineUsage(ev.usage)
+      if (ev.is_error === true) {
+        this.error = typeof ev.result === 'string' && ev.result
+          ? ev.result
+          : `cursor turn error${typeof ev.subtype === 'string' ? ` (${ev.subtype})` : ''}`
+      }
+      // The single turn-level hop — Cursor has no per-message usage, so this
+      // is the honest granularity (same contract as Codex's turn-completed).
+      if (ev.is_error !== true && this.usage && this.model && this.onHopUsage) {
+        const startedAt = this.startedAt
+        try {
+          this.onHopUsage({
+            model: this.model,
+            usage: this.usage,
+            latencyMs: startedAt != null ? Date.now() - startedAt : undefined,
+            hopIndex: 1,
+            textChars: this.text.length,
+          })
+        } catch { /* ledger best-effort — never break the stream */ }
+      }
+      return true
+    }
+    return false
+  }
+}
+
+/** Parse one stdout line of Cursor's stream-json. Non-JSON lines (banners,
+ * warnings that land on stdout) come back null and are logged verbatim. */
+function parseCursorLine(line: string): CursorEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as CursorEvent } catch { return null }
+}
+
+/** One-shot `cursor-agent -p --output-format stream-json …`: spawn, fold the
+ *  stream through a CursorTurnTracker, resolve on exit. The tracker's error is
+ *  folded into the result because a Cursor stream reports failure via
+ *  `is_error:true` regardless of the process exit code. Text is the
+ *  concatenated assistant text — what classify()/probe() want. */
+function spawnCursorStream(
+  command: string,
+  args: string[],
+  opts: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    shell: boolean
+    stdinText?: string
+    onHopUsage?: (r: EngineHopReport) => void
+    /** Model pin, used as the tracker's model until system/init names one. */
+    pin?: string | null
+    /** Fail a clean-exiting stream that never emitted its terminal `result`
+     *  event (run(): a turn that never finished is not a success). classify()
+     *  and probe() settle for whatever text arrived. */
+    requireResult?: boolean
+  },
+): Promise<EngineRunResult & { text: string }> {
+  return new Promise((resolve) => {
+    const tracker = new CursorTurnTracker(opts.pin ?? null, opts.onHopUsage)
+    const child = spawn(command, args, {
+      cwd: opts.cwd, env: opts.env,
+      stdio: [opts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      shell: opts.shell,
+    })
+    if (opts.stdinText != null) {
+      try { child.stdin?.write(opts.stdinText); child.stdin?.end() } catch { /* the 'error' handler resolves */ }
+    }
+    const onAbort = (): void => { child.kill('SIGTERM') }
+    opts.signal.addEventListener('abort', onAbort, { once: true })
+    if (opts.signal.aborted) onAbort()
+    const stderrTail: string[] = []
+    const stdoutTail: string[] = []
+    const decoder: Record<'stdout' | 'stderr', StringDecoder> = {
+      stdout: new StringDecoder('utf8'),
+      stderr: new StringDecoder('utf8'),
+    }
+    const carry: Record<'stdout' | 'stderr', string> = { stdout: '', stderr: '' }
+    const takeLine = (stream: 'stdout' | 'stderr', raw: string): void => {
+      const line = cleanLine(raw)
+      if (!line) return
+      pushTail(stream === 'stderr' ? stderrTail : stdoutTail, line)
+      opts.onLog?.(line)
+      if (stream === 'stdout') {
+        const ev = parseCursorLine(line)
+        if (ev) tracker.observe(ev)
+      }
+    }
+    const pump = (stream: 'stdout' | 'stderr', buf: Buffer | null): void => {
+      const text = buf === null ? decoder[stream].end() : decoder[stream].write(buf)
+      const lines = (carry[stream] + text).split('\n')
+      carry[stream] = buf === null ? '' : (lines.pop() ?? '')
+      for (const line of lines) takeLine(stream, line)
+    }
+    child.stdout?.on('data', (buf: Buffer) => pump('stdout', buf))
+    child.stderr?.on('data', (buf: Buffer) => pump('stderr', buf))
+    let settled = false
+    child.on('error', (err) => {
+      if (settled) return
+      settled = true
+      opts.signal.removeEventListener('abort', onAbort)
+      resolve({ exitCode: 1, error: err instanceof Error ? err.message : String(err), sessionId: null, text: '' })
+    })
+    child.on('close', (code, signalName) => {
+      if (settled) return
+      settled = true
+      opts.signal.removeEventListener('abort', onAbort)
+      pump('stdout', null)
+      pump('stderr', null)
+      const procExit = code ?? (signalName ? 128 : 1)
+      // The stream is the truth: is_error:true fails the turn even on exit 0.
+      const streamError = tracker.error
+        ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+        : (opts.requireResult && !tracker.sawResult
+          ? 'engine stream ended without a result event (cursor-agent exited early)'
+          : null)
+      const exitCode = procExit !== 0 ? procExit : (streamError ? 1 : 0)
+      const error = procExit !== 0
+        ? failurePreview({ exitCode: procExit, signalName, stderr: stderrTail, stdout: stdoutTail })
+        : streamError ?? undefined
+      resolve({ exitCode, error, sessionId: tracker.sessionId, usage: tracker.usage, model: tracker.model, text: tracker.text })
+    })
+  })
+}
+
+class CursorAdapter implements EngineAdapter {
+  readonly id = 'cursor' as const
+  readonly bin = 'cursor-agent'
+
+  /** A turn: full-tools one-shot (`--force` auto-approves the agent's tool use
+   *  inside its isolated, user-owned home — the Cursor analogue of Claude's
+   *  --dangerously-skip-permissions), `--trust` skips the workspace-trust
+   *  prompt a headless spawn can't answer. The prompt is the LAST argv element
+   *  (Cursor takes it positionally); on Windows it travels via stdin instead. */
+  private turn(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+    resumeSessionId?: string | null
+    onHopUsage?: (r: EngineHopReport) => void
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    // Continuous context across wakes: --resume re-opens the prior session in
+    // this fresh one-shot process (Cursor has no persistent protocol to keep
+    // warm instead).
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    const base = ['-p', ...resume, ...model, '--output-format', 'stream-json', '--force', '--trust']
+    return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+      stdinText: wantsStdinPrompt ? prompt : undefined,
+      onHopUsage: args.onHopUsage,
+      pin: args.model ?? null,
+      requireResult: true,
+    })
+  }
+
+  /** The READ-ONE triage/probe shape: `--mode ask` keeps the agent Q&A-only
+   *  (no edits, no shell), so classification can never mutate anything. Never
+   *  `--force` here. */
+  private ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    const base = ['--mode', 'ask', '-p', '--output-format', 'stream-json', ...model, '--trust']
+    return spawnCursorStream(command, wantsStdinPrompt ? base : [...base, prompt], {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+      stdinText: wantsStdinPrompt ? prompt : undefined,
+      pin: args.model ?? null,
+    })
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // User-owned triage flag set → plain print mode, raw text back (the same
+      // override discipline the other engines share; no stream to fold).
+      const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+      const base = [...flags, '-p']
+      return spawnCapture(command, wantsStdinPrompt ? base : [...base, args.prompt], {
+        cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell,
+        stdinText: wantsStdinPrompt ? args.prompt : undefined,
+      })
+    }
+    // Cursor has no fixed cheap cerebellum id (its models are account-gated
+    // aliases); unset CUMORA_TRIAGE_MODEL → Cursor's default ('Auto'), honestly
+    // reported back by the stream's system/init for the ledger.
+    const r = await this.ask(args.prompt, { cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, model: args.model })
+    return { text: r.text, error: r.error, usage: r.usage, model: r.model }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // 'small' → whatever triage runs on (CUMORA_TRIAGE_MODEL, else Cursor's
+    // default — the same model as 'big', honestly reported as such); 'big' →
+    // Cursor's default. Read-only ask mode either way.
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL || null) : null
+    const r = await this.ask(DOCTOR_PROMPT, { cwd: args.cwd, env: args.env, signal: args.signal, model })
+    return { text: r.text, error: r.error, usage: r.usage, model: r.model }
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // There is no distinct wake path to probe: no persistent protocol in this
+    // cursor-agent version, so the wake is the SAME one-shot spawn probe()
+    // already exercises. Mark skipped so doctor hides the redundant line.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.cursor', 'skills'), { recursive: true })
+    // Always rewrite AGENTS.md so persona edits land without requiring a fresh
+    // home (matches Claude and Codex). Cursor discovers AGENTS.md from its cwd.
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.cursor/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_CURSOR_ARGS')
+    if (flags.length) {
+      // Whole user-owned flag override → opaque print mode (same escape hatch
+      // as CUMORA_CLAUDE_ARGS / CUMORA_CODEX_ARGS / CUMORA_GROK_ARGS): we can't
+      // assume the stream-json shape, so no usage/hop ledger — but keep
+      // --resume + -p + prompt so session continuity survives the override.
+      const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+      const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+      const base = [...flags, ...resume, '-p']
+      return spawnEngine(command, wantsStdinPrompt ? base : [...base, args.prompt], args, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+    }
+    return this.turn(args.prompt, {
+      cwd: args.home, env: args.env, signal: args.signal, onLog: args.onLog,
+      model: args.model, resumeSessionId: args.resumeSessionId, onHopUsage: args.onHopUsage,
+    })
+  }
+
+  // No startSession: Cursor exposes no persistent stdio protocol in this
+  // version — the daemon runs the one-shot path above per wake and resumes
+  // the session id it reports (see the section note).
+}
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
   grok: new GrokAdapter(),
+  cursor: new CursorAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {

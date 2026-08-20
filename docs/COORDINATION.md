@@ -28,8 +28,8 @@ the bottom of this doc for the narrative.
 
 ## The shape of the problem
 
-Multi-agent collaboration in Cumora is **N independent claude/codex
-engine sessions on one operator's machine**, each woken by a server SSE event,
+Multi-agent collaboration in Cumora is **N independent local-engine
+sessions on one operator's machine**, each woken by a server SSE event,
 each reading the same conversation, each deciding independently what to do.
 Two failure modes:
 
@@ -669,7 +669,9 @@ one and re-test. Don't pile on.
 | Var | Default | Notes |
 |---|---|---|
 | `CUMORA_DEFAULT_CLAUDE_MODEL` | unset | Deploy-level model pin (e.g. `claude-opus-4-7`). Per-agent `participants.model` overrides this. |
-| `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for codex; deliberately not set by default. |
+| `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for Codex; deliberately not set by default. |
+| `CUMORA_DEFAULT_GROK_MODEL` | unset | Same shape for Grok Build. |
+| `CUMORA_DEFAULT_CURSOR_MODEL` | unset | Same shape for Cursor Agent; blank lets Cursor use Auto. |
 | `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` | 6 | Per-computer big-brain turn cap. Drop to 2-4 for very tight quotas; raise for higher tiers. |
 | `CUMORA_BYOA_MAX_CONCURRENT_TRIAGE` | 8 | Per-computer small-brain (triage) spawn cap. Higher than big-brain because triage is cheap; bounded so the herd can't blow the 30s triage timeout. |
 | `CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS` | 500 | Deterministic minimum interval between local-CLI spawn starts — the AdaptivePacer's base (3, 3b). |
@@ -773,4 +775,4 @@ fallback) and absent-member coverage (team-adapts principle).
 | `server/src/agents/agenda.ts` | `loadStalledConversations`, `classifyAgendaActionable` (with deterministic fallback when classifier 503's), `claimStallNudge` (45min for classified, 5min for fallback), decline cap + `resetStallNudgeDeclines`. |
 | `server/src/agents/runtime/server.ts` | `/runtime/inbox` endpoint with `?probe=1` flag for non-advancing reads. `/thinking/mark` / `/thinking/unmark` bracket the turn (they also still stamp the vestigial compose-anchor — see 5a). `/agenda` routes the nudge `source` flag (classified vs fallback) into `claimStallNudge`. |
 | `server/src/agents/runtime/inproc-client.ts` | `loadInbox()` — must remain a PURE READ. No more recordSeen side-effect (that broke a6e69aa). `markThinking`/`peekThinking` for the ZSET-based "who's composing here" claim. |
-| `server/src/agents/computer/registry.ts` | `listAgentsForComputer` with the `CUMORA_DEFAULT_CLAUDE_MODEL` fallback. |
+| `server/src/agents/computer/registry.ts` | `listAgentsForComputer` with per-engine `CUMORA_DEFAULT_*_MODEL` fallbacks. |
