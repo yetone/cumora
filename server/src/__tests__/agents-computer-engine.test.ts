@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { getAdapter, resolveSpawn } from '../agents/computer/engine.js'
+import { getAdapter, resolveSpawn, type EngineHopReport, type EngineRunResult } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const tempDirs: string[] = []
@@ -427,4 +427,93 @@ test('a normal run is unaffected by the abort wiring', { skip: IS_WIN }, async (
     signal: new AbortController().signal,
   })
   assert.equal(r.exitCode, 0)
+})
+
+// ── Grok ACP session: the ledger must see the REAL model ─────────────────────
+// `opts.model` is only the pin Cumora asked for, and it is null whenever the
+// operator left the model unpinned — the default. Reporting the engine id
+// ('grok') in its place puts a model that does not exist into llm_calls, and
+// prices the turn on a fallback rate. Grok announces the live model over ACP.
+
+/** A fake `grok agent … stdio`: ACP handshake, a models/update notification,
+ *  then one prompt result carrying usage. */
+async function fakeGrokAcp(root: string, opts: { announceModel?: string } = {}): Promise<string> {
+  const binDir = join(root, 'bin')
+  await mkdir(binDir, { recursive: true })
+  const announce = opts.announceModel
+    ? `if (msg.method === 'initialize') send({ jsonrpc: '2.0', method: '_x.ai/models/update', params: { currentModelId: ${JSON.stringify(opts.announceModel)} } })\n`
+    : ''
+  await writeFile(
+    join(binDir, 'grok'),
+    '#!/usr/bin/env node\n' +
+    "let buf = ''\n" +
+    "const send = (o) => process.stdout.write(JSON.stringify(o) + '\\n')\n" +
+    "process.stdin.on('data', (d) => {\n" +
+    "  buf += d.toString('utf8')\n" +
+    '  let nl\n' +
+    "  while ((nl = buf.indexOf('\\n')) >= 0) {\n" +
+    '    const line = buf.slice(0, nl); buf = buf.slice(nl + 1)\n' +
+    '    if (!line.trim()) continue\n' +
+    '    let msg; try { msg = JSON.parse(line) } catch { continue }\n' +
+    announce +
+    "    if (msg.method === 'initialize') send({ jsonrpc: '2.0', id: msg.id, result: { protocolVersion: 1 } })\n" +
+    "    else if (msg.method === 'session/new') send({ jsonrpc: '2.0', id: msg.id, result: { sessionId: 'sess-acp-1' } })\n" +
+    "    else if (msg.method === 'session/prompt') send({ jsonrpc: '2.0', id: msg.id, result: { stopReason: 'end_turn', usage: { input_tokens: 11, output_tokens: 4 } } })\n" +
+    '  }\n' +
+    '})\n' +
+    'setInterval(() => {}, 1 << 30)\n',
+    'utf8',
+  )
+  await chmod(join(binDir, 'grok'), 0o755)
+  return binDir
+}
+
+async function grokAcpTurn(binDir: string, home: string) {
+  const hops: EngineHopReport[] = []
+  const session = getAdapter('grok').startSession!({
+    home,
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    onLog: () => {},
+    onHopUsage: (h) => hops.push(h),
+  })
+  assert.ok(session, 'grok must start an ACP session on this platform')
+  liveSessions.push(session!)
+  const result = await Promise.race([
+    session!.send('go'),
+    delay(15_000).then(() => 'TIMEOUT' as const),
+  ])
+  assert.notEqual(result, 'TIMEOUT', 'the ACP turn never settled')
+  return { result: result as EngineRunResult, hops }
+}
+
+test('a Grok ACP turn reports the model the engine announced', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-grok-acp-'))
+  tempDirs.push(root)
+  const home = join(root, 'home')
+  await mkdir(home)
+  // No model pinned — the default, and exactly when the old code fell back to
+  // the engine id.
+  const binDir = await fakeGrokAcp(root, { announceModel: 'grok-4.6' })
+  const { result, hops } = await grokAcpTurn(binDir, home)
+
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.model, 'grok-4.6', 'the turn must be priced on the real model, not left null')
+  assert.equal(hops.length, 1)
+  assert.equal(hops[0].model, 'grok-4.6', 'the ledger hop must name a real model, not the engine id')
+  assert.equal(hops[0].usage.output_tokens, 4)
+})
+
+test('a Grok ACP turn still settles when no model is announced', { skip: IS_WIN }, async () => {
+  // Older CLI, or a build that drops the notification: fall back rather than
+  // hang or crash.
+  const root = await mkdtemp(join(tmpdir(), 'cumora-grok-acp2-'))
+  tempDirs.push(root)
+  const home = join(root, 'home')
+  await mkdir(home)
+  const binDir = await fakeGrokAcp(root)
+  const { result, hops } = await grokAcpTurn(binDir, home)
+
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.model, null, 'with nothing announced and nothing pinned there is no model to report')
+  assert.equal(hops[0].model, 'grok', 'the hop keeps its last-resort label')
 })

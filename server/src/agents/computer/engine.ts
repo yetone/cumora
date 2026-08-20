@@ -1517,6 +1517,12 @@ class GrokSession implements EngineSession {
   private queuedPrompt: string | null = null
   private steerWarned = false
   private readonly model: string | null
+  /** The model the agent is ACTUALLY running on, as reported by the ACP stream
+   *  (`_x.ai/models/update` → `currentModelId`). `this.model` is only the pin
+   *  Cumora asked for, and is null whenever the operator left the model
+   *  unpinned — which is the default. Mirrors ClaudeSession sniffing
+   *  `message.model` off its own stream. */
+  private curModel: string | null = null
   readonly carriesStandingPrompt: boolean
 
   constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
@@ -1642,6 +1648,14 @@ class GrokSession implements EngineSession {
       }
       return
     }
+    // Grok announces the live model here, and again whenever it changes mid
+    // session. Without it the ledger prices every ACP turn on a pin that is
+    // usually absent (see curModel).
+    if (msg.method === '_x.ai/models/update') {
+      const id = (msg.params as { currentModelId?: unknown } | undefined)?.currentModelId
+      if (typeof id === 'string' && id) this.curModel = id
+      return
+    }
     if (msg.method === 'session/update') {
       const update = (msg.params?.update ?? msg.params?.sessionUpdate) as Record<string, unknown> | undefined
       const kind = typeof update?.sessionUpdate === 'string' ? update.sessionUpdate
@@ -1665,7 +1679,7 @@ class GrokSession implements EngineSession {
       if (this.onHopUsage) {
         try {
           this.onHopUsage({
-            model: this.model || 'grok',
+            model: this.curModel || this.model || 'grok',
             usage: usage ?? {},
             latencyMs: Date.now() - this.pending.startedAt,
             hopIndex: 1,
@@ -1674,7 +1688,7 @@ class GrokSession implements EngineSession {
       }
       const p = this.pending
       this.pending = null
-      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.model })
+      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.curModel || this.model })
       return
     }
     if (msg.error && msg.id !== undefined) {

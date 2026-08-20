@@ -631,7 +631,10 @@ function StatCard({ label, value, sub, tone }: {
  *  (haiku/mini = cerebellum/small; everything else = main/big). */
 function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cachedInPer1M: number; outPer1M: number; estimated: boolean }[] }) {
   if (rows.length === 0) return null
-  const isSmall = (m: string) => /haiku|mini/i.test(m)
+  // Each engine's cerebellum: claude→haiku, codex→gpt-5.4-mini, grok→grok-4.5
+  // (see the daemon's triageModel). Without grok-4.5 here every Grok triage hop
+  // renders as "big brain" and the brain-tier split reads wrong.
+  const isSmall = (m: string) => /haiku|mini|grok-4\.5/i.test(m)
   return (
     <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
       <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">Token unit prices · small brain vs big brain (per 1M tokens — all ESTIMATES unless you set CUMORA_MODEL_PRICES_JSON)</div>
