@@ -487,6 +487,29 @@ async function runtimeGet<T>(
   } catch { return null }
 }
 
+/** Which conversation should show "<agent> is typing…" for this turn.
+ *
+ *  The wake's own conversation when it had one. Otherwise derive it from what is
+ *  unread, because a wake frequently carries none: a poll-driven turn never does
+ *  (only an SSE wake sets it, and polling is the only path left when the
+ *  wake-stream is down), and a wake that lands mid-turn is coalesced through
+ *  scheduleWake's busy branch, which re-kicks without a conversation.
+ *
+ *  `seen` is keyed by conversation_id, so the daemon already knows where the work
+ *  came from. With exactly one unread conversation that's unambiguous. With
+ *  several, stay silent rather than light up an arbitrary room — a wrong
+ *  indicator is worse than none, and the reply itself still lands correctly.
+ *
+ *  Exported for tests: this decides whether a working agent looks alive or dead,
+ *  and the "no indicator at all" case is the one users read as a hang. */
+export function typingConversation(
+  wakeConvo: string | null,
+  seen: Map<string, string>,
+): string | null {
+  if (wakeConvo) return wakeConvo
+  return seen.size === 1 ? [...seen.keys()][0] : null
+}
+
 function hashText(text: string): string {
   return createHash('sha1').update(text).digest('hex').slice(0, 12)
 }
@@ -1906,17 +1929,31 @@ class AgentRunner {
         const turnStart = Date.now()
         await this.ensureToken()
         const token = this.token
-        // Consume the wake's conversation: only a turn driven by a fresh wake
-        // FOR a conversation shows a "typing…" indicator there. Clearing it
-        // means a reconnect/cold-start catch-up turn (which reuses no wake)
-        // won't flash phantom "typing" in whatever conversation last woke us.
-        const convo = this.lastWakeConvo
+        // Consume the wake's conversation, so a later turn that reuses no wake
+        // can't flash phantom "typing" in whatever conversation last woke us.
+        // (The fallback below is derived from CURRENTLY unread messages, so it
+        // can't go stale the way a leftover wake value could.)
+        const wakeConvo = this.lastWakeConvo
         this.lastWakeConvo = null
         // Snapshot what's unread BEFORE triaging, so triage provably sees a
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
         const { seen, digest, hasReal } = await this.snapshotUnread(token)
+        // Which conversation should show "<agent> is typing…"? Prefer the one the
+        // wake named, but fall back to the unread we just snapshotted, because a
+        // wake often carries no conversation at all:
+        //
+        //   - a POLL-driven turn never has one (only an SSE wake sets
+        //     lastWakeConvo), and polling is the ONLY path left whenever the
+        //     wake-stream is down;
+        //   - a wake that arrives while this agent is mid-turn is coalesced, and
+        //     scheduleWake's busy branch re-kicks without a conversation.
+        //
+        // Both cases are exactly when a human IS waiting, and with no indicator
+        // the agent reads as dead: it can work for minutes — engine spawned, turn
+        // running — while the room shows nothing at all.
+        const convo = typingConversation(wakeConvo, seen)
         // HARD COST GATE (content-blind, fail-closed): if nothing unread is a
         // real human/agent message — empty, or system-only relays/status/
         // membership notices — NEVER run triage and NEVER spawn the big engine.
