@@ -14,6 +14,12 @@ import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage
 import { env } from '../env.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { stripLoneSurrogates } from './text-safety.js'
+import {
+  memoryVisibleInScope,
+  memoryWritePath,
+  parseMemoryPath,
+} from './memory-scope.js'
+import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -186,8 +192,8 @@ INTROSPECTION:
   participants-status
 
 PRIVATE TO EACH AGENT  (these write/read state owned by --as):
-  memory list [--as <id>] [--about <subject>] [--kind <kind>] [--limit N]
-  memory note <body> [--as <id>] [--about <subject>] [--kind <kind>]
+  memory list [--as <id>] [--about <subject>] [--kind <kind>] [--limit N] [--in <convo>] [--all]
+  memory note <body> [--as <id>] [--about <subject>] [--kind <kind>] [--in <convo>]
   memory pin <id>
   memory delete <id>
 
@@ -3571,14 +3577,16 @@ function normalizeMemoryKind(raw: unknown): MemoryKind {
 }
 
 /** Memory is stored as files inside the agent's workspace under
- *  `memory/<kind>/<id>.md`. Structured fields (`kind`, `about`, `pinned`,
- *  `source`, `createdAt`) live in the `meta` JSONB column. Reads use a
- *  `path LIKE 'memory/%'` prefix plus a partial JSONB index on
- *  `meta->>'about'` for the common `--about <subject>` filter. See
- *  migrate.ts for the one-shot copy from the legacy `agent_memory` table. */
+ *  `memory/<kind>/<id>.md` (global) or `memory/projects/<projectId>/<kind>/<id>.md`.
+ *  Structured fields (`kind`, `about`, `pinned`, `source`, `createdAt`) live
+ *  in the `meta` JSONB column. New writes stamp `source.conversationId` /
+ *  `source.projectId` (issue #45); existing `source: null` rows stay GLOBAL
+ *  — we never guess-migrate them into a project. See memory-scope.ts. */
 async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
   const op = parsed.positional[0]
   const me = resolveAs(parsed)
+  const explicitConvo = (typeof parsed.flags.in === 'string' ? parsed.flags.in : null)
+    ?? (typeof parsed.flags.conversation === 'string' ? parsed.flags.conversation : null)
   if (op === 'list') {
     const params: unknown[] = [me]
     let where = `agent_id = $1 AND path LIKE 'memory/%'`
@@ -3589,7 +3597,8 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     if (parsed.flags.kind) {
       const k = normalizeMemoryKind(parsed.flags.kind)
       params.push(`memory/${k}/%`)
-      where += ` AND path LIKE $${params.length}`
+      params.push(`memory/projects/%/${k}/%`)
+      where += ` AND (path LIKE $${params.length - 1} OR path LIKE $${params.length})`
     }
     const limit = Math.min(100, Math.max(1, Number(parsed.flags.limit ?? 20)))
     params.push(limit)
@@ -3603,36 +3612,59 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
          LIMIT ${limitParam}`,
       params,
     )
-    // Path segment encodes the kind; file stem is the id (sans `.md`).
     const parsed_rows = rows.map((r) => {
-      const segs = r.path.split('/')
-      const kind = segs[1] ?? 'note'
-      const id = (segs[2] ?? '').replace(/\.md$/, '')
+      const parsedPath = parseMemoryPath(r.path)
+      const kind = parsedPath?.kind ?? 'note'
+      const id = parsedPath?.id ?? ''
       const about = (r.meta?.about as string | undefined) ?? null
       const pinned = Boolean(r.meta?.pinned)
-      return { id, kind, about, body: r.body, pinned, created_at: r.updated_at }
+      const source = (r.meta?.source ?? null) as { conversationId?: string | null; projectId?: string | null } | null
+      return {
+        id, kind, about, body: r.body, pinned, created_at: r.updated_at,
+        path: r.path,
+        projectId: parsedPath?.projectId ?? source?.projectId ?? null,
+        meta: r.meta,
+      }
     })
-    if (parsed.flags.json) return ok(JSON.stringify(parsed_rows, null, 2))
-    if (parsed_rows.length === 0) return ok(`(${me} has no memory yet)`)
+    const showAll = Boolean(parsed.flags.all)
+    let scoped = parsed_rows
+    if (!showAll) {
+      const source = await resolveMemoryWriteSource(me, { conversationId: explicitConvo })
+      const projectIds = source.projectId ? [source.projectId] : []
+      const hasTurnContext = Boolean(explicitConvo || source.conversationId || source.projectId)
+      if (hasTurnContext) {
+        scoped = parsed_rows.filter((r) => memoryVisibleInScope(
+          { pinned: r.pinned, source: r.meta?.source as { conversationId?: string | null; projectId?: string | null } | null },
+          r.path,
+          { projectIds },
+        ))
+      }
+    }
+    if (parsed.flags.json) return ok(JSON.stringify(scoped.map(({ meta, path, ...rest }) => rest), null, 2))
+    if (scoped.length === 0) return ok(`(${me} has no memory yet)`)
     return ok([
-      `${parsed_rows.length} memory record(s) for ${me}:`,
+      `${scoped.length} memory record(s) for ${me}:`,
       '',
-      ...parsed_rows.map((m) => {
+      ...scoped.map((m) => {
         const t = new Date(m.created_at).toLocaleDateString()
         const pin = m.pinned ? '★ ' : '  '
-        return `  ${pin}[${m.id.slice(0, 10)}] ${m.kind.padEnd(11)} ${(m.about ?? '-').padEnd(10)} ${t}\n      ${m.body.slice(0, 280).replace(/\n/g, ' \\n ')}`
+        const proj = m.projectId ? ` proj:${m.projectId}` : ' global'
+        return `  ${pin}[${m.id.slice(0, 10)}] ${m.kind.padEnd(11)} ${(m.about ?? '-').padEnd(10)} ${t}${proj}\n      ${m.body.slice(0, 280).replace(/\n/g, ' \\n ')}`
       }),
     ].join('\n'))
   }
   if (op === 'note') {
     const body = parsed.positional[1]
-    if (!body) return err('usage: memory note <body> [--about subject] [--kind kind] [--as id]')
+    if (!body) return err('usage: memory note <body> [--about subject] [--kind kind] [--in convo] [--as id]')
     const kind = normalizeMemoryKind(parsed.flags.kind ?? 'observation')
     const about = parsed.flags.about ? String(parsed.flags.about) : null
     const id = `mem-${randomUUID().slice(0, 12)}`
-    const path = `memory/${kind}/${id}.md`
+    const source = await resolveMemoryWriteSource(me, { conversationId: explicitConvo })
+    const path = memoryWritePath(kind, id, source.projectId)
     const tenant = await agentCompany(me)
-    const meta = { type: 'memory', kind, about, pinned: false, source: null, createdAt: new Date().toISOString() }
+    const meta = await memoryMetaForWrite(me, {
+      path, kind, about, conversationId: explicitConvo, projectId: source.projectId,
+    })
     // Compute the embedding before INSERT so the row lands with both
     // body + vector in one shot. `embedText` returns null on failure
     // (rate limit, network blip, etc.) — we still write the row so the
@@ -3669,9 +3701,6 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
   if (op === 'pin') {
     const id = parsed.positional[1]
     if (!id) return err('usage: memory pin <id>')
-    // Toggle the `pinned` flag in meta JSONB. `||` on jsonb merges keys
-    // (right-hand side wins), so we read+rewrite by setting just that
-    // key and let Postgres handle the rest.
     const r = await pool.query<{ meta: Record<string, unknown> }>(
       `UPDATE agent_workspace
           SET meta = COALESCE(meta, '{}'::jsonb)
@@ -3887,10 +3916,18 @@ async function cmdWorkspace(parsed: ParsedArgs): Promise<CliResult> {
     const path = parsed.positional[1]
     const body = parsed.positional.slice(2).join(' ')
     if (!path || !body) return err('usage: workspace write <path> <body> [--as id]')
+    const memMeta = path.startsWith('memory/')
+      ? await memoryMetaForWrite(me, { path })
+      : null
     await pool.query(
-      `INSERT INTO agent_workspace (agent_id, path, body, company_id, updated_at) VALUES ($1, $2, $3, $4, NOW())
-       ON CONFLICT (agent_id, path) DO UPDATE SET body = EXCLUDED.body, company_id = EXCLUDED.company_id, updated_at = NOW()`,
-      [me, path, body, tenant],
+      `INSERT INTO agent_workspace (agent_id, path, body, meta, company_id, updated_at)
+         VALUES ($1, $2, $3, $4::jsonb, $5, NOW())
+       ON CONFLICT (agent_id, path) DO UPDATE
+         SET body = EXCLUDED.body,
+             company_id = EXCLUDED.company_id,
+             meta = COALESCE(agent_workspace.meta, EXCLUDED.meta),
+             updated_at = NOW()`,
+      [me, path, body, memMeta ? JSON.stringify(memMeta) : null, tenant],
     )
     return ok(`wrote ${path} (${body.length} chars)`, [{
       event: 'workspace.file_written',

@@ -90,6 +90,8 @@ interface InboxRow {
   conversation_title: string
   conversation_kind: string
   conversation_topic: string | null
+  project_id?: string | null
+  project_name?: string | null
   author_id: string
   /** Joined from `participants.kind` so the agent prompt can tell a human
    *  message apart from an agent reply without a hardcoded id list. Null
@@ -147,8 +149,9 @@ async function loadMemory(
   queryText: string,
   limits: { semantic?: number; recent?: number; total?: number } = {},
   rc: AgentRuntimeClient = runtime,
+  scope: { projectIds?: readonly string[]; conversationIds?: readonly string[] } = {},
 ): Promise<MemoryRow[]> {
-  return rc.loadMemory(agentId, queryText, limits)
+  return rc.loadMemory(agentId, queryText, limits, scope)
 }
 
 async function loadContext(
@@ -1943,7 +1946,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
 
   const [context, memory, climate, textExcerpts, skillsIndex] = await Promise.all([
     preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, convoIds),
-    loadMemory(agentId, memoryQuery),
+    loadMemory(agentId, memoryQuery, {}, runtime, { conversationIds: convoIds }),
     loadClimate(agentId),
     loadTextExcerpts(inbox),
     runtime.loadSkillsIndex(agentId),

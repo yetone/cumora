@@ -32,6 +32,14 @@ import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
 import { GLANCE_YIELD_RULES } from '../glance-protocol.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
+import {
+  composeMemoryDigest,
+  conversationHeader,
+  memoryIndexPathsForScope,
+  uniqueProjectIds,
+} from '../memory-scope.js'
+
+export { conversationHeader }
 
 const CONFIG_DIR = join(homedir(), '.cumora')
 const CONFIG_PATH = join(CONFIG_DIR, 'computer.json')
@@ -313,6 +321,7 @@ interface RuntimeInboxResponse {
     conversation_kind?: string
     conversation_title?: string
     conversation_topic?: string | null
+    project_id?: string | null
     project_name?: string | null
     author_name?: string
     author_kind?: string
@@ -345,31 +354,6 @@ const DIGEST_MAX_MESSAGE_LINES = 40
  *  shown, exactly as before.
  *
  *  Exported for tests — pure, no server and no engine. */
-/** The per-conversation header the wake digest opens each group with: the id,
- *  its kind/title, the project it belongs to, and the topic it exists for.
- *
- *  Project matters as much as topic here. An agent that sits in several project
- *  groups otherwise cannot tell them apart from the digest alone, so everything
- *  it has learned reads as one undifferentiated context — which is how work from
- *  one project ends up quoted as background in another. The cloud turn has
- *  always rendered a project line; this is the BYOA counterpart.
- *
- *  Exported for tests — pure, no server and no engine. */
-export function conversationHeader(row: {
-  conversation_id?: string
-  conversation_kind?: string
-  conversation_title?: string
-  project_name?: string | null
-  conversation_topic?: string | null
-}): string {
-  const kind = row.conversation_kind ? ` [${row.conversation_kind}]` : ''
-  const title = row.conversation_title ? ` "${row.conversation_title}"` : ''
-  let head = `# ${row.conversation_id}${kind}${title}`
-  if (row.project_name) head += `\n  Project: ${row.project_name}`
-  if (row.conversation_topic) head += `\n  Topic: ${row.conversation_topic}`
-  return head
-}
-
 export function renderInboxDigest(
   byConvo: Map<string, { head: string; msgs: string[] }>,
   budget = DIGEST_MAX_MESSAGE_LINES,
@@ -1318,16 +1302,19 @@ class AgentRunner {
     return [...ids]
   }
 
-  /** Preload the memory index (memory/MEMORY.md) so it's ALWAYS in the wake
-   *  prompt — the lightweight BYOA analog of the cloud agent's RAG memory
-   *  preload. We inject only the small index; the agent opens detail files on
-   *  demand. Capped so a runaway index can't blow up the prompt. */
-  private async memoryDigest(): Promise<string> {
-    try {
-      const txt = (await readFile(join(this.home, 'memory', 'MEMORY.md'), 'utf8')).trim()
-      if (!txt) return ''
-      return txt.length > 4000 ? `${txt.slice(0, 4000)}\n…(truncated — cat the file for the rest)` : txt
-    } catch { return '' }  // no index yet
+  /** Preload global + current-project memory indexes. Existing
+   *  `memory/MEMORY.md` stays GLOBAL; project work lives under
+   *  `memory/projects/<id>/MEMORY.md`. A no-project wake injects global
+   *  only — same contract as cloud `loadMemory`. */
+  private async memoryDigest(projectIds: readonly string[] = []): Promise<string> {
+    const parts: Array<{ label: string; body: string }> = []
+    for (const rel of memoryIndexPathsForScope(projectIds)) {
+      try {
+        const txt = (await readFile(join(this.home, rel), 'utf8')).trim()
+        if (txt) parts.push({ label: rel, body: txt })
+      } catch { /* missing index is fine */ }
+    }
+    return composeMemoryDigest(parts)
   }
 
   /** Triage the inbox on the LOCAL small brain. The whole point of BYOA is that
@@ -1487,7 +1474,7 @@ class AgentRunner {
     } catch { return null }
   }
 
-  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean }> {
+  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
     const seen = new Map<string, string>()
     // Unread grouped BY CONVERSATION (first-seen order), each with the header
@@ -1513,7 +1500,14 @@ class AgentRunner {
       if (row.kind !== 'system' || (alarm && (!alarm.assigneeId || alarm.assigneeId === this.agent.id))) hasReal = true
       let convo = byConvo.get(row.conversation_id)
       if (!convo) {
-        convo = { head: conversationHeader(row), msgs: [] }
+        const head = conversationHeader({
+          conversation_id: row.conversation_id,
+          conversation_kind: row.conversation_kind,
+          conversation_title: row.conversation_title,
+          conversation_topic: row.conversation_topic,
+          project_name: row.project_name,
+        })
+        convo = { head, msgs: [] }
         byConvo.set(row.conversation_id, convo)
       }
       const author = row.author_name ?? 'someone'
@@ -1528,7 +1522,10 @@ class AgentRunner {
       // <convo> '<body>' --quote <message_id>`.
       convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}`)
     }
-    return { seen, digest: renderInboxDigest(byConvo), hasReal }
+    const projectIds = uniqueProjectIds(
+      (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
+    )
+    return { seen, digest: renderInboxDigest(byConvo), hasReal, projectIds }
   }
 
   /** Advance this agent's read cursor over the conversations it just saw, so a
@@ -1601,11 +1598,12 @@ class AgentRunner {
       // Skype emoticons — shared with the cloud agent so a BYOA agent is as
       // expressive, not stuck on native emoji only.
       `${SKYPE_EMOTICONS_GUIDE}\n\n` +
-      `Memory: your only durable store lives under \`memory/\`, indexed by \`memory/MEMORY.md\`. ` +
-      `Consult it before acting. When the operator asks you to remember something (or you learn a ` +
-      `durable fact), WRITE it to a file under \`memory/\` and add a one-line pointer in MEMORY.md — ` +
-      `saying "got it" does NOT persist. Your in-context chat history can be wiped by compaction; ` +
-      `memory files remain. Keep MEMORY.md self-sufficient as a recovery point.\n\n` +
+      `Memory: durable store under \`memory/\` (global identity, indexed by \`memory/MEMORY.md\`) ` +
+      `and \`memory/projects/<projectId>/\` for unpinned work facts of the current project. ` +
+      `This wake injects only global + this project's index — other projects are out of scope. ` +
+      `Write project decisions/materials under \`memory/projects/<id>/\` (and a pointer in that folder's MEMORY.md); ` +
+      `write identity-level facts under \`memory/\`. Pinning a memory makes it global. ` +
+      `Saying "got it" does NOT persist. Chat history can be wiped by compaction; memory files remain.\n\n` +
       `Drive what you own forward — see a task through. Multi-step turns are fine; you do NOT have to ` +
       `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
       `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
@@ -1639,7 +1637,7 @@ class AgentRunner {
         ? `Your unread messages (ALREADY FETCHED — no need to re-run \`cumora inbox\` / \`cumora messages\` to re-read ` +
           `these; but DO \`cumora glance\` before posting in a group, to catch anything posted while you compose):\n${inboxDigest}\n\n`
         : `Run \`cumora inbox\`, then \`cumora messages <conversationId> --tail 30\`, to catch up.\n\n`) +
-      (memoryDigest ? `Your memory index (\`memory/MEMORY.md\`):\n${memoryDigest}\n\n` : ``) +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
       (roster ? `Your team right now (trust over memory — current roster; use these ids for @mentions and \`cumora dm\`):\n${roster}\n` : ``)
     ).trimEnd()
   }
@@ -1658,7 +1656,7 @@ class AgentRunner {
       `never nag, never revive a finished thread. Coordinate before you commit (claim before shared work, trust card status); ` +
       `follow your standing instructions for mechanics.\n\n` +
       `${brief}\n\n` +
-      (memoryDigest ? `Your memory index (\`memory/MEMORY.md\`):\n${memoryDigest}\n\n` : ``) +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : ``) +
       (roster ? `Your team (use these ids for @mentions):\n${roster}\n` : ``)
     ).trimEnd()
   }
@@ -1938,7 +1936,7 @@ class AgentRunner {
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
-        const { seen, digest, hasReal } = await this.snapshotUnread(token)
+        const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token)
         // HARD COST GATE (content-blind, fail-closed): if nothing unread is a
         // real human/agent message — empty, or system-only relays/status/
         // membership notices — NEVER run triage and NEVER spawn the big engine.
@@ -2064,7 +2062,7 @@ class AgentRunner {
         }
         try {
           const [memoryDigest, triageNote, roster] = await Promise.all([
-            this.memoryDigest(),
+            this.memoryDigest(projectIds),
             Promise.resolve(this.formatTriageNote(triage)),
             // Live team roster (names + roles + ids), fetched fresh from the
             // server so a locally-run agent knows WHO its teammates are and what

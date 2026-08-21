@@ -58,6 +58,12 @@ import {
 } from '../observability.js'
 import { buildSystemPrompt as buildSystemPromptImpl } from '../personas.js'
 import { loadSkillsIndex as loadSkillsIndexImpl } from '../skills.js'
+import { memoryVisibleInScope } from '../memory-scope.js'
+import { projectIdsForConversations } from '../memory-write.js'
+import {
+  clearThinkingConversations,
+  recordThinkingConversations,
+} from '../thinking-convos.js'
 import type {
   AgentRuntimeClient,
   ClimateRow,
@@ -75,8 +81,34 @@ import type {
 interface MemoryQueryRow {
   path: string
   body: string
-  meta: { kind?: string; about?: string | null; pinned?: boolean } | null
+  meta: {
+    kind?: string
+    about?: string | null
+    pinned?: boolean
+    source?: { conversationId?: string | null; projectId?: string | null } | null
+  } | null
   updated_at: string
+}
+
+/** Spec: memoryVisibleInScope. Pinned OR no project OR project in $n. */
+function memoryScopeSql(metaExpr: string, pathExpr: string, param: string): string {
+  const pid = `COALESCE(NULLIF(${metaExpr}#>>'{source,projectId}', ''), substring(${pathExpr} from '^memory/projects/([^/]+)/'))`
+  return `(
+    COALESCE((${metaExpr}->>'pinned')::boolean, false) = true
+    OR ${pid} IS NULL
+    OR ${pid} = ANY(${param}::text[])
+  )`
+}
+
+async function resolveMemoryScope(scope: {
+  projectIds?: readonly string[]
+  conversationIds?: readonly string[]
+} = {}): Promise<string[]> {
+  if (scope.projectIds && scope.projectIds.length > 0) return [...scope.projectIds]
+  if (scope.conversationIds && scope.conversationIds.length > 0) {
+    return projectIdsForConversations([...scope.conversationIds])
+  }
+  return []
 }
 
 function toMemoryRow(r: MemoryQueryRow): MemoryRow {
@@ -124,11 +156,6 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
       `WITH convos AS (
          SELECT c.id, c.company_id,
                 c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
-                -- Which project this group belongs to. The cloud turn already
-                -- shows it (turn.ts renders "Project: <name>"); BYOA agents saw
-                -- nothing, so an agent in several project groups had no way to
-                -- tell them apart. PK join on a tiny table inside the CTE that
-                -- already walks the agent's conversations.
                 c.project_id, pr.name AS project_name,
                 COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz) AS lr_at,
                 COALESCE(cr.last_read_message_id, '') AS lr_id,
@@ -233,25 +260,33 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     agentId: string,
     queryText: string,
     limits: { semantic?: number; recent?: number; total?: number } = {},
+    scope: { projectIds?: readonly string[]; conversationIds?: readonly string[] } = {},
   ): Promise<MemoryRow[]> {
     const semanticLimit = limits.semantic ?? 20
     const recentLimit = limits.recent ?? 10
     const totalLimit = limits.total ?? 40
+    const projectIds = await resolveMemoryScope(scope)
+    const readScope = { projectIds }
+    const scopePred = memoryScopeSql('meta', 'path', '$SCOPE')
 
     const { hasPgVector, embedText } = await import('../embeddings.js')
     const useSemantic = queryText.trim().length > 0 && (await hasPgVector())
     const queryVec = useSemantic ? await embedText(queryText) : null
+
+    const toVisible = (rows: MemoryQueryRow[]): MemoryRow[] =>
+      rows.filter((r) => memoryVisibleInScope(r.meta, r.path, readScope)).map(toMemoryRow)
 
     if (!queryVec) {
       const { rows } = await pool.query<MemoryQueryRow>(
         `SELECT path, body, meta, updated_at
            FROM agent_workspace
           WHERE agent_id = $1 AND path LIKE 'memory/%'
+            AND ${scopePred.replace('$SCOPE', '$3')}
           ORDER BY COALESCE((meta->>'pinned')::boolean, false) DESC, updated_at DESC
           LIMIT $2`,
-        [agentId, totalLimit],
+        [agentId, totalLimit, projectIds],
       )
-      return rows.map(toMemoryRow)
+      return toVisible(rows)
     }
 
     // Hybrid retrieval: three CTEs unioned, ROW_NUMBER dedupes by path
@@ -272,6 +307,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
             WHERE agent_id = $1 AND path LIKE 'memory/%'
               AND embedding IS NOT NULL
               AND COALESCE((meta->>'pinned')::boolean, false) = false
+              AND ${scopePred.replace('$SCOPE', '$6')}
             ORDER BY embedding <=> $2::vector ASC
             LIMIT $3
          ),
@@ -280,6 +316,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
              FROM agent_workspace
             WHERE agent_id = $1 AND path LIKE 'memory/%'
               AND COALESCE((meta->>'pinned')::boolean, false) = false
+              AND ${scopePred.replace('$SCOPE', '$6')}
             ORDER BY updated_at DESC
             LIMIT $4
          ),
@@ -298,9 +335,9 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
         WHERE rn = 1
         ORDER BY source_rank ASC, updated_at DESC
         LIMIT $5`,
-      [agentId, queryVec, semanticLimit, recentLimit, totalLimit],
+      [agentId, queryVec, semanticLimit, recentLimit, totalLimit, projectIds],
     )
-    return rows.map(toMemoryRow)
+    return toVisible(rows)
   }
 
   // ─── reads (cont.) ────────────────────────────────────────────────
@@ -408,7 +445,9 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     return rows
   }
 
-  /** Agent's feelings about people — top-24 most recently updated. */
+  /** Agent's feelings about people — top-24 most recently updated.
+   *  Climate is GLOBAL on purpose (issue #45): it does not follow the
+   *  project. Same agent identity across groups. */
   async loadClimate(agentId: string): Promise<ClimateRow[]> {
     const { rows } = await pool.query<ClimateRow>(
       `SELECT about_id, affinity, trust, last_note, updated_at
@@ -675,6 +714,9 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
 
   async markThinking(agentId: string, conversationIds: string[], ttlSec: number = 60): Promise<void> {
     if (conversationIds.length === 0) return
+    // Reverse index so memory writes can stamp the conversation/project this
+    // turn is actually in — without the agent passing `--in` every time.
+    await recordThinkingConversations(agentId, conversationIds, ttlSec)
     // Throttle refreshes: the claim TTL is 60s but the daemon re-marks every 6s.
     // Collapse to ≤1 per 30s per agent (still refreshes before the 60s TTL) to
     // cut the repeated Redis writes ~5x.
@@ -702,6 +744,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
 
   async unmarkThinking(agentId: string, conversationIds: string[]): Promise<void> {
     if (conversationIds.length === 0) return
+    await clearThinkingConversations(agentId)
     try {
       const pipe = redis.multi()
       for (const cid of conversationIds) pipe.zrem(thinkingKey(cid), agentId)
@@ -968,6 +1011,8 @@ export function busyKey(agentId: string): string {
 export function thinkingKey(conversationId: string): string {
   return `cumora:thinking:${conversationId}`
 }
+
+export { getThinkingConversations } from '../thinking-convos.js'
 
 /** Redis key for the per-scope worklog HASH. `scopeKey` is whatever
  *  namespace the caller wants — `tenant:<companyId>` for tenant-wide

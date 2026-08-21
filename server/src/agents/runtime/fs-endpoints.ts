@@ -27,6 +27,8 @@ import type { Router, Response } from 'express'
 import { pool } from '../../db/pool.js'
 import { isSafePath, likeEscape } from './fs-namespace.js'
 import type { AgentRuntimeClaims } from './jwt.js'
+import { buildMemoryMeta } from '../memory-scope.js'
+import { memoryMetaForWrite } from '../memory-write.js'
 
 function badRequest(res: Response, msg: string): void {
   res.status(400).json({ error: msg })
@@ -49,17 +51,16 @@ function ensureSafePath(p: string | undefined, res: Response): string | null {
 /** Memory paths land with a small meta JSONB so downstream readers
  *  (the semantic-retrieval pipeline, observability views) treat them
  *  as memory rather than scratch. Other paths get an empty meta. */
-function metaForPath(p: string): Record<string, unknown> {
+/** Sync stamp used when we only have the path (no agent). Live writes
+ *  go through {@link memoryMetaForWrite} so conversation/project land
+ *  in `source` instead of null. */
+export function metaForPath(p: string, source?: { conversationId?: string | null; projectId?: string | null }): Record<string, unknown> {
   if (p.startsWith('memory/')) {
-    const segs = p.split('/')
-    return {
-      type: 'memory',
-      kind: segs[1] ?? 'note',
-      about: null,
-      pinned: false,
-      source: null,
-      createdAt: new Date().toISOString(),
-    }
+    return buildMemoryMeta({
+      path: p,
+      conversationId: source?.conversationId,
+      projectId: source?.projectId,
+    })
   }
   return {}
 }
@@ -114,12 +115,14 @@ export function attachFsEndpoints(
 
   // PUT /runtime/fs/write   { path, body }   — upsert
   router.put('/fs/write', withAgent(async (c, req, res) => {
-    const body = req.body as { path?: string; body?: string } | undefined
+    const body = req.body as { path?: string; body?: string; conversationId?: string } | undefined
     const p = ensureSafePath(body?.path, res)
     if (p === null) return
     if (p === '') { badRequest(res, 'cannot write root'); return }
     const text = typeof body?.body === 'string' ? body.body : ''
-    const meta = metaForPath(p)
+    const meta = p.startsWith('memory/')
+      ? await memoryMetaForWrite(c.sub, { path: p, conversationId: body?.conversationId ?? null })
+      : metaForPath(p)
     await pool.query(
       `INSERT INTO agent_workspace (agent_id, path, body, meta, updated_at)
          VALUES ($1, $2, $3, $4::jsonb, NOW())
