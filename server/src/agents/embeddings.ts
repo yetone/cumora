@@ -83,31 +83,44 @@ export async function backfillMemoryEmbeddings(opts: { batchSize?: number; delay
   if (!(await hasPgVector())) return
   let processed = 0
   let failed = 0
+  let afterAgentId: string | null = null
+  let afterPath: string | null = null
   while (true) {
-    const { rows } = await pool.query<{ agent_id: string; path: string; body: string }>(
+    const result: { rows: Array<{ agent_id: string; path: string; body: string }> } = await pool.query(
       `SELECT agent_id, path, body
          FROM agent_workspace
         WHERE path LIKE 'memory/%' AND embedding IS NULL AND body <> ''
+          AND ($2::text IS NULL OR (agent_id, path) > ($2::text, $3::text))
+        ORDER BY agent_id, path
         LIMIT $1`,
-      [batchSize],
+      [batchSize, afterAgentId, afterPath],
     )
+    const rows: Array<{ agent_id: string; path: string; body: string }> = result.rows
     if (rows.length === 0) break
     for (const r of rows) {
-      const vec = await embedText(r.body)
-      if (!vec) { failed++; continue }
       try {
-        await pool.query(
-          `UPDATE agent_workspace SET embedding = $1::vector
-            WHERE agent_id = $2 AND path = $3`,
-          [vec, r.agent_id, r.path],
-        )
-        processed++
-      } catch (e) {
-        failed++
-        console.warn('[embed:backfill] UPDATE failed for', r.path, e instanceof Error ? e.message : String(e))
+        const vec = await embedText(r.body)
+        if (!vec) {
+          failed++
+          continue
+        }
+        try {
+          await pool.query(
+            `UPDATE agent_workspace SET embedding = $1::vector
+              WHERE agent_id = $2 AND path = $3`,
+            [vec, r.agent_id, r.path],
+          )
+          processed++
+        } catch (e) {
+          failed++
+          console.warn('[embed:backfill] UPDATE failed for', r.path, e instanceof Error ? e.message : String(e))
+        }
+      } finally {
+        if (delayMs > 0) await new Promise((res) => setTimeout(res, delayMs))
       }
-      if (delayMs > 0) await new Promise((res) => setTimeout(res, delayMs))
     }
+    afterAgentId = rows[rows.length - 1].agent_id
+    afterPath = rows[rows.length - 1].path
     if (rows.length < batchSize) break
   }
   if (processed + failed > 0) {
