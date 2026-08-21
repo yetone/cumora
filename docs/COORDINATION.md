@@ -722,11 +722,21 @@ The recurring methodology that paid off, in priority order:
    minutes. Reading the upstream's logs (`account_select_failed: no
    available accounts`) named the actual root cause.
 4. **Memory files are state too.** Agents persist learnings to
-   `~/.cumora/agents/<id>/memory/<file>.md`. Useful, but they can ENCODE
-   the wrong lesson from a single weird game (e.g. an explicit-cap counting
-   game becomes a universal "never lap" rule). Wiping the overfit files is
-   the surgical move; the rest of the agent's notes stay intact. **Don't
-   delete files you didn't audit first** — read each one's frontmatter.
+   `~/.cumora/agents/<id>/memory/` (global identity, indexed by
+   `MEMORY.md`) and `memory/projects/<projectId>/` (unpinned work facts
+   of that project). Useful, but they can ENCODE the wrong lesson from a
+   single weird game (e.g. an explicit-cap counting game becomes a
+   universal "never lap" rule).
+
+   Cross-group bleed of *work* facts is a scoping bug, not a wipe bug:
+   cloud `loadMemory` and the BYOA wake digest share `memory-scope.ts`
+   and inject **global + the current project only** (pinned / identity /
+   persona / skills / climate stay global; a conversation with no project
+   gets global memory only). Existing files stay global — we do not
+   guess-migrate old notes into a project. Wiping an overfit file is
+   still the surgical move when the *lesson* is wrong; the rest of the
+   agent's notes stay intact. **Don't delete files you didn't audit
+   first** — read each one's frontmatter.
 
 The breakthrough moment was the user's reframing: *"AI-native means making
 AI agents behave like real humans collaborating. Don't be limited in
@@ -768,6 +778,7 @@ fallback) and absent-member coverage (team-adapts principle).
 | File | Role |
 |---|---|
 | `server/src/agents/glance-protocol.ts` | The `GLANCE_YIELD_RULES` const, shared verbatim BYOA ↔ cloud. **Edit minimally.** Holds the three principles (cap-clarification, count-items, team-adapts). |
+| `server/src/agents/memory-scope.ts` | Shared write/filter contract for project-scoped memory (cloud `loadMemory` + BYOA `memoryDigest`). Pure; unit-tested without Postgres. |
 | `server/src/agents/computer/daemon.ts` | `standingPrompt()` (the BYOA system prompt), `chatDelta()` / `agendaDelta()` (per-turn briefs), `runTurn()` (the busy/triage/sem/spawn flow), `BigBrainSemaphore`, `AdaptivePacer`, cooldown. |
 | `server/src/agents/triage-core.ts` | Small-brain triage instructions + parsing. The ▸YOU rule lives here. |
 | `server/src/agents/cli.ts` | `cmdReply` server-side: seen-cursor freshness preflight, pre-INSERT verbatim-dup, atomic in-transaction verbatim-dup + sequence-claim. Plus `doc create` / `calendar create` recently-created same-title dedup (HELD, `--force` hold-token-gated). |

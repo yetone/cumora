@@ -139,8 +139,9 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
     _agentId: string,
     queryText: string,
     limits: { semantic?: number; recent?: number; total?: number } = {},
+    scope: { projectIds?: readonly string[]; conversationIds?: readonly string[] } = {},
   ): Promise<MemoryRow[]> {
-    const out = await this.call<{ rows: MemoryRow[] }>('POST', '/memory/query', { queryText, limits })
+    const out = await this.call<{ rows: MemoryRow[] }>('POST', '/memory/query', { queryText, limits, ...scope })
     return out.rows
   }
 

@@ -246,8 +246,16 @@ runtimeRouter.get('/agenda', withAgent(async (c, _req, res) => {
 }))
 
 runtimeRouter.post('/memory/query', withAgent(async (c, req, res) => {
-  const body = req.body as { queryText?: string; limits?: { semantic?: number; recent?: number; total?: number } } | undefined
-  const rows = await inprocClient.loadMemory(c.sub, body?.queryText ?? '', body?.limits)
+  const body = req.body as {
+    queryText?: string
+    limits?: { semantic?: number; recent?: number; total?: number }
+    projectIds?: string[]
+    conversationIds?: string[]
+  } | undefined
+  const rows = await inprocClient.loadMemory(c.sub, body?.queryText ?? '', body?.limits, {
+    projectIds: body?.projectIds,
+    conversationIds: body?.conversationIds,
+  })
   res.json({ rows })
 }))
 
