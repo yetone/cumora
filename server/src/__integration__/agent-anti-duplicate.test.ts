@@ -108,6 +108,28 @@ test('[integration] --continue bypass overrides the anti-monologue gate', async 
   assert.equal(bypassed.ok, true, `--continue should bypass the gate: ${bypassed.text}`)
 })
 
+test('[integration] a human can post immediately after inviting an agent', async () => {
+  const { companyId, humanId, convoId } = await seedGroupWithTwoAgents()
+  const invitedId = `a-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status)
+       VALUES ($1, $2, 'agent', $3, 'tester', 'C', '#abcdef', 'avail')`,
+    [invitedId, companyId, `Agent ${invitedId}`],
+  )
+
+  const invited = await runCli(['--as', humanId, 'invite', convoId, invitedId])
+  assert.equal(invited.ok, true, `invite should succeed: ${invited.text}`)
+
+  const followUp = await runCli([
+    '--as', humanId, 'reply', convoId, `@${invitedId} please review the synthetic task`,
+  ])
+  assert.equal(
+    followUp.ok,
+    true,
+    `the agent-only anti-monologue gate must not block a human follow-up: ${followUp.text}`,
+  )
+})
+
 test('[integration] DM (2-member convo) is exempt from the anti-monologue gate', async () => {
   const { companyId, agentId: agentA } = await seedCompanyWithAgent()
   const humanId = `h-${randomUUID().slice(0, 8)}`

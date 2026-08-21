@@ -14,6 +14,7 @@ import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { ensureSchemaOnce, resetAllTables, seedCompanyWithAgent, teardownAll } from './_helpers.js'
 import { pool } from '../db/pool.js'
+import { env } from '../env.js'
 
 before(async () => {
   await ensureSchemaOnce()
@@ -44,6 +45,26 @@ test('[integration] contacts lists same-tenant agents (no query)', async () => {
   )
   const text = await runCliText(['contacts', '--as', agentId])
   assert.match(text, /bram/i, `expected the other agent in the list; got:\n${text}`)
+})
+
+test('[integration] contacts keeps chat-only agents visible when email is disabled', async () => {
+  const { agentId, companyId } = await seedCompanyWithAgent({ agentId: 'aurora' })
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status, email)
+     VALUES ('local-agent', $1, 'agent', 'Local Agent', 'operator', 'L', '#abcdef', 'avail', NULL)
+     ON CONFLICT DO NOTHING`,
+    [companyId],
+  )
+
+  const previousDomain = env.EMAIL_DOMAIN
+  env.EMAIL_DOMAIN = ''
+  try {
+    const text = await runCliText(['contacts', '--as', agentId])
+    assert.match(text, /Local Agent/, `expected the chat-only agent in the list; got:\n${text}`)
+    assert.match(text, /chat only/i, `expected a truthful non-email marker; got:\n${text}`)
+  } finally {
+    env.EMAIL_DOMAIN = previousDomain
+  }
 })
 
 test('[integration] contacts shows each agent\'s role/function (the directory bug)', async () => {

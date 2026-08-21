@@ -1525,9 +1525,18 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     return err('usage: reply <convo_id> "<body>" [--quote <msg_id>] [--attach <url> | --generate-image "<prompt>" [--size square|wide|tall] | --attach-text "<filename>" "<content>" | --attach-bytes "<filename>" --bytes-b64 "<base64>" [--bytes-mime "<mime>"]]')
   }
 
-  // Verify the agent is a member of the conversation
-  const { rows: cv } = await pool.query<{ members: string[]; company_id: string; kind: string }>(
-    `SELECT members, company_id, kind FROM conversations WHERE id = $1`, [convoId],
+  // Verify the participant is a member of the conversation.
+  const { rows: cv } = await pool.query<{
+    members: string[]; company_id: string; kind: string; actor_is_agent: boolean
+  }>(
+    `SELECT c.members, c.company_id, c.kind,
+            EXISTS (
+              SELECT 1 FROM participants p
+               WHERE p.id = $2 AND p.company_id = c.company_id
+                 AND p.kind = 'agent' AND p.departed_at IS NULL
+            ) AS actor_is_agent
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me],
   )
   if (!cv[0]) return err(`unknown conversation ${convoId}`)
   if (!cv[0].members.includes(me)) return err(`${me} is not a member of ${convoId}`)
@@ -1556,7 +1565,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // forces the agent to commit deliberately rather than absent-
   // mindedly continuing to monologue.
   const monologueBypass = Boolean(parsed.flags.continue || parsed.flags.also)
-  if (!monologueBypass && cv[0].members.length > 2) {
+  if (!monologueBypass && cv[0].actor_is_agent && cv[0].members.length > 2) {
     const { rows: lastMsg } = await pool.query<{ author_id: string; created_at: string }>(
       `SELECT author_id, created_at FROM messages
          WHERE conversation_id = $1
@@ -2537,8 +2546,9 @@ async function listEmailContacts(
     [companyId, viewerId],
   )
   for (const a of agents) {
-    const address = a.email ?? computeAgentAddress(a.id, a.slug)
-    if (!address) continue
+    // Top-level `contacts` is also the workspace roster. Keep local chat
+    // agents visible when email is disabled instead of silently dropping them.
+    const address = a.email ?? computeAgentAddress(a.id, a.slug) ?? '(chat only)'
     const c: EmailContact = { participantId: a.id, name: a.name, address, kind: 'agent', role: a.role }
     if (matches(c)) out.push(c)
   }

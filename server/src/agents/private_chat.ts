@@ -1,11 +1,9 @@
 /**
- * Helper for an agent to start (or extend) a private 1-on-1 chat with
- * another agent. There is no special "side-channel" model on the
- * backend — private agent-to-agent chats are just `kind='direct'`
- * conversations with two members, same shape as any human-agent or
- * human-human DM. The partner's mailbox scheduler wakes them on the
- * new message via the standard CH_MESSAGE_NEW path, and they reply
- * through `cumora reply` like in any group.
+ * Helper for any participant to start (or extend) a private 1-on-1 chat
+ * with another participant. There is no special "side-channel" model on
+ * the backend: every DM is a `kind='direct'` conversation with two members.
+ * An agent recipient's mailbox scheduler wakes them on the new message via
+ * the standard CH_MESSAGE_NEW path, and they reply through `cumora reply`.
  *
  * (The frontend exposes a "peek" tab where the user can read these
  * agent-agent threads — that's a purely client-side affordance and
@@ -14,7 +12,6 @@
 import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, publish } from '../redis.js'
-import { getPersona } from './personas.js'
 import { companyIdForParticipant } from '../tenant.js'
 
 /** A participant's display name + kind, for ANY participant — human OR agent.
@@ -85,7 +82,7 @@ async function nextConversationSequence(conversationId: string): Promise<number>
   return rows[0]?.seq ?? 1
 }
 
-/** Open (or post into) a private 1-on-1 chat between two agents.
+/** Open (or post into) a private 1-on-1 chat between two participants.
  *  Idempotent on the conversation creation — repeated calls between the
  *  same pair reuse the existing direct conversation. */
 export async function startPrivateChat(args: {
@@ -95,15 +92,14 @@ export async function startPrivateChat(args: {
   opening: string
 }): Promise<{ conversationId: string; messageId: string }> {
   const { instigatorId, partnerId, topic, opening } = args
-  // The instigator is the calling agent; the PARTNER may be an agent OR a HUMAN
-  // — an agent legitimately DMs a person (a private game move to the host, a quiet
-  // word to a teammate). Previously we required BOTH to resolve via getPersona,
-  // which is agent-only, so getPersona(human)=null made EVERY agent→human DM throw
-  // "invalid private-chat participants"; the agent then fell back to announcing in
-  // the group. Validate the partner by EXISTENCE (any kind), not agent-ness.
+  // Humans and agents use the same direct-conversation model. Validate both
+  // endpoints by active participant existence rather than agent persona presence.
   if (instigatorId === partnerId) throw new Error('cannot open a DM with yourself')
-  const [iP, partner] = await Promise.all([getPersona(instigatorId), participantBrief(partnerId)])
-  if (!iP) throw new Error('private-chat instigator is not a known agent')
+  const [instigator, partner] = await Promise.all([
+    participantBrief(instigatorId),
+    participantBrief(partnerId),
+  ])
+  if (!instigator) throw new Error(`private-chat instigator not found: ${instigatorId}`)
   if (!partner) throw new Error(`private-chat partner not found: ${partnerId}`)
 
   const companyId = (await companyIdForParticipant(instigatorId)) ?? null
@@ -127,8 +123,8 @@ export async function startPrivateChat(args: {
     [instigatorId, conversationId],
   )
 
-  // Same channel as every other message — the mailbox scheduler wakes the
-  // partner agent and they decide whether to reply via the normal flow.
+  // Same channel as every other message. Agent recipients wake through the
+  // mailbox scheduler; human recipients see the direct conversation normally.
   await publish(CH_MESSAGE_NEW, {
     type: 'message.new',
     conversationId,
