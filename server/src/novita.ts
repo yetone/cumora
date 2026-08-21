@@ -94,6 +94,26 @@ interface RequestOpts {
   [key: string]: unknown
 }
 
+/** Build the per-call request options object passed to the underlying SDK's
+ *  `chat.completions.create(body, options)`. Every failed live smoke against
+ *  this shim (QA's `APIConnectionTimeoutError`) traced back to this line:
+ *  the SDK's `buildRequest` guards `timeout` with `if ('timeout' in options)`
+ *  — not a nullish check — so `{ timeout: opts?.timeout }` with `opts`
+ *  omitted still puts a `timeout: undefined` KEY on the object, which trips
+ *  `validatePositiveInteger('timeout', undefined)` and throws `OpenAIError:
+ *  timeout must be an integer` before any request is ever sent. That thrown
+ *  error then classifies as a connection failure upstream in turn.ts, which
+ *  is why it surfaced as a timeout instead of a type error. Only set a key
+ *  when its value is actually present. */
+function toRequestOptions(args: ResponsesCreateArgs, opts?: RequestOpts): RequestOpts {
+  const options: RequestOpts = {}
+  const signal = opts?.signal ?? args.signal
+  if (signal != null) options.signal = signal
+  if (opts?.maxRetries != null) options.maxRetries = opts.maxRetries
+  if (opts?.timeout != null) options.timeout = opts.timeout
+  return options
+}
+
 function toChatTools(tools: FunctionTool[] | undefined): ChatCompletionFunctionTool[] | undefined {
   if (!tools || tools.length === 0) return undefined
   return tools.map((t) => ({
@@ -254,7 +274,7 @@ async function createNonStreaming(args: ResponsesCreateArgs, opts?: RequestOpts)
   const body = buildChatBody(args, false)
   const completion = await novitaClient().chat.completions.create(
     body as unknown as Parameters<OpenAI['chat']['completions']['create']>[0] & { stream?: false },
-    { signal: opts?.signal ?? args.signal ?? undefined, maxRetries: opts?.maxRetries, timeout: opts?.timeout },
+    toRequestOptions(args, opts),
   )
   const choice = completion.choices[0]
   const outputText = choice?.message?.content ?? ''
@@ -296,7 +316,7 @@ async function* createStreaming(
   const body = buildChatBody(args, true)
   const stream = await novitaClient().chat.completions.create(
     body as unknown as Parameters<OpenAI['chat']['completions']['create']>[0] & { stream: true },
-    { signal: opts?.signal ?? args.signal ?? undefined, maxRetries: opts?.maxRetries, timeout: opts?.timeout },
+    toRequestOptions(args, opts),
   )
 
   const responseId = `novita-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
