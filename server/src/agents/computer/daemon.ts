@@ -263,10 +263,16 @@ class AdaptivePacer {
 const spawnPacer = new AdaptivePacer(MIN_SPAWN_INTERVAL_MS)
 
 // ─── self-update ──────────────────────────────────────────────────────────
-// Injected by esbuild at build time (agent-cli/build.mjs). Undefined when run
-// un-bundled (tsx dev); guarded with typeof so that path is a safe no-op.
+// Injected by esbuild at build time (agent-cli/build.mjs). Source-mode
+// launchers may provide CUMORA_VERSION; otherwise development falls back to
+// 0.0.0. The typeof guard keeps an undefined build constant safe at runtime.
 declare const __CUMORA_VERSION__: string | undefined
-const CURRENT_VERSION = typeof __CUMORA_VERSION__ === 'string' ? __CUMORA_VERSION__ : '0.0.0'
+export function resolveCurrentVersion(bundledVersion: string | undefined, envVersion = process.env.CUMORA_VERSION): string {
+  return bundledVersion ?? (envVersion?.trim() || '0.0.0')
+}
+const CURRENT_VERSION = resolveCurrentVersion(
+  typeof __CUMORA_VERSION__ === 'string' ? __CUMORA_VERSION__ : undefined,
+)
 const UPDATE_CHECK_MS = 6 * 60 * 60 * 1000 // re-check npm every 6h
 // Log rotation: the service supervisor (launchd StandardOutPath / systemd) writes
 // the daemon's stdout to ~/.cumora/daemon.log and NEVER rotates it — left alone it
