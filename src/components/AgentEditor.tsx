@@ -240,7 +240,7 @@ export function AgentEditor({ agent, onClose }: Props) {
             label={isByoa ? 'Big-brain model (大脑)' : 'Model'}
             hint={isByoa
               ? `Main reasoning model passed to the engine as --model. ${engine === 'codex' ? 'A model name (e.g. gpt-5.5, o3).' : engine === 'grok' ? 'A Grok model (e.g. grok-4.6).' : engine === 'cursor' ? 'A Cursor model id or alias; blank = Auto.' : "A Claude alias or full name (e.g. opus, sonnet, claude-sonnet-4-6)."} Blank = engine default.`
-              : 'Optional — leave blank to use the system default. Any OpenAI model name works (e.g. gpt-5.5, gpt-5.5-pro, gpt-5.5-mini).'}
+              : 'Optional — leave blank to use the system default. Any OpenAI model name works (e.g. gpt-5.5, gpt-5.5-pro, gpt-5.5-mini). Prefix with novita/ to run this agent on Novita instead (e.g. novita/deepseek/deepseek-v3.2).'}
           >
             <Input
               type="text"

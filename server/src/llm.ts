@@ -22,10 +22,21 @@
  * Critical: failures resolving the sub2api key are NEVER fatal — we
  * fall back to the legacy client. A wedged sub2api lookup must not
  * take down agent turns.
+ *
+ * Provider routing (model-based, on top of the above): whichever client is
+ * chosen by the tenant rules is wrapped by `withNovitaRouting` before it's
+ * returned. That wrapper inspects the `model` on each individual
+ * `responses.create()` call — not the tenant — and reroutes calls whose
+ * model carries the `novita/` prefix to Novita's real Chat Completions API
+ * via server/src/novita.ts's translation shim, since Novita has no Responses
+ * API to swap a base URL onto. Everything else about the returned client
+ * (chat.completions, images, embeddings, non-Novita responses.create calls)
+ * is the same object callers already know.
  */
 import OpenAI from 'openai'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
+import { isNovitaModel, novitaResponsesShim } from './novita.js'
 import { sub2apiConfigured, sub2apiOpenAIBaseURL } from './sub2api.js'
 
 interface CachedClient {
@@ -64,17 +75,50 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
   testLlmOverride = fn
 }
 
+/** Wrap a client so any call whose `model` carries the `novita/` prefix
+ *  (see server/src/novita.ts) is routed to Novita's real Chat Completions
+ *  API instead of this client's own `responses.create` — translated
+ *  through `novitaResponsesShim` so the caller sees an ordinary
+ *  Responses-API stream/return either way.
+ *
+ *  Model, not tenant, decides the provider: `getLlmClient` is resolved
+ *  once per tenant/hop before the model for that specific call is even
+ *  read off `args.model`, so routing has to happen at `.responses.create()`
+ *  call time, not here. Every caller in this codebase reads only
+ *  `client.responses.create(...)`, so wrapping just that property is a
+ *  complete, minimal interception — everything else (chat.completions,
+ *  images, embeddings) passes through to the real client untouched. */
+function withNovitaRouting(client: OpenAI): OpenAI {
+  return new Proxy(client, {
+    get(target, prop, receiver): unknown {
+      if (prop !== 'responses') return Reflect.get(target, prop, receiver)
+      const real = target.responses
+      return new Proxy(real, {
+        get(rt, p, rr): unknown {
+          if (p !== 'create') return Reflect.get(rt, p, rr)
+          return (args: { model?: string } & Record<string, unknown>, opts?: unknown) => {
+            if (isNovitaModel(args.model)) {
+              return novitaResponsesShim.create(args as never, opts as never)
+            }
+            return (real.create as (a: unknown, o?: unknown) => unknown)(args, opts)
+          }
+        },
+      })
+    },
+  })
+}
+
 /** Build (and cache) the OpenAI client for this tenant. Async because
  *  resolving the tenant's owner_user_id + sub2api_api_key is a DB hop.
  *  Always returns a working client — never throws on lookup failure. */
 export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
   if (testLlmOverride) return testLlmOverride(tenant)
   // No tenant context → legacy.
-  if (!tenant || !sub2apiConfigured()) return legacyClient()
+  if (!tenant || !sub2apiConfigured()) return withNovitaRouting(legacyClient())
 
   const cached = cache.get(tenant)
   if (cached && Date.now() - cached.mintedAt < CACHE_TTL_MS) {
-    return cached.client
+    return withNovitaRouting(cached.client)
   }
 
   try {
@@ -92,7 +136,7 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
       // hop, but with a short TTL so the next backfill picks up quickly.
       const c = legacyClient()
       cache.set(tenant, { client: c, key: 'legacy', mintedAt: Date.now() })
-      return c
+      return withNovitaRouting(c)
     }
     const c = new OpenAI({
       apiKey,
@@ -101,10 +145,10 @@ export async function getLlmClient(tenant: string | null): Promise<OpenAI> {
       timeout: SDK_TIMEOUT_MS,
     })
     cache.set(tenant, { client: c, key: apiKey, mintedAt: Date.now() })
-    return c
+    return withNovitaRouting(c)
   } catch (e) {
     console.warn(`[llm] tenant ${tenant} client lookup failed; legacy fallback`, e instanceof Error ? e.message : e)
-    return legacyClient()
+    return withNovitaRouting(legacyClient())
   }
 }
 

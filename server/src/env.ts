@@ -59,6 +59,16 @@ export const env = {
    */
   OPENAI_COMPACTION_MODEL: process.env.OPENAI_COMPACTION_MODEL ?? DEFAULT_SUPPORT_MODEL,
   /**
+   * Novita LLM API key. Optional — when unset, agents configured with a
+   * `novita/<model>` model id (see server/src/novita.ts) fall back to the
+   * legacy/sub2api client instead, so an unconfigured deployment doesn't
+   * break the run; the model just won't resolve to Novita as intended.
+   */
+  NOVITA_API_KEY: process.env.NOVITA_API_KEY ?? '',
+  /** Novita's OpenAI-compatible Chat Completions base. Override for a
+   *  self-hosted proxy or a pinned API version. */
+  NOVITA_BASE_URL: (process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, ''),
+  /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
    * `{ content: "..." }` JSON payload. When unset, alerts are still
