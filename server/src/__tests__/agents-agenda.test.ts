@@ -9,6 +9,7 @@ import assert from 'node:assert/strict'
 import {
   renderAgendaBrief,
   classifyAgendaActionable,
+  parseAgendaVerdict,
   AGENDA_CLASSIFIER_ERROR,
   __test,
   type AgentAgenda,
@@ -307,6 +308,33 @@ test('renderAgendaBrief works with only calendar events', () => {
 })
 
 // ────────────────────────────────────────────────────────────────────────────
+// Agenda verdict parsing — fail closed while recovering provider formatting
+// drift that still carries an explicit decision.
+// ────────────────────────────────────────────────────────────────────────────
+
+test('parseAgendaVerdict accepts fenced strict JSON', () => {
+  const parsed = parseAgendaVerdict('```json\n{"actionable":false,"focus":"","reason":"done"}\n```')
+  assert.deepEqual(parsed, { actionable: false, focus: '', reason: 'done' })
+})
+
+test('parseAgendaVerdict salvages unquoted keys and single-quoted strings', () => {
+  const parsed = parseAgendaVerdict("{ actionable: false, focus: '', reason: 'already concluded' }")
+  assert.deepEqual(parsed, { actionable: false, focus: '', reason: 'already concluded' })
+})
+
+test('parseAgendaVerdict salvages a truncated explicit negative', () => {
+  const parsed = parseAgendaVerdict('{"actionable":false,"focus":"","reason":"already done"')
+  assert.deepEqual(parsed, { actionable: false, focus: '', reason: 'already done' })
+})
+
+test('parseAgendaVerdict never salvages an unfocused malformed positive as actionable', () => {
+  const parsed = parseAgendaVerdict('{ actionable: true, reason: "maybe" }')
+  assert.deepEqual(parsed, {
+    actionable: false, focus: '', reason: 'malformed positive verdict without focus',
+  })
+})
+
+// ────────────────────────────────────────────────────────────────────────────
 // classifyAgendaActionable JSON-robustness — the production classifier is a
 // boundary between us and a non-deterministic LLM. Every branch in the
 // parse path needs explicit coverage so a single malformed reply can't
@@ -328,6 +356,22 @@ test('classifyAgendaActionable: empty agenda short-circuits before the LLM call'
   assert.equal(v.actionable, false)
   assert.equal(v.reason, 'empty agenda')
   assert.equal(called, false, 'must not call the LLM when there is nothing to triage')
+})
+
+test('classifyAgendaActionable leaves output headroom beyond reasoning tokens', async () => {
+  let maxOutputTokens = 0
+  __setLlmClientOverrideForTesting((async () => ({
+    responses: {
+      create: async (request: { max_output_tokens?: number }) => {
+        maxOutputTokens = request.max_output_tokens ?? 0
+        return { output_text: JSON.stringify({ actionable: false, focus: '', reason: 'done' }) }
+      },
+    },
+  })) as unknown as Parameters<typeof __setLlmClientOverrideForTesting>[0])
+  await classifyAgendaActionable({
+    persona: STUB_PERSONA, companyId: 'c1', agenda: SINGLE_CARD_AGENDA,
+  })
+  assert.ok(maxOutputTokens >= 2_000, 'live support-model reasoning exceeded 800 tokens before emitting JSON')
 })
 
 test('classifyAgendaActionable: happy path with strict boolean true', async () => {

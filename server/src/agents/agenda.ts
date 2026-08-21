@@ -403,6 +403,45 @@ export interface AgendaVerdict {
  *  string-matching. */
 export const AGENDA_CLASSIFIER_ERROR = 'classifier error'
 
+/** Parse the support model's verdict conservatively. JSON mode is not enough
+ * for every OpenAI-compatible provider: DeepSeek sometimes wraps JSON, omits
+ * key quotes, or truncates after all required fields. Recover only an explicit
+ * actionable value. A malformed positive also needs a non-empty focus, so
+ * salvage can never turn ambiguous output into a wake. */
+export function parseAgendaVerdict(raw: string): {
+  actionable?: unknown
+  focus?: unknown
+  reason?: unknown
+} | null {
+  const unfenced = raw.trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+  const firstBrace = unfenced.indexOf('{')
+  if (firstBrace < 0) return null
+  const lastBrace = unfenced.lastIndexOf('}')
+  const candidate = unfenced.slice(firstBrace, lastBrace > firstBrace ? lastBrace + 1 : undefined)
+  try {
+    return JSON.parse(candidate) as { actionable?: unknown; focus?: unknown; reason?: unknown }
+  } catch { /* conservative field salvage below */ }
+
+  const actionMatch = candidate.match(
+    /(?:["']?actionable["']?)\s*:\s*(true|false|1|0|["']true["']|["']false["'])/i,
+  )
+  if (!actionMatch) return null
+  const actionToken = actionMatch[1].replace(/["']/g, '').toLowerCase()
+  const actionable = actionToken === 'true' || actionToken === '1'
+  const stringField = (name: string): string => {
+    const match = candidate.match(new RegExp(`(?:["']?${name}["']?)\\s*:\\s*(["'])([\\s\\S]*?)\\1(?:\\s*[,}]|$)`, 'i'))
+    return match?.[2] ?? ''
+  }
+  const focus = stringField('focus')
+  const reason = stringField('reason')
+  if (actionable && !focus.trim()) {
+    return { actionable: false, focus: '', reason: 'malformed positive verdict without focus' }
+  }
+  return { actionable, focus, reason }
+}
+
 /** Cerebellum classifier: given the agenda + persona, decide if a
  *  wake is justified. Strict JSON. Falls back to "actionable=false"
  *  on any error so a classifier outage doesn't burn brain calls on
@@ -459,12 +498,15 @@ Reply as strict JSON.`
       instructions,
       input,
       text: { format: { type: 'json_object' } },
-      max_output_tokens: 300,
-      reasoning: { effort: 'low' },
+      // DeepSeek V4 Flash regularly spends the first ~300 tokens on hidden
+      // reasoning. A 300-token cap then truncates the JSON to one character,
+      // which made every minute-level BYOA agenda check fail closed. Leave
+      // enough room for reasoning plus the small structured verdict.
+      max_output_tokens: 2000,
+      reasoning: { effort: 'minimal' },
     })
-    const parsed = JSON.parse(r.output_text ?? '{}') as {
-      actionable?: unknown; focus?: unknown; reason?: unknown
-    }
+    const parsed = parseAgendaVerdict(r.output_text ?? '')
+    if (!parsed) throw new Error('agenda classifier returned no recoverable verdict')
     // Coerce to a real boolean *strictly*. `Boolean("no")` is `true`
     // because non-empty strings are truthy — so if the model replies
     // {"actionable": "no"} (treating it as natural language) we'd
