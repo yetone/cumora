@@ -88,6 +88,15 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *  `client.responses.create(...)`, so wrapping just that property is a
  *  complete, minimal interception — everything else (chat.completions,
  *  images, embeddings) passes through to the real client untouched. */
+let novitaUnconfiguredWarned = false
+/** One log line, not one per call — this fires on every hop of every turn of
+ *  an agent whose model names an unconfigured provider. */
+function warnNovitaUnconfiguredOnce(model: string | undefined): void {
+  if (novitaUnconfiguredWarned) return
+  novitaUnconfiguredWarned = true
+  console.warn(`[llm] model "${model}" requests Novita but NOVITA_API_KEY is unset — using the tenant's normal client instead`)
+}
+
 function withNovitaRouting(client: OpenAI): OpenAI {
   return new Proxy(client, {
     get(target, prop, receiver): unknown {
@@ -98,7 +107,15 @@ function withNovitaRouting(client: OpenAI): OpenAI {
           if (p !== 'create') return Reflect.get(rt, p, rr)
           return (args: { model?: string } & Record<string, unknown>, opts?: unknown) => {
             if (isNovitaModel(args.model)) {
-              return novitaResponsesShim.create(args as never, opts as never)
+              // Route to Novita only when this deployment actually configured
+              // a key — otherwise fall through to the tenant's normal client,
+              // exactly as env.ts documents. Without this guard an unset key
+              // sent the call to api.novita.ai with an empty bearer and the
+              // agent died on an unexplained 401 instead of degrading.
+              if (env.NOVITA_API_KEY) {
+                return novitaResponsesShim.create(args as never, opts as never)
+              }
+              warnNovitaUnconfiguredOnce(args.model)
             }
             return (real.create as (a: unknown, o?: unknown) => unknown)(args, opts)
           }
