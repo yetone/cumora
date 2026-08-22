@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { api } from '@/api/client'
 import { cn } from '@/lib/utils'
+import { useT } from '@/lib/i18n'
 
 /**
  * Inline poll composer. Floats above the chat input when the user types
@@ -40,6 +41,7 @@ function expireToMinutes(c: ExpireChoice): number | null {
 }
 
 export function PollComposer({ onSubmitted, onCancel, conversationId }: Props) {
+  const t = useT()
   const [question, setQuestion] = useState('')
   const [mode, setMode] = useState<'single' | 'multi'>('single')
   const [options, setOptions] = useState<string[]>(['', ''])
@@ -111,7 +113,7 @@ export function PollComposer({ onSubmitted, onCancel, conversationId }: Props) {
       })
       onSubmitted()
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'failed to create poll')
+      setError(e instanceof Error ? e.message : t('poll.failedToCreate'))
       setSubmitting(false)
     }
   }
@@ -147,12 +149,12 @@ export function PollComposer({ onSubmitted, onCancel, conversationId }: Props) {
             <rect x="17" y="14" width="4" height="6" rx="1" />
           </svg>
         </span>
-        <span className="font-semibold text-ink-700">New poll</span>
+        <span className="font-semibold text-ink-700">{t('poll.title')}</span>
         <button
           type="button"
           onClick={onCancel}
           className="ml-auto px-2 py-0.5 text-ink-500 rounded-full hover:bg-ink-50 transition"
-          aria-label="Cancel poll"
+          aria-label={t('poll.cancelAria')}
         >×</button>
       </div>
 
@@ -160,7 +162,7 @@ export function PollComposer({ onSubmitted, onCancel, conversationId }: Props) {
         ref={questionRef}
         value={question}
         onChange={(e) => setQuestion(e.target.value)}
-        placeholder="Ask the room a question…"
+        placeholder={t('poll.questionPh')}
         maxLength={280}
         className="w-full px-2 py-2 text-[14px] font-semibold text-ink-900 placeholder-ink-300 bg-transparent border-b border-ink-50 focus:border-sky2-200 outline-none transition"
         onKeyDown={(e) => {
@@ -195,7 +197,7 @@ export function PollComposer({ onSubmitted, onCancel, conversationId }: Props) {
                 type="button"
                 onClick={() => removeOption(i)}
                 className="opacity-0 group-hover:opacity-100 transition w-5 h-5 rounded-full text-ink-400 hover:bg-ink-50 hover:text-coral-deep grid place-items-center"
-                aria-label="Remove option"
+                aria-label={t('poll.removeOptAria')}
               >×</button>
             )}
           </div>

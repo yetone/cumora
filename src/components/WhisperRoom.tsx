@@ -13,6 +13,7 @@ import { DocumentLink } from './DocumentLink'
 import { CalendarLink } from './CalendarLink'
 import type { ApiWhisperMessage } from '@/api/client'
 import type { Participant } from '@/types'
+import { useT } from '@/lib/i18n'
 
 /** Inline-only renderer for whisper bubbles — keeps the dashed-coral
  *  mention chip (whispers use a different visual register than the main
@@ -158,6 +159,7 @@ function Divider({ label }: { label: string }) {
 }
 
 export function WhisperRoom({ pairId }: { pairId: string }) {
+  const t = useT()
   const list = useWhispers((s) => s.list)
   const byIdList = useWhispers((s) => s.byId)
   const streaming = useWhispers((s) => s.streaming)
@@ -218,8 +220,8 @@ export function WhisperRoom({ pairId }: { pairId: string }) {
           <svg width="12" height="12" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
             <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" /><circle cx="12" cy="12" r="3" />
           </svg>
-          <b className="font-semibold tracking-wide uppercase text-[9.5px]">Observer mode</b>
-          <span className="font-display italic text-ink-500 text-[11px]">silent peek — inject to step in</span>
+          <b className="font-semibold tracking-wide uppercase text-[9.5px]">{t('whisper.observerMode')}</b>
+          <span className="font-display italic text-ink-500 text-[11px]">{t('whisper.observerHint')}</span>
         </div>
       </div>
 
@@ -252,10 +254,10 @@ export function WhisperRoom({ pairId }: { pairId: string }) {
             )}
           </h2>
           <div className="text-[11.5px] text-ink-500 mt-0.5 truncate font-display italic">
-            {isGroup ? `${ms.length} agents` : (whisper.about ?? 'private thread')}
+            {isGroup ? t('whisper.nAgents', { n: ms.length }) : (whisper.about ?? t('whisper.privateThread'))}
             <span className="not-italic text-ink-300"> · </span>
             <span className="not-italic text-ink-300">
-              started {new Date(whisper.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+              {t('whisper.startedAt', { time: new Date(whisper.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })}
             </span>
           </div>
         </div>
@@ -263,9 +265,9 @@ export function WhisperRoom({ pairId }: { pairId: string }) {
 
       {/* Thread */}
       <div className="overflow-y-auto py-3 px-6 pb-3 flex flex-col gap-3 relative">
-        <Divider label={`opened ${new Date(whisper.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`} />
+        <Divider label={t('whisper.openedAt', { time: new Date(whisper.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })} />
         {messages.length === 0 && (
-          <div className="text-center text-ink-300 text-[12px] font-display italic py-6">no messages yet</div>
+          <div className="text-center text-ink-300 text-[12px] font-display italic py-6">{t('whisper.noMessages')}</div>
         )}
         {messages.map((msg) => <Bubble key={msg.id} msg={msg} />)}
       </div>
@@ -277,7 +279,7 @@ export function WhisperRoom({ pairId }: { pairId: string }) {
           style={{ border: '1.5px solid var(--whisper-100)' }}>
           <Avatar p={meAvatar} size={26} ringColor="var(--cloud)" showStatus={false} />
           <div className="flex-1 text-[13px] text-ink-300">
-            Inject a thought — <em className="font-display italic font-normal">they'll see it as if you'd been listening…</em>
+            {t('whisper.injectPrompt')}
           </div>
         </div>
       </div>

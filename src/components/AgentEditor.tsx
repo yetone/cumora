@@ -9,6 +9,7 @@ import { Input } from '@/components/Input'
 import { TextArea } from '@/components/TextArea'
 import { Select } from '@/components/Select'
 import type { Participant, EngineId } from '@/types'
+import { useT } from '@/lib/i18n'
 
 const PALETTE = [
   '#FFB088', '#FFD9D2', '#FFB7AF', '#F4B740',
@@ -23,6 +24,7 @@ interface Props {
 }
 
 export function AgentEditor({ agent, onClose }: Props) {
+  const t = useT()
   const editing = agent !== null
   const [name, setName] = useState(agent?.name ?? '')
   const [role, setRole] = useState(agent?.role ?? '')
@@ -184,69 +186,69 @@ export function AgentEditor({ agent, onClose }: Props) {
           </div>
           <div className="flex-1">
             <h2 className="font-display font-medium text-[20px] tracking-tight">
-              {editing ? `Edit ${agent!.name}` : 'New agent'}
+              {editing ? t('agent.editAgent', { name: agent!.name }) : t('agent.newAgent')}
             </h2>
             <div className="text-[12.5px] text-ink-500 italic font-display">
-              {editing ? 'Tweak how this teammate behaves.' : 'Define a new teammate from scratch.'}
+              {editing ? t('agent.editSubtitle') : t('agent.newSubtitle')}
             </div>
           </div>
           <button
             onClick={onClose}
             className="w-8 h-8 rounded-full grid place-items-center text-ink-500 hover:bg-sky2-50 hover:text-ink-900 transition"
-            aria-label="Close"
+            aria-label={t('common.close')}
           >×</button>
         </div>
 
         <div className="px-6 py-5 space-y-4 overflow-y-auto flex-1 min-h-0">
-          <Field label="Name" hint="What teammates call them. The handle (@-mention id) is derived from this automatically.">
+          <Field label={t('agent.nameLabel')} hint={t('agent.nameHint')}>
             <Input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Saga"
+              placeholder={t('agent.namePh')}
             />
           </Field>
 
-          <Field label="Role" hint="One- or two-word title shown next to the name.">
+          <Field label={t('agent.roleLabel')} hint={t('agent.roleHint')}>
             <Input
               type="text"
               value={role}
               onChange={(e) => setRole(e.target.value)}
-              placeholder="e.g. Storyteller"
+              placeholder={t('agent.rolePh')}
             />
           </Field>
 
-          <Field label="Style (system prompt)" hint="The agent's voice, instincts, and quirks. Written in second person — the LLM reads this as 'you'.">
+          <Field label={t('agent.styleLabel')} hint={t('agent.styleHint')}>
             <TextArea
               value={systemPrompt}
               onChange={(e) => setSystemPrompt(e.target.value)}
               rows={5}
-              placeholder="You write narratives. You sense what the team forgets to say out loud. Direct, warm, never preachy."
+              placeholder={t('agent.stylePh')}
               className="font-display italic"
               style={{ minHeight: 110 }}
             />
           </Field>
 
-          <Field label="Bio" hint="Optional, shown on the agent card.">
+          <Field label={t('agent.bioLabel')} hint={t('agent.bioHint')}>
             <TextArea
               value={bio}
               onChange={(e) => setBio(e.target.value)}
               rows={2}
-              placeholder="A one-line description of what they're best at."
+              placeholder={t('agent.bioPh')}
             />
           </Field>
 
           <Field
-            label={isByoa ? 'Big-brain model (大脑)' : 'Model'}
+            label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
             hint={isByoa
-              ? `Main reasoning model passed to the engine as --model. ${engine === 'codex' ? 'A model name (e.g. gpt-5.5, o3).' : engine === 'grok' ? 'A Grok model (e.g. grok-4.6).' : engine === 'cursor' ? 'A Cursor model id or alias; blank = Auto.' : "A Claude alias or full name (e.g. opus, sonnet, claude-sonnet-4-6)."} Blank = engine default.`
-              : 'Optional — leave blank to use the system default. Any OpenAI model name works (e.g. gpt-5.5, gpt-5.5-pro, gpt-5.5-mini). Prefix with novita/ to run this agent on Novita instead (e.g. novita/deepseek/deepseek-v3.2).'}
+              ? `${t('agent.modelHintByoaPrefix')} ${engine === 'codex' ? t('agent.modelHintByoaCodex') : engine === 'grok' ? t('agent.modelHintByoaGrok') : engine === 'cursor' ? t('agent.modelHintByoaCursor') : t('agent.modelHintByoaClaude')} ${t('agent.modelHintByoaSuffix')}`
+              : t('agent.modelHintCloud')}
           >
             <Input
               type="text"
               value={model}
               onChange={(e) => setModel(e.target.value)}
-              placeholder="(default)"
+              placeholder={t('agent.defaultPh')}
               className="font-mono"
               spellCheck={false}
             />
@@ -254,20 +256,20 @@ export function AgentEditor({ agent, onClose }: Props) {
 
           {isByoa && (
             <Field
-              label="Small-brain model (小脑)"
+              label={t('agent.fastLabelByoa')}
               hint={engine === 'codex'
-                ? 'Cheaper model for light auxiliary tasks (e.g. gpt-5.4-mini). Blank = same as big-brain.'
+                ? t('agent.fastHintByoaCodex')
                 : engine === 'grok'
-                  ? 'Cheaper/faster Grok model for light auxiliary tasks (e.g. grok-4.5). Blank = engine default.'
+                  ? t('agent.fastHintByoaGrok')
                   : engine === 'cursor'
-                    ? 'Not used by Cursor; triage follows CUMORA_TRIAGE_MODEL on the computer. Blank = Auto.'
-                    : "Cheaper/faster model for light auxiliary tasks — maps to Claude's ANTHROPIC_SMALL_FAST_MODEL. Blank = engine default."}
+                    ? t('agent.fastHintByoaCursor')
+                    : t('agent.fastHintByoaClaude')}
             >
               <Input
                 type="text"
                 value={fastModel}
                 onChange={(e) => setFastModel(e.target.value)}
-                placeholder="(default)"
+                placeholder={t('agent.defaultPh')}
                 className="font-mono"
                 spellCheck={false}
               />
@@ -275,11 +277,11 @@ export function AgentEditor({ agent, onClose }: Props) {
           )}
 
           <Field
-            label="Runs on"
-            hint="Which computer executes this agent. Cumora Cloud is managed; a computer you've paired runs it on your local Claude Code, Codex, Grok Build, or Cursor Agent."
+            label={t('agent.runsOnLabel')}
+            hint={t('agent.runsOnHint')}
           >
             <Select
-              ariaLabel="Runs on"
+              ariaLabel={t('agent.runsOnLabel')}
               value={computerId}
               onValueChange={changeComputer}
               options={[
@@ -293,23 +295,23 @@ export function AgentEditor({ agent, onClose }: Props) {
                   .map((c) => ({
                     value: c.id,
                     label: `${c.kind === 'cloud' ? '☁' : c.kind === 'vps' ? '🖥' : '💻'} ${c.name}`
-                      + (c.kind !== 'cloud' && c.status !== 'online' ? ' (offline)' : ''),
+                      + (c.kind !== 'cloud' && c.status !== 'online' ? ` ${t('agent.offlineSuffix')}` : ''),
                   })),
                 ...(isFreeTier && !isNativePlatform()
-                  ? [{ value: '__cloud_pro__', label: '☁ Cumora Cloud — upgrade to Pro', disabled: true }]
+                  ? [{ value: '__cloud_pro__', label: t('agent.upgradeToPro'), disabled: true }]
                   : []),
               ]}
             />
             {selectedComputer && selectedComputer.kind !== 'cloud' && (
               <div className="mt-2">
                 <Select
-                  ariaLabel="Engine"
+                  ariaLabel={t('agent.engineLabel')}
                   value={engine}
                   onValueChange={(v) => setEngine(v as EngineId)}
                   options={(selectedComputer.availableEngines.length
                     ? selectedComputer.availableEngines
                     : (['claude'] as EngineId[])
-                  ).map((en) => ({ value: en, label: en === 'claude' ? 'Claude Code' : en === 'codex' ? 'Codex' : en === 'grok' ? 'Grok Build' : en === 'cursor' ? 'Cursor' : en }))}
+                  ).map((en) => ({ value: en, label: en === 'claude' ? t('agent.engineClaude') : en === 'codex' ? t('agent.engineCodex') : en === 'grok' ? t('agent.engineGrok') : en === 'cursor' ? t('agent.engineCursor') : en }))}
                 />
               </div>
             )}
@@ -319,7 +321,7 @@ export function AgentEditor({ agent, onClose }: Props) {
                 style={{ background: 'var(--sky-50)', border: '1px solid var(--sky-100)' }}
               >
                 <div className="text-[12px] font-semibold text-ink-900 mb-1">
-                  {selectedComputer?.name} is offline. Run this on that computer:
+                  {t('agent.computerOfflineMsg', { name: selectedComputer?.name ?? '' })}
                 </div>
                 {repairErr ? (
                   <div className="text-[11.5px] text-coral-deep bg-coral-soft rounded-[8px] p-2">{repairErr}</div>
@@ -334,17 +336,17 @@ export function AgentEditor({ agent, onClose }: Props) {
                       className="mt-2 inline-flex items-center justify-center min-w-[108px] text-[11.5px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                       style={{ background: repairCopied ? '#3BB273' : 'var(--skype)' }}
                     >
-                      {repairCopied ? '✓ Copied!' : 'Copy command'}
+                      {repairCopied ? t('agent.copied') : t('agent.copyCommand')}
                     </button>
                   </>
                 ) : (
-                  <div className="text-[11.5px] text-ink-400">Generating reconnect command…</div>
+                  <div className="text-[11.5px] text-ink-400">{t('agent.generatingReconnect')}</div>
                 )}
               </div>
             )}
           </Field>
 
-          <Field label="Avatar color" hint="Used as a fallback when no AI portrait is generated.">
+          <Field label={t('agent.avatarColorLabel')} hint={t('agent.avatarColorHint')}>
             <div className="flex flex-wrap gap-2">
               {PALETTE.map((c) => (
                 <button
@@ -365,10 +367,8 @@ export function AgentEditor({ agent, onClose }: Props) {
           </Field>
 
           <Field
-            label="AI-generated portrait"
-            hint={editing
-              ? 'Generates an editorial portrait fitting this agent\'s name, role, and style. Save your edits first if you tweaked the style.'
-              : 'Available after the agent is created. Save first, then re-open to generate.'}
+            label={t('agent.aiPortraitLabel')}
+            hint={editing ? t('agent.aiPortraitHintEdit') : t('agent.aiPortraitHintNew')}
           >
             <div className="flex items-center gap-4">
               {/* Avatar preview with breathing/sparkle animation while generating */}
@@ -451,13 +451,13 @@ export function AgentEditor({ agent, onClose }: Props) {
                     <path d="M12 2l2 5 5 2-5 2-2 5-2-5-5-2 5-2z"/><path d="M19 14l1 2 2 1-2 1-1 2-1-2-2-1 2-1z"/>
                   </svg>
                   {generatingAvatar
-                    ? <span>Painting<span className="ae-dots" /></span>
-                    : (avatarUrl ? 'Regenerate' : 'Generate with AI')}
+                    ? <span>{t('agent.painting')}<span className="ae-dots" /></span>
+                    : (avatarUrl ? t('agent.regenerate') : t('agent.generateAi'))}
                 </button>
 
                 {generatingAvatar && (
                   <div className="text-[11.5px] text-whisper-deep font-display italic leading-[1.5]">
-                    Composing {name || 'your agent'}'s portrait — usually 15–30s. You can keep editing other fields.
+                    {t('agent.composingPortrait', { name: name || t('agent.composingPortraitFallback') })}
                   </div>
                 )}
 
@@ -466,7 +466,7 @@ export function AgentEditor({ agent, onClose }: Props) {
                     type="button"
                     onClick={() => setAvatarUrl(null)}
                     className="self-start text-[11.5px] text-ink-500 hover:text-coral-deep transition"
-                  >clear portrait (use color block instead)</button>
+                  >{t('agent.clearPortrait')}</button>
                 )}
 
                 {avatarErr && (
@@ -490,7 +490,7 @@ export function AgentEditor({ agent, onClose }: Props) {
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >Cancel</button>
+          >{t('agent.cancelBtn')}</button>
           <div className="flex-1" />
           <button
             onClick={submit}
@@ -501,7 +501,7 @@ export function AgentEditor({ agent, onClose }: Props) {
               boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)',
             }}
           >
-            {busy ? 'Saving…' : (editing ? 'Save changes' : 'Create agent')}
+            {busy ? t('agent.saving') : (editing ? t('agent.saveChanges') : t('agent.createAgent'))}
           </button>
         </div>
       </div>

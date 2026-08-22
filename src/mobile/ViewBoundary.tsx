@@ -12,6 +12,7 @@
  * a fresh tab always gets a fresh boundary.
  */
 import { Component, type ReactNode } from 'react'
+import { translate, useLocaleStore, type MessageKey } from '@/lib/i18n'
 
 interface Props {
   /** Human-readable tab name shown in the fallback copy. */
@@ -38,21 +39,27 @@ export class ViewBoundary extends Component<Props, State> {
 
   render(): ReactNode {
     if (this.state.error) {
+      // Class component — read the locale snapshot at render time. The
+      // locale store is a plain zustand slice; useLocaleStore.getState()
+      // gives us a fresh value on every render without re-subscribing
+      // (we don't need reactivity inside this once-per-error render).
+      const locale = useLocaleStore.getState().locale
+      const t = (k: MessageKey, vars?: Record<string, string | number>) => translate(locale, k, vars)
       return (
         <div className="absolute inset-0 grid place-items-center bg-paper p-8 text-center">
           <div className="max-w-[280px]">
             <div className="font-display text-[18px] text-ink-900 mb-2">
-              {this.props.name} hit a snag.
+              {t('viewBoundary.hitASnag', { name: this.props.name })}
             </div>
             <div className="font-display italic text-[13px] text-ink-500 leading-snug mb-5">
-              {this.state.error.message || 'An unexpected error occurred while rendering this tab.'}
+              {this.state.error.message || t('viewBoundary.fallbackMsg')}
             </div>
             <button
               type="button"
               onClick={() => this.setState({ error: null })}
               className="h-10 px-5 rounded-[10px] text-[13px] font-semibold text-white"
               style={{ background: 'var(--skype)' }}
-            >Try again</button>
+            >{t('viewBoundary.tryAgain')}</button>
           </div>
         </div>
       )

@@ -18,6 +18,7 @@ import { useDocuments } from '@/stores/documents'
 import { useAuth } from '@/stores/auth'
 import { api, ws } from '@/api/client'
 import { cn } from '@/lib/utils'
+import { useT } from '@/lib/i18n'
 import {
   IBold, IItalic, IStrike, IH1, IH2, IH3,
   IList, IListOrdered, IQuote, ICode, ICodeBlock, ILink, IImage, IUndo, IRedo,
@@ -115,6 +116,7 @@ interface DocumentEditorProps {
 }
 
 export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFull }: DocumentEditorProps) {
+  const t = useT()
   const user = useAuth((s) => s.user)
   const doc = useDocuments((s) => s.list.find((d) => d.id === documentId) ?? null)
   const rename = useDocuments((s) => s.rename)
@@ -149,12 +151,12 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
 
   if (!doc) return (
     <div className="h-full flex items-center justify-center text-stone-400 text-sm">
-      Document not found.
+      {t('docEdit.notFound')}
     </div>
   )
   if (!user || !session) return (
     <div className="h-full flex items-center justify-center text-stone-400 text-sm">
-      Loading…
+      {t('common.loading')}
     </div>
   )
 
@@ -186,8 +188,8 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
             'flex-1 min-w-0 bg-transparent font-medium text-stone-900 focus:outline-none',
             isPeek ? 'text-[16px] leading-[1.35]' : 'text-xl',
           )}
-          placeholder="Untitled"
-          aria-label="Document title"
+          placeholder={t('docEdit.untitledPh')}
+          aria-label={t('docEdit.titleAria')}
         />
         <div className="shrink-0">
           <PresenceStrip session={session} synced={synced} />
@@ -197,8 +199,8 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
             type="button"
             onClick={onOpenFull}
             className="w-8 h-8 rounded-[8px] grid place-items-center text-ink-500 hover:text-skype-deep hover:bg-sky2-100 transition"
-            title="Open in Documents"
-            aria-label="Open in Documents"
+            title={t('docEdit.openInDocs')}
+            aria-label={t('docEdit.openInDocs')}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
               <path d="M14 4h6v6" />
@@ -212,8 +214,8 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
             type="button"
             onClick={onClose}
             className="w-8 h-8 rounded-[8px] grid place-items-center text-ink-400 hover:text-ink-900 hover:bg-ink-100/70 transition"
-            title="Close document"
-            aria-label="Close document"
+            title={t('docEdit.closeDocument')}
+            aria-label={t('docEdit.closeDocument')}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" className="w-4 h-4">
               <path d="M6 6l12 12M18 6L6 18" />
@@ -223,12 +225,12 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
           <button
             type="button"
             onClick={() => {
-              if (!confirm('Delete this document?')) return
+              if (!confirm(t('docEdit.deleteConfirm'))) return
               void remove(doc.id).catch(() => { /* swallow */ })
             }}
             className="text-xs leading-none text-stone-500 hover:text-red-600 transition-colors"
           >
-            Delete
+            {t('docEdit.deleteAction')}
           </button>
         )}
       </header>
@@ -254,9 +256,11 @@ interface CollaborativeEditorProps {
 }
 
 function CollaborativeEditor({ session, synced, userName, userColor, documentId, variant }: CollaborativeEditorProps) {
+  const t = useT()
   const refreshingImagesRef = useRef(new Set<string>())
   // Memoize the awareness object reference for the cursor extension —
   // TipTap reads it once at mount.
+  const placeholderText = t('docEdit.placeholder')
   const extensions = useMemo(() => [
     // Disable StarterKit's undo/redo because Collaboration ships its own
     // (Yjs-aware) one — running both yields double-undos. TipTap v3
@@ -272,7 +276,7 @@ function CollaborativeEditor({ session, synced, userName, userColor, documentId,
       allowBase64: false,
     }),
     Placeholder.configure({
-      placeholder: 'Start writing — humans and agents can both edit live.',
+      placeholder: placeholderText,
     }),
     Collaboration.configure({ document: session.doc }),
     CollaborationCaret.configure({
@@ -285,7 +289,7 @@ function CollaborativeEditor({ session, synced, userName, userColor, documentId,
     // ids — which is what lets the server-side notifier work without
     // having to second-guess fuzzy text matches.
     buildMentionExtension(),
-  ], [session, userName, userColor])
+  ], [session, userName, userColor, placeholderText])
 
   const editor = useEditor({
     extensions,
@@ -405,6 +409,7 @@ function CollaborativeEditor({ session, synced, userName, userColor, documentId,
 interface ToolbarProps { editor: Editor | null; disabled: boolean }
 
 function Toolbar({ editor, disabled }: ToolbarProps) {
+  const t = useT()
   if (!editor) {
     return <div className="border-b border-stone-100 px-4 py-2 h-[42px] bg-stone-50/60" />
   }
@@ -421,60 +426,60 @@ function Toolbar({ editor, disabled }: ToolbarProps) {
       <button
         type="button" className={btn(editor.isActive('bold'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleBold().run()}
-        title="Bold (⌘B)"
+        title={t('docEdit.bold')}
       ><IBold className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('italic'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleItalic().run()}
-        title="Italic (⌘I)"
+        title={t('docEdit.italic')}
       ><IItalic className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('strike'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleStrike().run()}
-        title="Strikethrough"
+        title={t('docEdit.strikethrough')}
       ><IStrike className="w-4 h-4" /></button>
       <ToolbarSep />
       <button
         type="button" className={btn(editor.isActive('heading', { level: 1 }))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()}
-        title="Heading 1"
+        title={t('docEdit.heading1')}
       ><IH1 className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('heading', { level: 2 }))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()}
-        title="Heading 2"
+        title={t('docEdit.heading2')}
       ><IH2 className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('heading', { level: 3 }))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleHeading({ level: 3 }).run()}
-        title="Heading 3"
+        title={t('docEdit.heading3')}
       ><IH3 className="w-4 h-4" /></button>
       <ToolbarSep />
       <button
         type="button" className={btn(editor.isActive('bulletList'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleBulletList().run()}
-        title="Bullet list"
+        title={t('docEdit.bulletList')}
       ><IList className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('orderedList'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleOrderedList().run()}
-        title="Ordered list"
+        title={t('docEdit.orderedList')}
       ><IListOrdered className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('blockquote'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleBlockquote().run()}
-        title="Quote"
+        title={t('docEdit.quote')}
       ><IQuote className="w-4 h-4" /></button>
       <ToolbarSep />
       <button
         type="button" className={btn(editor.isActive('code'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleCode().run()}
-        title="Inline code"
+        title={t('docEdit.inlineCode')}
       ><ICode className="w-4 h-4" /></button>
       <button
         type="button" className={btn(editor.isActive('codeBlock'))} disabled={disabled}
         onClick={() => editor.chain().focus().toggleCodeBlock().run()}
-        title="Code block"
+        title={t('docEdit.codeBlock')}
       ><ICodeBlock className="w-4 h-4" /></button>
       <LinkButton editor={editor} disabled={disabled} />
       <ImageButton editor={editor} disabled={disabled} />
@@ -482,12 +487,12 @@ function Toolbar({ editor, disabled }: ToolbarProps) {
       <button
         type="button" className={btn(false)} disabled={disabled || !editor.can().undo()}
         onClick={() => editor.chain().focus().undo().run()}
-        title="Undo (⌘Z)"
+        title={t('docEdit.undo')}
       ><IUndo className="w-4 h-4" /></button>
       <button
         type="button" className={btn(false)} disabled={disabled || !editor.can().redo()}
         onClick={() => editor.chain().focus().redo().run()}
-        title="Redo (⌘⇧Z)"
+        title={t('docEdit.redo')}
       ><IRedo className="w-4 h-4" /></button>
     </div>
   )
@@ -498,6 +503,7 @@ function ToolbarSep() {
 }
 
 function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }) {
+  const t = useT()
   const fileRef = useRef<HTMLInputElement | null>(null)
   const [uploading, setUploading] = useState(false)
   const insertImage = (attrs: { src: string; alt?: string; storageKey?: string | null }) => {
@@ -510,18 +516,18 @@ function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }
   }
   const uploadAndInsert = async (file: File) => {
     if (!file.type.startsWith('image/')) {
-      alert('Choose an image file.')
+      alert(t('docEdit.chooseImageFile'))
       return
     }
     setUploading(true)
     try {
       const attachment = await api.uploadFile(file)
-      if (attachment.kind !== 'img') throw new Error('Uploaded file is not an image.')
+      if (attachment.kind !== 'img') throw new Error(t('docEdit.uploadedNotImage'))
       insertImage({ src: attachment.url, alt: attachment.name, storageKey: attachment.key ?? null })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.warn('[docs] image upload failed', msg)
-      alert(`Image upload failed: ${msg}`)
+      alert(t('docEdit.uploadFailed', { msg }))
     } finally {
       setUploading(false)
     }
@@ -545,14 +551,14 @@ function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }
         onClick={(event) => {
           if (event.altKey) {
             const existing = editor.getAttributes('image') as { src?: string; alt?: string }
-            const input = prompt('Image URL:', existing.src ?? '')
+            const input = prompt(t('docEdit.imageUrlPrompt'), existing.src ?? '')
             if (input === null) return
             const url = input.trim()
             if (!url || !isSafeImageUrl(url)) {
-              alert('Use an http(s) URL or an app-relative /path.')
+              alert(t('docEdit.imageUrlInvalid'))
               return
             }
-            const altInput = prompt('Alt text:', existing.alt ?? '')
+            const altInput = prompt(t('docEdit.altTextPrompt'), existing.alt ?? '')
             if (altInput === null) return
             const alt = altInput.trim()
             insertImage(alt ? { src: url, alt } : { src: url })
@@ -568,7 +574,7 @@ function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }
               : 'text-stone-600 hover:bg-stone-100'
           ),
         )}
-        title={uploading ? 'Uploading image' : 'Insert image'}
+        title={uploading ? t('docEdit.uploadingImage') : t('docEdit.insertImage')}
       >
         <IImage className="w-4 h-4" />
       </button>
@@ -577,6 +583,7 @@ function ImageButton({ editor, disabled }: { editor: Editor; disabled: boolean }
 }
 
 function LinkButton({ editor, disabled }: { editor: Editor; disabled: boolean }) {
+  const t = useT()
   const isActive = editor.isActive('link')
   return (
     <button
@@ -584,7 +591,7 @@ function LinkButton({ editor, disabled }: { editor: Editor; disabled: boolean })
       disabled={disabled}
       onClick={() => {
         const existing = editor.getAttributes('link').href as string | undefined
-        const input = prompt('Link URL (leave empty to unlink):', existing ?? '')
+        const input = prompt(t('docEdit.linkPrompt'), existing ?? '')
         if (input === null) return
         const url = input.trim()
         if (!url) {
@@ -601,7 +608,7 @@ function LinkButton({ editor, disabled }: { editor: Editor; disabled: boolean })
             : 'text-stone-600 hover:bg-stone-100'
         ),
       )}
-      title="Link"
+      title={t('docEdit.link')}
     >
       <ILink className="w-4 h-4" />
     </button>
@@ -613,6 +620,7 @@ function LinkButton({ editor, disabled }: { editor: Editor; disabled: boolean })
 interface PeerInfo { clientId: number; name: string; color: string }
 
 function PresenceStrip({ session, synced }: { session: YDocSession; synced: boolean }) {
+  const t = useT()
   const [peers, setPeers] = useState<PeerInfo[]>([])
   useEffect(() => {
     const refresh = () => {
@@ -634,8 +642,8 @@ function PresenceStrip({ session, synced }: { session: YDocSession; synced: bool
   // ascent/descent (16.5px for 12px Manrope), not line-height, so it
   // centers on a different baseline than the 12px-tall Delete button.
   // As a block, height = leading-none line-height = 12px = same box.
-  if (!synced) return <span className="block text-xs leading-none text-stone-400">syncing…</span>
-  if (peers.length === 0) return <span className="block text-xs leading-none text-stone-400">only you</span>
+  if (!synced) return <span className="block text-xs leading-none text-stone-400">{t('docEdit.syncing')}</span>
+  if (peers.length === 0) return <span className="block text-xs leading-none text-stone-400">{t('docEdit.onlyYou')}</span>
   return (
     <div className="flex items-center -space-x-1.5">
       {peers.slice(0, 6).map((p) => (

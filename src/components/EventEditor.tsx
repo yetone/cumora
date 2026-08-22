@@ -14,6 +14,7 @@ import { DateTimePicker } from '@/components/DateTimePicker'
 import { Input } from '@/components/Input'
 import { TextArea } from '@/components/TextArea'
 import type { CalendarEvent, CalendarEventKind, RecurrenceRule, Participant } from '@/types'
+import { useTLabel } from '@/lib/i18n'
 
 /** Prefilled defaults passed in when creating a NEW event from a calendar
  *  drag-select or right-click. Ignored when `event` is supplied (edit
@@ -33,7 +34,19 @@ interface Props {
   onClose: () => void
 }
 
+// i18n: original English labels stay as the source of truth (and fallback)
+// so future copy edits by the author auto-flow. The parallel lookup table
+// gives t() a MessageKey to resolve without changing the data shape.
 const WEEKDAY_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const WEEKDAY_LABEL_KEY = [
+  'event.weekdaySun',
+  'event.weekdayMon',
+  'event.weekdayTue',
+  'event.weekdayWed',
+  'event.weekdayThu',
+  'event.weekdayFri',
+  'event.weekdaySat',
+] as const
 
 /** Format a JS Date into `YYYY-MM-DDTHH:mm` for `<input type=datetime-local>`. */
 function toLocalInput(d: Date): string {
@@ -50,6 +63,11 @@ function fromLocalInput(s: string): string {
 }
 
 export function EventEditor({ event, prefill, onClose }: Props) {
+  // Non-invasive i18n: prefer translated MessageKey, fall back to the
+  // author's original English literal so future copy edits stay in sync.
+  // The optional params object is forwarded to t() when the bundle has
+  // a translated entry that uses interpolation.
+  const tLabel = useTLabel()
   const create = useCalendar((s) => s.create)
   const update = useCalendar((s) => s.update)
   const remove = useCalendar((s) => s.remove)
@@ -126,9 +144,9 @@ export function EventEditor({ event, prefill, onClose }: Props) {
   const submit = async () => {
     setErr(null)
     const cleanTitle = title.trim()
-    if (!cleanTitle) { setErr('title is required'); return }
-    if (kind === 'agent_task' && !assigneeId) { setErr('pick an assignee for the agent task'); return }
-    if (!startAt) { setErr('start time is required'); return }
+    if (!cleanTitle) { setErr(tLabel('event.titleRequired', "title is required")); return }
+    if (kind === 'agent_task' && !assigneeId) { setErr(tLabel('event.assigneeRequired', "pick an assignee for the agent task")); return }
+    if (!startAt) { setErr(tLabel('event.startTimeRequired', "start time is required")); return }
 
     const recurrence: RecurrenceRule | null = recurEnabled
       ? {
@@ -172,7 +190,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
 
   const onDelete = async () => {
     if (!event) return
-    if (!confirm(`Delete "${event.title}"? This wipes its dispatch history too.`)) return
+    if (!confirm(tLabel('event.deleteConfirm', `Delete "${event.title}"? This wipes its dispatch history too.`, { title: event.title }))) return
     setBusy(true)
     try {
       await remove(event.id)
@@ -190,7 +208,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
     try {
       const r = await runNow(event.id)
       if (r.status === 'dispatched') onClose()
-      else setErr(`run-now: ${r.status}${r.error ? ` — ${r.error}` : ''}`)
+      else setErr(tLabel('event.runNowError', `run-now: ${r.status}${r.error ? ` — ${r.error}` : ''}`, { status: r.status, error: r.error ? tLabel('event.runNowErrorSep', ' — ') + r.error : '' }))
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
@@ -213,28 +231,26 @@ export function EventEditor({ event, prefill, onClose }: Props) {
       >
         <div className="px-6 py-5 border-b border-ink-100 shrink-0">
           <h2 className="font-display font-medium text-[20px] tracking-tight">
-            {isEdit ? 'Edit event' : 'New event'}
+            {isEdit ? tLabel('event.editEvent', "Edit event") : tLabel('event.newEvent', "New event")}
           </h2>
           <div className="text-[12.5px] text-ink-500 italic font-display mt-0.5">
-            {kind === 'agent_task'
-              ? 'Pick an agent and a time. When it fires, your prompt lands in the conversation and wakes them.'
-              : 'A personal time marker — no agent gets pinged.'}
+            {kind === 'agent_task' ? tLabel('event.subtitleAgentTask', "Pick an agent and a time. When it fires, your prompt lands in the conversation and wakes them.") : tLabel('event.subtitlePersonal', "A personal time marker — no agent gets pinged.")}
           </div>
         </div>
 
         <div className="px-6 py-5 overflow-y-auto overflow-x-hidden flex-1 min-h-0 space-y-5">
-          <Field label="Title">
+          <Field label={tLabel('event.titleLabel', "Title")}>
             <Input
               type="text"
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="e.g. Daily standup digest"
+              placeholder={tLabel('event.titlePh', "e.g. Daily standup digest")}
               autoFocus
               maxLength={200}
             />
           </Field>
 
-          <Field label="Kind" hint="Agent task fires a prompt; personal is just a time marker.">
+          <Field label={tLabel('event.kindLabel', "Kind")} hint={tLabel('event.kindHint', "Agent task fires a prompt; personal is just a time marker.")}>
             <div className="flex gap-2">
               {(['agent_task', 'personal'] as const).map((k) => (
                 <button
@@ -247,35 +263,32 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                     color: kind === k ? 'white' : 'var(--ink-700)',
                     border: '1.5px solid ' + (kind === k ? 'var(--skype)' : 'var(--ink-100)'),
                   }}
-                >{k === 'agent_task' ? 'Agent task' : 'Personal'}</button>
+                >{k === 'agent_task' ? tLabel('event.kindAgentTask', "Agent task") : tLabel('event.kindPersonal', "Personal")}</button>
               ))}
             </div>
           </Field>
 
-          <Field label="When">
+          <Field label={tLabel('event.whenLabel', "When")}>
             <label className="flex items-center gap-2 text-[13px] text-ink-700 mb-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={allDay}
                 onChange={(e) => setAllDay(e.target.checked)}
               />
-              All-day
+              {tLabel('event.allDay', "All-day")}
             </label>
             <div className="grid grid-cols-2 gap-2">
               <div>
-                <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-1">Starts</div>
+                <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-1">{tLabel('event.startsLabel', "Starts")}</div>
                 <DateTimePicker
                   mode={allDay ? 'date' : 'datetime'}
                   value={startAt}
-                  // All-day saves T00:00; otherwise the picker emits its
-                  // normal HH:mm. We round-trip through the same value
-                  // shape regardless of mode so the submit logic stays put.
                   onChange={(v) => setStartAt(allDay ? `${v.slice(0, 10)}T00:00` : v)}
                 />
               </div>
               <div>
                 <div className="text-[10px] uppercase tracking-wider text-ink-400 mb-1">
-                  Ends <span className="normal-case text-ink-300">— optional</span>
+                  {tLabel('event.endsLabel', "Ends")} <span className="normal-case text-ink-300">{tLabel('event.endsOptional', "— optional")}</span>
                 </div>
                 <DateTimePicker
                   mode={allDay ? 'date' : 'datetime'}
@@ -291,19 +304,19 @@ export function EventEditor({ event, prefill, onClose }: Props) {
             </div>
           </Field>
 
-          <Field label="Repeat" hint="Leave off for a one-shot event.">
+          <Field label={tLabel('event.repeatLabel', "Repeat")} hint={tLabel('event.repeatHint', "Leave off for a one-shot event.")}>
             <label className="flex items-center gap-2 text-[13px] text-ink-700 mb-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={recurEnabled}
                 onChange={(e) => setRecurEnabled(e.target.checked)}
               />
-              Recurring
+              {tLabel('event.recurring', "Recurring")}
             </label>
             {recurEnabled && (
               <div className="space-y-2 pl-1">
                 <div className="flex items-center gap-2">
-                  <span className="text-[12.5px] text-ink-500">every</span>
+                  <span className="text-[12.5px] text-ink-500">{tLabel('event.everyLabel', "every")}</span>
                   <Input
                     type="number"
                     min={1}
@@ -317,10 +330,10 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                     className="ev-input"
                     style={{ width: 'auto' }}
                   >
-                    <option value="daily">day{recur.interval > 1 ? 's' : ''}</option>
-                    <option value="weekly">week{recur.interval > 1 ? 's' : ''}</option>
-                    <option value="monthly">month{recur.interval > 1 ? 's' : ''}</option>
-                    <option value="yearly">year{recur.interval > 1 ? 's' : ''}</option>
+                    <option value="daily">{`day${recur.interval > 1 ? 's' : ''}`}</option>
+                    <option value="weekly">{`week${recur.interval > 1 ? 's' : ''}`}</option>
+                    <option value="monthly">{`month${recur.interval > 1 ? 's' : ''}`}</option>
+                    <option value="yearly">{`year${recur.interval > 1 ? 's' : ''}`}</option>
                   </select>
                 </div>
                 {recur.freq === 'weekly' && (
@@ -343,20 +356,20 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                             color: on ? 'white' : 'var(--ink-600)',
                             border: '1.5px solid ' + (on ? 'var(--skype)' : 'var(--ink-100)'),
                           }}
-                        >{label}</button>
+                        >{tLabel(WEEKDAY_LABEL_KEY[idx], label)}</button>
                       )
                     })}
                   </div>
                 )}
                 <div className="flex items-center gap-3 flex-wrap">
                   <div className="text-[11.5px] text-ink-500 flex items-center gap-1.5">
-                    <span>until</span>
+                    <span>{tLabel('event.untilLabel', "until")}</span>
                     <div style={{ width: 180 }}>
                       <DateTimePicker
                         mode="date"
                         value={recur.until ? `${recur.until.slice(0, 10)}T00:00` : ''}
                         allowClear
-                        placeholder="never"
+                        placeholder={tLabel('event.neverPh', "never")}
                         onChange={(v) => setRecur({
                           ...recur,
                           until: v ? new Date(`${v.slice(0, 10)}T00:00:00`).toISOString() : null,
@@ -365,30 +378,30 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                     </div>
                   </div>
                   <label className="text-[11.5px] text-ink-500 flex items-center gap-1.5">
-                    or max
+                    {tLabel('event.orMaxLabel', "or max")}
                     <Input
                       type="number"
                       min={1}
-                      placeholder="∞"
+                      placeholder={tLabel('event.infinitePh', "∞")}
                       value={recur.count ?? ''}
                       onChange={(e) => setRecur({ ...recur, count: e.target.value ? Math.max(1, Number(e.target.value)) : null })}
                       style={{ width: 80 }}
                     />
-                    times
+                    {tLabel('event.timesLabel', "times")}
                   </label>
                 </div>
               </div>
             )}
           </Field>
 
-          <Field label="Reminder" hint="Heads-up to you (and any human assignee) before each occurrence.">
+          <Field label={tLabel('event.reminderLabel', "Reminder")} hint={tLabel('event.reminderHint', "Heads-up to you (and any human assignee) before each occurrence.")}>
             <label className="flex items-center gap-2 text-[13px] text-ink-700 mb-2 cursor-pointer">
               <input
                 type="checkbox"
                 checked={reminderEnabled}
                 onChange={(e) => setReminderEnabled(e.target.checked)}
               />
-              Remind me before
+              {tLabel('event.remindMeBefore', "Remind me before")}
             </label>
             {reminderEnabled && (
               <div className="space-y-2 pl-1">
@@ -412,7 +425,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                       )
                     })}
                   </div>
-                  <span className="text-[11.5px] text-ink-400">or</span>
+                  <span className="text-[11.5px] text-ink-400">{tLabel('event.orLabel', "or")}</span>
                   <Input
                     type="number"
                     min={0}
@@ -420,7 +433,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                     onChange={(e) => setReminderMinutes(Math.max(0, Number(e.target.value) || 0))}
                     style={{ width: 80 }}
                   />
-                  <span className="text-[11.5px] text-ink-500">minutes before</span>
+                  <span className="text-[11.5px] text-ink-500">{tLabel('event.minutesBefore', "minutes before")}</span>
                 </div>
                 <div className="flex gap-1.5">
                   {(['toast', 'email', 'both'] as const).map((ch) => {
@@ -436,7 +449,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                           color: on ? 'white' : 'var(--ink-700)',
                           border: '1.5px solid ' + (on ? 'var(--skype)' : 'var(--ink-100)'),
                         }}
-                      >{ch === 'toast' ? 'Toast' : ch === 'email' ? 'Email' : 'Both'}</button>
+                      >{ch === 'toast' ? tLabel('event.remChannelToast', "Toast") : ch === 'email' ? tLabel('event.remChannelEmail', "Email") : tLabel('event.remChannelBoth', "Both")}</button>
                     )
                   })}
                 </div>
@@ -446,7 +459,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
 
           {kind === 'agent_task' && (
             <>
-              <Field label="Assign to" hint="The agent (or human) who'll receive the dispatch.">
+              <Field label={tLabel('event.assignToLabel', "Assign to")} hint={tLabel('event.assignToHint', "The agent (or human) who'll receive the dispatch.")}>
                 <div className="grid grid-cols-1 gap-1 max-h-[200px] overflow-auto pr-1">
                   {candidates.map((p) => {
                     const on = assigneeId === p.id
@@ -465,7 +478,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                         <div className="flex-1 min-w-0">
                           <div className="text-[13px] font-semibold text-ink-900 truncate">{p.name}</div>
                           <div className="text-[11px] text-ink-500 truncate">
-                            {p.role || (p.kind === 'human' ? 'human' : 'agent')}
+                            {p.role || (p.kind === 'human' ? tLabel('common.human', "human") : tLabel('common.agent', "agent"))}
                           </div>
                         </div>
                         {on && (
@@ -476,30 +489,30 @@ export function EventEditor({ event, prefill, onClose }: Props) {
                   })}
                   {candidates.length === 0 && (
                     <div className="text-[12.5px] text-ink-500 italic font-display py-4 text-center">
-                      No teammates available — add an agent first.
+                      {tLabel('event.noTeammates', "No teammates available — add an agent first.")}
                     </div>
                   )}
                 </div>
               </Field>
 
-              <Field label="Post in" hint="Where the dispatch message lands when it fires. Leave blank to use your DM with the assignee.">
+              <Field label={tLabel('event.postInLabel', "Post in")} hint={tLabel('event.postInHint', "Where the dispatch message lands when it fires. Leave blank to use your DM with the assignee.")}>
                 <select
                   value={targetConversationId ?? ''}
                   onChange={(e) => setTargetConversationId(e.target.value || null)}
                   className="ev-input"
                 >
-                  <option value="">— Direct message with assignee —</option>
+                  <option value="">{tLabel('event.dmAssignee', "— Direct message with assignee —")}</option>
                   {targetConvos.map((c) => (
                     <option key={c.id} value={c.id}>{c.title}</option>
                   ))}
                 </select>
               </Field>
 
-              <Field label="Prompt" hint="What the agent should do each time. Plain text — agents see it as a system message.">
+              <Field label={tLabel('event.promptLabel', "Prompt")} hint={tLabel('event.promptHint', "What the agent should do each time. Plain text — agents see it as a system message.")}>
                 <TextArea
                   value={agentPrompt}
                   onChange={(e) => setAgentPrompt(e.target.value)}
-                  placeholder="e.g. Summarize the past 24h of conversation activity and post the digest here."
+                  placeholder={tLabel('event.promptPh', "e.g. Summarize the past 24h of conversation activity and post the digest here.")}
                   rows={4}
                   maxLength={8000}
                 />
@@ -507,22 +520,22 @@ export function EventEditor({ event, prefill, onClose }: Props) {
             </>
           )}
 
-          <Field label="Privacy" hint="Private events only show up for the creator and the assignee. The workspace owner can still see private events that involve an agent, for supervision. Default: shared with everyone in the workspace.">
+          <Field label={tLabel('event.privacyLabel', "Privacy")} hint={tLabel('event.privacyHint', "Private events only show up for the creator and the assignee. The workspace owner can still see private events that involve an agent, for supervision. Default: shared with everyone in the workspace.")}>
             <label className="flex items-center gap-2 text-[13px] text-ink-700 cursor-pointer">
               <input
                 type="checkbox"
                 checked={isPrivate}
                 onChange={(e) => setIsPrivate(e.target.checked)}
               />
-              <span>🔒 Private — hide from the shared calendar</span>
+              <span>{tLabel('event.privateHideShared', "🔒 Private — hide from the shared calendar")}</span>
             </label>
           </Field>
 
-          <Field label="Notes" hint="Optional context — shown alongside the prompt on dispatch.">
+          <Field label={tLabel('event.notesLabel', "Notes")} hint={tLabel('event.notesHint', "Optional context — shown alongside the prompt on dispatch.")}>
             <TextArea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Anything else worth knowing…"
+              placeholder={tLabel('event.notesPh', "Anything else worth knowing?")}
               rows={2}
               maxLength={4000}
             />
@@ -540,7 +553,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
               disabled={busy}
               className="px-3 py-2 rounded-[9px] text-[12.5px] font-semibold text-coral-deep bg-cloud hover:bg-coral-soft transition"
               style={{ border: '1px solid var(--ink-100)' }}
-            >Delete</button>
+            >{tLabel('common.delete', "Delete")}</button>
           )}
           {isEdit && event!.kind === 'agent_task' && event!.status === 'active' && (
             <button
@@ -548,8 +561,8 @@ export function EventEditor({ event, prefill, onClose }: Props) {
               disabled={busy}
               className="px-3 py-2 rounded-[9px] text-[12.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-100 transition"
               style={{ border: '1px solid var(--ink-100)' }}
-              title="Fire this event right now, without waiting for its next scheduled time"
-            >Run now</button>
+              title={tLabel('event.runNowTitle', "Fire this event right now, without waiting for its next scheduled time")}
+            >{tLabel('event.runNow', "Run now")}</button>
           )}
           <div className="flex-1" />
           <button
@@ -557,7 +570,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
             disabled={busy}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >Cancel</button>
+          >{tLabel('common.cancel', "Cancel")}</button>
           <button
             onClick={submit}
             disabled={busy}
@@ -566,7 +579,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
               background: 'var(--skype)',
               boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)',
             }}
-          >{busy ? 'Saving…' : isEdit ? 'Save' : 'Schedule'}</button>
+          >{busy ? tLabel('event.saving', "Saving…") : isEdit ? tLabel('common.save', "Save") : tLabel('event.schedule', "Schedule")}</button>
         </div>
       </div>
 

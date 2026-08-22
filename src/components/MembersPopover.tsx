@@ -8,6 +8,7 @@ import { Avatar } from './Avatar'
 import { HumanBadge } from './HumanBadge'
 import { useApp } from '@/stores/app'
 import { useMe } from '@/stores/auth'
+import { useT } from '@/lib/i18n'
 import type { Participant } from '@/types'
 
 const STATUS_LABEL: Record<string, string> = {
@@ -27,6 +28,7 @@ interface Props {
 }
 
 export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) {
+  const t = useT()
   const ref = useRef<HTMLDivElement>(null)
   const openInfo = useApp((s) => s.openAgentInfo)
   const meId = useMe()
@@ -74,7 +76,7 @@ export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) 
     <div
       ref={ref}
       role="dialog"
-      aria-label="Conversation members"
+      aria-label={t('members.ariaLabel')}
       className="fixed z-[60] w-[280px] py-1 rounded-[12px] bg-cloud animate-rise"
       style={{
         left: anchor.right - 280,
@@ -83,7 +85,7 @@ export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) 
       }}
     >
       <div className="px-3 pt-2 pb-1.5 text-[10.5px] font-bold tracking-[0.12em] uppercase text-ink-300">
-        {members.length} {members.length === 1 ? 'member' : 'members'}
+        {members.length === 1 ? t('members.countOne', { n: members.length }) : t('members.countOther', { n: members.length })}
       </div>
       <div className="max-h-[400px] overflow-y-auto py-0.5">
         {sorted.map((p) => {
@@ -102,7 +104,7 @@ export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) 
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-1.5">
                   <span className="text-[13px] font-semibold text-ink-900 truncate">{p.name}</span>
-                  {isYou && <span className="text-[9.5px] font-bold py-px px-1.5 rounded uppercase tracking-wider bg-sky2-100 text-skype-deep">you</span>}
+                  {isYou && <span className="text-[9.5px] font-bold py-px px-1.5 rounded uppercase tracking-wider bg-sky2-100 text-skype-deep">{t('members.youBadge')}</span>}
                   {!isYou && p.kind === 'human' && <HumanBadge />}
                 </div>
                 <div className="text-[11.5px] text-ink-500 truncate flex items-center gap-1.5">

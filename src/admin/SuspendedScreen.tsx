@@ -14,6 +14,7 @@
  * the next time they try to sign in.
  */
 import { useState } from 'react'
+import { useT } from '@/lib/i18n'
 
 interface CarriedSuspension { email: string | null; reason: string | null }
 
@@ -29,6 +30,7 @@ export function consumeSuspendedFragment(): CarriedSuspension | null {
 }
 
 export function SuspendedScreen({ email, reason }: { email: string | null; reason: string | null }) {
+  const t = useT()
   const [dismissed, setDismissed] = useState(false)
   if (dismissed) {
     // Falling out of the screen reloads → AuthGate decides what to render
@@ -37,27 +39,39 @@ export function SuspendedScreen({ email, reason }: { email: string | null; reaso
     location.reload()
     return null
   }
+  const displayEmail = email ?? t('waitlist.suspendedEmailFallback')
   return (
     <div className="cumora-waitlist-screen">
       <div className="cumora-waitlist-card">
         <div className="cumora-waitlist-emoji" aria-hidden>🔒</div>
-        <div className="cumora-waitlist-title">Your account is suspended</div>
+        <div className="cumora-waitlist-title">{t('waitlist.suspendedTitle')}</div>
         <div className="cumora-waitlist-sub" style={{ marginBottom: reason ? 16 : 24 }}>
-          Access for <span className="cumora-waitlist-email">{email ?? 'your account'}</span> has been
-          temporarily disabled by a Cumora administrator.
+          {(() => {
+            // Split the translated body around the {email} placeholder so
+            // we can wrap the rendered address in a styled <b> without
+            // resorting to dangerouslySetInnerHTML.
+            const rendered = t('waitlist.suspendedBody', { email: displayEmail })
+            const parts = rendered.split(displayEmail)
+            return (
+              <>
+                {parts[0]}
+                <b className="cumora-waitlist-email">{displayEmail}</b>
+                {parts.slice(1).join(displayEmail)}
+              </>
+            )
+          })()}
         </div>
         {reason ? (
           <div className="cumora-suspended-reason" role="note">
-            <div className="cumora-suspended-reason-label">Reason from the admin</div>
+            <div className="cumora-suspended-reason-label">{t('waitlist.suspendedReasonLabel')}</div>
             <div className="cumora-suspended-reason-body">{reason}</div>
           </div>
         ) : null}
         <div className="cumora-waitlist-sub" style={{ marginTop: 16, marginBottom: 24 }}>
-          If you think this is a mistake, reply to your most recent message from us, or
-          reach out to your workspace owner.
+          {t('waitlist.suspendedFooter')}
         </div>
         <button className="btn-ghost" onClick={() => setDismissed(true)}>
-          Done
+          {t('waitlist.suspendedDone')}
         </button>
       </div>
     </div>

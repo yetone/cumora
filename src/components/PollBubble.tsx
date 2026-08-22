@@ -3,6 +3,7 @@ import type { Message, PollTally } from '@/types'
 import { api } from '@/api/client'
 import { useParticipants } from '@/stores/participants'
 import { useMe } from '@/stores/auth'
+import { useT } from '@/lib/i18n'
 import { Avatar } from './Avatar'
 import { cn } from '@/lib/utils'
 
@@ -38,6 +39,7 @@ function timeRemaining(iso: string | null): string | null {
 }
 
 export function PollBubble({ msg }: Props) {
+  const t = useT()
   const meId = useMe()
   const byId = useParticipants((s) => s.byId)
   const poll = msg.poll
@@ -93,7 +95,7 @@ export function PollBubble({ msg }: Props) {
       // overlay so we render from the canonical tallies.
       setPendingPicks(null)
     } catch (e) {
-      setErrorMsg(e instanceof Error ? e.message : 'vote failed')
+      setErrorMsg(e instanceof Error ? e.message : t('pollBubble.voteFailed'))
     } finally {
       setSubmitting(false)
     }
@@ -145,16 +147,16 @@ export function PollBubble({ msg }: Props) {
             <rect x="17" y="14" width="4" height="6" rx="1" />
           </svg>
         </span>
-        <span className="font-semibold text-ink-700">Poll</span>
+        <span className="font-semibold text-ink-700">{t('pollBubble.pollLabel')}</span>
         <span className="text-ink-300">·</span>
         <span>{author?.name ?? msg.authorId}</span>
         {poll.mode === 'multi' && (
-          <span className="ml-1 px-1.5 py-0.5 rounded-full bg-ink-50 text-ink-500 text-[10px] tracking-wide uppercase">multi</span>
+          <span className="ml-1 px-1.5 py-0.5 rounded-full bg-ink-50 text-ink-500 text-[10px] tracking-wide uppercase">{t('pollBubble.multi')}</span>
         )}
         <span className="ml-auto text-ink-400 tabular-nums">
           {isClosed
-            ? (poll.closedReason === 'expired' ? 'expired' : 'closed')
-            : (remaining ? `${remaining} left` : 'open')}
+            ? (poll.closedReason === 'expired' ? t('pollBubble.expired') : t('pollBubble.closed'))
+            : (remaining ? t('pollBubble.leftSfx', { n: remaining }) : t('pollBubble.open'))}
         </span>
       </div>
 
@@ -229,7 +231,7 @@ export function PollBubble({ msg }: Props) {
               <span className="relative z-[1] flex-1 min-w-0 text-[13.5px] text-ink-800 truncate">
                 {opt.text}
                 {isWinner && (
-                  <span className="ml-1.5 text-[11px] text-skype-deep" title="winning option">★</span>
+                  <span className="ml-1.5 text-[11px] text-skype-deep" title={t('pollBubble.winningTitle')}>★</span>
                 )}
               </span>
               <span className="relative z-[1] flex items-center gap-1.5 text-[11.5px] tabular-nums text-ink-500">
@@ -245,12 +247,12 @@ export function PollBubble({ msg }: Props) {
       {/* Footer / multi-choice submit */}
       <div className="px-3.5 pb-3 pt-1 flex items-center gap-2 text-[11.5px] text-ink-500 min-h-[28px]">
         <span className="tabular-nums">
-          {totalVotes === 0 ? 'no votes yet' : `${totalVotes} ${totalVotes === 1 ? 'vote' : 'votes'}`}
+          {totalVotes === 0 ? t('pollBubble.noVotes') : (totalVotes === 1 ? t('pollBubble.nVotesOne', { n: totalVotes }) : t('pollBubble.nVotesOther', { n: totalVotes }))}
         </span>
         {!isClosed && myCurrentVotes.size > 0 && (
           <>
             <span className="text-ink-300">·</span>
-            <span>you voted</span>
+            <span>{t('pollBubble.youVoted')}</span>
           </>
         )}
         {errorMsg && (
@@ -264,7 +266,7 @@ export function PollBubble({ msg }: Props) {
               disabled={submitting}
               className="px-2 py-0.5 rounded-full text-ink-500 hover:bg-ink-50 transition"
             >
-              reset
+              {t('pollBubble.reset')}
             </button>
             <button
               type="button"
@@ -272,7 +274,7 @@ export function PollBubble({ msg }: Props) {
               disabled={submitting}
               className="px-2.5 py-0.5 rounded-full bg-skype-deep text-white font-semibold tracking-wide hover:brightness-105 transition disabled:opacity-50"
             >
-              {submitting ? 'saving…' : 'submit'}
+              {submitting ? t('pollBubble.saving') : t('pollBubble.submit')}
             </button>
           </span>
         )}

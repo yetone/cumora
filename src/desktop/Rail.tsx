@@ -9,20 +9,25 @@ import { Avatar } from '@/components/Avatar'
 import { IChat, IWhisper, IAgent, IAgents, IBoard, IDoc, ICalendar, IObserve, IExit, IShip } from '@/components/icons'
 import { api } from '@/api/client'
 import { cn } from '@/lib/utils'
+import { useT, type MessageKey } from '@/lib/i18n'
 import type { Participant, ViewKey } from '@/types'
 
-const baseItems: Array<{ key: ViewKey['view']; Icon: typeof IChat; label: string }> = [
-  { key: 'conversations', Icon: IChat, label: 'Conversations' },
-  { key: 'whispers', Icon: IWhisper, label: 'Whispers' },
-  { key: 'shipping', Icon: IShip, label: 'Ship' },
-  { key: 'boards', Icon: IBoard, label: 'Boards' },
-  { key: 'calendar', Icon: ICalendar, label: 'Calendar' },
-  { key: 'documents', Icon: IDoc, label: 'Docs' },
-  { key: 'agents', Icon: IAgent, label: 'Agents' },
-  { key: 'me', Icon: IAgents, label: 'Me' },
+// `label` is a message key rather than the string itself — the array is
+// module scope, so it can't call a translator that re-renders on a
+// locale switch. Resolution happens at render.
+const baseItems: Array<{ key: ViewKey['view']; Icon: typeof IChat; label: MessageKey }> = [
+  { key: 'conversations', Icon: IChat, label: 'nav.conversations' },
+  { key: 'whispers', Icon: IWhisper, label: 'nav.whispers' },
+  { key: 'shipping', Icon: IShip, label: 'nav.ship' },
+  { key: 'boards', Icon: IBoard, label: 'nav.boards' },
+  { key: 'calendar', Icon: ICalendar, label: 'nav.calendar' },
+  { key: 'documents', Icon: IDoc, label: 'nav.docs' },
+  { key: 'agents', Icon: IAgent, label: 'nav.agents' },
+  { key: 'me', Icon: IAgents, label: 'nav.me' },
 ]
 
 export function Rail() {
+  const t = useT()
   const view = useApp((s) => s.view)
   const setView = useApp((s) => s.setView)
   const devtoolsEnabled = useDevtools((s) => s.enabled)
@@ -45,7 +50,7 @@ export function Rail() {
   const assembled = devtoolsEnabled
     ? [
         ...baseItems.slice(0, 3),
-        { key: 'observability' as const, Icon: IObserve, label: 'Observe' },
+        { key: 'observability' as const, Icon: IObserve, label: 'nav.observe' as MessageKey },
         ...baseItems.slice(3),
       ]
     : baseItems
@@ -62,7 +67,7 @@ export function Rail() {
   const fallback: Participant = {
     id: authUser?.id ?? 'me',
     kind: 'human',
-    name: authUser?.name ?? 'You',
+    name: authUser?.name ?? t('common.you'),
     initial: (authUser?.name ?? 'Y').charAt(0).toUpperCase(),
     avatarBg: 'linear-gradient(135deg, #FF7A6B, #F4B740)',
     status: 'avail',
@@ -77,7 +82,7 @@ export function Rail() {
       <button
         className="mb-3.5 relative"
         onClick={() => setView('me')}
-        title={daemonOutdated ? 'A computer daemon needs updating — open You' : (authUser?.name ?? 'You')}
+        title={daemonOutdated ? t('common.daemonOutdatedTip') : (authUser?.name ?? t('common.you'))}
       >
         <Avatar p={meAvatar} size={44} ringColor="var(--cloud)" />
         {daemonOutdated && (
@@ -95,8 +100,8 @@ export function Rail() {
           <button
             key={key}
             onClick={() => setView(key)}
-            title={label}
-            aria-label={label}
+            title={t(label)}
+            aria-label={t(label)}
             className={cn(
               'w-11 h-11 rounded-xl grid place-items-center transition relative',
               active ? 'bg-cloud text-skype-deep shadow-soft' : 'text-ink-500 hover:bg-cloud hover:text-skype-deep',
@@ -127,8 +132,8 @@ export function Rail() {
           location.reload()
         }}
         className="w-11 h-11 rounded-xl grid place-items-center text-ink-400 hover:bg-cloud hover:text-coral-deep transition-colors"
-        title="Sign out"
-        aria-label="Sign out"
+        title={t('common.signOut')}
+        aria-label={t('common.signOut')}
       >
         <IExit className="w-[22px] h-[22px]" />
       </button>

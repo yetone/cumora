@@ -3,6 +3,8 @@
  * offset terms (0-based). Renders first/last + a window around the current
  * page with ellipses, plus Prev/Next. Hidden when there's only one page.
  */
+import { useT } from '@/lib/i18n'
+
 export function Pager({ total, pageSize, offset, loading, onPage }: {
   total: number
   pageSize: number
@@ -11,6 +13,7 @@ export function Pager({ total, pageSize, offset, loading, onPage }: {
   /** called with the new offset to load */
   onPage: (offset: number) => void
 }) {
+  const t = useT()
   const pages = Math.max(1, Math.ceil(total / pageSize))
   if (pages <= 1) return null
   const current = Math.floor(offset / pageSize)
@@ -36,9 +39,9 @@ export function Pager({ total, pageSize, offset, loading, onPage }: {
 
   return (
     <div className="admin-pager">
-      <span>{offset + 1}–{Math.min(offset + pageSize, total)} of {total}</span>
+      <span>{t('adminPager.range', { from: offset + 1, to: Math.min(offset + pageSize, total), total })}</span>
       <div className="admin-pager-btns">
-        <button className="btn-ghost" disabled={current === 0 || loading} onClick={() => go(current - 1)}>Prev</button>
+        <button className="btn-ghost" disabled={current === 0 || loading} onClick={() => go(current - 1)}>{t('adminPager.prev')}</button>
         {cells.map((c, i) => c === 'gap'
           ? <span key={`gap-${i}`} className="admin-pager-ellipsis">…</span>
           : (
@@ -52,7 +55,7 @@ export function Pager({ total, pageSize, offset, loading, onPage }: {
               {c + 1}
             </button>
           ))}
-        <button className="btn-ghost" disabled={current >= pages - 1 || loading} onClick={() => go(current + 1)}>Next</button>
+        <button className="btn-ghost" disabled={current >= pages - 1 || loading} onClick={() => go(current + 1)}>{t('adminPager.next')}</button>
       </div>
     </div>
   )

@@ -7,14 +7,25 @@ import { useConversations } from '@/stores/conversations'
 import { IPlus } from '@/components/icons'
 import { AgentEditor } from '@/components/AgentEditor'
 import { HumanBadge } from '@/components/HumanBadge'
+import { type MessageKey, useTLabel } from '@/lib/i18n'
 import type { Participant } from '@/types'
 
+// statusLabels kept as the source of truth (English fallback), so the
+// author's copy edits stay in sync. The parallel statusLabelsKey gives t()
+// a MessageKey to resolve without changing the data shape.
 const statusLabels: Record<string, string> = {
   avail: 'Available',
   working: 'Working',
   thinking: 'Thinking',
   waiting: 'Waiting on you',
   resting: 'Resting',
+}
+const statusLabelsKey: Record<string, MessageKey> = {
+  avail: 'magents.statusAvail',
+  working: 'magents.statusWorking',
+  thinking: 'magents.statusThinking',
+  waiting: 'magents.statusWaiting',
+  resting: 'magents.statusResting',
 }
 
 const statusColors: Record<string, string> = {
@@ -26,6 +37,9 @@ const statusColors: Record<string, string> = {
 }
 
 export function MobileAgents() {
+  // Non-invasive i18n: prefer translated MessageKey, fall back to the
+  // author's original English literal so future copy edits stay in sync.
+  const tLabel = useTLabel()
   const byId = useParticipants((s) => s.byId)
   const convoList = useConversations((s) => s.list)
   const setView = useApp((s) => s.setView)
@@ -63,10 +77,10 @@ export function MobileAgents() {
         style={{ paddingTop: 'max(env(safe-area-inset-top), 12px)', background: 'rgba(250, 252, 254, 0.95)' }}>
         <div className="px-4 pt-2 pb-3">
           <h1 className="font-display font-medium text-[26px] tracking-tight text-ink-900 leading-none">
-            Your team <em className="not-italic text-skype-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>of {agents.length}</em>
+            {tLabel('magents.titleLead', 'Your team')} <em className="not-italic text-skype-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>{tLabel('magents.titleCount', `of ${agents.length}`, { n: agents.length })}</em>
           </h1>
           <div className="text-[12.5px] text-ink-500 mt-0.5 font-display italic">
-            agents work on their own, loop you in when needed
+            {tLabel('magents.subtitle', 'agents work on their own, loop you in when needed')}
           </div>
         </div>
       </div>
@@ -89,7 +103,7 @@ export function MobileAgents() {
         <div className="space-y-2.5">
           {agents.length === 0 && (
             <div className="text-center text-ink-300 italic font-display py-12 text-[13px]">
-              No agents in this workspace yet. Hire one below.
+              {tLabel('magents.empty', 'No agents in this workspace yet. Hire one below.')}
             </div>
           )}
           {agents.map((p) => (
@@ -110,7 +124,7 @@ export function MobileAgents() {
                   <div className="inline-flex items-center gap-1.5 text-[10.5px] font-semibold py-0.5 px-2 rounded-full"
                     style={{ background: `${statusColors[p.status]}1F`, color: statusColors[p.status] }}>
                     <span className="w-1.5 h-1.5 rounded-full" style={{ background: statusColors[p.status] }} />
-                    {statusLabels[p.status]}
+                    {statusLabels[p.status] ? tLabel(statusLabelsKey[p.status], statusLabels[p.status]) : ''}
                   </div>
                 </div>
               </div>
@@ -137,8 +151,8 @@ export function MobileAgents() {
               <IPlus className="w-5 h-5" strokeWidth={2} />
             </div>
             <div className="text-left">
-              <div className="font-display font-medium text-[15px] text-ink-900" style={{ letterSpacing: '-0.01em' }}>Hire an agent</div>
-              <div className="font-display italic text-[11.5px] text-ink-500">design a new teammate</div>
+              <div className="font-display font-medium text-[15px] text-ink-900" style={{ letterSpacing: '-0.01em' }}>{tLabel('magents.hireTitle', 'Hire an agent')}</div>
+              <div className="font-display italic text-[11.5px] text-ink-500">{tLabel('magents.hireSub', 'design a new teammate')}</div>
             </div>
           </button>
         </div>
@@ -149,7 +163,7 @@ export function MobileAgents() {
 
         {humans.length > 0 && (
           <>
-            <div className="px-2 pt-6 pb-2 text-[10px] font-bold text-ink-300 tracking-[0.12em] uppercase">Human teammates</div>
+            <div className="px-2 pt-6 pb-2 text-[10px] font-bold text-ink-300 tracking-[0.12em] uppercase">{tLabel('magents.humansHead', 'Human teammates')}</div>
             <div className="space-y-2">
               {humans.map((p) => (
                 <div key={p.id} className="bg-cloud rounded-[12px] p-3.5 flex items-center gap-3"
@@ -157,7 +171,7 @@ export function MobileAgents() {
                   <Avatar p={p} size={36} />
                   <div className="flex-1 min-w-0">
                     <div className="font-bold text-[14px] text-ink-900 leading-tight">{p.name}</div>
-                    <div className="text-[11px] text-ink-500 mt-0.5">{statusLabels[p.status]}</div>
+                    <div className="text-[11px] text-ink-500 mt-0.5">{statusLabels[p.status] ? tLabel(statusLabelsKey[p.status], statusLabels[p.status]) : ''}</div>
                   </div>
                   <HumanBadge />
                 </div>

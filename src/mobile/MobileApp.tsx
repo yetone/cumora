@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from 'react'
 import { AnimatePresence, motion, useTransform, type MotionValue } from 'framer-motion'
 import { useApp } from '@/stores/app'
+import { useT } from '@/lib/i18n'
 import { MobileChatList } from './MobileChatList'
 import { MobileChat, MobileChatInfo } from './MobileChat'
 import { MobileTabBar } from './MobileTabBar'
@@ -38,6 +39,7 @@ const slideTransition = { type: 'spring' as const, stiffness: 320, damping: 38, 
 const fadeTransition = { duration: 0.14, ease: [0.4, 0, 0.2, 1] as const }
 
 function MobileDocumentPeek({ documentId, onClose }: { documentId: string; onClose: () => void }) {
+  const t = useT()
   const loaded = useDocuments((s) => s.loaded)
   const load = useDocuments((s) => s.load)
   const doc = useDocuments((s) => s.list.find((d) => d.id === documentId) ?? null)
@@ -53,7 +55,7 @@ function MobileDocumentPeek({ documentId, onClose }: { documentId: string; onClo
           <div className="w-12 h-12 rounded-[12px] grid place-items-center bg-sky2-50 text-skype-deep">
             <IDoc className="w-5 h-5" />
           </div>
-          <div className="text-[12.5px] font-display italic">Opening document…</div>
+          <div className="text-[12.5px] font-display italic">{t('mapp.openingDoc')}</div>
         </div>
       </div>
     )
@@ -66,16 +68,16 @@ function MobileDocumentPeek({ documentId, onClose }: { documentId: string; onClo
           <div className="mx-auto w-12 h-12 rounded-[12px] grid place-items-center bg-coral-soft/45 text-coral-deep">
             <IDoc className="w-5 h-5" />
           </div>
-          <div className="mt-3 text-[14px] font-semibold text-ink-900">Document unavailable</div>
+          <div className="mt-3 text-[14px] font-semibold text-ink-900">{t('mapp.docUnavailable')}</div>
           <div className="mt-1 text-[12px] text-ink-500 leading-relaxed">
-            This artifact may have been deleted or moved out of this workspace.
+            {t('mapp.docUnavailableBody')}
           </div>
           <button
             type="button"
             onClick={onClose}
             className="mt-4 h-8 px-3 rounded-[8px] text-[12px] font-semibold text-ink-600 border border-ink-100 hover:bg-sky2-50 transition"
           >
-            Close
+            {t('mapp.docUnavailableClose')}
           </button>
         </div>
       </div>
@@ -92,6 +94,7 @@ function MobileDocumentPeek({ documentId, onClose }: { documentId: string; onClo
 }
 
 export function MobileApp() {
+  const t = useT()
   const view = useApp((s) => s.view)
   const convoId = useApp((s) => s.selectedConversationId)
   const stack = useApp((s) => s.mobileStack)
@@ -290,7 +293,7 @@ export function MobileApp() {
             <motion.div key="shipping" className="absolute inset-0"
               initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
               transition={fadeTransition}>
-              <ViewBoundary name="Ship"><Suspense fallback={<div className="h-full grid place-items-center text-sm text-ink-400">Opening Ship…</div>}><ShippingWorkspace compact /></Suspense></ViewBoundary>
+              <ViewBoundary name="Ship"><Suspense fallback={<div className="h-full grid place-items-center text-sm text-ink-400">{t('mapp.openingShip')}</div>}><ShippingWorkspace compact /></Suspense></ViewBoundary>
             </motion.div>
           )}
 

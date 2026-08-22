@@ -25,13 +25,25 @@ import { IBack, IMail, IConvene, IWhisper } from '@/components/icons'
 import { api } from '@/api/client'
 import { tapHaptic } from '@/lib/native'
 import { cn } from '@/lib/utils'
+import { type MessageKey, useTLabel } from '@/lib/i18n'
 
+// statusLabels kept as the source of truth so upstream changes
+// to the participant status vocabulary flow through cleanly. The
+// *Key table is an i18n lookup that resolves to the localized string;
+// render as tLabel(statusLabelsKey[k] ?? null, statusLabels[k] ?? 'idle').
 const STATUS_LABEL: Record<string, string> = {
   avail: 'Available',
   working: 'Working',
   thinking: 'Thinking',
   waiting: 'Waiting on you',
   resting: 'Resting',
+}
+const STATUS_LABEL_KEY: Record<string, MessageKey> = {
+  avail: 'mpinfo.statusAvail',
+  working: 'mpinfo.statusWorking',
+  thinking: 'mpinfo.statusThinking',
+  waiting: 'mpinfo.statusWaiting',
+  resting: 'mpinfo.statusResting',
 }
 const STATUS_COLOR: Record<string, string> = {
   avail: 'var(--avail)',
@@ -42,6 +54,10 @@ const STATUS_COLOR: Record<string, string> = {
 }
 
 export function MobileParticipantInfo() {
+  // tLabel: prefer the i18n string for `key`; if missing (or == key)
+  // fall back to the English source-of-truth so the UI keeps working
+  // even when a translation is absent.
+  const tLabel = useTLabel()
   const participantId = useApp((s) => s.infoAgentId)
   const close = useApp((s) => s.closeAgentInfo)
   const select = useApp((s) => s.selectConversation)
@@ -60,10 +76,32 @@ export function MobileParticipantInfo() {
   if (p.id === meId) {
     return (
       <section className="flex flex-col h-full overflow-hidden bg-paper">
-        <DeepHeader title="Profile" onBack={close} />
+        <DeepHeader title={tLabel('mpinfo.profileTitle', 'Profile')} onBack={close} />
         <div className="flex-1 grid place-items-center px-8 text-center">
           <div className="font-display italic text-[13px] text-ink-500">
-            That's you — head over to <span className="text-skype-deep font-semibold not-italic">Me</span> for your own profile.
+            {(() => {
+              // Wrap the rendered {me} label (e.g. '我的') in a styled
+              // <span> so the call-to-action still pops in zh-CN, where
+              // the word would otherwise blend into the surrounding
+              // italic body copy.
+              // English fallback: "That's you — head over to {me} for your own profile."
+              const meLabel = tLabel('nav.me', 'Me')
+              // Look up the i18n template; fall back to the English source-of-truth
+              // so the UI keeps working even when a translation is absent.
+              // We substitute {me} with \u0000 (a placeholder the JSX below splits on)
+              // so the styled <span>{meLabel}</span> can be injected between parts[0]
+              // and parts[1] without losing its CSS classes.
+              const tmpl = tLabel('mpinfo.itsYou', "That's you \u2014 head over to {me} for your own profile.")
+              const rendered = tmpl.replace(/\{me\}/g, '\u0000')
+              const parts = rendered.split('\u0000')
+              return (
+                <>
+                  {parts[0]}
+                  <span className="text-skype-deep font-semibold not-italic">{meLabel}</span>
+                  {parts.slice(1).join('\u0000')}
+                </>
+              )
+            })()}
           </div>
         </div>
       </section>
@@ -72,7 +110,7 @@ export function MobileParticipantInfo() {
 
   const isAgent = p.kind === 'agent'
   const statusColor = STATUS_COLOR[p.status] ?? 'var(--resting)'
-  const subtitle = p.role ?? (isAgent ? 'agent' : 'human teammate')
+  const subtitle = p.role ?? (isAgent ? tLabel('common.agent', 'agent') : tLabel('mpinfo.humanTeammate', 'human teammate'))
   // Sky wash for agents, coral for humans — matches the chip colour
   // scheme used by MentionChip elsewhere so the page lands "feeling
   // like" the chip the user just tapped.
@@ -137,11 +175,11 @@ export function MobileParticipantInfo() {
           </div>
           <div className="inline-flex items-center gap-1.5 py-1.5 px-3 rounded-full bg-cloud border border-ink-100 text-[11.5px] text-ink-700">
             <span className="w-[7px] h-[7px] rounded-full" style={{ background: statusColor }} />
-            {STATUS_LABEL[p.status] ?? 'idle'}
+            {tLabel(STATUS_LABEL_KEY[p.status] ?? 'mpinfo.statusIdle', STATUS_LABEL[p.status] ?? 'idle')}
           </div>
         </div>
 
-        <Section title="Actions">
+        <Section title={tLabel('mpinfo.sectionActions', 'Actions')}>
           <div className={cn('grid gap-2', isAgent ? 'grid-cols-3' : 'grid-cols-1')}>
             <button
               type="button"
@@ -156,7 +194,7 @@ export function MobileParticipantInfo() {
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
               </svg>
-              {opening ? 'Opening…' : 'DM'}
+              {opening ? tLabel('mpinfo.opening', 'Opening\u2026') : tLabel('mpinfo.btnDM', 'DM')}
             </button>
             {/* Whisper / Convene mirror the desktop pane — agent-team
                 rituals only. Placeholder buttons today; kept on screen
@@ -169,7 +207,7 @@ export function MobileParticipantInfo() {
                   style={{ background: 'var(--skype-ink)' }}
                 >
                   <IWhisper className="w-[14px] h-[14px]" />
-                  Whisper
+                  {tLabel('mpinfo.btnWhisper', 'Whisper')}
                 </button>
                 <button
                   type="button"
@@ -177,7 +215,7 @@ export function MobileParticipantInfo() {
                   style={{ border: '1px solid var(--ink-100)' }}
                 >
                   <IConvene className="w-[14px] h-[14px]" />
-                  Convene
+                  {tLabel('mpinfo.btnConvene', 'Convene')}
                 </button>
               </>
             )}
@@ -185,13 +223,13 @@ export function MobileParticipantInfo() {
         </Section>
 
         {p.email && (
-          <Section title="Email">
+          <Section title={tLabel('mpinfo.sectionEmail', 'Email')}>
             <button
               type="button"
               onClick={copyEmail}
               className="w-full py-2.5 px-3 bg-cloud rounded-[12px] flex items-center gap-2 text-[12px] text-ink-700 font-mono active:opacity-80 transition text-left"
               style={{ border: '1px solid var(--ink-100)' }}
-              title={copied ? 'Copied!' : 'Tap to copy'}
+              title={copied ? tLabel('mpinfo.emailCopiedTitle', 'Copied!') : tLabel('mpinfo.emailTapCopyTitle', 'Tap to copy')}
             >
               <IMail className="w-3.5 h-3.5 shrink-0 text-skype-deep" strokeWidth={2} />
               <span className="truncate flex-1">{p.email}</span>
@@ -201,14 +239,14 @@ export function MobileParticipantInfo() {
                   copied ? 'text-avail' : 'text-ink-300',
                 )}
               >
-                {copied ? 'copied' : 'copy'}
+                {copied ? tLabel('mpinfo.emailCopied', 'copied') : tLabel('mpinfo.emailCopy', 'copy')}
               </span>
             </button>
           </Section>
         )}
 
         {isAgent && (p.tools?.length ?? 0) > 0 && (
-          <Section title="Tools enabled">
+          <Section title={tLabel('mpinfo.toolsEnabled', 'Tools enabled')}>
             <div className="grid grid-cols-2 gap-1.5">
               {(p.tools ?? []).map((t) => (
                 <div
@@ -225,7 +263,7 @@ export function MobileParticipantInfo() {
         )}
 
         {isAgent && p.bio && (
-          <Section title={`About ${p.name}`}>
+          <Section title={tLabel('mpinfo.sectionAbout', `About ${p.name}`, { name: p.name })}>
             <div
               className="py-3 px-3.5 rounded-r-[10px] font-display italic font-normal text-[13.5px] leading-[1.55] text-ink-700"
               style={{
@@ -245,6 +283,8 @@ export function MobileParticipantInfo() {
 /** Sticky deep-page header — back arrow + screen title. Matches the
  *  pattern used by MobileChatInfo so deep navigation feels uniform. */
 function DeepHeader({ title, onBack }: { title: string; onBack: () => void }) {
+  // tLabel: same shape as the main component's helper — see above.
+  const tLabel = useTLabel()
   return (
     <header
       className="border-b border-ink-100 bg-cloud/95 backdrop-blur-md sticky top-0 z-10"
@@ -255,7 +295,7 @@ function DeepHeader({ title, onBack }: { title: string; onBack: () => void }) {
           type="button"
           onClick={onBack}
           className="w-9 h-9 grid place-items-center rounded-full active:bg-sky2-50 transition text-ink-700"
-          aria-label="Back"
+          aria-label={tLabel('mpinfo.back', 'Back')}
         >
           <IBack className="w-[18px] h-[18px]" />
         </button>

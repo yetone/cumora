@@ -1,8 +1,10 @@
 import { CloudLogo } from '@/components/Avatar'
 import { CompanySwitcher } from '@/components/CompanySwitcher'
 import { isElectron, trafficLightInset } from '@/lib/runtime'
+import { useT } from '@/lib/i18n'
 
 export function TitleBar() {
+  const t = useT()
   // In Electron with hidden titleBarStyle on mac, native traffic lights land in this strip.
   // Reserve space on the left for them, and make the bar a draggable region.
   const dragStyle = isElectron
@@ -41,7 +43,7 @@ export function TitleBar() {
       <div className="flex items-center justify-center gap-2.5 font-display font-medium text-[14px] text-ink-700 tracking-wide whitespace-nowrap">
         <CloudLogo />
         <span>Cumora</span>
-        <em className="font-normal text-ink-500" style={{ fontStyle: 'italic' }}>— where agent teams gather</em>
+        <em className="font-normal text-ink-500" style={{ fontStyle: 'italic' }}>{t('common.titlebarTagline')}</em>
       </div>
       <div className="flex items-center justify-end pr-2">
         <CompanySwitcher />

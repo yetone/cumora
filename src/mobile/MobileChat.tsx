@@ -23,8 +23,10 @@ import { COMPOSER_EMOJIS } from '@/lib/emoji'
 import { SKYPE_EMOJIS, findSkypeByShortcode } from '@/lib/skypeEmojis'
 import { TwEmoji } from '@/components/TwEmoji'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
+import { useT, type MessageKey } from '@/lib/i18n'
 
 export function MobileChat() {
+  const t = useT()
   const convoId = useApp((s) => s.selectedConversationId)
   const select = useApp((s) => s.selectConversation)
   const pushStack = useApp((s) => s.pushMobileStack)
@@ -299,7 +301,7 @@ export function MobileChat() {
       const p = byId[id]
       if (!p) return null
       const name = p.name?.trim()
-      return name || (p.kind === 'agent' ? 'An agent' : 'Someone')
+      return name || (p.kind === 'agent' ? t('mclist.fallbackAgent') : t('mclist.fallbackSomeone'))
     })
     .filter((n): n is string => Boolean(n))
   const muted = isMuted(c)
@@ -308,7 +310,7 @@ export function MobileChat() {
     if (!convoId || conveneStarting) return
     setConveneStarting(true)
     try {
-      await api.startConvene(convoId, c.title || 'live work session')
+      await api.startConvene(convoId, c.title || t('convene.sessionTitleFallback'))
       setView('convene')
     } catch (err) {
       console.warn('start convene failed', err)
@@ -328,7 +330,7 @@ export function MobileChat() {
 
   const leaveConvo = async () => {
     if (!convoId) return
-    if (!confirm('Leave this conversation? Agents will continue without you.')) {
+    if (!confirm(t('mobchat.confirmLeaveBody'))) {
       setMenuOpen(false)
       return
     }
@@ -510,7 +512,7 @@ export function MobileChat() {
               </div>
               <div className="text-[11px] font-semibold flex items-center gap-1 leading-none mt-0.5 text-working">
                 <span className="w-1.5 h-1.5 rounded-full animate-pulse-soft bg-working" />
-                {agents.length} agents
+                {t('mobchat.agentsHeader', { n: agents.length })}
               </div>
             </div>
           </Pressable>
@@ -518,7 +520,7 @@ export function MobileChat() {
             onClick={onConvene}
             disabled={conveneStarting}
             className="w-10 h-10 grid place-items-center text-ink-700 active:bg-sky2-50 rounded-full disabled:opacity-50"
-            aria-label="Start Convene"
+            aria-label={t('mobchat.startConvene')}
           >
             <IConvene className="w-[20px] h-[20px]" />
           </Pressable>
@@ -527,7 +529,7 @@ export function MobileChat() {
               onClick={() => setMenuOpen((v) => !v)}
               haptic="medium"
               className="w-10 h-10 grid place-items-center text-ink-700 active:bg-sky2-50 rounded-full"
-              aria-label="More"
+              aria-label={t('mobchat.more')}
             >
               <IMore className="w-[20px] h-[20px]" />
             </Pressable>
@@ -548,20 +550,20 @@ export function MobileChat() {
                     onClick={() => { pushStack('info'); setMenuOpen(false) }}
                     className="w-full text-left py-2.5 px-3.5 text-[13px] text-ink-700 active:bg-sky2-50"
                   >
-                    View details
+                    {t('mobchat.viewDetails')}
                   </button>
                   <button
                     onClick={toggleMute}
                     className="w-full text-left py-2.5 px-3.5 text-[13px] text-ink-700 active:bg-sky2-50"
                   >
-                    {muted ? 'Unmute' : 'Mute notifications'}
+                    {muted ? t('mobchat.unmute') : t('mobchat.muteNotifications')}
                   </button>
                   <div className="h-px bg-ink-100 mx-1.5 my-1" />
                   <button
                     onClick={leaveConvo}
                     className="w-full text-left py-2.5 px-3.5 text-[13px] text-coral-deep active:bg-coral-soft/60"
                   >
-                    Leave conversation
+                    {t('mobchat.leaveConversation')}
                   </button>
                 </div>
               </>
@@ -667,12 +669,12 @@ export function MobileChat() {
             <button
               onClick={() => setAttachment(null)}
               className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0"
-              aria-label="Remove attachment"
+              aria-label={t('mobchat.removeAttachment')}
             >×</button>
           </div>
         )}
         {uploading && (
-          <div className="mb-2 text-[11.5px] text-ink-500 italic">uploading…</div>
+          <div className="mb-2 text-[11.5px] text-ink-500 italic">{t('mobchat.uploading')}</div>
         )}
         {uploadError && (
           <div className="mb-2 text-[11.5px] py-1 px-2 rounded-md text-coral-deep bg-coral-soft inline-block max-w-full truncate">
@@ -684,16 +686,16 @@ export function MobileChat() {
             <div className="w-[3px] rounded bg-skype shrink-0" />
             <div className="min-w-0 flex-1 flex flex-col gap-0.5">
               <div className="text-[10.5px] font-bold uppercase tracking-wider text-skype-deep">
-                Replying to {byId[replyingToMsg?.authorId ?? '']?.name ?? replyingToMsg?.authorId ?? '…'}
+                {t('mobchat.replyingTo', { name: byId[replyingToMsg?.authorId ?? '']?.name ?? replyingToMsg?.authorId ?? '…' })}
               </div>
               <div className="text-[12px] text-ink-500 truncate">
-                {replyingToMsg ? replyingToMsg.body.slice(0, 140).replace(/\n/g, ' ') : '(loading…)'}
+                {replyingToMsg ? replyingToMsg.body.slice(0, 140).replace(/\n/g, ' ') : t('mobchat.replyLoading')}
               </div>
             </div>
             <button
               onClick={() => setReplyingTo(convoId, null)}
               className="w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0 self-center"
-              aria-label="Cancel reply"
+              aria-label={t('mobchat.cancelReply')}
             >×</button>
           </div>
         )}
@@ -713,7 +715,7 @@ export function MobileChat() {
             onMouseDown={(e) => e.preventDefault()}
           >
             <div className="px-3 pt-2 pb-1 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">
-              Mention {mention.query ? `· "${mention.query}"` : ''}
+              {mention.query ? `${t('mobchat.mentionHeader')} ${t('mobchat.mentionQuerySuffix', { query: mention.query })}` : t('mobchat.mentionHeader')}
             </div>
             {filteredMentions.map((entry, i) => {
               const active = i === mentionIndex
@@ -730,8 +732,8 @@ export function MobileChat() {
                   >
                     <img src="/everyone.png" alt="" className="w-[28px] h-[28px] rounded-full object-cover" />
                     <div className="flex-1 min-w-0">
-                      <div className="text-[13px] font-semibold text-ink-900 truncate">Everyone</div>
-                      <div className="text-[11px] text-ink-500 truncate">Notify all members of this room</div>
+                      <div className="text-[13px] font-semibold text-ink-900 truncate">{t('mobchat.everyone')}</div>
+                      <div className="text-[11px] text-ink-500 truncate">{t('mobchat.notifyAll')}</div>
                     </div>
                   </button>
                 )
@@ -776,8 +778,8 @@ export function MobileChat() {
               key={convoId}
               ref={editorRef}
               defaultValue={draft}
-              placeholder="Type @ to summon"
-              ariaLabel="Message composer"
+              placeholder={t('mobchat.typeAtToSummon')}
+              ariaLabel={t('mobchat.composerAria')}
               className="rich-input flex-1 whitespace-pre-wrap bg-transparent outline-none text-[14px] text-ink-900 leading-[1.4]"
               style={{ minHeight: '1.4em' }}
               maxHeight={120}
@@ -825,7 +827,7 @@ export function MobileChat() {
                 : 'var(--ink-200)',
               boxShadow: canSend ? '0 4px 12px -3px rgba(0, 168, 240, 0.5)' : 'none',
             }}
-            aria-label="Send"
+            aria-label={t('mobchat.sendAria')}
           >
             <ISend className="w-[18px] h-[18px]" strokeWidth={2} />
           </Pressable>
@@ -834,7 +836,7 @@ export function MobileChat() {
           <Pressable
             onClick={() => fileRef.current?.click()}
             className="w-9 h-9 grid place-items-center text-ink-500 rounded-full active:bg-sky2-50"
-            aria-label="Attach file"
+            aria-label={t('mobchat.attachFile')}
           >
             <IClip className="w-[20px] h-[20px]" />
           </Pressable>
@@ -845,7 +847,7 @@ export function MobileChat() {
               'w-9 h-9 grid place-items-center rounded-full active:bg-sky2-50',
               mention ? 'text-skype-deep bg-sky2-50' : 'text-ink-500',
             )}
-            aria-label="Mention"
+            aria-label={t('mobchat.mentionAria')}
           >
             <IAt className="w-[20px] h-[20px]" />
           </Pressable>
@@ -856,7 +858,7 @@ export function MobileChat() {
               'w-9 h-9 grid place-items-center rounded-full active:bg-sky2-50',
               emojiOpen ? 'text-skype-deep bg-sky2-50' : 'text-ink-500',
             )}
-            aria-label="Emoji"
+            aria-label={t('mobchat.emojiAria')}
           >
             <ISmile className="w-[20px] h-[20px]" />
           </Pressable>
@@ -882,7 +884,7 @@ export function MobileChat() {
                     'flex-1 text-[11px] font-semibold uppercase tracking-wider py-1.5 rounded-[6px] transition',
                     emojiTab === k ? 'bg-sky2-100 text-skype-deep' : 'text-ink-500 active:bg-sky2-50',
                   )}
-                >{k === 'std' ? 'Standard' : 'Skype'}</button>
+                >{k === 'std' ? t('mobchat.emojiStd') : t('mobchat.emojiSkype')}</button>
               ))}
             </div>
             <div className="px-2 py-2 max-h-[220px] overflow-y-auto">
@@ -920,7 +922,7 @@ export function MobileChat() {
         onReact={(emoji) => {
           if (tapback) void toggleReaction(tapback.msg.id, emoji)
         }}
-        actions={tapback ? buildMessageTapbackActions(tapback.msg, convoId, setReplyingTo, meId) : []}
+        actions={tapback ? buildMessageTapbackActions(tapback.msg, convoId, setReplyingTo, meId, t) : []}
         onClose={() => setTapback(null)}
       />
     </section>
@@ -948,18 +950,19 @@ type StreamCtx = { hasMoreOlder: boolean; loadingOlder: boolean }
  *  "Loading earlier…" and a blank space), so paging never changes the
  *  header's height and never re-anchors the scroll. */
 function StreamHeader({ context }: { context?: StreamCtx }) {
+  const t = useT()
   const hasMoreOlder = context?.hasMoreOlder ?? false
   const loadingOlder = context?.loadingOlder ?? false
   return (
     <div className="px-3 pt-4 flex flex-col gap-3">
       {hasMoreOlder ? (
         <div className="self-center py-1 px-2.5 rounded-full text-[10.5px] font-medium text-ink-400">
-          {loadingOlder ? 'Loading earlier…' : ' '}
+          {loadingOlder ? t('chat.loadingEarlier') : ' '}
         </div>
       ) : (
         <div className="flex items-center gap-3 text-ink-300 text-[10.5px] font-bold tracking-[0.08em] uppercase">
           <span className="flex-1 h-px bg-gradient-to-r from-transparent via-ink-100 to-transparent" />
-          Beginning
+          {t('chat.beginning')}
           <span className="flex-1 h-px bg-gradient-to-r from-transparent via-ink-100 to-transparent" />
         </div>
       )}
@@ -1023,15 +1026,16 @@ function buildMessageTapbackActions(
   convoId: string | null,
   setReplyingTo: (convoId: string, msgId: string | null) => void,
   meId: string | null,
+  t: (key: MessageKey, vars?: Record<string, string | number>) => string,
 ): TapbackAction[] {
   const out: TapbackAction[] = []
   out.push({
-    label: 'Reply',
+    label: t('mobchat.tapbackReply'),
     onClick: () => { if (convoId) setReplyingTo(convoId, msg.id) },
   })
   if (msg.body && msg.body.trim()) {
     out.push({
-      label: 'Copy text',
+      label: t('mobchat.tapbackCopy'),
       onClick: () => {
         // Best-effort — `navigator.clipboard.writeText` returns a
         // promise we don't await; failures fall through silently
@@ -1044,7 +1048,7 @@ function buildMessageTapbackActions(
   // desktop ChatPane permission model: agents own their own rows.
   if (meId && msg.authorId === meId) {
     out.push({
-      label: 'Delete',
+      label: t('common.delete'),
       destructive: true,
       onClick: () => {
         // Wire deletion later — for now just close, no destructive
@@ -1057,15 +1061,8 @@ function buildMessageTapbackActions(
   return out
 }
 
-const statusLabel: Record<string, string> = {
-  avail: 'Available',
-  working: 'Working',
-  thinking: 'Thinking',
-  waiting: 'Waiting on you',
-  resting: 'Resting',
-}
-
 export function MobileChatInfo() {
+  const t = useT()
   const pushStack = useApp((s) => s.pushMobileStack)
   const setView = useApp((s) => s.setView)
   const convoId = useApp((s) => s.selectedConversationId)
@@ -1102,6 +1099,16 @@ export function MobileChatInfo() {
   const humanCount = memberPs.filter((p) => p.kind === 'human').length
   const groupAgents = memberPs.filter((p) => p.kind === 'agent')
   const statusTone = focus?.status ?? 'avail'
+  // Localized status pill — same five tones as the desktop ChatPane, just
+  // looked up through the i18n layer here so the mobile info card renders
+  // the same Chinese/English as everywhere else.
+  const statusLabel: Record<string, string> = {
+    avail: t('info.statusAvail'),
+    working: t('info.statusWorking'),
+    thinking: t('info.statusThinking'),
+    waiting: t('info.statusWaiting'),
+    resting: t('info.statusResting'),
+  }
 
   const startConvene = async () => {
     if (!convoId || busy) return
@@ -1123,7 +1130,7 @@ export function MobileChatInfo() {
 
   const onLeave = async () => {
     if (!convoId) return
-    if (!confirm('Leave this conversation? Agents will continue without you.')) return
+    if (!confirm(t('mobchat.confirmLeaveBody'))) return
     try {
       await api.leaveConversation(convoId)
       useApp.getState().selectConversation(null)
@@ -1179,11 +1186,11 @@ export function MobileChatInfo() {
           <button
             onClick={() => pushStack('chat')}
             className="w-10 h-10 grid place-items-center text-ink-700 active:bg-sky2-50 rounded-full transition"
-            aria-label="Back"
+            aria-label={t('mpinfo.back')}
           >
             <IBack className="w-[22px] h-[22px]" strokeWidth={2} />
           </button>
-          <h1 className="font-display font-medium text-[18px] text-ink-900" style={{ letterSpacing: '-0.01em' }}>Details</h1>
+          <h1 className="font-display font-medium text-[18px] text-ink-900" style={{ letterSpacing: '-0.01em' }}>{t('mobchat.details')}</h1>
         </div>
       </header>
 
@@ -1214,12 +1221,12 @@ export function MobileChatInfo() {
               type="button"
               onClick={startEditTitle}
               className="font-display font-medium text-[26px] tracking-tight mb-1 active:text-skype-deep transition border-b border-dashed border-ink-200 leading-tight max-w-full truncate"
-              title="Tap to rename"
+              title={t('mobchat.tapToRename')}
             >{c.title}</button>
           )}
           <div className="font-display italic text-[14px] text-ink-500">
-            {memberPs.length} {memberPs.length === 1 ? 'member' : 'members'}
-            {agentCount > 0 && ` · ${agentCount} ${agentCount === 1 ? 'agent' : 'agents'}`}
+            {memberPs.length} {memberPs.length === 1 ? t('mobchat.memberOne') : t('mobchat.memberMany')}
+            {agentCount > 0 && ` · ${agentCount} ${agentCount === 1 ? t('mobchat.agentOne') : t('mobchat.agentMany')}`}
           </div>
           {/* Topic — tap to edit; prompt to add when empty. */}
           {editingTopic ? (
@@ -1233,7 +1240,7 @@ export function MobileChatInfo() {
                 if (e.key === 'Enter') { e.preventDefault(); void saveTopic() }
                 if (e.key === 'Escape') setEditingTopic(false)
               }}
-              placeholder="What's this group for?"
+              placeholder={t('mobchat.topicPlaceholder')}
               maxLength={200}
               className="mt-2 block w-full text-center bg-transparent text-[12.5px] text-ink-700 italic font-display placeholder:text-ink-300 outline-none border-b border-sky2-200 focus:border-skype-deep transition pb-0.5"
             />
@@ -1242,14 +1249,14 @@ export function MobileChatInfo() {
               type="button"
               onClick={startEditTopic}
               className="mt-2 block mx-auto max-w-full truncate text-[12.5px] text-ink-500 italic font-display active:text-skype-deep transition"
-              title="Tap to edit topic"
+              title={t('mobchat.tapToEditTopic')}
             >{c.topic}</button>
           ) : (
             <button
               type="button"
               onClick={startEditTopic}
               className="mt-2 inline-block text-[12.5px] text-ink-300 italic font-display active:text-skype-deep transition"
-            >+ add a topic</button>
+            >{t('mobchat.addTopic')}</button>
           )}
         </div>
       ) : focus ? (
@@ -1278,23 +1285,23 @@ export function MobileChatInfo() {
           className="py-3 px-4 rounded-xl text-white font-semibold text-[13px] active:opacity-80 transition disabled:opacity-50"
           style={{ background: 'var(--skype-ink)' }}
         >
-          {busy ? 'Starting…' : 'Convene'}
+          {busy ? t('mobchat.starting') : t('mobchat.convene')}
         </button>
         <button
           onClick={onToggleMute}
           className="py-3 px-4 rounded-xl bg-cloud border border-ink-100 text-ink-700 font-semibold text-[13px] active:bg-sky2-50 transition"
         >
-          {muted ? 'Unmute' : 'Mute'}
+          {muted ? t('mobchat.unmute') : t('mobchat.mute')}
         </button>
       </div>
 
       {c.kind !== 'direct' && (
         <div className="py-4 px-5 border-b border-ink-100">
-          <h4 className="text-[10.5px] font-bold text-ink-300 tracking-wider uppercase mb-3">Members</h4>
+          <h4 className="text-[10.5px] font-bold text-ink-300 tracking-wider uppercase mb-3">{t('mobchat.members')}</h4>
           <div className="grid grid-cols-3 gap-2 mb-3">
-            <Stat n={String(memberPs.length)} l="members" />
-            <Stat n={String(agentCount)} l="agents" />
-            <Stat n={String(humanCount)} l="humans" />
+            <Stat n={String(memberPs.length)} l={t('mobchat.statMembers')} />
+            <Stat n={String(agentCount)} l={t('mobchat.statAgents')} />
+            <Stat n={String(humanCount)} l={t('mobchat.statHumans')} />
           </div>
           {/* Search — only worth showing once the list is long enough to
               warrant scanning. Filters by name or @id. */}
@@ -1304,7 +1311,7 @@ export function MobileChatInfo() {
               <input
                 value={memberQuery}
                 onChange={(e) => setMemberQuery(e.target.value)}
-                placeholder="Search members…"
+                placeholder={t('mobchat.searchMembersPh')}
                 className="flex-1 min-w-0 text-[13px] text-ink-700 bg-transparent outline-none placeholder:text-ink-300"
               />
               {memberQuery && (
@@ -1312,7 +1319,7 @@ export function MobileChatInfo() {
                   type="button"
                   onClick={() => setMemberQuery('')}
                   className="w-6 h-6 -mr-1 grid place-items-center text-ink-400 active:text-ink-600 shrink-0"
-                  aria-label="Clear search"
+                  aria-label={t('mobchat.clearSearch')}
                 >×</button>
               )}
             </div>
@@ -1334,10 +1341,10 @@ export function MobileChatInfo() {
                   <Avatar p={p} size={32} />
                   <div className="flex-1 min-w-0">
                     <div className="text-[13px] font-semibold text-ink-900 truncate">
-                      {p.name}{isSelf && <span className="text-ink-300 font-normal"> · you</span>}
+                      {p.name}{isSelf && <span className="text-ink-300 font-normal">{t('mobchat.youSuffix')}</span>}
                     </div>
                     <div className="text-[11px] text-ink-500 truncate font-display italic">
-                      {p.kind === 'agent' ? (p.role ?? 'agent') : 'human teammate'}
+                      {p.kind === 'agent' ? (p.role ?? t('common.agent')) : t('mobchat.humanTeammate')}
                     </div>
                   </div>
                   <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: `var(--${p.status ?? 'avail'})` }} />
@@ -1347,7 +1354,7 @@ export function MobileChatInfo() {
             })}
             {filteredMembers.length === 0 && (
               <div className="py-5 text-center text-[12px] text-ink-400 italic font-display">
-                No members match “{memberQuery}”
+                {t('mobchat.noMembersMatch', { query: memberQuery })}
               </div>
             )}
           </div>
@@ -1356,7 +1363,7 @@ export function MobileChatInfo() {
 
       {!isGroup && focus && (focus.tools ?? []).length > 0 && (
         <div className="py-4 px-5 border-b border-ink-100">
-          <h4 className="text-[10.5px] font-bold text-ink-300 tracking-wider uppercase mb-3">Tools</h4>
+          <h4 className="text-[10.5px] font-bold text-ink-300 tracking-wider uppercase mb-3">{t('mobchat.tools')}</h4>
           <div className="grid grid-cols-2 gap-2">
             {(focus.tools ?? []).map((t) => (
               <div key={t} className="py-2.5 px-3 bg-cloud border border-ink-100 rounded-[10px] flex items-center gap-2 text-[12.5px] text-ink-700">
@@ -1370,7 +1377,7 @@ export function MobileChatInfo() {
 
       {!isGroup && focus?.bio && (
         <div className="py-4 px-5 border-b border-ink-100">
-          <h4 className="text-[10.5px] font-bold text-ink-300 tracking-wider uppercase mb-3">About</h4>
+          <h4 className="text-[10.5px] font-bold text-ink-300 tracking-wider uppercase mb-3">{t('mobchat.about')}</h4>
           <div
             className="py-3 px-3.5 rounded-r-lg font-display italic text-[13px] leading-[1.55] text-ink-700"
             style={{
@@ -1389,8 +1396,8 @@ export function MobileChatInfo() {
           className="w-full py-3 px-4 rounded-[12px] text-[13px] font-semibold text-coral-deep transition text-left active:opacity-70"
           style={{ border: '1px solid rgba(255, 122, 107, 0.3)' }}
         >
-          Leave conversation
-          <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">agents continue without you</span>
+          {t('mobchat.leaveConversation')}
+          <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">{t('mobchat.agentsContinueWithout')}</span>
         </button>
       </div>
     </section>

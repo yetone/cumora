@@ -12,9 +12,11 @@ import { useEffect, useRef, useState } from 'react'
 import { api } from '@/api/client'
 import { useApp } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
+import { useT } from '@/lib/i18n'
 import { InvitePeopleModal } from './InvitePeopleModal'
 
 export function CompanySwitcher() {
+  const t = useT()
   const companies = useAuth((s) => s.companies)
   const activeId = useAuth((s) => s.activeCompanyId)
   const setActive = useAuth((s) => s.setActiveCompany)
@@ -78,7 +80,7 @@ export function CompanySwitcher() {
         >
           {active ? active.name.charAt(0).toUpperCase() : '·'}
         </span>
-        <span className="max-w-[140px] truncate">{active?.name ?? 'no workspace'}</span>
+        <span className="max-w-[140px] truncate">{active?.name ?? t('company.noWorkspace')}</span>
         <span className="text-ink-300 text-[10px] leading-none">▾</span>
       </button>
 
@@ -93,7 +95,7 @@ export function CompanySwitcher() {
           }}
         >
           <div className="px-3 py-1 text-[10.5px] uppercase tracking-wide text-ink-300 font-display">
-            Switch workspace
+            {t('company.switchWorkspace')}
           </div>
           {companies.map((c) => (
             <button
@@ -126,7 +128,7 @@ export function CompanySwitcher() {
                 className="w-5 h-5 rounded grid place-items-center shrink-0 text-[11px]"
                 style={{ background: 'var(--sky-50)', color: 'var(--skype)' }}
               >+</span>
-              <span className="flex-1">Invite people to <b className="font-semibold">{active.name}</b></span>
+              <span className="flex-1">{t('company.invitePeoplePrefix')}<b className="font-semibold">{active.name}</b></span>
             </button>
           )}
 
@@ -137,7 +139,7 @@ export function CompanySwitcher() {
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter') void submitNew() }}
-                placeholder="Workspace name"
+                placeholder={t('company.workspaceNamePh')}
                 className="w-full px-2 py-1.5 text-[12.5px] rounded outline-none"
                 style={{ border: '1.5px solid var(--ink-100)', background: 'var(--paper)' }}
               />
@@ -148,11 +150,11 @@ export function CompanySwitcher() {
                   disabled={!newName.trim() || busy}
                   className="flex-1 py-1.5 rounded text-[12px] font-semibold text-white disabled:opacity-50"
                   style={{ background: 'var(--skype)' }}
-                >{busy ? '…' : 'Create'}</button>
+                >{busy ? '…' : t('company.createBtn')}</button>
                 <button
                   onClick={() => { setCreating(false); setNewName(''); setErr(null) }}
                   className="px-3 py-1.5 rounded text-[12px] text-ink-500 hover:bg-cloud"
-                >Cancel</button>
+                >{t('common.cancel')}</button>
               </div>
             </div>
           ) : (
@@ -161,7 +163,7 @@ export function CompanySwitcher() {
               className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
             >
               <span className="w-5 h-5 rounded grid place-items-center text-ink-500 shrink-0" style={{ border: '1px dashed var(--ink-100)' }}>+</span>
-              Create new workspace
+              {t('company.createNew')}
             </button>
           )}
         </div>

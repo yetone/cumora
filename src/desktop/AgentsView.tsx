@@ -8,10 +8,11 @@ import { Avatar } from '@/components/Avatar'
 import { IPlus } from '@/components/icons'
 import { AgentEditor } from '@/components/AgentEditor'
 import { api } from '@/api/client'
+import { useT, type MessageKey } from '@/lib/i18n'
 import type { Participant } from '@/types'
 
-const STATUS_LABEL: Record<string, string> = {
-  avail: 'Available', working: 'Working', thinking: 'Thinking', waiting: 'Waiting on you', resting: 'Resting',
+const STATUS_LABEL_KEY: Record<string, MessageKey> = {
+  avail: 'agents.statusAvail', working: 'agents.statusWorking', thinking: 'agents.statusThinking', waiting: 'agents.statusWaiting', resting: 'agents.statusResting',
 }
 const STATUS_COLOR: Record<string, string> = {
   avail: 'var(--avail)', working: 'var(--working)', thinking: 'var(--thinking)', waiting: 'var(--waiting)', resting: 'var(--resting)',
@@ -22,15 +23,18 @@ function AgentCard({ p, onEdit, onDelete }: {
   onEdit: (p: Participant) => void
   onDelete: (p: Participant) => void
 }) {
+  const t = useT()
   const setView = useApp((s) => s.setView)
   const select = useApp((s) => s.selectConversation)
   const conversations = useConversations((s) => s.list)
   const host = useComputers((s) => (p.computerId ? s.byId[p.computerId] : undefined))
   const hostIcon = !host || host.kind === 'cloud' ? '☁' : host.kind === 'vps' ? '🖥' : '💻'
-  const hostLabel = host ? host.name : 'Cumora Cloud'
+  const hostLabel = host ? host.name : t('agents.hostCloud')
   const hostOffline = !!host && host.kind !== 'cloud' && host.status !== 'online'
   const displayStatus = hostOffline ? 'resting' : p.status
-  const displayStatusLabel = hostOffline ? 'Computer offline' : STATUS_LABEL[p.status]
+  const displayStatusLabel = hostOffline
+    ? t('agents.statusOffline')
+    : t((STATUS_LABEL_KEY[p.status] ?? 'common.idle') as MessageKey)
   const direct = useMemo(
     () => conversations.find((c) => c.kind === 'direct' && c.members.includes(p.id)),
     [conversations, p.id],
@@ -68,8 +72,8 @@ function AgentCard({ p, onEdit, onDelete }: {
           onClick={() => onEdit(p)}
           className="w-7 h-7 rounded-full grid place-items-center bg-cloud hover:bg-sky2-50 text-ink-500 hover:text-skype-deep transition"
           style={{ border: '1px solid var(--ink-100)' }}
-          title="Edit"
-          aria-label="Edit agent"
+          title={t('agents.cardEdit')}
+          aria-label={t('agents.cardEditAgent')}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
@@ -77,8 +81,8 @@ function AgentCard({ p, onEdit, onDelete }: {
           onClick={() => onDelete(p)}
           className="w-7 h-7 rounded-full grid place-items-center bg-cloud hover:bg-coral-soft text-ink-500 hover:text-coral-deep transition"
           style={{ border: '1px solid var(--ink-100)' }}
-          title="Off-board"
-          aria-label="Off-board agent"
+          title={t('agents.cardOffboard')}
+          aria-label={t('agents.cardOffboardAgent')}
         >
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>
         </button>
@@ -100,10 +104,10 @@ function AgentCard({ p, onEdit, onDelete }: {
             </div>
             <div className="inline-flex items-center gap-1 text-[11px] py-0.5 px-2 rounded-full text-ink-500"
               style={{ background: 'var(--ink-100)' }}
-              title={hostOffline ? `${hostLabel} is offline` : `Runs on ${hostLabel}`}>
+              title={hostOffline ? t('agents.hostOfflineTip', { host: hostLabel }) : t('agents.hostRunsOn', { host: hostLabel })}>
               <span>{hostIcon}</span>
               <span className="max-w-[120px] truncate">{hostLabel}</span>
-              {hostOffline && <span className="italic text-ink-400">· sleeping</span>}
+              {hostOffline && <span className="italic text-ink-400">{t('agents.hostOfflineSuffix')}</span>}
             </div>
           </div>
         </div>
@@ -113,7 +117,7 @@ function AgentCard({ p, onEdit, onDelete }: {
         "{p.bio || p.systemPrompt || '—'}"
       </div>
 
-      <div className="text-[9.5px] font-bold text-ink-300 tracking-wider uppercase mb-2">Tools</div>
+      <div className="text-[9.5px] font-bold text-ink-300 tracking-wider uppercase mb-2">{t('agents.tools')}</div>
       <div className="flex flex-wrap gap-1 mb-4">
         {(p.tools ?? []).map((t) => (
           <span key={t} className="font-mono text-[10.5px] py-0.5 px-1.5 rounded text-ink-700"
@@ -129,11 +133,11 @@ function AgentCard({ p, onEdit, onDelete }: {
           disabled={openingChat}
           className="flex-1 py-2 px-3 bg-skype text-white rounded-[9px] text-[12px] font-semibold transition disabled:opacity-60"
           style={{ boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.4)' }}>
-          {openingChat ? 'Opening…' : 'Chat'}
+          {openingChat ? t('agents.openingChat') : t('agents.cardChat')}
         </button>
         <button className="flex-1 py-2 px-3 bg-cloud text-ink-700 rounded-[9px] text-[12px] font-semibold hover:border-whisper-200 hover:text-whisper-deep transition"
           style={{ border: '1px solid var(--ink-100)' }}>
-          Whisper
+          {t('agents.cardWhisper')}
         </button>
       </div>
     </div>
@@ -141,6 +145,7 @@ function AgentCard({ p, onEdit, onDelete }: {
 }
 
 function HireCard({ onClick }: { onClick: () => void }) {
+  const t = useT()
   return (
     <button
       onClick={onClick}
@@ -154,10 +159,10 @@ function HireCard({ onClick }: { onClick: () => void }) {
           <IPlus className="w-6 h-6" strokeWidth={2} />
         </div>
         <div className="font-display font-medium text-[18px] text-ink-900 mb-1.5" style={{ letterSpacing: '-0.01em' }}>
-          Add an agent
+          {t('agents.addAgent')}
         </div>
         <div className="font-display italic font-normal text-[12.5px] text-ink-500 max-w-[200px] mx-auto leading-[1.5]">
-          Define an id, a name, and the style they speak in.
+          {t('agents.addAgentSub')}
         </div>
       </div>
     </button>
@@ -169,6 +174,7 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
   onCancel: () => void
   onConfirmed: () => void
 }) {
+  const t = useT()
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const submit = async () => {
@@ -194,12 +200,12 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
         style={{ border: '1px solid var(--ink-100)' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="font-display font-medium text-[20px] tracking-tight mb-1.5">Off-board {p.name}?</h3>
+        <h3 className="font-display font-medium text-[20px] tracking-tight mb-1.5">{t('agents.offboardTitle', { name: p.name })}</h3>
         <p className="text-[13px] text-ink-700 leading-[1.6] mb-3">
-          {p.name} will leave the team. They stop replying, get hidden from other agents' rosters, and disappear from active conversations.
+          {t('agents.offboardBody1', { name: p.name })}
         </p>
         <p className="text-[12.5px] text-ink-500 leading-[1.55] font-display italic mb-4">
-          Their memory, log, workspace, tasks, and message history all stay intact — you can rehire them any time and they'll pick up where they left off.
+          {t('agents.offboardBody2')}
         </p>
         {err && (
           <div className="text-[12.5px] text-coral-deep bg-coral-soft py-2 px-3 rounded-lg mb-3">{err}</div>
@@ -210,13 +216,13 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >Cancel</button>
+          >{t('common.cancel')}</button>
           <button
             onClick={submit}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
             style={{ background: 'var(--coral-deep)' }}
-          >{busy ? 'Off-boarding…' : `Off-board ${p.name}`}</button>
+          >{busy ? t('agents.offboarding') : t('agents.offboardButton', { name: p.name })}</button>
         </div>
       </div>
     </div>
@@ -224,9 +230,10 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
 }
 
 function FormerAgentCard({ p, onRehire }: { p: Participant; onRehire: (p: Participant) => void }) {
+  const t = useT()
   const departed = p.departedAt
-    ? `off-boarded ${new Date(p.departedAt).toLocaleDateString()}`
-    : 'off-boarded'
+    ? t('agents.offboardedAt', { date: new Date(p.departedAt).toLocaleDateString() })
+    : t('agents.offboarded')
   return (
     <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-3 transition hover:shadow-soft"
       style={{ border: '1px solid var(--ink-100)', opacity: 0.78 }}>
@@ -241,16 +248,17 @@ function FormerAgentCard({ p, onRehire }: { p: Participant; onRehire: (p: Partic
         onClick={() => onRehire(p)}
         className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition inline-flex items-center gap-1"
         style={{ border: '1px solid var(--sky2-200)' }}
-        title={`Rehire ${p.name}`}
+        title={t('agents.rehireTitle', { name: p.name })}
       >
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 4 3 10 9 10"/></svg>
-        Rehire
+        {t('agents.rehire')}
       </button>
     </div>
   )
 }
 
 export function AgentsView() {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const meId = useMe()
   const allAgents = Object.values(byId).filter((p) => p.kind === 'agent')
@@ -281,10 +289,10 @@ export function AgentsView() {
         <div className="mb-6 flex items-end gap-4">
           <div className="flex-1">
             <h1 className="font-display font-medium text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
-              Your team <em className="italic text-skype-deep" style={{ fontWeight: 400 }}>of {list.length}</em>
+              {t('agents.teamHeadline')} <em className="italic text-skype-deep" style={{ fontWeight: 400 }}>{t('agents.teamCountEm', { count: list.length })}</em>
             </h1>
             <div className="font-display italic font-normal text-[15px] text-ink-500">
-              Agents work on their own and with each other. They'll loop you in when they need a call.
+              {t('agents.teamSubtitle')}
             </div>
           </div>
           <button
@@ -296,22 +304,22 @@ export function AgentsView() {
             }}
           >
             <IPlus className="w-4 h-4" strokeWidth={2.5} />
-            New agent
+            {t('agents.newAgent')}
           </button>
         </div>
 
         <div className="flex gap-3 mb-6 text-[11px]">
           <div className="py-1.5 px-3 bg-cloud rounded-full text-ink-700 border border-ink-100">
-            <b className="text-skype-deep font-semibold">{list.filter((a) => a.status === 'working').length}</b> working
+            <b className="text-skype-deep font-semibold">{list.filter((a) => a.status === 'working').length}</b> {t('agents.countWorking')}
           </div>
           <div className="py-1.5 px-3 bg-cloud rounded-full text-ink-700 border border-ink-100">
-            <b className="text-thinking font-semibold">{list.filter((a) => a.status === 'thinking').length}</b> thinking
+            <b className="text-thinking font-semibold">{list.filter((a) => a.status === 'thinking').length}</b> {t('agents.countThinking')}
           </div>
           <div className="py-1.5 px-3 bg-cloud rounded-full text-ink-700 border border-ink-100">
-            <b className="text-avail font-semibold">{list.filter((a) => a.status === 'avail').length}</b> available
+            <b className="text-avail font-semibold">{list.filter((a) => a.status === 'avail').length}</b> {t('agents.countAvailable')}
           </div>
           <div className="py-1.5 px-3 bg-cloud rounded-full text-ink-700 border border-ink-100">
-            <b className="text-resting font-semibold">{list.filter((a) => a.status === 'resting').length}</b> resting
+            <b className="text-resting font-semibold">{list.filter((a) => a.status === 'resting').length}</b> {t('agents.countResting')}
           </div>
         </div>
 
@@ -325,10 +333,10 @@ export function AgentsView() {
         {departed.length > 0 && (
           <div className="mt-10 mb-2">
             <h2 className="font-display font-medium text-[20px] tracking-tight text-ink-700 mb-1.5" style={{ letterSpacing: '-0.02em' }}>
-              Former teammates <em className="italic text-ink-500" style={{ fontWeight: 400, fontSize: '0.85em' }}>· {departed.length}</em>
+              {t('agents.formerHeadline')} <em className="italic text-ink-500" style={{ fontWeight: 400, fontSize: '0.85em' }}>{t('agents.formerCount', { count: departed.length })}</em>
             </h2>
             <div className="font-display italic font-normal text-[13px] text-ink-500 mb-4">
-              Off-boarded — their memory and history are preserved. Rehire any time and they'll pick up where they left off.
+              {t('agents.formerSubtitle')}
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
               {departed.map((p) => <FormerAgentCard key={p.id} p={p} onRehire={rehire} />)}
@@ -339,10 +347,10 @@ export function AgentsView() {
         {humans.length > 0 && (
           <div className="mt-10 mb-2">
             <h2 className="font-display font-medium text-[24px] tracking-tight text-ink-900 mb-1.5" style={{ letterSpacing: '-0.02em' }}>
-              Human teammates
+              {t('agents.humansHeadline')}
             </h2>
             <div className="font-display italic font-normal text-[13.5px] text-ink-500 mb-5">
-              People you work with.
+              {t('agents.humansSubtitle')}
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3">
               {humans.map((p) => (
@@ -351,9 +359,9 @@ export function AgentsView() {
                   <Avatar p={p} size={40} />
                   <div className="flex-1 min-w-0">
                     <div className="font-bold text-[14px] text-ink-900">{p.name}</div>
-                    <div className="text-[11px] text-ink-500">{STATUS_LABEL[p.status] ?? 'idle'}</div>
+                    <div className="text-[11px] text-ink-500">{t((STATUS_LABEL_KEY[p.status] ?? 'common.idle') as MessageKey)}</div>
                   </div>
-                  <span className="text-[9px] font-bold py-0.5 px-1.5 rounded uppercase tracking-wider bg-coral-soft text-coral-deep">human</span>
+                  <span className="text-[9px] font-bold py-0.5 px-1.5 rounded uppercase tracking-wider bg-coral-soft text-coral-deep">{t('common.human')}</span>
                 </div>
               ))}
             </div>

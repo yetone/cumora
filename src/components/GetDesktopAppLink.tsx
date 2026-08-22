@@ -12,6 +12,7 @@
  * coming through the welcome email).
  */
 import type { CSSProperties } from 'react'
+import { useT } from '@/lib/i18n'
 
 // `?download=1` tells the marketing site to skip its waitlist gate. We
 // pass it from every surface where the viewer has *some* claim to the
@@ -37,12 +38,12 @@ interface Props {
   style?: CSSProperties
 }
 
-function detectLabel(): string {
+function detectLabel(t: ReturnType<typeof useT>): string {
   const ua = typeof navigator !== 'undefined' ? navigator.userAgent : ''
-  if (/Mac OS X|Macintosh/i.test(ua)) return 'Download for macOS'
-  if (/Windows/i.test(ua)) return 'Download for Windows'
-  if (/Linux/i.test(ua) && !/Android/i.test(ua)) return 'Download for Linux'
-  return 'Download Cumora'
+  if (/Mac OS X|Macintosh/i.test(ua)) return t('download.forMac')
+  if (/Windows/i.test(ua)) return t('download.forWindows')
+  if (/Linux/i.test(ua) && !/Android/i.test(ua)) return t('download.forLinux')
+  return t('download.generic')
 }
 
 interface VariantDefaults {
@@ -69,7 +70,8 @@ const VARIANT_DEFAULTS: Record<GetDesktopAppLinkVariant, VariantDefaults> = {
 }
 
 export function GetDesktopAppLink({ variant, label, gateBypass = true, className, style }: Props) {
-  const text = label ?? detectLabel()
+  const t = useT()
+  const text = label ?? detectLabel(t)
   const href = gateBypass ? DOWNLOAD_URL_BYPASS : DOWNLOAD_URL_GATED
   const defaults = VARIANT_DEFAULTS[variant]
   // Overrides REPLACE defaults rather than merging — passing a className

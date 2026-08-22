@@ -30,6 +30,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api, type ApiInvitationPreview } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { isElectron, isWebAppHost } from '@/lib/runtime'
+import { useT } from '@/lib/i18n'
 import { CloudLogo } from './Avatar'
 import { GetDesktopAppLink } from './GetDesktopAppLink'
 import { WindowDragStrip } from './WindowDragStrip'
@@ -102,6 +103,7 @@ interface Props {
 }
 
 export function InviteAcceptScreen({ token, onDone }: Props) {
+  const t = useT()
   const token_ = token
   const tokenUserId = useAuth((s) => s.user?.id ?? null)
   const tokenStr = useAuth((s) => s.token)
@@ -216,61 +218,63 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
 
         {!joinedCompany && previewErr && (
           <ErrorBlock
-            title="Couldn't load this invitation"
+            title={t('inviteAccept.couldntLoadTitle')}
             body={previewErr}
             onDismiss={() => { clearPendingInvite(); onDone() }}
           />
         )}
 
         {!joinedCompany && !preview && !previewErr && (
-          <div className="text-[13px] text-ink-400 italic font-display">checking your invitation…</div>
+          <div className="text-[13px] text-ink-400 italic font-display">{t('inviteAccept.checking')}</div>
         )}
 
         {!joinedCompany && preview && preview.status === 'not_found' && (
           <ErrorBlock
-            title="That invite link doesn't work"
-            body="It may have been mistyped. Ask the person who invited you to send a fresh link."
+            title={t('inviteAccept.linkBrokenTitle')}
+            body={t('inviteAccept.linkBrokenBody')}
             onDismiss={() => { clearPendingInvite(); onDone() }}
           />
         )}
 
         {!joinedCompany && preview && preview.status === 'revoked' && (
           <ErrorBlock
-            title="This invitation was revoked"
-            body={`The owners of ${companyName} cancelled it. Ask them to send a new invite.`}
+            title={t('inviteAccept.revokedTitle')}
+            body={t('inviteAccept.revokedBody', { name: companyName })}
             onDismiss={() => { clearPendingInvite(); onDone() }}
           />
         )}
 
         {!joinedCompany && preview && preview.status === 'expired' && (
           <ErrorBlock
-            title="This invitation expired"
-            body={`Invitations to ${companyName} expire after 7 days. Ask for a fresh one.`}
+            title={t('inviteAccept.expiredTitle')}
+            body={t('inviteAccept.expiredBody', { name: companyName })}
             onDismiss={() => { clearPendingInvite(); onDone() }}
           />
         )}
 
         {!joinedCompany && preview && preview.status === 'consumed' && (
           <ErrorBlock
-            title="This invitation was already used"
-            body={`The link to ${companyName} is single-use and someone already redeemed it.`}
+            title={t('inviteAccept.usedTitle')}
+            body={t('inviteAccept.usedBody', { name: companyName })}
             onDismiss={() => { clearPendingInvite(); onDone() }}
           />
         )}
 
         {!joinedCompany && preview && preview.status === 'wrong_email' && inv && (
           <div className="flex flex-col items-center gap-4 text-center">
-            <h1 className="font-display text-[20px] text-ink-900">Wrong account</h1>
+            <h1 className="font-display text-[20px] text-ink-900">{t('inviteAccept.wrongAccount')}</h1>
             <p className="text-[13px] text-ink-500 font-display italic leading-relaxed">
-              This invite to <b className="not-italic text-ink-900">{companyName}</b> is reserved for{' '}
-              <b className="not-italic text-ink-900">{inv.email}</b>, but you're signed in as{' '}
-              <b className="not-italic text-ink-900">{user?.email}</b>. Sign out and back in with the right email.
+              {t('inviteAccept.wrongAccountBody', {
+                company: companyName,
+                email: inv.email ?? '',
+                current: user?.email ?? '',
+              })}
             </p>
             <button
               onClick={() => { useAuth.getState().clear() }}
               className="px-4 py-2 rounded-[10px] text-[13px] font-semibold transition"
               style={{ background: 'var(--ink-700)', color: 'white' }}
-            >Sign out</button>
+            >{t('inviteAccept.signOut')}</button>
           </div>
         )}
 
@@ -289,7 +293,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
           <div className="flex flex-col items-center gap-5 text-center w-full">
             <div className="space-y-1">
               <div className="text-[12.5px] text-ink-400 font-display italic">
-                {inviter} invited you to
+                {t('inviteAccept.invitedBy', { name: inviter })}
               </div>
               <h1 className="font-display text-[24px] tracking-tight text-ink-900">
                 {companyName}
@@ -314,11 +318,11 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
                     background: 'var(--skype)',
                     boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
                   }}
-                >{busy ? 'Joining…' : `Join ${companyName} as ${inv.role}`}</button>
+                >{busy ? t('inviteAccept.joinBusy') : t('inviteAccept.joinAs', { company: companyName, role: inv.role })}</button>
                 <button
                   onClick={() => { clearPendingInvite(); onDone() }}
                   className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic"
-                >Not now</button>
+                >{t('inviteAccept.notNow')}</button>
               </>
             )}
 
@@ -349,6 +353,7 @@ function JoinedSuccessBlock({ companyName, onContinueInBrowser }: {
   companyName: string
   onContinueInBrowser: () => void
 }) {
+  const t = useT()
   return (
     <div className="flex flex-col items-center gap-5 text-center w-full">
       <div
@@ -362,10 +367,10 @@ function JoinedSuccessBlock({ companyName, onContinueInBrowser }: {
       </div>
       <div className="space-y-1">
         <h1 className="font-display text-[22px] tracking-tight text-ink-900">
-          Welcome to {companyName}
+          {t('inviteAccept.welcomeTo', { name: companyName })}
         </h1>
         <p className="text-[12.5px] text-ink-500 font-display italic">
-          You're in. Cumora works best as a desktop app — pick how to keep going.
+          {t('inviteAccept.welcomeBody')}
         </p>
       </div>
       <div className="w-full flex flex-col gap-2.5">
@@ -376,13 +381,13 @@ function JoinedSuccessBlock({ companyName, onContinueInBrowser }: {
             background: 'var(--skype)',
             boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
           }}
-        >Open in Cumora app</button>
+        >{t('inviteAccept.openApp')}</button>
         <GetDesktopAppLink variant="button-secondary" />
         {!isWebAppHost && (
           <button
             onClick={onContinueInBrowser}
             className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
-          >Continue in browser</button>
+          >{t('inviteAccept.continueInBrowser')}</button>
         )}
       </div>
     </div>
@@ -399,11 +404,12 @@ function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
   companyName: string
   onSwitchInBrowser: () => void
 }) {
+  const t = useT()
   return (
     <div className="flex flex-col items-center gap-5 text-center w-full">
-      <h1 className="font-display text-[20px] text-ink-900">You're already in {companyName}</h1>
+      <h1 className="font-display text-[20px] text-ink-900">{t('inviteAccept.alreadyIn', { name: companyName })}</h1>
       <p className="text-[12.5px] text-ink-500 font-display italic -mt-2">
-        Pick up where you left off — on this device or anywhere you've installed Cumora.
+        {t('inviteAccept.alreadyInBody')}
       </p>
       <div className="w-full flex flex-col gap-2.5">
         <button
@@ -413,13 +419,13 @@ function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
             background: 'var(--skype)',
             boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
           }}
-        >Open in Cumora desktop</button>
+        >{t('inviteAccept.openDesktop')}</button>
         <GetDesktopAppLink variant="button-secondary" />
         {!isWebAppHost && (
           <button
             onClick={onSwitchInBrowser}
             className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
-          >Continue in browser</button>
+          >{t('inviteAccept.continueInBrowser')}</button>
         )}
       </div>
     </div>
@@ -428,6 +434,7 @@ function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
 
 function ErrorBlock({ title, body, onDismiss }: { title: string; body: string; onDismiss?: () => void }) {
   const tokenStr = useAuth((s) => s.token)
+  const t = useT()
   return (
     <div className="flex flex-col items-center gap-4 text-center">
       <h1 className="font-display text-[20px] text-ink-900">{title}</h1>
@@ -437,13 +444,14 @@ function ErrorBlock({ title, body, onDismiss }: { title: string; body: string; o
           onClick={onDismiss}
           className="px-4 py-2 rounded-[10px] text-[12.5px] font-semibold text-ink-700 transition"
           style={{ background: 'var(--cloud)', border: '1px solid var(--ink-100)' }}
-        >Continue to Cumora</button>
+        >{t('inviteAccept.continueToCumora')}</button>
       )}
     </div>
   )
 }
 
 function SignInToAccept({ token }: { token: string }) {
+  const t = useT()
   const [busy, setBusy] = useState<'google' | 'github' | null>(null)
   const go = (provider: 'google' | 'github') => {
     setBusy(provider)
@@ -473,7 +481,7 @@ function SignInToAccept({ token }: { token: string }) {
   return (
     <div className="w-full flex flex-col gap-2.5">
       <div className="text-[12.5px] text-ink-500 font-display italic text-center">
-        Sign in to accept this invite
+        {t('auth.signInToAccept')}
       </div>
       <button
         type="button"
@@ -482,7 +490,7 @@ function SignInToAccept({ token }: { token: string }) {
         className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
       >
         <GoogleMark />
-        {busy === 'google' ? 'Redirecting…' : 'Continue with Google'}
+        {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
       </button>
       <button
         type="button"
@@ -491,14 +499,14 @@ function SignInToAccept({ token }: { token: string }) {
         className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
       >
         <GitHubMark />
-        {busy === 'github' ? 'Redirecting…' : 'Continue with GitHub'}
+        {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
       </button>
       <div className="text-[10.5px] text-ink-300 text-center font-display italic">
-        We use your provider only to verify it's you — no posting, no scope creep.
+        {t('auth.providerNote')}
       </div>
       <div className="text-[11.5px] text-ink-400 text-center font-display italic pt-1">
-        Don't have the desktop app yet?{' '}
-        <GetDesktopAppLink variant="text" label="Get Cumora" />
+        {t('inviteAccept.getCumoraPre')}
+        <GetDesktopAppLink variant="text" label={t('inviteAccept.getCumora')} />
       </div>
     </div>
   )

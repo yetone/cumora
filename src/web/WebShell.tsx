@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react'
 import { api } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { AuthGate } from '@/components/AuthGate'
+import { useT } from '@/lib/i18n'
 import { CloudLogo } from '@/components/Avatar'
 import { GetDesktopAppLink } from '@/components/GetDesktopAppLink'
 
@@ -46,6 +47,7 @@ export function WebShell() {
  *  mount; the manual button is a re-arm in case the browser swallowed
  *  the first attempt (e.g. user was tabbed away). */
 function WebHandoff() {
+  const t = useT()
   const token = useAuth((s) => s.token)
   const companyId = useAuth((s) => s.activeCompanyId)
   const clear = useAuth((s) => s.clear)
@@ -73,9 +75,9 @@ function WebHandoff() {
       <div className="w-[360px] flex flex-col items-center gap-7 text-center">
         <CloudLogo size={64} />
         <div className="space-y-1">
-          <div className="font-display text-[22px] text-ink-900">You're signed in</div>
+          <div className="font-display text-[22px] text-ink-900">{t('web.signedIn')}</div>
           <div className="font-display italic text-[13px] text-ink-400">
-            Opening Cumora on your desktop…
+            {t('web.openingDesktop')}
           </div>
         </div>
         <div className="w-full flex flex-col gap-2.5">
@@ -86,15 +88,15 @@ function WebHandoff() {
               background: 'var(--skype)',
               boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)',
             }}
-          >Open in Cumora desktop</button>
+          >{t('web.openDesktop')}</button>
           <GetDesktopAppLink variant="button-secondary" />
           <button
             onClick={() => void signOut()}
             className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
-          >Sign out</button>
+          >{t('web.signOut')}</button>
         </div>
         <div className="text-[11px] text-ink-300 font-display italic">
-          Cumora only runs as a desktop app — open it or install it to continue.
+          {t('web.onlyDesktopNote')}
         </div>
       </div>
     </div>
@@ -106,6 +108,7 @@ function WebHandoff() {
  *  as a waitlist verdict (→ WaitlistConfirmedScreen, handled in App.tsx),
  *  or as a suspended verdict (→ SuspendedScreen, also App.tsx). */
 function WebLanding() {
+  const t = useT()
   const [busy, setBusy] = useState<'google' | 'github' | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const approvedEntry = new URLSearchParams(location.search).has('approved')
@@ -130,9 +133,9 @@ function WebLanding() {
       <div className="w-[360px] flex flex-col items-center gap-7">
         <CloudLogo size={64} />
         <div className="text-center space-y-1">
-          <div className="font-display text-[22px] text-ink-900">Cumora is a desktop app</div>
+          <div className="font-display text-[22px] text-ink-900">{t('web.desktopApp')}</div>
           <div className="font-display italic text-[13px] text-ink-400">
-            Sign in to join, or open the desktop app if it's already installed
+            {t('web.desktopAppSub')}
           </div>
         </div>
         <div className="w-full flex flex-col gap-3">
@@ -143,7 +146,7 @@ function WebLanding() {
             className="h-11 rounded-[10px] border border-ink-200 bg-white hover:bg-cloud transition-colors flex items-center justify-center gap-3 text-[14px] text-ink-800 disabled:opacity-60"
           >
             <GoogleMark />
-            {busy === 'google' ? 'Redirecting…' : 'Continue with Google'}
+            {busy === 'google' ? t('auth.redirecting') : t('auth.continueWithGoogle')}
           </button>
           <button
             type="button"
@@ -152,7 +155,7 @@ function WebLanding() {
             className="h-11 rounded-[10px] bg-[#1f2328] hover:bg-[#2a3037] text-white transition-colors flex items-center justify-center gap-3 text-[14px] disabled:opacity-60"
           >
             <GitHubMark />
-            {busy === 'github' ? 'Redirecting…' : 'Continue with GitHub'}
+            {busy === 'github' ? t('auth.redirecting') : t('auth.continueWithGithub')}
           </button>
         </div>
         {err && (
@@ -162,7 +165,7 @@ function WebLanding() {
         )}
         <div className="w-full flex items-center gap-3 text-[11px] text-ink-300 font-display italic">
           <div className="flex-1 h-px bg-ink-100" />
-          or
+          {t('web.or')}
           <div className="flex-1 h-px bg-ink-100" />
         </div>
         <div className="w-full flex flex-col gap-2.5">
@@ -171,7 +174,7 @@ function WebLanding() {
             onClick={() => tryDeepLink('cumora://open')}
             className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-ink-700 transition"
             style={{ background: 'var(--cloud)', border: '1px solid var(--ink-100)' }}
-          >Open in Cumora desktop</button>
+          >{t('web.openDesktop')}</button>
           <GetDesktopAppLink
             variant="button-secondary"
             gateBypass={approvedEntry}
@@ -180,7 +183,7 @@ function WebLanding() {
           />
         </div>
         <div className="text-[11px] text-ink-300 text-center font-display italic">
-          We use your provider only to verify it's you — no posting, no scope creep.
+          {t('web.providerNote2')}
         </div>
       </div>
     </div>

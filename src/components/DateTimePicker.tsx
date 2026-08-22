@@ -20,6 +20,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { ICalendar } from '@/components/icons'
+import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 interface Props {
@@ -79,6 +80,7 @@ export function DateTimePicker({
   allowClear, disabled,
   className,
 }: Props) {
+  const t = useT()
   const [open, setOpen] = useState(false)
   const [cursorMonth, setCursorMonth] = useState<Date>(() => {
     const { date } = parseValue(value)
@@ -220,7 +222,7 @@ export function DateTimePicker({
                 type="button"
                 onClick={() => setCursorMonth(new Date(cursorMonth.getFullYear(), cursorMonth.getMonth() - 1, 1))}
                 className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100 transition"
-                aria-label="Previous month"
+                aria-label={t('dtpicker.prevMonth')}
               >‹</button>
               <span className="text-[13px] font-semibold text-ink-900 mx-1 min-w-[120px] text-center">
                 {cursorMonth.toLocaleDateString(undefined, { month: 'long', year: 'numeric' })}
@@ -229,7 +231,7 @@ export function DateTimePicker({
                 type="button"
                 onClick={() => setCursorMonth(new Date(cursorMonth.getFullYear(), cursorMonth.getMonth() + 1, 1))}
                 className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100 transition"
-                aria-label="Next month"
+                aria-label={t('dtpicker.nextMonth')}
               >›</button>
             </div>
             <div className="flex items-center gap-2">
@@ -246,13 +248,13 @@ export function DateTimePicker({
                   }
                 }}
                 className="text-[11.5px] font-medium text-skype-deep hover:underline px-1"
-              >Today</button>
+              >{t('dtpicker.today')}</button>
               {allowClear && value && (
                 <button
                   type="button"
                   onClick={() => { onChange(''); setOpen(false) }}
                   className="text-[11.5px] font-medium text-ink-400 hover:text-coral-deep transition px-1"
-                >Clear</button>
+                >{t('dtpicker.clear')}</button>
               )}
             </div>
           </div>
@@ -297,13 +299,13 @@ export function DateTimePicker({
             {mode === 'datetime' && (
               <div className="flex gap-1 border-l border-ink-100 pl-3">
                 <Column
-                  label="hr"
+                  label={t('dtpicker.hourLabel')}
                   values={Array.from({ length: 24 }, (_, h) => h)}
                   selected={hour}
                   onPick={pickHour}
                 />
                 <Column
-                  label="min"
+                  label={t('dtpicker.minuteLabel')}
                   values={MINUTE_STEPS}
                   // Highlight the closest 5-min step so picker stays useful
                   // even when the value was set to, say, :17 via the API.

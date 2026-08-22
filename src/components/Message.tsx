@@ -28,8 +28,10 @@ import { useBoards } from '@/stores/boards'
 import { useCalendar } from '@/stores/calendar'
 import { PollBubble } from './PollBubble'
 import { LinkPreview, firstUrlInBody } from './LinkPreview'
+import { useT } from '@/lib/i18n'
 
 function MentionChip({ id }: { id: string }) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const openAgentInfo = useApp((s) => s.openAgentInfo)
   const meId = useMe()
@@ -47,7 +49,7 @@ function MentionChip({ id }: { id: string }) {
         style={{ verticalAlign: '-0.15em' }}
       >
         <img src="/everyone.png" alt="" className="w-4 h-4 rounded-full object-cover" />
-        <span style={{ lineHeight: '16px' }}>@all</span>
+        <span style={{ lineHeight: '16px' }}>{t('msgview.atAll')}</span>
       </span>
     )
   }
@@ -122,6 +124,7 @@ function MentionChip({ id }: { id: string }) {
 /** Elegant floating preview card shown on @mention hover. Renders via
  *  portal so it escapes scroll-container clipping. */
 function MentionCard({ p, x, y }: { p: Participant; x: number; y: number }) {
+  const t = useT()
   const ref = useRef<HTMLDivElement | null>(null)
   const [adjusted, setAdjusted] = useState<{ left: number; top: number } | null>(null)
   useLayoutEffect(() => {
@@ -136,7 +139,7 @@ function MentionCard({ p, x, y }: { p: Participant; x: number; y: number }) {
     if (top + r.height > window.innerHeight - margin) top = y - r.height - 18  // flip above the anchor
     setAdjusted({ left, top })
   }, [x, y])
-  const role = p.role || (p.kind === 'human' ? 'human teammate' : 'agent')
+  const role = p.role || (p.kind === 'human' ? t('mobchat.humanTeammate') : t('common.agent'))
   return (
     <div
       ref={ref}
@@ -352,6 +355,7 @@ function MessageRefChip({ n }: { n: number }) {
 function MessagePeekCard(
   { msg, author, x, y }: { msg: Message; author: Participant | null; x: number; y: number },
 ) {
+  const t = useT()
   const ARROW = 8
   const W = 320
   const left = Math.max(8, Math.min(window.innerWidth - W - 8, x - W / 2))
@@ -372,7 +376,7 @@ function MessagePeekCard(
           </div>
         </div>
         <div className="text-[12.5px] text-ink-700 leading-[1.55] line-clamp-5 break-words">
-          {bodyPreview || <span className="italic text-ink-400">(no text)</span>}
+          {bodyPreview || <span className="italic text-ink-400">{t('msgview.noText')}</span>}
         </div>
       </div>
     </div>
@@ -568,6 +572,7 @@ function timeAgo(iso: string): string {
 }
 
 function DocumentArtifactCard({ id: rawId, conversationId }: { id: string; conversationId: string }) {
+  const t = useT()
   const id = useResolvedDocumentId(rawId) // git-style short-id → full id
   const loaded = useDocuments((s) => s.loaded)
   const loadDocuments = useDocuments((s) => s.load)
@@ -580,7 +585,7 @@ function DocumentArtifactCard({ id: rawId, conversationId }: { id: string; conve
     if (!loaded) void loadDocuments()
   }, [loadDocuments, loaded])
 
-  const title = doc?.title?.trim() || (loaded ? 'Document unavailable' : 'Opening document…')
+  const title = doc?.title?.trim() || (loaded ? t('docs.unavailable') : t('docs.opening'))
   const author = doc ? byId[doc.createdBy]?.name ?? doc.createdBy : null
   const updated = doc ? timeAgo(doc.updatedAt) : null
   const isPinnedHere = doc?.conversationId === conversationId
@@ -616,7 +621,7 @@ function DocumentArtifactCard({ id: rawId, conversationId }: { id: string; conve
 
         <div className="min-w-0">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">Document</span>
+            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">{t('msgview.cardDocument')}</span>
             <span className="w-1 h-1 rounded-full bg-ink-200 shrink-0" />
             <span className="text-[10.5px] text-ink-400 truncate">{id}</span>
           </div>
@@ -628,14 +633,14 @@ function DocumentArtifactCard({ id: rawId, conversationId }: { id: string; conve
             {isPinnedHere && (
               <>
                 <span className="w-1 h-1 rounded-full bg-ink-200 shrink-0" />
-                <span className="shrink-0 text-gold-deep">in this conversation</span>
+                <span className="shrink-0 text-gold-deep">{t('chat.inThisConversation')}</span>
               </>
             )}
           </div>
         </div>
 
         <div className="ml-1 h-8 px-3 rounded-full bg-sky2-50 text-skype-deep text-[11.5px] font-semibold inline-flex items-center gap-1.5 transition group-hover:bg-skype group-hover:text-white">
-          Open
+          {t('common.open')}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
             <path d="M9 18l6-6-6-6" />
           </svg>
@@ -646,6 +651,7 @@ function DocumentArtifactCard({ id: rawId, conversationId }: { id: string; conve
 }
 
 function BoardArtifactCard({ id: rawId }: { id: string }) {
+  const t = useT()
   const id = useResolvedBoardId(rawId) // git-style short-id → full id
   const loadList = useBoards((s) => s.loadList)
   const loadingList = useBoards((s) => s.loadingList)
@@ -674,7 +680,7 @@ function BoardArtifactCard({ id: rawId }: { id: string }) {
   }, [id, loadBoard, loadingBoardId, snapshot])
 
   const isBoardPending = !snapshot && (loadingBoardId === id || requestedBoardId.current !== id)
-  const title = snapshot?.title?.trim() || summary?.title?.trim() || (isBoardPending ? 'Opening board...' : 'Board unavailable')
+  const title = snapshot?.title?.trim() || summary?.title?.trim() || (isBoardPending ? t('docs.openingBoard') : t('peek.boardUnavailable'))
   const updated = snapshot?.updatedAt || summary?.updatedAt
   const columns = snapshot?.columns.length ?? null
   const cards = snapshot?.cards.length ?? null
@@ -706,7 +712,7 @@ function BoardArtifactCard({ id: rawId }: { id: string }) {
 
         <div className="min-w-0">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">Kanban</span>
+            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">{t('msgview.cardKanban')}</span>
             <span className="w-1 h-1 rounded-full bg-ink-200 shrink-0" />
             <span className="text-[10.5px] text-ink-400 truncate">{id}</span>
           </div>
@@ -725,7 +731,7 @@ function BoardArtifactCard({ id: rawId }: { id: string }) {
         </div>
 
         <div className="ml-1 h-8 px-3 rounded-full bg-sky2-50 text-skype-deep text-[11.5px] font-semibold inline-flex items-center gap-1.5 transition group-hover:bg-skype-deep group-hover:text-white">
-          Open
+          {t('common.open')}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
             <path d="M9 18l6-6-6-6" />
           </svg>
@@ -736,6 +742,7 @@ function BoardArtifactCard({ id: rawId }: { id: string }) {
 }
 
 function CardArtifactCard({ id: rawId }: { id: string }) {
+  const t = useT()
   const id = useResolvedCardId(rawId) // git-style short-id → full id (best-effort for cards)
   const lookup = useBoards((s) => s.cardLookups[id])
   const loadingCardId = useBoards((s) => s.loadingCardId)
@@ -754,7 +761,7 @@ function CardArtifactCard({ id: rawId }: { id: string }) {
 
   const card = lookup?.card ?? null
   const assignee = card?.assigneeId ? byId[card.assigneeId]?.name ?? card.assigneeId : null
-  const title = card?.title.trim() || (failed ? 'Card unavailable' : 'Opening card...')
+  const title = card?.title.trim() || (failed ? t('boards.cardUnavailable') : t('boards.openingCard'))
   const updated = card?.updatedAt ? timeAgo(card.updatedAt) : null
   const location = lookup ? `${lookup.board.title} -> ${lookup.column.title}` : id
 
@@ -794,7 +801,7 @@ function CardArtifactCard({ id: rawId }: { id: string }) {
 
         <div className="min-w-0">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">Kanban card</span>
+            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">{t('msgview.cardKanbanCard')}</span>
             <span className="w-1 h-1 rounded-full bg-ink-200 shrink-0" />
             <span className="text-[10.5px] text-ink-400 truncate">{id}</span>
           </div>
@@ -817,7 +824,7 @@ function CardArtifactCard({ id: rawId }: { id: string }) {
         </div>
 
         <div className="ml-1 h-8 px-3 rounded-full bg-sky2-50 text-skype-deep text-[11.5px] font-semibold inline-flex items-center gap-1.5 transition group-hover:bg-skype-deep group-hover:text-white">
-          Peek
+          {t('common.peek')}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
             <path d="M9 18l6-6-6-6" />
           </svg>
@@ -828,6 +835,7 @@ function CardArtifactCard({ id: rawId }: { id: string }) {
 }
 
 function CalendarArtifactCard({ id: rawId }: { id: string }) {
+  const t = useT()
   const id = useResolvedCalendarId(rawId) // git-style short-id → full event id
   const loadingEventId = useCalendar((s) => s.loadingEventId)
   const loadEvent = useCalendar((s) => s.loadEvent)
@@ -844,7 +852,7 @@ function CalendarArtifactCard({ id: rawId }: { id: string }) {
     }
   }, [event, failed, id, loadEvent, loadingEventId])
 
-  const title = event?.title?.trim() || (failed ? 'Event unavailable' : 'Opening event...')
+  const title = event?.title?.trim() || (failed ? t('peek.eventUnavailable') : t('docs.openingEvent'))
   const assignee = event?.assigneeId ? byId[event.assigneeId]?.name ?? event.assigneeId : null
   const start = event ? new Date(event.startAt) : null
   const startLabel = start && Number.isFinite(start.getTime())
@@ -873,7 +881,7 @@ function CalendarArtifactCard({ id: rawId }: { id: string }) {
 
         <div className="min-w-0">
           <div className="flex items-center gap-2 min-w-0">
-            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">Calendar</span>
+            <span className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">{t('msgview.cardCalendar')}</span>
             <span className="w-1 h-1 rounded-full bg-ink-200 shrink-0" />
             <span className="text-[10.5px] text-ink-400 truncate">{id}</span>
           </div>
@@ -896,7 +904,7 @@ function CalendarArtifactCard({ id: rawId }: { id: string }) {
         </div>
 
         <div className="ml-1 h-8 px-3 rounded-full bg-sky2-50 text-skype-deep text-[11.5px] font-semibold inline-flex items-center gap-1.5 transition group-hover:bg-skype group-hover:text-white">
-          Open
+          {t('common.open')}
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
             <path d="M9 18l6-6-6-6" />
           </svg>
@@ -1055,6 +1063,7 @@ function AttachmentCard({ msg }: { msg: Message }) {
  * server sanitizes and the sandbox forbids scripts, so even residual
  * hostile markup can't escape. */
 function _EmailCard({ msg }: { msg: Message }) {
+  const t = useT()
   const openComposeReply = useApp((s) => s.openComposeReply)
   const [showHtml, setShowHtml] = useState(false)
   const [htmlBody, setHtmlBody] = useState<string | null>(null)
@@ -1144,12 +1153,12 @@ function _EmailCard({ msg }: { msg: Message }) {
           )}
         </div>
         <div className="font-display font-medium text-[16px] leading-snug text-ink-900 break-words">
-          {e.subject || <span className="text-ink-400 italic">(no subject)</span>}
+          {e.subject || <span className="text-ink-400 italic">{t('email.noSubject')}</span>}
         </div>
       </div>
       <div className="px-4 py-2.5 text-[11.5px] text-ink-500 space-y-0.5 border-b border-[rgba(120,110,95,0.18)]">
         <div className="flex gap-2">
-          <span className="font-semibold w-7 shrink-0 text-ink-300 uppercase tracking-wider text-[10px] pt-0.5">From</span>
+          <span className="font-semibold w-7 shrink-0 text-ink-300 uppercase tracking-wider text-[10px] pt-0.5">{t('msgview.emailFrom')}</span>
           <span className="text-ink-700 break-all">{e.from}</span>
         </div>
         {recipients.length > 0 && recipients.map((r, i) => (
@@ -1162,7 +1171,7 @@ function _EmailCard({ msg }: { msg: Message }) {
       {showHtml ? (
         <div className="px-2 py-2 bg-white">
           {htmlLoading && (
-            <div className="px-3 py-6 text-[12px] text-ink-400 italic">loading html…</div>
+            <div className="px-3 py-6 text-[12px] text-ink-400 italic">{t('msgview.loadingHtml')}</div>
           )}
           {htmlError && (
             <div className="px-3 py-3 text-[12px] text-coral-deep">
@@ -1190,7 +1199,7 @@ function _EmailCard({ msg }: { msg: Message }) {
           className="px-4 py-2 text-[11.5px] text-coral-deep border-t border-[rgba(196,60,50,0.25)]"
           style={{ background: 'rgba(196, 60, 50, 0.06)' }}
         >
-          delivery failed: {e.transportError}
+          {t('email.deliveryFailedPrefix')} {e.transportError}
         </div>
       )}
       <div className="flex items-center gap-2 px-4 py-2 border-t border-[rgba(120,110,95,0.18)]">
@@ -1200,7 +1209,7 @@ function _EmailCard({ msg }: { msg: Message }) {
           className="inline-flex items-center gap-1.5 py-1.5 px-3 text-[11.5px] font-semibold text-ink-700 bg-cloud border border-ink-100 rounded-[7px] hover:border-sky2-200 hover:text-skype-deep transition"
         >
           <IMail className="w-3.5 h-3.5" strokeWidth={2} />
-          Reply
+          {t('email.reply')}
         </button>
       </div>
     </div>
@@ -1252,6 +1261,7 @@ function EmailAttachmentRow({ att }: { att: NonNullable<NonNullable<Message['ema
  *  link can open in a new tab; everything is forced to target=_blank +
  *  rel=noopener via a CSP-friendly wrapper around the body. */
 function EmailHtmlFrame({ html }: { html: string }) {
+  const t = useT()
   const ref = useRef<HTMLIFrameElement | null>(null)
   const [h, setH] = useState(120)
   // Wrap the sanitized body in a minimal HTML skeleton with a base target
@@ -1297,15 +1307,16 @@ function EmailHtmlFrame({ html }: { html: string }) {
       sandbox="allow-popups allow-popups-to-escape-sandbox"
       referrerPolicy="no-referrer"
       style={{ width: '100%', height: h, border: 0, background: 'white', borderRadius: 6 }}
-      title="HTML email body"
+      title={t('msgview.htmlEmailBody')}
     />
   )
 }
 
 function WhisperLink({ msg }: { msg: Message }) {
+  const t = useT()
+  const byId = useParticipants((s) => s.byId)
   if (!msg.whisperLink) return null
   const w = msg.whisperLink
-  const byId = useParticipants((s) => s.byId)
   const a = byId[w.pair[0]]
   const b = byId[w.pair[1]]
   return (
@@ -1321,9 +1332,9 @@ function WhisperLink({ msg }: { msg: Message }) {
         <svg width="14" height="14" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path d="M3 12c0-4 4-8 9-8s9 4 9 8-4 8-9 8a10 10 0 01-3-.5L3 21l1.5-5A8 8 0 013 12z"/></svg>
       </div>
       <div className="min-w-0 flex-1">
-        <span className="text-whisper-deep font-bold">{a?.name}</span> and <span className="text-whisper-deep font-bold">{b?.name}</span> are whispering — <em className="font-display italic font-normal text-whisper-deep">{w.snippet}</em> · {w.count} messages
+        <span className="text-whisper-deep font-bold">{a?.name}</span>{t('msgview.and')}<span className="text-whisper-deep font-bold">{b?.name}</span>{t('msgview.whisperingSuffix')} <em className="font-display italic font-normal text-whisper-deep">{w.snippet}</em> · {w.count} messages
       </div>
-      <div className="ml-auto text-[11px] font-semibold py-1 px-2.5 rounded-full bg-[rgba(124,92,255,0.15)] text-whisper-deep shrink-0">Peek →</div>
+      <div className="ml-auto text-[11px] font-semibold py-1 px-2.5 rounded-full bg-[rgba(124,92,255,0.15)] text-whisper-deep shrink-0">{t('msgview.peekArrow')}</div>
     </div>
   )
 }
@@ -1516,6 +1527,7 @@ function ReactionTooltip({ emoji, names, anchorX, anchorY }: {
  * ApiWhisperMessage without a type adapter).
  */
 export function SystemRow({ msg, delay = 0, animate = true }: { msg: { body: string }; delay?: number; animate?: boolean }) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const openAgentInfo = useApp((s) => s.openAgentInfo)
   // Same animate-once contract as MessageRow: don't replay the rise-in fade on
@@ -1585,9 +1597,9 @@ export function SystemRow({ msg, delay = 0, animate = true }: { msg: { body: str
         {payload.kind === 'kicked' && actor ? (
           <>
             <SystemActor p={actor} onClick={() => openAgentInfo(actor.id)} />
-            <span>— removed</span>
+            <span>{t('msgview.removedActor')}</span>
             <SystemActor p={subject} onClick={onClick} />
-            <span>from the group</span>
+            <span>{t('msgview.removedFromGroup')}</span>
           </>
         ) : (
           <>
@@ -1621,6 +1633,7 @@ function SystemActor({ p, onClick }: { p: Participant; onClick: () => void }) {
  *  quoted-original via the global hash trick (`#m-${id}`) — Message rows
  *  carry that id on the wrapper div so it works as a CSS scroll target. */
 function QuoteCard({ msg }: { msg: Message }) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const jumpToMessage = useApp((s) => s.jumpToMessage)
   if (!msg.quotedMessageId) return null
@@ -1638,7 +1651,7 @@ function QuoteCard({ msg }: { msg: Message }) {
         className="mb-1 max-w-[min(100%,580px)] flex items-stretch gap-2 text-left rounded-md bg-cloud/60 border border-ink-100 hover:border-ink-200 px-2 py-1.5 transition-colors"
       >
         <span className="w-[3px] rounded bg-ink-200" />
-        <span className="min-w-0 text-[11.5px] text-ink-400 italic">[message deleted]</span>
+        <span className="min-w-0 text-[11.5px] text-ink-400 italic">{t('msgview.messageDeleted')}</span>
       </button>
     )
   }
@@ -1650,7 +1663,7 @@ function QuoteCard({ msg }: { msg: Message }) {
     <button
       onClick={jump}
       className="mb-1 max-w-[min(100%,580px)] flex items-stretch gap-2 text-left rounded-md bg-cloud/60 border border-ink-100 hover:border-ink-200 hover:bg-cloud px-2 py-1.5 transition-colors"
-      title="Jump to original"
+      title={t('msgview.jumpToOriginal')}
     >
       <span className="w-[3px] rounded bg-skype" />
       <span className="min-w-0 flex flex-col gap-0.5">
@@ -1665,13 +1678,14 @@ function QuoteCard({ msg }: { msg: Message }) {
  *  picks up the quote draft. Composers are responsible for wiring this into
  *  the actual sendUserMessage call. */
 function ReplyIconButton({ msg }: { msg: Message }) {
+  const t = useT()
   const setReplyingTo = useApp((s) => s.setReplyingTo)
   return (
     <button
       onClick={() => setReplyingTo(msg.conversationId, msg.id)}
       className="w-6 h-6 rounded-full hover:bg-sky2-50 grid place-items-center text-ink-400 hover:text-skype-deep"
-      title="Reply"
-      aria-label="Reply to this message"
+      title={t('chat.reply')}
+      aria-label={t('chat.replyToMessage')}
     >
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
         <polyline points="9 17 4 12 9 7" />
@@ -1682,6 +1696,7 @@ function ReplyIconButton({ msg }: { msg: Message }) {
 }
 
 function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowProps) {
+  const t = useT()
   const openAgentInfo = useApp((s) => s.openAgentInfo)
   const openThreadView = useApp((s) => s.openThreadView)
   const meId = useMe()
@@ -1723,7 +1738,7 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
         onClick={onAvatarClick}
         disabled={isMine}
         className={cn('rounded-full transition', !isMine && 'hover:opacity-80 active:scale-95 cursor-pointer')}
-        title={isMine ? undefined : `Show ${author.name}'s info`}
+        title={isMine ? undefined : t('chat.showAuthorInfo', { name: author.name })}
       >
         <Avatar p={author} size={38} ringColor="var(--cloud)" />
       </button>
@@ -1788,18 +1803,18 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
 
         {(msg.failed || msg.unconfirmed) && (
           <div className="mt-1 flex items-center gap-2 text-[11px] text-coral-deep">
-            <span>{msg.unconfirmed ? 'Delivery not confirmed' : 'Failed to send'}</span>
+            <span>{msg.unconfirmed ? t('chat.deliveryUnconfirmed') : t('chat.failedToSend')}</span>
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); void retryFailedMessage(msg.conversationId, msg.id) }}
               className="font-semibold underline underline-offset-2 hover:text-coral-700"
-            >Retry</button>
+            >{t('chat.tryAgain')}</button>
             <span className="text-ink-300">·</span>
             <button
               type="button"
               onClick={(e) => { e.stopPropagation(); discardFailedMessage(msg.conversationId, msg.id) }}
               className="font-semibold underline underline-offset-2 hover:text-coral-700"
-            >Dismiss</button>
+            >{t('chat.dismiss')}</button>
           </div>
         )}
 
@@ -1854,19 +1869,20 @@ export const MessageRow = memo(MessageRowImpl)
  * "Iris and Bram are typing…", "Iris, Bram and 2 more are typing…").
  */
 export function TypingRow({ names }: { names: string[] }) {
+  const t = useT()
   const visible = names.length > 0
   let body: React.ReactNode = null
   if (names.length === 1) {
-    body = <><b className="text-ink-700 font-semibold">{names[0]}</b> is typing…</>
+    body = <><b className="text-ink-700 font-semibold">{names[0]}</b>{t('msgview.typingIs')}</>
   } else if (names.length === 2) {
-    body = <><b className="text-ink-700 font-semibold">{names[0]}</b> and <b className="text-ink-700 font-semibold">{names[1]}</b> are typing…</>
+    body = <><b className="text-ink-700 font-semibold">{names[0]}</b>{t('msgview.and')}<b className="text-ink-700 font-semibold">{names[1]}</b>{t('msgview.typingAre')}</>
   } else if (names.length >= 3) {
     body = (
       <>
-        <b className="text-ink-700 font-semibold">{names[0]}</b>, <b className="text-ink-700 font-semibold">{names[1]}</b>
+        <b className="text-ink-700 font-semibold">{names[0]}</b>{t('msgview.typingSep')}<b className="text-ink-700 font-semibold">{names[1]}</b>
         {names.length === 3
-          ? <> and <b className="text-ink-700 font-semibold">{names[2]}</b> are typing…</>
-          : <> and <b className="text-ink-700 font-semibold">{names.length - 2} more</b> are typing…</>}
+          ? <>{t('msgview.and')}<b className="text-ink-700 font-semibold">{names[2]}</b>{t('msgview.typingAre')}</>
+          : <>{t('msgview.and')}<b className="text-ink-700 font-semibold">{t('msgview.nMore', { n: names.length - 2 })}</b>{t('msgview.typingAre')}</>}
       </>
     )
   }

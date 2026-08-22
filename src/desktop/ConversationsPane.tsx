@@ -15,10 +15,27 @@ import { ResizeHandle } from '@/components/ResizeHandle'
 import { ISearch, IMail, IPlus } from '@/components/icons'
 import { cn } from '@/lib/utils'
 import { api, type ApiProject, type ApiSearchResults } from '@/api/client'
+import { useLocale, useT, type MessageKey } from '@/lib/i18n'
+
+/** The reactive translator, threaded into the helpers below so they stay
+ *  pure and their callers' components re-render on a locale switch. */
+type Translator = ReturnType<typeof useT>
 import type { Conversation, Participant } from '@/types'
 
 const staticFilters = ['All', 'Unread', 'Agents', 'Humans', 'Groups', 'Email', 'Whispers'] as const
 type StaticFilter = (typeof staticFilters)[number]
+/** Display labels for the static filter chips. The enum values in
+ *  `staticFilters` stay English so the existing `matches()` comparison
+ *  keeps working; this Record maps each enum to its translation key. */
+const FILTER_LABEL: Record<StaticFilter, MessageKey> = {
+  All: 'convo.filterAll',
+  Unread: 'convo.filterUnread',
+  Agents: 'convo.filterAgents',
+  Humans: 'convo.filterHumans',
+  Groups: 'convo.filterGroups',
+  Email: 'convo.filterEmail',
+  Whispers: 'convo.filterWhispers',
+}
 /** A filter is either one of the static labels, or a project chip identified
  *  by `project:<id>`. Keeping it as a string union lets the existing chip
  *  loop iterate uniformly. */
@@ -29,13 +46,13 @@ type Filter = StaticFilter | `project:${string}`
  *  at click time, not at module load, so "tomorrow" always resolves
  *  against the user's current wall-clock — not whatever it was when the
  *  app first booted. */
-const MUTE_DURATIONS: Array<{ label: string; compute: () => Date }> = [
-  { label: 'For 15 minutes', compute: () => new Date(Date.now() + 15 * 60_000) },
-  { label: 'For 1 hour',     compute: () => new Date(Date.now() + 60 * 60_000) },
-  { label: 'For 8 hours',    compute: () => new Date(Date.now() + 8 * 60 * 60_000) },
-  { label: 'For 24 hours',   compute: () => new Date(Date.now() + 24 * 60 * 60_000) },
+const MUTE_DURATIONS: Array<{ label: MessageKey; compute: () => Date }> = [
+  { label: 'convo.mute15m', compute: () => new Date(Date.now() + 15 * 60_000) },
+  { label: 'convo.mute1h',  compute: () => new Date(Date.now() + 60 * 60_000) },
+  { label: 'convo.mute8h',  compute: () => new Date(Date.now() + 8 * 60 * 60_000) },
+  { label: 'convo.mute24h', compute: () => new Date(Date.now() + 24 * 60 * 60_000) },
   {
-    label: 'Until tomorrow morning',
+    label: 'convo.muteTomorrow',
     // 9 AM the next calendar day, local time. If the user clicks this at
     // 02:00 on Tuesday they get silence until Wednesday 09:00 — matches
     // how a human reads "until tomorrow".
@@ -47,7 +64,7 @@ const MUTE_DURATIONS: Array<{ label: string; compute: () => Date }> = [
     },
   },
   {
-    label: 'Until next Monday',
+    label: 'convo.muteMonday',
     // Next Monday 9 AM local. If today IS Monday we skip to the FOLLOWING
     // Monday — "next" reads as "a whole week of quiet", not "a few hours".
     compute: () => {
@@ -63,15 +80,17 @@ const MUTE_DURATIONS: Array<{ label: string; compute: () => Date }> = [
 
 /** Short label shown next to the "Muted" menu row so users know how long
  *  they've still got left without diving into the submenu. */
-function muteHint(mutedUntil: string | null | undefined): string {
-  if (!mutedUntil) return 'forever'
+function muteHint(t: Translator, mutedUntil: string | null | undefined): string {
+  if (!mutedUntil) return t('convo.muteHintForever')
   const until = new Date(mutedUntil)
   if (Number.isNaN(until.getTime())) return ''
   const now = new Date()
   const sameDay = until.toDateString() === now.toDateString()
-  return sameDay
-    ? `until ${until.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
-    : `until ${until.toLocaleDateString([], { month: 'short', day: 'numeric' })}`
+  return t('convo.muteHintUntil', {
+    when: sameDay
+      ? until.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      : until.toLocaleDateString([], { month: 'short', day: 'numeric' }),
+  })
 }
 
 function matches(c: Conversation, f: Filter, byId: Record<string, { kind: string }>) {
@@ -116,6 +135,7 @@ function TeamAvatar() {
 }
 
 function ConvoAvatar({ c }: { c: Conversation }) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const meId = useMe()
 
@@ -177,7 +197,7 @@ function ConvoAvatar({ c }: { c: Conversation }) {
             border: '1.5px solid var(--paper)',
             color: '#7A6A3F',
           }}
-          title="Email thread"
+          title={t('convo.emailThread')}
         >
           <IMail className="w-2.5 h-2.5" strokeWidth={2.5} />
         </span>
@@ -189,6 +209,7 @@ function ConvoAvatar({ c }: { c: Conversation }) {
 }
 
 function Tag({ c }: { c: Conversation }) {
+  const t = useT()
   // Note: c.subtitle (auto-generated as "cross-project · N" / "team · N")
   // intentionally NOT rendered — it duplicates the member count already
   // visible in the hive avatar and crowded the row layout. Only meaningful
@@ -201,7 +222,7 @@ function Tag({ c }: { c: Conversation }) {
     <span
       className="text-[10px] font-semibold tracking-wider uppercase whitespace-nowrap"
       style={{ color: 'var(--skype-deep)' }}
-    >teammate</span>
+    >{t('convo.teammateTag')}</span>
   )
   return null
 }
@@ -242,6 +263,7 @@ function MutedGlyph({ title }: { title: string }) {
 }
 
 function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
+  const t = useT()
   const isFreshPulled = c.tag === 'fresh-pulled'
   const muted = isMuted(c)
   const typingIds = useMessages((s) => s.typing[c.id])
@@ -267,7 +289,7 @@ function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
     >
       {isFreshPulled && selected && (
         <span className="absolute -top-2 right-3 bg-cloud border border-[rgba(244,183,64,0.5)] text-gold-deep text-[9px] font-extrabold tracking-wider uppercase py-0.5 px-2 rounded-full shadow">
-          {pulledByName ? `NEW · pulled by ${pulledByName}` : 'NEW'}
+          {pulledByName ? t('convo.newPulledBy', { name: pulledByName }) : t('convo.new')}
         </span>
       )}
       <ConvoAvatar c={c} />
@@ -281,7 +303,7 @@ function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
             'text-[13.5px] font-semibold truncate',
             muted ? 'text-ink-700 opacity-80' : 'text-ink-900',
           )}>{c.title}</span>
-          {muted && <MutedGlyph title={muteTooltip(c.mutedUntil)} />}
+          {muted && <MutedGlyph title={muteTooltip(t, c.mutedUntil)} />}
           <Tag c={c} />
         </div>
         {typingNames.length > 0 ? (
@@ -293,10 +315,10 @@ function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
             </span>
             <span className="truncate">
               {typingNames.length === 1
-                ? `${typingNames[0]} is typing…`
+                ? t('convo.typingOne', { name: typingNames[0] })
                 : typingNames.length === 2
-                  ? `${typingNames[0]} and ${typingNames[1]} are typing…`
-                  : `${typingNames[0]} and ${typingNames.length - 1} more are typing…`}
+                  ? t('convo.typingTwo', { a: typingNames[0], b: typingNames[1] })
+                  : t('convo.typingMore', { a: typingNames[0], n: typingNames.length - 1 })}
             </span>
           </div>
         ) : c.preview && (
@@ -326,16 +348,16 @@ function ConvoRow({ c, selected, onClick, onContextMenu }: RowProps) {
 
 /** Tooltip for the bell-off glyph — surfaces the auto-unmute time so the
  *  user remembers when notifications come back. */
-function muteTooltip(mutedUntil: string | null | undefined): string {
-  if (!mutedUntil) return 'Muted'
+function muteTooltip(t: Translator, mutedUntil: string | null | undefined): string {
+  if (!mutedUntil) return t('convo.muted')
   const until = new Date(mutedUntil)
-  if (Number.isNaN(until.getTime())) return 'Muted'
+  if (Number.isNaN(until.getTime())) return t('convo.muted')
   const now = new Date()
   const sameDay = until.toDateString() === now.toDateString()
   const fmt = sameDay
     ? until.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : until.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-  return `Muted until ${fmt}`
+  return t('convo.mutedUntil', { when: fmt })
 }
 
 /** Strip MD/mention sigils so message snippets read as plain text — we
@@ -402,6 +424,7 @@ function rowClass(isSelected: boolean): string {
 function SearchResultsPane({
   query, results, loading, selectedIdx, onHover, onSelectConversation, onOpenDirect,
 }: SearchResultsPaneProps) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const q = query.trim()
 
@@ -414,14 +437,14 @@ function SearchResultsPane({
   }, [selectedIdx])
 
   if (loading && !results) {
-    return <div className="px-4 py-6 text-[12px] text-ink-300 italic font-display">Searching…</div>
+    return <div className="px-4 py-6 text-[12px] text-ink-300 italic font-display">{t('convo.searching')}</div>
   }
   if (!results) return null
   const total = results.participants.length + results.rooms.length + results.groups.length + results.messages.length
   if (total === 0) {
     return (
       <div className="px-4 py-8 text-center text-[12.5px] text-ink-300 italic font-display">
-        No matches for <span className="text-ink-700 not-italic font-semibold">"{q}"</span>
+        {t('convo.noMatches')} <span className="text-ink-700 not-italic font-semibold">"{q}"</span>
       </div>
     )
   }
@@ -435,7 +458,7 @@ function SearchResultsPane({
 
   return (
     <div ref={containerRef}>
-      <SearchSection label="People" count={results.participants.length}>
+      <SearchSection label={t('convo.searchPeople')} count={results.participants.length}>
         {results.participants.map((p, i) => {
           const idx = peopleStart + i
           const sel = idx === selectedIdx
@@ -460,7 +483,7 @@ function SearchResultsPane({
               <div className="min-w-0">
                 <div className="text-[13px] font-semibold text-ink-900 truncate">{highlight(p.name, q)}</div>
                 <div className="text-[11px] text-ink-500 truncate">
-                  {p.role ?? (p.kind === 'agent' ? 'agent' : 'human teammate')}
+                  {p.role ?? (p.kind === 'agent' ? t('convo.roleAgent') : t('convo.roleHuman'))}
                 </div>
               </div>
               <span className="text-[9px] font-bold py-px px-1.5 rounded uppercase tracking-wider whitespace-nowrap"
@@ -473,7 +496,7 @@ function SearchResultsPane({
         })}
       </SearchSection>
 
-      <SearchSection label="Rooms" count={results.rooms.length}>
+      <SearchSection label={t('convo.searchRooms')} count={results.rooms.length}>
         {results.rooms.map((r, i) => {
           const idx = roomsStart + i
           return (
@@ -494,7 +517,7 @@ function SearchResultsPane({
         })}
       </SearchSection>
 
-      <SearchSection label="Groups" count={results.groups.length}>
+      <SearchSection label={t('convo.searchGroups')} count={results.groups.length}>
         {results.groups.map((g, i) => {
           const idx = groupsStart + i
           return (
@@ -515,7 +538,7 @@ function SearchResultsPane({
         })}
       </SearchSection>
 
-      <SearchSection label="Messages" count={results.messages.length}>
+      <SearchSection label={t('convo.searchMessages')} count={results.messages.length}>
         {results.messages.map((m, i) => {
           const idx = messagesStart + i
           const sel = idx === selectedIdx
@@ -533,12 +556,12 @@ function SearchResultsPane({
             >
               <div className="flex items-center justify-between gap-2 mb-0.5">
                 <div className="text-[12px] font-semibold text-ink-900 truncate">
-                  <span className="text-ink-500 font-normal">in</span> {m.conversationTitle}
+                  <span className="text-ink-500 font-normal">{t('convo.inConvo')}</span> {m.conversationTitle}
                 </div>
                 <div className="text-[10px] text-ink-300 tabular-nums shrink-0">{tsLabel}</div>
               </div>
               <div className="text-[11.5px] text-ink-500 leading-[1.45] line-clamp-2">
-                <span className="text-ink-700 font-medium">{m.authorName ?? 'unknown'}: </span>
+                <span className="text-ink-700 font-medium">{m.authorName ?? t('convo.unknown')}: </span>
                 {highlight(plainSnippet(m.snippet), q)}
               </div>
             </button>
@@ -561,6 +584,7 @@ function SearchConvoButton({ id, kind, title, members, byId, query, index, isSel
   onHover: (idx: number) => void
   onClick: () => void
 }) {
+  const t = useT()
   const meId = useMe()
   const ps = members.map((m) => byId[m]).filter((p): p is Participant => Boolean(p))
   // Build a single-button row that mirrors ConvoAvatar's logic but in
@@ -584,8 +608,8 @@ function SearchConvoButton({ id, kind, title, members, byId, query, index, isSel
       <div className="min-w-0">
         <div className="text-[13px] font-semibold text-ink-900 truncate">{highlight(title, query)}</div>
         <div className="text-[11px] text-ink-500 truncate">
-          {kind === 'whisper' ? 'whisper · ' : kind === 'group' ? 'group · ' : ''}
-          {members.length} {members.length === 1 ? 'member' : 'members'}
+          {kind === 'whisper' ? t('convo.kindWhisper') : kind === 'group' ? t('convo.kindGroup') : ''}
+          {t(members.length === 1 ? 'convo.member' : 'convo.members', { n: members.length })}
         </div>
       </div>
     </button>
@@ -593,6 +617,8 @@ function SearchConvoButton({ id, kind, title, members, byId, query, index, isSel
 }
 
 export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React.MouseEvent) => void }) {
+  const t = useT()
+  const locale = useLocale()
   const selected = useApp((s) => s.selectedConversationId)
   const select = useApp((s) => s.selectConversation)
   const list = useConversations((s) => s.list)
@@ -709,7 +735,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
     e.stopPropagation()
     const items: ContextMenuItem[] = []
     items.push({
-      label: c.pinned ? 'Unpin' : 'Pin to top',
+      label: c.pinned ? t('convo.unpin') : t('convo.pin'),
       icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 17v5"/><path d="M9 10.76V4l-2.5-1.5L5 4l1.5 1.5V10.76A6 6 0 0 0 5 16h14a6 6 0 0 0-1.5-5.24V5.5L19 4l-1.5-1.5L15 4v6.76A6 6 0 0 0 12 11a6 6 0 0 0-3-.24z"/></svg>,
       onSelect: () => togglePin(c),
     })
@@ -721,35 +747,35 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
     const muteSubmenu: ContextMenuItem[] = []
     if (muted) {
       muteSubmenu.push({
-        label: 'Unmute',
+        label: t('convo.unmute'),
         icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>,
         onSelect: () => void setMute(c, false, null),
       })
     }
     for (const opt of MUTE_DURATIONS) {
       muteSubmenu.push({
-        label: opt.label,
+        label: t(opt.label),
         onSelect: () => void setMute(c, true, opt.compute()),
       })
     }
     muteSubmenu.push({
-      label: 'Until I turn it back on',
+      label: t('convo.muteForever'),
       onSelect: () => void setMute(c, true, null),
     })
     items.push({
-      label: muted ? 'Muted' : 'Mute conversation',
+      label: muted ? t('convo.muted') : t('convo.mute'),
       icon: bellOff,
-      hint: muted ? muteHint(c.mutedUntil) : undefined,
+      hint: muted ? muteHint(t, c.mutedUntil) : undefined,
       submenu: muteSubmenu,
     })
     if (c.kind === 'group') {
       items.push({
-        label: 'Add members…',
+        label: t('convo.addMembers'),
         icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>,
         onSelect: () => setAddingMembersTo(c),
       })
       items.push({
-        label: 'Leave group',
+        label: t('convo.leaveGroup'),
         destructive: true,
         icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>,
         onSelect: () => setConfirmLeave(c),
@@ -760,12 +786,12 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
       const other = otherId ? byId[otherId] : undefined
       if (other) {
         items.push({
-          label: `Create group with ${other.name}…`,
+          label: t('convo.createGroupWith', { name: other.name }),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="9" cy="7" r="4"/><path d="M3 21v-2a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v2"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>,
           onSelect: () => setCreatingWithMember(other.id),
         })
         items.push({
-          label: `Add ${other.name} to a group…`,
+          label: t('convo.addToAGroup', { name: other.name }),
           icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>,
           onSelect: () => setAddingToGroup({ participantId: other.id, name: other.name }),
         })
@@ -793,13 +819,15 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
     const out: ConvoListItem[] = []
     if (!loaded) out.push({ type: 'loading', key: 'loading' })
     if (pinned.length > 0) {
-      out.push({ type: 'label', key: 'label:pinned', text: 'Pinned' })
+      out.push({ type: 'label', key: 'label:pinned', text: t('convo.pinned') })
       for (const c of pinned) out.push({ type: 'row', key: `p:${c.id}`, c })
       if (rest.length > 0) out.push({ type: 'divider', key: 'divider' })
     }
     for (const c of rest) out.push({ type: 'row', key: `r:${c.id}`, c })
     return out
-  }, [loaded, pinned, rest])
+    // locale in the deps so the baked-in section label re-renders on a
+    // language switch (t itself is identity-unstable, locale is not).
+  }, [loaded, pinned, rest, locale])
 
   const sectionLabel = (label: string, hint?: string) => (
     <div className="px-2 pt-3 pb-1.5 text-[10px] font-bold text-ink-300 tracking-[0.12em] uppercase flex items-center justify-between">
@@ -817,7 +845,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
     <aside className="relative flex flex-col overflow-hidden border-r border-ink-100 bg-paper">
       <div className="pt-3 px-[18px] pb-2 flex items-center gap-2">
         <h1 className="font-display font-medium text-[20px] tracking-tight text-ink-900 leading-none flex-1 min-w-0 truncate whitespace-nowrap">
-          Conversations
+          {t('convo.title')}
           <svg
             viewBox="0 0 24 24"
             width="17" height="17"
@@ -838,8 +866,8 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           type="button"
           onClick={() => setCreating(true)}
           className="inline-flex items-center p-1.5 text-ink-700 bg-cloud border border-ink-100 rounded-[7px] hover:border-sky2-200 hover:text-skype-deep transition shrink-0"
-          title="Create a new group conversation"
-          aria-label="Create a new group conversation"
+          title={t('convo.newGroup')}
+          aria-label={t('convo.newGroup')}
         >
           <IPlus className="w-3.5 h-3.5" strokeWidth={2.5} />
         </button>
@@ -847,8 +875,8 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           type="button"
           onClick={useApp.getState().openComposeNew}
           className="inline-flex items-center p-1.5 text-ink-700 bg-cloud border border-ink-100 rounded-[7px] hover:border-sky2-200 hover:text-skype-deep transition shrink-0"
-          title="Compose new email"
-          aria-label="Compose new email"
+          title={t('convo.newEmail')}
+          aria-label={t('convo.newEmail')}
         >
           <IMail className="w-3.5 h-3.5" strokeWidth={2.5} />
         </button>
@@ -880,14 +908,14 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
             }
           }}
           className="flex-1 min-w-0 bg-transparent outline-none text-ink-700 placeholder:text-ink-300"
-          placeholder="Find a conversation, agent, or human…"
+          placeholder={t('convo.searchPlaceholder')}
         />
         {query ? (
           <button
             type="button"
             onClick={() => { setQuery(''); searchRef.current?.focus() }}
             className="shrink-0 grid place-items-center w-4 h-4 rounded-full bg-ink-100 hover:bg-ink-200 text-ink-500 transition"
-            aria-label="Clear search"
+            aria-label={t('convo.clearSearch')}
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" className="w-2.5 h-2.5">
               <line x1="6" y1="6" x2="18" y2="18" />
@@ -935,7 +963,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
                 boxShadow: '0 1px 2px -1px rgba(0, 120, 200, 0.12)',
               } : undefined}
             >
-              {f}
+              {t(FILTER_LABEL[f])}
               {showBadge && (
                 <span
                   className="inline-grid place-items-center min-w-[16px] h-4 px-1 rounded-full text-[9.5px] font-bold"
@@ -1011,7 +1039,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
             components={{ Footer: () => <div style={{ height: 18 }} /> }}
             itemContent={(_, item) => {
               if (item.type === 'loading') {
-                return <div className="px-3 py-4 text-[12px] text-ink-300 italic font-display">Loading…</div>
+                return <div className="px-3 py-4 text-[12px] text-ink-300 italic font-display">{t('convo.loading')}</div>
               }
               if (item.type === 'label') return sectionLabel(item.text)
               if (item.type === 'divider') {
@@ -1089,6 +1117,7 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
   groups: Conversation[]
   onClose: () => void
 }) {
+  const t = useT()
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [done, setDone] = useState<{ groupTitle: string } | null>(null)
@@ -1118,18 +1147,18 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-6 py-5 border-b border-ink-100 shrink-0">
-          <h3 className="font-display font-medium text-[18px] tracking-tight">Add {participantName} to…</h3>
-          <div className="text-[12px] text-ink-500 italic font-display mt-0.5">Pick a group you want them in.</div>
+          <h3 className="font-display font-medium text-[18px] tracking-tight">{t('convo.addToTitle', { name: participantName })}</h3>
+          <div className="text-[12px] text-ink-500 italic font-display mt-0.5">{t('convo.addToGroupPrompt')}</div>
         </div>
         <div className="flex-1 overflow-y-auto px-3 py-2.5 min-h-0">
           {done ? (
             <div className="py-6 text-center">
-              <div className="text-[14px] text-ink-900 font-medium">Added to <em className="not-italic text-skype-deep">"{done.groupTitle}"</em>.</div>
-              <div className="text-[12px] text-ink-500 italic font-display mt-1">{participantName} will see new messages from this group.</div>
+              <div className="text-[14px] text-ink-900 font-medium">{t('convo.addedTo')} <em className="not-italic text-skype-deep">"{done.groupTitle}"</em>.</div>
+              <div className="text-[12px] text-ink-500 italic font-display mt-1">{t('convo.willSeeMessages', { name: participantName })}</div>
             </div>
           ) : groups.length === 0 ? (
             <div className="py-6 text-center text-[12.5px] text-ink-500 italic font-display">
-              {participantName} is already in every group you have, or you have no groups yet.
+              {t('convo.noGroupsForAdd', { name: participantName })}
             </div>
           ) : (
             <div className="flex flex-col gap-1.5">
@@ -1144,10 +1173,10 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
                   <div className="flex-1 min-w-0">
                     <div className="text-[13px] font-semibold text-ink-900 truncate">{g.title}</div>
                     <div className="text-[11px] text-ink-500 truncate">
-                      {g.members.length} {g.members.length === 1 ? 'member' : 'members'}
+                      {t(g.members.length === 1 ? 'convo.member' : 'convo.members', { n: g.members.length })}
                     </div>
                   </div>
-                  <span className="text-skype-deep text-[12.5px] font-semibold">+ Add</span>
+                  <span className="text-skype-deep text-[12.5px] font-semibold">+ {t('convo.add')}</span>
                 </button>
               ))}
             </div>
@@ -1161,7 +1190,7 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >{done ? 'Done' : 'Cancel'}</button>
+          >{done ? t('common.done') : t('common.cancel')}</button>
         </div>
       </div>
     </div>
@@ -1173,6 +1202,7 @@ function ConfirmLeave({ c, onCancel, onLeft }: {
   onCancel: () => void
   onLeft: () => void | Promise<void>
 }) {
+  const t = useT()
   const [busy, setBusy] = useState(false)
   return (
     <div
@@ -1185,9 +1215,9 @@ function ConfirmLeave({ c, onCancel, onLeft }: {
         style={{ border: '1px solid var(--ink-100)' }}
         onClick={(e) => e.stopPropagation()}
       >
-        <h3 className="font-display font-medium text-[20px] tracking-tight mb-1.5">Leave “{c.title}”?</h3>
+        <h3 className="font-display font-medium text-[20px] tracking-tight mb-1.5">{t('convo.leaveTitle', { title: c.title })}</h3>
         <p className="text-[13px] text-ink-700 leading-[1.6] mb-4">
-          You'll stop seeing new messages from this group. The other members can keep talking; you can be re-added by anyone in the group.
+          {t('convo.leaveWarning')}
         </p>
         <div className="flex gap-2">
           <button
@@ -1195,13 +1225,13 @@ function ConfirmLeave({ c, onCancel, onLeft }: {
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >Cancel</button>
+          >{t('common.cancel')}</button>
           <button
             onClick={async () => { setBusy(true); await onLeft() }}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
             style={{ background: 'var(--coral-deep)' }}
-          >{busy ? 'Leaving…' : 'Leave group'}</button>
+          >{busy ? t('convo.leaving') : t('convo.leaveGroup')}</button>
         </div>
       </div>
     </div>
@@ -1216,6 +1246,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
   candidates: Participant[]
   onClose: () => void
 }) {
+  const t = useT()
   const [busyId, setBusyId] = useState<string | null>(null)
   const [added, setAdded] = useState<Set<string>>(new Set())
   const [err, setErr] = useState<string | null>(null)
@@ -1254,12 +1285,12 @@ function AddMembersPicker({ group, candidates, onClose }: {
       >
         <div className="px-6 py-5 border-b border-ink-100 shrink-0">
           <h3 className="font-display font-medium text-[18px] tracking-tight">
-            Add members to <span className="text-skype-deep">{group.title}</span>
+            {t('convo.addMembersTo')} <span className="text-skype-deep">{group.title}</span>
           </h3>
           <div className="text-[12px] text-ink-500 italic font-display mt-0.5">
             {remaining.length === 0
-              ? 'Everyone in this workspace is already in the group.'
-              : `Click anyone to add them. ${added.size} added so far.`}
+              ? t('convo.everyoneAlreadyInGroup')
+              : t('convo.clickToAdd', { count: added.size })}
           </div>
         </div>
         {remaining.length > 0 && (
@@ -1270,7 +1301,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
                 autoFocus
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="Filter by name or id…"
+                placeholder={t('convo.filterPlaceholder')}
                 className="flex-1 text-[13px] text-ink-700 bg-transparent outline-none placeholder:text-ink-300"
               />
             </div>
@@ -1278,7 +1309,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
         )}
         <div className="flex-1 overflow-y-auto py-2">
           {filtered.length === 0 && query.trim() && (
-            <div className="px-6 py-4 text-[12px] italic text-ink-300 font-display">no match for "{query}"</div>
+            <div className="px-6 py-4 text-[12px] italic text-ink-300 font-display">{t('convo.noMatchQuery', { query })}</div>
           )}
           {filtered.map((p) => {
             const busy = busyId === p.id
@@ -1293,25 +1324,25 @@ function AddMembersPicker({ group, candidates, onClose }: {
                 <div className="flex-1 min-w-0">
                   <div className="text-[13.5px] font-semibold text-ink-900 truncate">{p.name}</div>
                   <div className="text-[11px] text-ink-500 truncate">
-                    {p.role ?? (p.kind === 'human' ? 'human teammate' : 'agent')}
+                    {p.role ?? (p.kind === 'human' ? t('convo.roleHuman') : t('convo.roleAgent'))}
                   </div>
                 </div>
                 {busy
-                  ? <span className="text-[11px] text-ink-300">adding…</span>
-                  : <span className="text-[11px] text-skype-deep font-semibold">Add</span>}
+                  ? <span className="text-[11px] text-ink-300">{t('convo.adding')}</span>
+                  : <span className="text-[11px] text-skype-deep font-semibold">{t('convo.add')}</span>}
               </button>
             )
           })}
           {added.size > 0 && (
             <div className="px-5 pt-3 pb-1 text-[10px] font-bold text-ink-300 tracking-[0.12em] uppercase">
-              Just added
+              {t('convo.justAdded')}
             </div>
           )}
           {added.size > 0 && candidates.filter((p) => added.has(p.id)).map((p) => (
             <div key={`done-${p.id}`} className="flex items-center gap-3 py-2 px-5 opacity-60">
               <Avatar p={p} size={28} ringColor="var(--cloud)" showStatus={false} />
               <div className="flex-1 text-[12.5px] text-ink-700 truncate">{p.name}</div>
-              <span className="text-[10px] font-semibold text-avail">✓ added</span>
+              <span className="text-[10px] font-semibold text-avail">{t('convo.addedCheck')}</span>
             </div>
           ))}
         </div>
@@ -1325,7 +1356,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
             onClick={onClose}
             className="ml-auto py-2 px-4 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
-          >Done</button>
+          >{t('common.done')}</button>
         </div>
       </div>
     </div>

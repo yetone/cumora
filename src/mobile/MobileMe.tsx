@@ -10,20 +10,24 @@ import { usePrefs } from '@/stores/preferences'
 import { CompanySwitcher } from '@/components/CompanySwitcher'
 import { getPushStatus, initPushNotifications, teardownPushNotifications, type PushStatus } from '@/lib/push'
 import { api } from '@/api/client'
+import { LanguagePicker } from '@/components/LanguagePicker'
+import { translate, useLocale, useT, type MessageKey } from '@/lib/i18n'
 import type { Participant } from '@/types'
 
-interface ToggleablePref { key: string; lbl: string; sub: string; default?: boolean }
+interface ToggleablePref { key: string; lbl: MessageKey; sub: MessageKey; default?: boolean }
 
+// `lbl` / `sub` are message keys; `key` stays the server-side preference id.
 const TOGGLE_PREFS: ToggleablePref[] = [
-  { key: 'notify.push',          lbl: 'Push notifications',          sub: 'banner + badge when the app is closed', default: true },
-  { key: 'notify.group_pull',    lbl: 'Notify on group pulls',       sub: 'when an agent loops you in',         default: true },
-  { key: 'notify.mention',       lbl: 'Notify on mentions',          sub: 'when agents @ you',                  default: true },
-  { key: 'ui.typing_indicators', lbl: 'Show typing indicators',      sub: 'see when agents are drafting',       default: true },
-  { key: 'ui.reduce_motion',     lbl: 'Reduce motion',               sub: 'fewer animations',                   default: false },
-  { key: 'agents.new_tools_ok',  lbl: 'Agents can call new tools',   sub: 'with granted permissions',           default: true },
+  { key: 'notify.push',          lbl: 'mobileMe.prefs.push',         sub: 'mobileMe.prefs.pushSub',         default: true },
+  { key: 'notify.group_pull',    lbl: 'mobileMe.prefs.groupPull',    sub: 'mobileMe.prefs.groupPullSub',    default: true },
+  { key: 'notify.mention',       lbl: 'mobileMe.prefs.mention',      sub: 'mobileMe.prefs.mentionSub',      default: true },
+  { key: 'ui.typing_indicators', lbl: 'mobileMe.prefs.typing',       sub: 'mobileMe.prefs.typingSub',       default: true },
+  { key: 'ui.reduce_motion',     lbl: 'mobileMe.prefs.reduceMotion', sub: 'mobileMe.prefs.reduceMotionSub', default: false },
+  { key: 'agents.new_tools_ok',  lbl: 'mobileMe.prefs.newTools',     sub: 'mobileMe.prefs.newToolsSub',     default: true },
 ]
 
 export function MobileMe() {
+  const t = useT()
   const authUser = useAuth((s) => s.user)
   const meId = useMe()
   const companies = useAuth((s) => s.companies)
@@ -60,14 +64,19 @@ export function MobileMe() {
   // Warm one-line "you steward N agents across M rooms" copy. Beats a
   // 4-card dashboard grid as a homepage statement — the numbers are
   // there but they read as personal context, not KPIs.
+  const locale = useLocale()
   const stewardLine = useMemo(() => {
+    // Built from message keys rather than concatenated English so a
+    // locale can reorder the sentence — and so languages without plural
+    // inflection don't have to carry the singular/plural split.
+    const tr = (key: MessageKey, vars?: Record<string, string | number>) => translate(locale, key, vars)
     const parts: string[] = []
-    if (agents.length) parts.push(`${agents.length} agent${agents.length === 1 ? '' : 's'}`)
-    if (convoList.length) parts.push(`${convoList.length} room${convoList.length === 1 ? '' : 's'}`)
-    if (whisperList.length) parts.push(`${whisperList.length} peek${whisperList.length === 1 ? '' : 's'}`)
-    if (parts.length === 0) return 'A quiet workspace — invite some agents to get started.'
-    return `Steward of ${parts.join(' · ')}.`
-  }, [agents.length, convoList.length, whisperList.length])
+    if (agents.length) parts.push(tr('mobileMe.agentCount', { count: agents.length }))
+    if (convoList.length) parts.push(tr('mobileMe.roomCount', { count: convoList.length }))
+    if (whisperList.length) parts.push(tr('mobileMe.peekCount', { count: whisperList.length }))
+    if (parts.length === 0) return tr('mobileMe.quietSteward')
+    return tr('mobileMe.steward', { parts: parts.join(' · ') })
+  }, [agents.length, convoList.length, whisperList.length, locale])
 
   return (
     <section className="flex flex-col h-full overflow-hidden bg-paper">
@@ -87,7 +96,7 @@ export function MobileMe() {
           {me.name}
         </h2>
         <div className="font-display italic text-[13px] text-ink-500 mt-0.5 mb-2.5">
-          {authUser?.email ?? 'human · team owner'}
+          {authUser?.email ?? t('mobileMe.defaultRole')}
         </div>
         <div className="font-display italic text-[12.5px] text-ink-700 max-w-[280px] mx-auto leading-snug">
           {stewardLine}
@@ -102,21 +111,21 @@ export function MobileMe() {
 
       <div className="flex-1 overflow-y-auto pb-20">
         {companies.length > 1 && (
-          <Section title="Workspace">
+          <Section title={t('mobileMe.workspace')}>
             <div className="bg-cloud rounded-[12px] p-2" style={{ border: '1px solid var(--ink-100)' }}>
               <CompanySwitcher />
             </div>
           </Section>
         )}
 
-        <Section title="Your team">
+        <Section title={t('mobileMe.yourTeam')}>
           {agents.length === 0 ? (
             <div
               className="text-center bg-cloud rounded-[12px] py-5 px-4"
               style={{ border: '1px dashed var(--ink-100)' }}
             >
               <div className="font-display italic text-[13px] text-ink-500 leading-snug">
-                A quiet workspace — no agents have joined yet.
+                {t('mobileMe.quietWorkspace')}
               </div>
             </div>
           ) : (
@@ -162,11 +171,11 @@ export function MobileMe() {
           )}
         </Section>
 
-        <Section title="Push notifications">
+        <Section title={t('mobileMe.push')}>
           <PushStatusTile />
         </Section>
 
-        <Section title="Preferences">
+        <Section title={t('mobileMe.preferences')}>
           <div className="bg-cloud rounded-[12px] divide-y divide-ink-100"
             style={{ border: '1px solid var(--ink-100)' }}>
             {TOGGLE_PREFS.map((it) => {
@@ -180,8 +189,8 @@ export function MobileMe() {
                   className="w-full text-left flex items-center gap-3 p-3.5 active:bg-paper transition"
                 >
                   <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-[13px] text-ink-900 leading-tight">{it.lbl}</div>
-                    <div className="font-display italic text-[11px] text-ink-500 mt-0.5">{it.sub}</div>
+                    <div className="font-semibold text-[13px] text-ink-900 leading-tight">{t(it.lbl)}</div>
+                    <div className="font-display italic text-[11px] text-ink-500 mt-0.5">{t(it.sub)}</div>
                   </div>
                   <span className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', on ? 'bg-skype' : 'bg-ink-200')}>
                     <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', on ? 'left-[18px]' : 'left-0.5')}
@@ -190,6 +199,17 @@ export function MobileMe() {
                 </button>
               )
             })}
+          </div>
+        </Section>
+
+        <Section title={t('mobileMe.language')}>
+          <div className="bg-cloud rounded-[12px] p-3.5 flex items-center gap-3"
+            style={{ border: '1px solid var(--ink-100)' }}>
+            <div className="flex-1 min-w-0">
+              <div className="font-semibold text-[13px] text-ink-900 leading-tight">{t('common.language')}</div>
+              <div className="font-display italic text-[11px] text-ink-500 mt-0.5">{t('common.languageSub')}</div>
+            </div>
+            <LanguagePicker className="w-[140px] shrink-0" />
           </div>
         </Section>
 
@@ -209,8 +229,8 @@ export function MobileMe() {
             className="w-full py-3 px-4 rounded-[12px] text-[13px] font-semibold text-coral-deep transition text-left active:opacity-70"
             style={{ border: '1px solid rgba(255, 122, 107, 0.3)' }}
           >
-            Sign out
-            <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">end this session on this device</span>
+            {t('common.signOut')}
+            <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">{t('mobileMe.signOutSub')}</span>
           </button>
           <DeleteAccountButton />
         </div>
@@ -232,6 +252,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
  *  the UI so users can SEE why notifications aren't arriving and
  *  re-trigger registration without quitting the app. */
 function PushStatusTile() {
+  const t = useT()
   const [status, setStatus] = useState<PushStatus>(() => getPushStatus())
   const [busy, setBusy] = useState(false)
   useEffect(() => {
@@ -246,8 +267,7 @@ function PushStatusTile() {
     return (
       <div className="bg-cloud rounded-[12px] p-3.5 text-[12px] text-ink-500 font-display italic"
         style={{ border: '1px solid var(--ink-100)' }}>
-        Push notifications run on the iOS / Android native shell — this
-        web preview just uses live socket messages.
+        {t('push.notSupported')}
       </div>
     )
   }
@@ -257,16 +277,16 @@ function PushStatusTile() {
     : perm === 'denied' ? 'var(--coral)'
     : perm === 'prompt' || perm === 'prompt-with-rationale' ? 'var(--gold)'
     : 'var(--ink-300)'
-  const permLabel = perm === 'granted' ? 'Allowed'
-    : perm === 'denied' ? 'Blocked'
-    : perm === 'prompt' || perm === 'prompt-with-rationale' ? 'Not asked yet'
-    : 'Unknown'
+  const permLabel = perm === 'granted' ? t('push.permAllowed')
+    : perm === 'denied' ? t('push.permBlocked')
+    : perm === 'prompt' || perm === 'prompt-with-rationale' ? t('push.permNotAsked')
+    : t('push.permUnknown')
   const stepLabel: Record<typeof status.lastStep, string> = {
-    idle:                 'init never ran (check the prefs toggle above)',
-    'load-plugin':        'stuck loading the @capacitor/push-notifications plugin',
-    'request-permission': 'stuck asking iOS for permission (system dialog blocked?)',
-    register:             'stuck on APNs token request (entitlement / network)',
-    done:                 'init completed — waiting for APNs to hand back a token',
+    idle:                 t('push.stepIdle'),
+    'load-plugin':        t('push.stepLoadPlugin'),
+    'request-permission': t('push.stepRequestPerm'),
+    register:             t('push.stepRegister'),
+    done:                 t('push.stepDone'),
   }
 
   const reregister = async (force: boolean) => {
@@ -288,30 +308,30 @@ function PushStatusTile() {
       <div className="p-3.5 flex items-center gap-3">
         <span className="w-2 h-2 rounded-full shrink-0" style={{ background: status.prefEnabled ? 'var(--avail)' : 'var(--coral)' }} />
         <div className="flex-1 min-w-0">
-          <div className="font-semibold text-[13px] text-ink-900 leading-tight">App preference</div>
+          <div className="font-semibold text-[13px] text-ink-900 leading-tight">{t('push.appPref')}</div>
           <div className="font-display italic text-[11px] text-ink-500 mt-0.5">
             {status.prefEnabled
-              ? 'notify.push is ON — init will run on next app launch.'
-              : "notify.push is OFF — toggle it on above (or tap 'Reset & retry' below)."}
+              ? t('push.appPrefOnSub')
+              : t('push.appPrefOffSub')}
           </div>
         </div>
         <span className="text-[10.5px] font-bold tracking-wider uppercase px-2 py-1 rounded-full"
           style={{ background: 'var(--ink-100)', color: 'var(--ink-700)' }}>
-          {status.prefEnabled ? 'On' : 'Off'}
+          {status.prefEnabled ? t('push.on') : t('push.off')}
         </span>
       </div>
       <div className="p-3.5 flex items-center gap-3">
         <span className="w-2 h-2 rounded-full shrink-0" style={{ background: permColor }} />
         <div className="flex-1 min-w-0">
-          <div className="font-semibold text-[13px] text-ink-900 leading-tight">iOS permission</div>
+          <div className="font-semibold text-[13px] text-ink-900 leading-tight">{t('push.iosPerm')}</div>
           <div className="font-display italic text-[11px] text-ink-500 mt-0.5">
             {perm === 'denied'
-              ? 'Open iOS Settings → Cumora → Notifications to re-enable.'
+              ? t('push.iosPermDenied')
               : perm === 'granted'
-                ? 'iOS will deliver alerts when the app is in background.'
+                ? t('push.iosPermGranted')
                 : perm === 'unknown'
-                  ? 'iOS hasn\'t been asked yet — see the last-step row below.'
-                  : 'iOS will show its dialog the next time init runs.'}
+                  ? t('push.iosPermUnknown')
+                  : t('push.iosPermWillAsk')}
           </div>
         </div>
         <span className="text-[10.5px] font-bold tracking-wider uppercase px-2 py-1 rounded-full"
@@ -322,25 +342,25 @@ function PushStatusTile() {
       <div className="p-3.5 flex items-center gap-3">
         <span className="w-2 h-2 rounded-full shrink-0" style={{ background: status.tokenSuffix ? 'var(--avail)' : 'var(--ink-300)' }} />
         <div className="flex-1 min-w-0">
-          <div className="font-semibold text-[13px] text-ink-900 leading-tight">Device token</div>
+          <div className="font-semibold text-[13px] text-ink-900 leading-tight">{t('push.deviceToken')}</div>
           <div className="font-display italic text-[11px] text-ink-500 mt-0.5">
             {status.tokenSuffix
-              ? `Registered with server (…${status.tokenSuffix}).`
-              : 'No APNs token yet — see the last-step row below.'}
+              ? t('push.deviceTokenOk', { suffix: status.tokenSuffix })
+              : t('push.deviceTokenNone')}
           </div>
         </div>
       </div>
       {/* The smoking gun for "why is push silently dead?". Shows the
           deepest step the most recent init() reached. */}
       <div className="p-3.5">
-        <div className="text-[10.5px] font-bold uppercase tracking-wider text-ink-500 mb-1">Last init step</div>
+        <div className="text-[10.5px] font-bold uppercase tracking-wider text-ink-500 mb-1">{t('push.lastStep')}</div>
         <div className="font-display italic text-[12px] text-ink-700 leading-snug">
           {stepLabel[status.lastStep]}
         </div>
       </div>
       {status.lastError && (
         <div className="p-3.5 text-[11.5px] font-display italic text-coral-deep leading-snug">
-          Last error: {status.lastError}
+          {t('push.lastError', { err: status.lastError })}
         </div>
       )}
       <button
@@ -349,9 +369,9 @@ function PushStatusTile() {
         disabled={busy}
         className="w-full text-left p-3.5 active:bg-paper transition text-[12.5px] font-semibold text-skype-deep disabled:opacity-50"
       >
-        {busy ? 'Working…' : 'Re-register this device'}
+        {busy ? t('push.working') : t('push.reregister')}
         <span className="block font-display italic text-[11px] text-ink-500 mt-0.5 font-normal not-italic">
-          Runs init again — respects the app preference toggle.
+          {t('push.reregisterSub')}
         </span>
       </button>
       <button
@@ -360,9 +380,9 @@ function PushStatusTile() {
         disabled={busy}
         className="w-full text-left p-3.5 active:bg-paper transition text-[12.5px] font-semibold text-coral-deep disabled:opacity-50"
       >
-        Reset &amp; retry (force)
+        {t('push.resetRetry')}
         <span className="block font-display italic text-[11px] text-ink-500 mt-0.5 font-normal not-italic">
-          Bypasses the in-app preference — useful if the toggle got stuck off.
+          {t('push.resetRetrySub')}
         </span>
       </button>
     </div>
@@ -374,6 +394,7 @@ function PushStatusTile() {
  *  (no native confirm() dialog which iOS WKWebView styles poorly)
  *  so the destructive-action UX matches the rest of the app. */
 function DeleteAccountButton() {
+  const t = useT()
   const [stage, setStage] = useState<'idle' | 'confirm' | 'busy'>('idle')
   const [err, setErr] = useState<string | null>(null)
 
@@ -385,8 +406,8 @@ function DeleteAccountButton() {
         className="w-full py-3 px-4 rounded-[12px] text-[13px] font-semibold text-coral-deep transition text-left active:opacity-70"
         style={{ border: '1px solid rgba(255, 122, 107, 0.3)' }}
       >
-        Delete account
-        <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">permanently remove this Cumora account</span>
+        {t('push.deleteTitle')}
+        <span className="block font-display italic text-[11px] text-ink-500 mt-0.5">{t('push.deleteSub')}</span>
       </button>
     )
   }
@@ -397,12 +418,10 @@ function DeleteAccountButton() {
       style={{ border: '1px solid var(--coral)', background: 'rgba(255, 122, 107, 0.06)' }}
     >
       <div className="font-display text-[13px] text-ink-900 font-semibold mb-1">
-        Permanently delete this account?
+        {t('push.deleteConfirmTitle')}
       </div>
       <div className="font-display italic text-[12px] text-ink-700 leading-snug mb-3">
-        Your sign-in, OAuth links, and personal profile will be erased. Messages
-        you posted in shared rooms stay (with your name shown as "Deleted
-        user") so other members keep their history. This cannot be undone.
+        {t('push.deleteConfirmBody')}
       </div>
       {err && (
         <div className="text-[11.5px] text-coral-deep font-display italic mb-2 leading-snug">
@@ -416,7 +435,7 @@ function DeleteAccountButton() {
           onClick={() => { setStage('idle'); setErr(null) }}
           className="flex-1 h-9 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-paper transition active:opacity-70 disabled:opacity-50"
           style={{ border: '1px solid var(--ink-100)' }}
-        >Cancel</button>
+        >{t('push.deleteCancel')}</button>
         <button
           type="button"
           disabled={stage === 'busy'}
@@ -438,7 +457,7 @@ function DeleteAccountButton() {
           }}
           className="flex-1 h-9 rounded-[9px] text-[12.5px] font-semibold text-white transition active:opacity-70 disabled:opacity-50"
           style={{ background: 'var(--coral)' }}
-        >{stage === 'busy' ? 'Deleting…' : 'Delete'}</button>
+        >{stage === 'busy' ? t('push.deleteBusy') : t('push.deleteConfirmBtn')}</button>
       </div>
     </div>
   )

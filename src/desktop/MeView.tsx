@@ -7,37 +7,51 @@ import { useDevtools } from '@/stores/devtools'
 import { useAuth } from '@/stores/auth'
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
+import { LanguagePicker } from '@/components/LanguagePicker'
+import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import { isWindows } from '@/lib/runtime'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 
-const tabs = ['Profile', 'Usage', 'Computers', 'Projects', 'Trust & autonomy', 'Preferences'] as const
-type Tab = (typeof tabs)[number]
+// The tab's identity is its `key`; the label is a message key resolved at
+// render. Before this they were the same string, which would have made
+// the active tab depend on the UI language.
+const tabs = [
+  { key: 'profile', label: 'me.tab.profile' },
+  { key: 'usage', label: 'me.tab.usage' },
+  { key: 'computers', label: 'me.tab.computers' },
+  { key: 'projects', label: 'me.tab.projects' },
+  { key: 'trust', label: 'me.tab.trust' },
+  { key: 'preferences', label: 'me.tab.preferences' },
+] as const satisfies ReadonlyArray<{ key: string; label: MessageKey }>
+type Tab = (typeof tabs)[number]['key']
 
-const PREF_GROUPS: Array<{ title: string; items: Array<{ key: string; lbl: string; sub: string; default: boolean }> }> = [
+// `lbl` / `sub` are message keys — the preference `key` is the server-side
+// identifier and never changes with the language.
+const PREF_GROUPS: Array<{ title: MessageKey; items: Array<{ key: string; lbl: MessageKey; sub: MessageKey; default: boolean }> }> = [
   {
-    title: 'Notifications',
+    title: 'me.prefs.notifications',
     items: [
-      { key: 'notify.group_pulled', lbl: 'When an agent pulls a group with you in it', sub: 'always · never · only urgent', default: true },
-      { key: 'notify.whisper_mention', lbl: 'When a whisper mentions you', sub: 'always · digest · never', default: true },
-      { key: 'notify.convene_called', lbl: 'When a Convene session is called', sub: 'always · never', default: true },
-      { key: 'notify.daily_summary', lbl: 'Daily summary of overnight agent activity', sub: '8:00am local time', default: false },
+      { key: 'notify.group_pulled', lbl: 'me.prefs.groupPulled', sub: 'me.prefs.groupPulledSub', default: true },
+      { key: 'notify.whisper_mention', lbl: 'me.prefs.whisperMention', sub: 'me.prefs.whisperMentionSub', default: true },
+      { key: 'notify.convene_called', lbl: 'me.prefs.conveneCalled', sub: 'me.prefs.conveneCalledSub', default: true },
+      { key: 'notify.daily_summary', lbl: 'me.prefs.dailySummary', sub: 'me.prefs.dailySummarySub', default: false },
     ],
   },
   {
-    title: 'Look & feel',
+    title: 'me.prefs.lookFeel',
     items: [
-      { key: 'ui.reduce_motion', lbl: 'Reduce motion', sub: 'fewer animations', default: false },
-      { key: 'ui.typing_indicators', lbl: 'Show typing indicators', sub: 'see when agents are drafting', default: true },
-      { key: 'ui.thoughts_in_main', lbl: 'Show "thinking aloud" snippets in main chat', sub: 'usually private to whispers', default: false },
+      { key: 'ui.reduce_motion', lbl: 'me.prefs.reduceMotion', sub: 'me.prefs.reduceMotionSub', default: false },
+      { key: 'ui.typing_indicators', lbl: 'me.prefs.typingIndicators', sub: 'me.prefs.typingIndicatorsSub', default: true },
+      { key: 'ui.thoughts_in_main', lbl: 'me.prefs.thoughtsInMain', sub: 'me.prefs.thoughtsInMainSub', default: false },
     ],
   },
   {
-    title: 'Privacy',
+    title: 'me.prefs.privacy',
     items: [
-      { key: 'priv.allow_silent_whispers', lbl: 'Let agents whisper without your peek', sub: 'they still log to your transcript', default: true },
-      { key: 'priv.allow_new_tools', lbl: 'Let agents call new tools autonomously', sub: 'with the permissions you\'ve granted', default: true },
-      { key: 'priv.allow_human_invites', lbl: 'Let agents add humans to groups', sub: 'with your consent each time', default: false },
+      { key: 'priv.allow_silent_whispers', lbl: 'me.prefs.silentWhispers', sub: 'me.prefs.silentWhispersSub', default: true },
+      { key: 'priv.allow_new_tools', lbl: 'me.prefs.newTools', sub: 'me.prefs.newToolsSub', default: true },
+      { key: 'priv.allow_human_invites', lbl: 'me.prefs.humanInvites', sub: 'me.prefs.humanInvitesSub', default: false },
     ],
   },
 ]
@@ -46,6 +60,7 @@ function ProfileTab() {
   // Pull both the auth user (real account: id, email, providers) and the
   // matching participant (for avatar). They're usually the same person but
   // participant rows can lag in the local cache, so we don't gate on it.
+  const t = useT()
   const authUser = useAuth((s) => s.user)
   const meParticipant = useParticipants((s) => (authUser ? s.byId[authUser.id] : null))
   const serverOrigin = getServerOrigin() || 'same-origin (Vite proxy)'
@@ -62,7 +77,7 @@ function ProfileTab() {
   const providers = authUser.providers ?? []
   return (
     <div className="space-y-6">
-      <Section title="↳ Identity">
+      <Section title={t('me.sectionIdentity')}>
         <div className="bg-cloud rounded-[14px] p-5 flex items-start gap-5"
           style={{ border: '1px solid var(--ink-100)' }}>
           {meParticipant
@@ -82,13 +97,13 @@ function ProfileTab() {
         </div>
       </Section>
 
-      <Section title="↳ Session">
+      <Section title={t('me.sectionSession')}>
         <div className="bg-cloud rounded-[14px] p-5 flex items-center justify-between gap-4"
           style={{ border: '1px solid var(--ink-100)' }}>
           <div className="min-w-0">
-            <div className="font-display text-[14px] text-ink-800">Signed in to <span className="font-mono text-[12px]">{serverOrigin}</span></div>
+            <div className="font-display text-[14px] text-ink-800">{t('me.sessionTitle', { server: serverOrigin })}</div>
             <div className="font-display italic text-[12px] text-ink-400 mt-0.5">
-              Signing out clears the local token and revokes this session on the server.
+              {t('me.sessionHint')}
             </div>
           </div>
           <button
@@ -96,7 +111,7 @@ function ProfileTab() {
             onClick={signOut}
             className="shrink-0 h-9 px-4 rounded-[8px] bg-ink-800 hover:bg-ink-900 text-white text-[13px] font-display transition-colors"
           >
-            Sign out
+            {t('common.signOut')}
           </button>
         </div>
       </Section>
@@ -111,14 +126,15 @@ function ProfileTab() {
 /** Discord invite. Renders on every platform (web + desktop) so feedback
  *  has a single, advertised entry point that doesn't go through email. */
 function CommunitySection() {
+  const t = useT()
   return (
-    <Section title="↳ Community & feedback">
+    <Section title={t('me.sectionCommunity')}>
       <div className="bg-cloud rounded-[14px] p-5 flex items-center justify-between gap-4"
         style={{ border: '1px solid var(--ink-100)' }}>
         <div className="min-w-0">
-          <div className="font-display text-[14px] text-ink-800">Join the Cumora Discord</div>
+          <div className="font-display text-[14px] text-ink-800">{t('me.communityTitle')}</div>
           <div className="font-display italic text-[12px] text-ink-400 mt-0.5">
-            Share feedback, report bugs, and meet other people running agent teams.
+            {t('me.communityHint')}
           </div>
         </div>
         <a
@@ -131,7 +147,7 @@ function CommunitySection() {
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path d="M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189Z" />
           </svg>
-          Join Discord
+          {t('me.joinDiscord')}
         </a>
       </div>
     </Section>
@@ -144,6 +160,7 @@ function CommunitySection() {
  *  AuthedApp level via a custom window event (avoids prop-drilling
  *  through three layers of view components). */
 function AboutSection() {
+  const t = useT()
   const [version, setVersion] = useState<string | null>(null)
   const [supported, setSupported] = useState<boolean>(false)
 
@@ -159,15 +176,13 @@ function AboutSection() {
   if (!version) return null
 
   return (
-    <Section title="↳ About">
+    <Section title={t('me.sectionAbout')}>
       <div className="bg-cloud rounded-[14px] p-5 flex items-center justify-between gap-4"
         style={{ border: '1px solid var(--ink-100)' }}>
         <div className="min-w-0">
-          <div className="font-display text-[14px] text-ink-800">Cumora <span className="font-mono text-[12px]">v{version}</span></div>
+          <div className="font-display text-[14px] text-ink-800">{t('me.versionLine', { version })}</div>
           <div className="font-display italic text-[12px] text-ink-400 mt-0.5">
-            {supported
-              ? 'Auto-update checks daily. You\'ll see a banner when a new version is ready.'
-              : 'Auto-update is not available in this build (open the dialog to see why).'}
+            {supported ? t('me.autoUpdateDaily') : t('me.autoUpdateUnsupported')}
           </div>
         </div>
         <button
@@ -176,7 +191,7 @@ function AboutSection() {
           className="shrink-0 h-9 px-4 rounded-[8px] text-[13px] font-display transition-colors text-white"
           style={{ background: 'var(--skype)' }}
         >
-          Check for updates
+          {t('me.checkUpdates')}
         </button>
       </div>
     </Section>
@@ -193,10 +208,10 @@ function AboutSection() {
 
 type PeriodKey = 'daily' | 'weekly' | 'monthly'
 
-const PERIOD_META: Array<{ key: PeriodKey; label: string; sub: string }> = [
-  { key: 'daily',   label: 'Daily',   sub: 'rolls over at local midnight' },
-  { key: 'weekly',  label: 'Weekly',  sub: 'rolls over weekly' },
-  { key: 'monthly', label: 'Monthly', sub: 'rolls over monthly' },
+const PERIOD_META: Array<{ key: PeriodKey; label: MessageKey; sub: MessageKey }> = [
+  { key: 'daily',   label: 'me.periodDaily',   sub: 'me.rolloverDaily' },
+  { key: 'weekly',  label: 'me.periodWeekly',  sub: 'me.rolloverWeekly' },
+  { key: 'monthly', label: 'me.periodMonthly', sub: 'me.rolloverMonthly' },
 ]
 
 function fmtUsd(n: number): string {
@@ -212,7 +227,7 @@ function fmtUsd(n: number): string {
  *  blank string when sub2api didn't hand back a window start (older
  *  rows). The period length is fixed (24h / 7d / ~30d) — sub2api uses
  *  rolling windows, so we count forward from window_start. */
-function resetsHint(period: PeriodKey, windowStart: string | null): string {
+function resetsHint(t: (k: MessageKey, params?: Record<string, string | number>) => string, period: PeriodKey, windowStart: string | null): string {
   if (!windowStart) return ''
   const start = new Date(windowStart).getTime()
   if (Number.isNaN(start)) return ''
@@ -220,23 +235,24 @@ function resetsHint(period: PeriodKey, windowStart: string | null): string {
               : period === 'weekly' ? 7 * 86_400_000
               : 30 * 86_400_000
   const remaining = start + lenMs - Date.now()
-  if (remaining <= 0) return 'resets soon'
+  if (remaining <= 0) return t('me.resetsSoon')
   const h = Math.floor(remaining / 3_600_000)
   if (h < 1) {
     const m = Math.max(1, Math.floor(remaining / 60_000))
-    return `resets in ${m}m`
+    return t('me.resetsInMinutes', { n: m })
   }
-  if (h < 48) return `resets in ${h}h`
+  if (h < 48) return t('me.resetsInHours', { n: h })
   const d = Math.floor(h / 24)
-  return `resets in ${d}d`
+  return t('me.resetsInDays', { n: d })
 }
 
 function QuotaCard({ period, label, sub, window }: {
   period: PeriodKey
-  label: string
-  sub: string
+  label: MessageKey
+  sub: MessageKey
   window: ApiQuotaWindow | null
 }) {
+  const t = useT()
   const used = window?.usedUsd ?? 0
   const limit = window?.limitUsd ?? null
   const pct = limit != null && limit > 0 ? Math.min(100, (used / limit) * 100) : 0
@@ -251,15 +267,15 @@ function QuotaCard({ period, label, sub, window }: {
                  : tone === 'warn'   ? 'var(--coral, #FF7A6B)'
                  : tone === 'ok'     ? 'var(--skype, #00A8F0)'
                  : 'var(--ink-300, #94A8BC)'
-  const resets = window ? resetsHint(period, window.windowStart) : ''
+  const resets = window ? resetsHint(t, period, window.windowStart) : ''
   return (
     <div className="bg-cloud rounded-[14px] p-5 flex flex-col gap-3"
       style={{ border: '1px solid var(--ink-100)' }}>
       <div className="flex items-baseline justify-between gap-3">
-        <div className="font-display font-semibold text-[14px] text-ink-900">{label}</div>
+        <div className="font-display font-semibold text-[14px] text-ink-900">{t(label)}</div>
         {limit != null
           ? <div className="font-mono text-[11px] font-semibold text-ink-500">{pct.toFixed(0)}%</div>
-          : <div className="font-mono text-[10px] tracking-wider uppercase text-ink-300">unlimited</div>}
+          : <div className="font-mono text-[10px] tracking-wider uppercase text-ink-300">{t('me.unlimited')}</div>}
       </div>
       <div className="font-display tabular-nums text-[22px] tracking-tight text-ink-900" style={{ letterSpacing: '-0.02em' }}>
         {fmtUsd(used)}
@@ -276,7 +292,7 @@ function QuotaCard({ period, label, sub, window }: {
         />
       </div>
       <div className="flex items-center justify-between text-[11px]">
-        <span className="font-display italic text-ink-400">{sub}</span>
+        <span className="font-display italic text-ink-400">{t(sub)}</span>
         {resets && <span className="font-mono text-ink-500">{resets}</span>}
       </div>
     </div>
@@ -284,6 +300,7 @@ function QuotaCard({ period, label, sub, window }: {
 }
 
 function UsageTab() {
+  const t = useT()
   const [state, setState] = useState<
     | { kind: 'loading' }
     | { kind: 'ready'; configured: boolean; snapshot: ApiQuotaSnapshot | null; error?: string }
@@ -301,13 +318,13 @@ function UsageTab() {
   if (state.kind === 'loading') {
     return (
       <div className="space-y-6">
-        <Section title="↳ Quota">
+        <Section title={t('me.sectionQuota')}>
           <div className="grid grid-cols-3 gap-3">
             {PERIOD_META.map((p) => (
               <div key={p.key} className="bg-cloud rounded-[14px] p-5 h-[140px]"
                 style={{ border: '1px solid var(--ink-100)' }}>
-                <div className="font-display font-semibold text-[14px] text-ink-300">{p.label}</div>
-                <div className="font-display italic text-[12px] text-ink-300 mt-2">loading…</div>
+                <div className="font-display font-semibold text-[14px] text-ink-300">{t(p.label)}</div>
+                <div className="font-display italic text-[12px] text-ink-300 mt-2">{t('common.loading')}</div>
               </div>
             ))}
           </div>
@@ -319,15 +336,15 @@ function UsageTab() {
   if (state.kind === 'error') {
     return (
       <div className="space-y-6">
-        <Section title="↳ Quota">
+        <Section title={t('me.sectionQuota')}>
           <div className="bg-cloud rounded-[14px] p-6 text-center"
             style={{ border: '1px solid var(--ink-100)' }}>
-            <div className="font-display text-[14px] text-ink-700 mb-1">Couldn't fetch your quota</div>
+            <div className="font-display text-[14px] text-ink-700 mb-1">{t('me.quotaFetchFailed')}</div>
             <div className="font-display italic text-[12px] text-coral-deep mb-3">{state.message}</div>
             <button onClick={load}
               className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white"
               style={{ background: 'var(--skype)' }}>
-              Try again
+              {t('common.tryAgain')}
             </button>
           </div>
         </Section>
@@ -340,12 +357,12 @@ function UsageTab() {
   if (!configured) {
     return (
       <div className="space-y-6">
-        <Section title="↳ Quota">
+        <Section title={t('me.sectionQuota')}>
           <div className="bg-cloud rounded-[14px] p-6"
             style={{ border: '1px dashed var(--ink-100)' }}>
-            <div className="font-display text-[14px] text-ink-700">No quota gateway on this deployment</div>
+            <div className="font-display text-[14px] text-ink-700">{t('me.noQuotaGateway')}</div>
             <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
-              This server isn't running a sub2api gateway, so per-period quotas aren't tracked. Usage is governed by the host's own API key allowance.
+              {t('me.noQuotaHint')}
             </div>
           </div>
         </Section>
@@ -356,21 +373,19 @@ function UsageTab() {
   if (!snapshot) {
     return (
       <div className="space-y-6">
-        <Section title="↳ Quota">
+        <Section title={t('me.sectionQuota')}>
           <div className="bg-cloud rounded-[14px] p-6"
             style={{ border: '1px dashed var(--ink-100)' }}>
             <div className="font-display text-[14px] text-ink-700">
-              {error ? 'Quota gateway is unreachable' : 'No active subscription'}
+              {error ? t('me.quotaUnreachable') : t('me.noActiveSub')}
             </div>
             <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
-              {error
-                ? 'The cumora server couldn\'t reach the quota gateway. Try again in a moment.'
-                : 'Your account hasn\'t been provisioned on the quota gateway yet. This usually clears up on its own — try again in a minute.'}
+              {error ? t('me.quotaGatewayUnreachHint') : t('me.subNotProvisioned')}
             </div>
             <button onClick={load}
               className="mt-3 px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
               style={{ border: '1px dashed var(--sky2-300)' }}>
-              Refresh
+              {t('me.refresh')}
             </button>
           </div>
         </Section>
@@ -380,10 +395,10 @@ function UsageTab() {
 
   return (
     <div className="space-y-6">
-      <Section title="↳ Quota">
+      <Section title={t('me.sectionQuota')}>
         <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-          What your agents have spent on this account, across the rolling windows the gateway enforces. Numbers are in USD.
-          {snapshot.groupName ? <> Plan: <span className="not-italic font-semibold text-skype-deep">{snapshot.groupName}</span>.</> : null}
+          {t('me.quotaIntro')}
+          {snapshot.groupName ? <> {t('me.quotaIntroPlan', { plan: snapshot.groupName })}</> : null}
         </div>
         <div className="grid grid-cols-3 gap-3">
           {PERIOD_META.map((p) => (
@@ -400,9 +415,9 @@ function UsageTab() {
           <button onClick={load}
             className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}>
-            Refresh
+            {t('me.refresh')}
           </button>
-          {error && <span className="text-[11.5px] text-coral-deep font-display italic">last refresh had a hiccup: {error}</span>}
+          {error && <span className="text-[11.5px] text-coral-deep font-display italic">{t('me.refreshFailed', { msg: error })}</span>}
         </div>
       </Section>
     </div>
@@ -410,6 +425,7 @@ function UsageTab() {
 }
 
 function TrustTab() {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const autonomy = usePrefs((s) => s.autonomy)
   const setAutonomy = usePrefs((s) => s.setAutonomy)
@@ -417,9 +433,9 @@ function TrustTab() {
 
   return (
     <div className="space-y-6">
-      <Section title="↳ Per-agent autonomy">
+      <Section title={t('me.sectionPerAgent')}>
         <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-          Each agent has a threshold for acting on their own — pulling groups, kicking off tools, whispering peers. Adjust per agent if their judgment doesn't match yours.
+          {t('me.perAgentIntro')}
         </div>
         <div className="space-y-2">
           {agents.map((a) => {
@@ -436,7 +452,7 @@ function TrustTab() {
                 </div>
                 <div className="min-w-0">
                   <div className="text-[11px] text-ink-500 mb-1.5 flex justify-between">
-                    <span>autonomy threshold</span>
+                    <span>{t('me.autonomyThreshold')}</span>
                     <span className="font-mono text-[11px] font-semibold text-ink-700">{trust.toFixed(2)}</span>
                   </div>
                   <input type="range" min={0} max={1} step={0.01} value={trust}
@@ -449,7 +465,7 @@ function TrustTab() {
         </div>
       </Section>
 
-      <Section title="↳ Pulled-group track records">
+      <Section title={t('me.sectionTrackRecords')}>
         <div className="grid grid-cols-3 gap-3">
           {agents.slice(0, 3).map((a) => {
             const ar = autonomy[a.id]
@@ -461,9 +477,9 @@ function TrustTab() {
                   <div className="font-bold text-[13px] text-ink-900">{a.name}</div>
                 </div>
                 <div className="grid grid-cols-3 gap-1.5 text-center">
-                  <Stat n={ar?.pulled ?? 0} l="pulled" tone="good" />
-                  <Stat n={ar?.led ?? 0} l="led" tone="good" />
-                  <Stat n={ar?.dissolved ?? 0} l="noise" tone="warn" />
+                  <Stat n={ar?.pulled ?? 0} l="me.statPulled" tone="good" />
+                  <Stat n={ar?.led ?? 0} l="me.statLed" tone="good" />
+                  <Stat n={ar?.dissolved ?? 0} l="me.statNoise" tone="warn" />
                 </div>
               </div>
             )
@@ -474,16 +490,18 @@ function TrustTab() {
   )
 }
 
-function Stat({ n, l, tone }: { n: number; l: string; tone: 'good' | 'warn' }) {
+function Stat({ n, l, tone }: { n: number; l: MessageKey; tone: 'good' | 'warn' }) {
+  const t = useT()
   return (
     <div>
       <div className="font-display text-[20px] font-medium" style={{ color: tone === 'good' ? 'var(--avail)' : 'var(--coral-deep)' }}>{n}</div>
-      <div className="text-[9px] font-bold text-ink-300 uppercase tracking-wider">{l}</div>
+      <div className="text-[9px] font-bold text-ink-300 uppercase tracking-wider">{t(l)}</div>
     </div>
   )
 }
 
 function ProjectsTab() {
+  const t = useT()
   const [projects, setProjects] = useState<ApiProject[]>([])
   const [showArchived, setShowArchived] = useState(false)
   const [creating, setCreating] = useState(false)
@@ -521,38 +539,41 @@ function ProjectsTab() {
 
   return (
     <div className="space-y-6">
-      <Section title="↳ Projects">
+      <Section title={t('me.sectionProjects')}>
         <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
-          Projects bundle related groups under a name + a tint. Attach a group to a project so the team and the agents both see what scope the conversation belongs to.
+          {t('me.projectsIntro')}
         </div>
 
         <div className="space-y-2">
           {visible.length === 0 && !creating && (
             <div className="bg-cloud rounded-[12px] p-6 text-center text-[13px] text-ink-500 italic font-display"
               style={{ border: '1px dashed var(--ink-100)' }}>
-              No projects yet. Click <b className="not-italic text-skype-deep">+ New project</b> to start one.
+              {t('me.noProjects')}
             </div>
           )}
-          {visible.map((p) => (
-            <div key={p.id} className="bg-cloud rounded-[12px] p-4 flex items-center gap-4"
-              style={{ border: '1px solid var(--ink-100)', opacity: p.status === 'archived' ? 0.55 : 1 }}>
-              <div className="w-3 h-10 rounded-full shrink-0" style={{ background: p.color ?? 'var(--ink-200)' }} />
-              <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <div className="font-semibold text-[14px] text-ink-900 truncate">{p.name}</div>
-                  {p.status === 'archived' && <span className="text-[10px] text-ink-300 uppercase tracking-wider">archived</span>}
+          {visible.map((p) => {
+            const count = p.conversationCount
+            return (
+              <div key={p.id} className="bg-cloud rounded-[12px] p-4 flex items-center gap-4"
+                style={{ border: '1px solid var(--ink-100)', opacity: p.status === 'archived' ? 0.55 : 1 }}>
+                <div className="w-3 h-10 rounded-full shrink-0" style={{ background: p.color ?? 'var(--ink-200)' }} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <div className="font-semibold text-[14px] text-ink-900 truncate">{p.name}</div>
+                    {p.status === 'archived' && <span className="text-[10px] text-ink-300 uppercase tracking-wider">{t('me.archived')}</span>}
+                  </div>
+                  <div className="font-display italic text-[12px] text-ink-500 truncate">
+                    {p.description || t('me.noDescription')}  ·  {count === 1 ? t('me.projectConvoCount', { n: count }) : t('me.projectConvoCountPlural', { n: count })}
+                  </div>
                 </div>
-                <div className="font-display italic text-[12px] text-ink-500 truncate">
-                  {p.description || '(no description)'}  ·  {p.conversationCount} conversation{p.conversationCount === 1 ? '' : 's'}
-                </div>
+                <button
+                  onClick={() => archive(p.id, p.status !== 'archived')}
+                  className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-ink-700 bg-paper hover:bg-sky2-50 transition"
+                  style={{ border: '1px solid var(--ink-100)' }}
+                >{p.status === 'archived' ? t('me.restore') : t('me.archive')}</button>
               </div>
-              <button
-                onClick={() => archive(p.id, p.status !== 'archived')}
-                className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-ink-700 bg-paper hover:bg-sky2-50 transition"
-                style={{ border: '1px solid var(--ink-100)' }}
-              >{p.status === 'archived' ? 'Restore' : 'Archive'}</button>
-            </div>
-          ))}
+            )
+          })}
         </div>
 
         {creating ? (
@@ -563,7 +584,7 @@ function ProjectsTab() {
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="Project name"
+              placeholder={t('me.projectNamePh')}
               className="w-full px-3 py-2 text-[13px] rounded outline-none"
               style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
             />
@@ -571,7 +592,7 @@ function ProjectsTab() {
               type="text"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Short description (optional)"
+              placeholder={t('me.projectDescPh')}
               className="w-full px-3 py-2 text-[12.5px] rounded outline-none"
               style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
             />
@@ -582,11 +603,11 @@ function ProjectsTab() {
                 disabled={!name.trim() || busy}
                 className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white disabled:opacity-50"
                 style={{ background: 'var(--skype)' }}
-              >{busy ? '…' : 'Create project'}</button>
+              >{busy ? t('me.createProjectBusy') : t('me.createProject')}</button>
               <button
                 onClick={() => { setCreating(false); setName(''); setDescription(''); setErr(null) }}
                 className="px-3 py-1.5 rounded-[8px] text-[12px] text-ink-500 hover:bg-cloud"
-              >Cancel</button>
+              >{t('common.cancel')}</button>
             </div>
           </div>
         ) : (
@@ -595,13 +616,13 @@ function ProjectsTab() {
               onClick={() => setCreating(true)}
               className="px-4 py-2 rounded-[10px] text-[12.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
               style={{ border: '1px dashed var(--sky2-300)' }}
-            >+ New project</button>
+            >{t('me.newProject')}</button>
             {archivedCount > 0 && (
               <button
                 onClick={() => setShowArchived((v) => !v)}
                 className="text-[11.5px] text-ink-500 hover:text-skype-deep transition italic font-display"
               >
-                {showArchived ? 'Hide archived' : `Show archived (${archivedCount})`}
+                {showArchived ? t('me.hideArchived') : t('me.showArchivedCount', { n: archivedCount })}
               </button>
             )}
           </div>
@@ -612,6 +633,7 @@ function ProjectsTab() {
 }
 
 function PreferencesTab() {
+  const t = useT()
   const prefs = usePrefs((s) => s.prefs)
   const setPref = usePrefs((s) => s.setPref)
   const devtoolsEnabled = useDevtools((s) => s.enabled)
@@ -628,7 +650,7 @@ function PreferencesTab() {
   return (
     <div className="space-y-6">
       {PREF_GROUPS.map((g) => (
-        <Section key={g.title} title={`↳ ${g.title}`}>
+        <Section key={g.title} title={`↳ ${t(g.title)}`}>
           <div className="bg-cloud rounded-[14px] divide-y divide-ink-100"
             style={{ border: '1px solid var(--ink-100)' }}>
             {g.items.map((it, i) => {
@@ -636,8 +658,8 @@ function PreferencesTab() {
               return (
                 <div key={i} className="flex items-center gap-4 p-4 cursor-pointer" onClick={() => setPref(it.key, !on)}>
                   <div className="flex-1 min-w-0">
-                    <div className="font-semibold text-[13px] text-ink-900">{it.lbl}</div>
-                    <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">{it.sub}</div>
+                    <div className="font-semibold text-[13px] text-ink-900">{t(it.lbl)}</div>
+                    <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">{t(it.sub)}</div>
                   </div>
                   <span className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', on ? 'bg-skype' : 'bg-ink-200')}>
                     <span className={cn('absolute w-4 h-4 bg-white rounded-full top-0.5 transition-all', on ? 'left-[18px]' : 'left-0.5')}
@@ -649,17 +671,18 @@ function PreferencesTab() {
           </div>
         </Section>
       ))}
+      <LanguageSection />
       <SkypeSoundSection />
       {devtoolsCanEnable && (
-        <Section title="↳ Developer">
+        <Section title={`↳ ${t('me.prefs.developer')}`}>
           <Checkbox
             checked={devtoolsEnabled}
             disabled={devtoolsLocal}
             onCheckedChange={(next) => { void setDevMode(next) }}
-            label="Developer mode"
+            label={t('me.prefs.developerMode')}
             description={devtoolsLocal
-              ? 'Always on while running the local development build'
-              : 'Show Observe and unlock backend-gated developer tools on this device'}
+              ? t('me.prefs.developerModeLocal')
+              : t('me.prefs.developerModeSub')}
           />
         </Section>
       )}
@@ -667,22 +690,41 @@ function PreferencesTab() {
   )
 }
 
+function LanguageSection() {
+  const t = useT()
+  return (
+    <Section title={`↳ ${t('me.prefs.languageSection')}`}>
+      <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-4"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-[13px] text-ink-900">{t('common.language')}</div>
+          <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+            {t('common.languageSub')}
+          </div>
+        </div>
+        <LanguagePicker className="w-[180px] shrink-0" />
+      </div>
+    </Section>
+  )
+}
+
 function SkypeSoundSection() {
   // Local-only toggle — see stores/sound.ts for why this isn't synced
   // through the server preferences store. Default is muted; users opt
   // in if they want the classic (clap) / (drum) chimes.
+  const t = useT()
   const muted = useSoundStore((s) => s.muted)
   const setMuted = useSoundStore((s) => s.setMuted)
   const on = !muted
   return (
-    <Section title="↳ Skype emoticons">
+    <Section title={`↳ ${t('me.prefs.skypeSection')}`}>
       <div className="bg-cloud rounded-[14px]"
         style={{ border: '1px solid var(--ink-100)' }}>
         <div className="flex items-center gap-4 p-4 cursor-pointer" onClick={() => setMuted(on)}>
           <div className="flex-1 min-w-0">
-            <div className="font-semibold text-[13px] text-ink-900">Play classic Skype sounds</div>
+            <div className="font-semibold text-[13px] text-ink-900">{t('me.prefs.skypeSounds')}</div>
             <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
-              this device only · plays once when a Skype emoticon enters view; click an emoticon to replay
+              {t('me.prefs.skypeSoundsSub')}
             </div>
           </div>
           <span className={cn('w-9 h-5 rounded-full relative shrink-0 transition-colors', on ? 'bg-skype' : 'bg-ink-200')}>
@@ -695,11 +737,15 @@ function SkypeSoundSection() {
   )
 }
 
+// Brand and engine names stay in English in every locale. The values
+// below are display labels surfaced to users when we list computers —
+// products keep their own casing.
 const ENGINE_LABEL: Record<string, string> = { managed: 'Cumora', claude: 'Claude Code', codex: 'Codex', grok: 'Grok Build', cursor: 'Cursor' }
 const KIND_ICON: Record<string, string> = { cloud: '☁', local: '💻', vps: '🖥' }
 const STATUS_COLOR: Record<string, string> = { online: '#3BB273', busy: '#E6A23C', offline: 'var(--ink-300)' }
 
 function ComputersTab() {
+  const t = useT()
   const byId = useComputers((s) => s.byId)
   const loaded = useComputers((s) => s.loaded)
   const participants = useParticipants((s) => s.byId)
@@ -720,7 +766,7 @@ function ComputersTab() {
   const [repairCopied, setRepairCopied] = useState(false)
 
   useEffect(() => { void useComputers.getState().refresh() }, [])
-  useEffect(() => { if (!repairCopied) return; const t = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(t) }, [repairCopied])
+  useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
 
   async function toggleRepair(id: string) {
     if (repairFor === id) { setRepairFor(null); setRepairCode(null); return }
@@ -728,7 +774,7 @@ function ComputersTab() {
     try { setRepairCode((await api.repairComputer(id)).code) }
     catch (e) { alert(e instanceof Error ? e.message : String(e)); setRepairFor(null) }
   }
-  useEffect(() => { if (!copied) return; const t = window.setTimeout(() => setCopied(false), 1600); return () => window.clearTimeout(t) }, [copied])
+  useEffect(() => { if (!copied) return; const id = window.setTimeout(() => setCopied(false), 1600); return () => window.clearTimeout(id) }, [copied])
 
   function copyCommand() {
     void navigator.clipboard?.writeText(pairCommand)
@@ -763,7 +809,7 @@ function ComputersTab() {
   }
 
   async function remove(id: string, label: string) {
-    if (!confirm(`Remove "${label}"? Its agents will go offline until you re-pair.`)) return
+    if (!confirm(t('me.removeConfirm', { label }))) return
     try {
       await api.deleteComputer(id)
       await useComputers.getState().refresh()
@@ -772,18 +818,11 @@ function ComputersTab() {
 
   return (
     <div className="space-y-6">
-      <Section title="↳ Where your agents run">
-        <p className="text-[13px] text-ink-500 mb-4 max-w-[640px]">
-          Every agent runs on a <strong>Computer</strong>. <em>Cumora Cloud</em> is built in and
-          always on. Pair your own machine or a VPS to run agents on your local
-          <span className="font-mono text-[12px]"> Claude Code</span>,
-          <span className="font-mono text-[12px]"> Codex</span>,
-          <span className="font-mono text-[12px]"> Grok Build</span>, or
-          <span className="font-mono text-[12px]"> Cursor</span> — each agent gets its own isolated
-          workspace, memory and skills there.
-        </p>
+      <Section title={t('me.sectionComputers')}>
+        {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
+        <p className="text-[13px] text-ink-500 mb-4 max-w-[640px]" dangerouslySetInnerHTML={{ __html: t('me.computersIntro') }} />
 
-        {!loaded && <div className="text-[13px] text-ink-400">Loading…</div>}
+        {!loaded && <div className="text-[13px] text-ink-400">{t('common.loading')}</div>}
 
         <div className="grid gap-3">
           {list.map((c) => {
@@ -807,25 +846,25 @@ function ComputersTab() {
                       {c.daemonOutdated && (
                         <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full"
                           style={{ background: 'rgba(244,183,64,0.18)', color: 'var(--gold-deep)' }}
-                          title={c.latestDaemonVersion ? `Update to v${c.latestDaemonVersion}` : 'Update available'}>
-                          ↑ update{c.daemonVersion ? ` · v${c.daemonVersion}` : ''}
+                          title={c.latestDaemonVersion ? t('me.updateToVersion', { version: c.latestDaemonVersion }) : t('me.updateAvailableTitle')}>
+                          ↑ {t('me.updateAvailableShort')}{c.daemonVersion ? ` · ${t('me.daemonVersion', { version: c.daemonVersion })}` : ''}
                         </span>
                       )}
                     </div>
                     <div className="text-[12px] text-ink-500 mt-0.5">
                       {c.availableEngines.map((e) => ENGINE_LABEL[e] ?? e).join(', ') || '—'}
-                      {' · '}{n} agent{n === 1 ? '' : 's'}
+                      {' · '}{n === 1 ? t('me.agentsCountOne', { n }) : t('me.agentsCountOther', { n })}
                       {repairable && c.daemonVersion && (
-                        <>{' · '}<span className="font-mono text-[11px] text-ink-400">v{c.daemonVersion}</span></>
+                        <>{' · '}<span className="font-mono text-[11px] text-ink-400">{t('me.daemonVersion', { version: c.daemonVersion })}</span></>
                       )}
                     </div>
                   </div>
                   {repairable && (
                     <>
-                      <span className="text-[12px] font-semibold text-skype-deep">{expanded ? 'Hide' : 'Reconnect'}</span>
+                      <span className="text-[12px] font-semibold text-skype-deep">{expanded ? t('me.hideAction') : t('me.reconnect')}</span>
                       <button onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
                         className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
-                        Remove
+                        {t('me.remove')}
                       </button>
                     </>
                   )}
@@ -833,17 +872,17 @@ function ComputersTab() {
                 {expanded && (
                   <div className="px-4 pb-4 pt-3 border-t border-ink-100">
                     <div className="text-[12px] text-ink-500 mb-2 italic font-display">
-                      Run this on “{c.name}” to reconnect it — its agents stay attached. This token stays valid.
+                      {t('me.repairHint', { name: c.name })}
                     </div>
                     {!repairCode ? (
-                      <div className="text-[12px] text-ink-400">Generating…</div>
+                      <div className="text-[12px] text-ink-400">{t('me.computersGenerating')}</div>
                     ) : (
                       <>
                         <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{repairCmd}</pre>
                         <button onClick={(e) => { e.stopPropagation(); void navigator.clipboard?.writeText(repairCmd); setRepairCopied(true) }}
                           className="mt-2 inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                           style={{ background: repairCopied ? '#3BB273' : 'var(--skype)' }}>
-                          {repairCopied ? '✓ Copied!' : 'Copy command'}
+                          {repairCopied ? t('me.copied') : t('me.copyCommand')}
                         </button>
                       </>
                     )}
@@ -857,13 +896,12 @@ function ComputersTab() {
         {code ? (
           <div className="mt-4 bg-sky-50 rounded-[14px] p-4" style={{ border: '1px solid var(--sky-100)' }}>
             <div className="text-[13px] font-semibold text-ink-900 mb-1">
-              Run this on the machine you want to host agents:
+              {t('me.runOnHost')}
             </div>
-            <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display">
-              Needs <span className="font-mono not-italic">claude</span>, <span className="font-mono not-italic">codex</span>, <span className="font-mono not-italic">grok</span>, or <span className="font-mono not-italic">cursor-agent</span> installed. The computer names itself after that machine and appears here once paired. This token stays valid.
-            </div>
+            {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
+            <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display" dangerouslySetInnerHTML={{ __html: t('me.engineRequired') }} />
             <div className="flex items-center gap-2.5 mb-2.5">
-              <span className="text-[12px] text-ink-500">Engine</span>
+              <span className="text-[12px] text-ink-500">{t('me.engineLabel')}</span>
               <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
                 {([['claude', 'Claude Code'], ['codex', 'Codex'], ['grok', 'Grok Build'], ['cursor', 'Cursor']] as const).map(([id, label]) => (
                   <button key={id} type="button" onClick={() => setEngine(id)}
@@ -875,18 +913,18 @@ function ComputersTab() {
                   </button>
                 ))}
               </div>
-              <span className="text-[11px] text-ink-400">just the default — this computer can still run agents on any detected engine</span>
+              <span className="text-[11px] text-ink-400">{t('me.engineDefaultHint')}</span>
             </div>
             {isWindows ? (
               <div className="mb-2.5 text-[12px] text-ink-600">
-                Keep this terminal open while the agents run.
-                <span className="text-ink-400"> — background service install isn’t supported on Windows yet.</span>
+                {t('me.keepTerminalOpen')}
+                <span className="text-ink-400"> — {t('me.bgServiceUnsupported')}</span>
               </div>
             ) : (
               <label className="flex items-start gap-2 mb-2.5 cursor-pointer select-none">
                 <input type="checkbox" checked={asService} onChange={(e) => setAsService(e.target.checked)} className="mt-[3px]" />
                 <span className="text-[12px] text-ink-600">
-                  Keep it running in the background <span className="text-ink-400">— auto-start on boot, auto-restart on crash, auto-update. Otherwise this terminal has to stay open.</span>
+                  {t('me.keepInBackground')} <span className="text-ink-400">— {t('me.keepInBackgroundDetail')}</span>
                 </span>
               </label>
             )}
@@ -902,12 +940,12 @@ function ComputersTab() {
                       style={{ animation: 'cp-pop 0.32s cubic-bezier(.36,1.6,.4,1)' }}>
                       <polyline points="20 6 9 17 4 12" />
                     </svg>
-                    <span style={{ animation: 'cp-fade 0.2s ease' }}>Copied!</span>
+                    <span style={{ animation: 'cp-fade 0.2s ease' }}>{t('me.copiedShort')}</span>
                   </>
-                ) : 'Copy command'}
+                ) : t('me.copyCommand')}
               </button>
               <button onClick={() => setCode(null)}
-                className="text-[12px] font-semibold px-3 py-1.5 rounded-[9px] border border-ink-100 text-ink-600">Done</button>
+                className="text-[12px] font-semibold px-3 py-1.5 rounded-[9px] border border-ink-100 text-ink-600">{t('me.done')}</button>
             </div>
             <style>{`
               @keyframes cp-pop { 0% { transform: scale(0.2); opacity: 0 } 55% { transform: scale(1.3) } 100% { transform: scale(1); opacity: 1 } }
@@ -919,7 +957,7 @@ function ComputersTab() {
             {err && <div className="mt-4 text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2">{err}</div>}
             <button onClick={addComputer} disabled={busy}
               className="mt-4 px-4 py-2 rounded-[10px] bg-skype text-white text-[13px] font-semibold disabled:opacity-50">
-              {busy ? 'Generating…' : '+ Add a computer'}
+              {busy ? t('me.computersGenerating') : t('me.addComputer')}
             </button>
           </>
         )}
@@ -942,6 +980,7 @@ function Section({ title, children }: { title: string; children: React.ReactNode
  *  once the daemon restarts onto the latest (the next heartbeat clears the flag).
  *  Warm gold (an invitation to update), not alarm red. One-click copy. */
 function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
+  const t = useT()
   const byId = useComputers((s) => s.byId)
   const [copied, setCopied] = useState(false)
   const outdated = Object.values(byId).filter((c) => c.daemonOutdated)
@@ -967,30 +1006,30 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
           style={{ background: 'rgba(244,183,64,0.22)', color: 'var(--gold-deep)' }}>↑</div>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2.5 flex-wrap">
-            <span className="font-display font-semibold text-[15px] text-ink-900">Update available</span>
+            <span className="font-display font-semibold text-[15px] text-ink-900">{t('me.updateAvailableTitle')}</span>
             {latest && (
               <span className="inline-flex items-center gap-1.5 text-[11px] font-mono">
                 {one?.daemonVersion && (
-                  <span className="px-1.5 py-0.5 rounded-full" style={{ background: 'var(--ink-100)', color: 'var(--ink-500)' }}>v{one.daemonVersion}</span>
+                  <span className="px-1.5 py-0.5 rounded-full" style={{ background: 'var(--ink-100)', color: 'var(--ink-500)' }}>{t('me.daemonVersion', { version: one.daemonVersion })}</span>
                 )}
                 <span className="text-ink-300">→</span>
-                <span className="px-1.5 py-0.5 rounded-full font-semibold" style={{ background: 'rgba(244,183,64,0.30)', color: 'var(--gold-deep)' }}>v{latest}</span>
+                <span className="px-1.5 py-0.5 rounded-full font-semibold" style={{ background: 'rgba(244,183,64,0.30)', color: 'var(--gold-deep)' }}>{t('me.daemonVersion', { version: latest })}</span>
               </span>
             )}
           </div>
           <div className="text-[12.5px] text-ink-600 mt-1 leading-relaxed">
             {one ? (
-              <><strong className="text-ink-900 font-medium">{one.name}</strong> is running an outdated agent daemon.</>
+              <><strong className="text-ink-900 font-medium">{one.name}</strong>{' '}{t('me.daemonOutdatedOne')}</>
             ) : (
-              <><strong className="text-ink-900 font-medium">{outdated.length} computers</strong> are running an outdated agent daemon: {outdated.map((c) => c.name).join(', ')}.</>
+              <><strong className="text-ink-900 font-medium">{outdated.length}</strong> {t('me.daemonOutdatedMany', { n: outdated.length, names: outdated.map((c) => c.name).join(', ') })}</>
             )}
             {allManual ? (
-              <>{' '}{one ? 'It runs' : 'They run'} as a foreground command — press <kbd className="font-mono text-[11px]">Ctrl-C</kbd> in {one ? 'its' : 'each'} terminal, then re-run to update. Tip: <code className="font-mono text-[11px]">--install-service</code> makes updates automatic.</>
+              <>{' '}{one ? t('me.daemonManualHelp') : t('me.daemonManualHelpPlural')}</>
             ) : (
               <>
-                {' '}Restart {one ? 'it' : 'them'} to pick up the latest fixes — agents stay attached.
+                {' '}{one ? t('me.daemonAutoHelp') : t('me.daemonAutoHelpPlural')}
                 {manual.length > 0 && (
-                  <>{' '}({manual.map((c) => c.name).join(', ')} {manual.length === 1 ? 'runs' : 'run'} as a foreground command — Ctrl-C and re-run there instead.)</>
+                  <>{' '}({manual.map((c) => c.name).join(', ')} {manual.length === 1 ? t('me.daemonManualInfix') : t('me.daemonManualInfixPlural')} {t('me.daemonManualRun')} — Ctrl-C and re-run there instead.)</>
                 )}
               </>
             )}
@@ -1000,11 +1039,11 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
             <button onClick={copy}
               className="shrink-0 inline-flex items-center justify-center min-w-[82px] text-[12px] font-semibold px-3 rounded-[10px] text-white transition-colors duration-200"
               style={{ background: copied ? 'var(--avail)' : 'var(--gold-deep)' }}>
-              {copied ? '✓ Copied' : 'Copy'}
+              {copied ? t('me.copiedShort') : t('me.copy')}
             </button>
           </div>
           <button onClick={onJump} className="mt-2 text-[11.5px] font-semibold text-gold-deep hover:underline" style={{ color: 'var(--gold-deep)' }}>
-            Manage computers →
+            {t('me.manageComputers')}
           </button>
         </div>
       </div>
@@ -1013,7 +1052,8 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
 }
 
 export function MeView() {
-  const [tab, setTab] = useState<Tab>('Profile')
+  const t = useT()
+  const [tab, setTab] = useState<Tab>('profile')
   const hasOutdated = useComputers((s) => Object.values(s.byId).some((c) => c.daemonOutdated))
   useEffect(() => { void useComputers.getState().refresh() }, [])
 
@@ -1023,39 +1063,39 @@ export function MeView() {
       <div className="max-w-[1100px] mx-auto">
         <div className="mb-6">
           <h1 className="font-display font-medium text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
-            You <em className="italic text-coral-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>at the center</em>
+            {t('me.headline')} <em className="italic text-coral-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>{t('me.headlineEm')}</em>
           </h1>
           <div className="font-display italic font-normal text-[15px] text-ink-500">
-            How your agents see you, what they remember, and how much rope they get.
+            {t('me.subtitle')}
           </div>
         </div>
 
-        <DaemonUpgradeBanner onJump={() => setTab('Computers')} />
+        <DaemonUpgradeBanner onJump={() => setTab('computers')} />
 
         <div className="flex gap-1 mb-7 border-b border-ink-100">
-          {tabs.map((t, i) => (
+          {tabs.map((tabDef, i) => (
             <button
-              key={t}
-              onClick={() => setTab(t)}
+              key={tabDef.key}
+              onClick={() => setTab(tabDef.key)}
               className={cn(
                 'py-2.5 text-[13px] font-semibold border-b-2 transition -mb-px inline-flex items-center gap-1.5',
                 i === 0 ? 'pl-0 pr-5' : 'px-5',
-                tab === t ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700',
+                tab === tabDef.key ? 'border-skype text-skype-deep' : 'border-transparent text-ink-500 hover:text-ink-700',
               )}>
-              {t}
-              {t === 'Computers' && hasOutdated && (
-                <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--gold-deep)' }} title="A daemon needs updating" />
+              {t(tabDef.label)}
+              {tabDef.key === 'computers' && hasOutdated && (
+                <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--gold-deep)' }} title={t('me.daemonNeedsUpdate')} />
               )}
             </button>
           ))}
         </div>
 
-        {tab === 'Profile' && <ProfileTab />}
-        {tab === 'Usage' && <UsageTab />}
-        {tab === 'Computers' && <ComputersTab />}
-        {tab === 'Projects' && <ProjectsTab />}
-        {tab === 'Trust & autonomy' && <TrustTab />}
-        {tab === 'Preferences' && <PreferencesTab />}
+        {tab === 'profile' && <ProfileTab />}
+        {tab === 'usage' && <UsageTab />}
+        {tab === 'computers' && <ComputersTab />}
+        {tab === 'projects' && <ProjectsTab />}
+        {tab === 'trust' && <TrustTab />}
+        {tab === 'preferences' && <PreferencesTab />}
       </div>
     </main>
   )

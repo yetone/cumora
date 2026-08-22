@@ -24,6 +24,7 @@ import { useMe } from '@/stores/auth'
 import { Avatar } from '@/components/Avatar'
 import { IPlus, ICalendar, IClock, IRepeat, ITrash } from '@/components/icons'
 import { EventEditor, type EventEditorPrefill } from '@/components/EventEditor'
+import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 import type { CalendarEvent, RecurrenceRule } from '@/types'
 
@@ -40,7 +41,15 @@ type EditingState =
   | null
 
 const DAY_MS = 86_400_000
-const WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const WEEK_KEYS = [
+  'cal.weekShortSun',
+  'cal.weekShortMon',
+  'cal.weekShortTue',
+  'cal.weekShortWed',
+  'cal.weekShortThu',
+  'cal.weekShortFri',
+  'cal.weekShortSat',
+] as const
 const HOUR_HEIGHT = 48
 const SLOT_MINUTES = 30
 const SLOT_HEIGHT = (HOUR_HEIGHT * SLOT_MINUTES) / 60
@@ -111,13 +120,15 @@ function nextOccurrence(event: CalendarEvent, from: Date): Date | null {
   return null
 }
 
-function describeRecurrence(r: RecurrenceRule | null): string {
-  if (!r) return 'one-shot'
-  const every = r.interval > 1 ? `every ${r.interval} ` : 'every '
-  const freqMap = { daily: 'day', weekly: 'week', monthly: 'month', yearly: 'year' } as const
-  const base = `${every}${freqMap[r.freq]}${r.interval > 1 ? 's' : ''}`
+function describeRecurrence(r: RecurrenceRule | null, t: ReturnType<typeof useT>): string {
+  if (!r) return t('cal.oneShot')
+  const every = r.interval > 1 ? t('cal.everyN', { n: r.interval }) : t('cal.every')
+  const freqMap = { daily: 'cal.dayUnit', weekly: 'cal.weekUnit', monthly: 'cal.monthUnit', yearly: 'cal.yearUnit' } as const
+  const pluralMap = { daily: 'cal.dayUnitPlural', weekly: 'cal.weekUnitPlural', monthly: 'cal.monthUnitPlural', yearly: 'cal.yearUnitPlural' } as const
+  const unitKey = r.interval > 1 ? pluralMap[r.freq] : freqMap[r.freq]
+  const base = `${every} ${t(unitKey)}`
   if (r.freq === 'weekly' && r.byweekday && r.byweekday.length) {
-    return `${base} · ${r.byweekday.map((d) => WEEK[d]).join('/')}`
+    return `${base} · ${r.byweekday.map((d) => t(WEEK_KEYS[d])).join(t('cal.weekdayJoin'))}`
   }
   return base
 }
@@ -207,6 +218,7 @@ function ContextMenu({ x, y, items, onClose }: {
 /* ─────────────────────────── MonthGrid ─────────────────────────── */
 
 function MonthGrid({ cursor, events, onEdit, onNew }: GridProps) {
+  const t = useT()
   const monthStart = startOfMonth(cursor)
   const monthEnd = endOfMonth(cursor)
   const gridStart = useMemo(() => {
@@ -272,7 +284,7 @@ function MonthGrid({ cursor, events, onEdit, onNew }: GridProps) {
   return (
     <>
       <div className="grid grid-cols-7 px-4 pt-3 text-[11px] uppercase tracking-wide text-ink-400 select-none">
-        {WEEK.map((d) => <div key={d} className="px-2 py-1">{d}</div>)}
+        {WEEK_KEYS.map((k) => <div key={k} className="px-2 py-1">{t(k)}</div>)}
       </div>
       <div className="flex-1 min-h-0 overflow-auto px-4 pb-4">
         <div
@@ -348,7 +360,7 @@ function MonthGrid({ cursor, events, onEdit, onNew }: GridProps) {
           onClose={() => setMenu(null)}
           items={[
             {
-              label: `New event on ${menu.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}`,
+              label: t('cal.newEventOn', { date: menu.date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) }),
               onClick: () => {
                 const start = new Date(menu.date); start.setHours(9, 0, 0, 0)
                 const end = new Date(menu.date); end.setHours(10, 0, 0, 0)
@@ -356,7 +368,7 @@ function MonthGrid({ cursor, events, onEdit, onNew }: GridProps) {
               },
             },
             {
-              label: 'New all-day event',
+              label: t('cal.newAllDay'),
               onClick: () => {
                 const start = new Date(menu.date); start.setHours(0, 0, 0, 0)
                 const end = new Date(menu.date); end.setHours(23, 59, 0, 0)
@@ -373,6 +385,7 @@ function MonthGrid({ cursor, events, onEdit, onNew }: GridProps) {
 /* ─────────────────────────── TimeGrid (Week / Day) ─────────────────────────── */
 
 function TimeGrid({ cursor, events, onEdit, onNew, dayCount }: GridProps & { dayCount: 1 | 7 }) {
+  const t = useT()
   const start = useMemo(
     () => dayCount === 7 ? startOfWeek(cursor) : startOfDay(cursor),
     [cursor.getTime(), dayCount],
@@ -464,7 +477,7 @@ function TimeGrid({ cursor, events, onEdit, onNew, dayCount }: GridProps & { day
             const isToday = sameDay(d, new Date())
             return (
               <div key={i} className="px-2 py-2 text-center border-l border-ink-100">
-                <div className="text-[10px] uppercase tracking-wider text-ink-400">{WEEK[d.getDay()]}</div>
+                <div className="text-[10px] uppercase tracking-wider text-ink-400">{t(WEEK_KEYS[d.getDay()])}</div>
                 <div className={cn(
                   'mt-0.5 text-base font-semibold',
                   isToday ? 'text-skype' : 'text-ink-900',
@@ -592,14 +605,14 @@ function TimeGrid({ cursor, events, onEdit, onNew, dayCount }: GridProps & { day
           onClose={() => setMenu(null)}
           items={[
             {
-              label: `New event at ${formatTime(menu.date)}`,
+              label: t('cal.newEventAt', { time: formatTime(menu.date) }),
               onClick: () => {
                 const end = new Date(menu.date); end.setHours(end.getHours() + 1)
                 onNew({ startAt: menu.date, endAt: end })
               },
             },
             {
-              label: 'New all-day event',
+              label: t('cal.newAllDay'),
               onClick: () => {
                 const s = new Date(menu.date); s.setHours(0, 0, 0, 0)
                 const e = new Date(menu.date); e.setHours(23, 59, 0, 0)
@@ -616,6 +629,7 @@ function TimeGrid({ cursor, events, onEdit, onNew, dayCount }: GridProps & { day
 /* ─────────────────────────── CalendarView ─────────────────────────── */
 
 export function CalendarView() {
+  const t = useT()
   const [mode, setMode] = useState<ViewMode>('week')
   const [cursor, setCursor] = useState<Date>(() => new Date())
   const [editing, setEditing] = useState<EditingState>(null)
@@ -684,15 +698,17 @@ export function CalendarView() {
       <div className="flex flex-col min-h-0">
         <div className="px-6 py-3 border-b border-ink-100 flex items-center gap-3 shrink-0">
           <ICalendar className="w-5 h-5 text-skype" />
-          <h1 className="text-lg font-semibold text-ink-900">Calendar</h1>
+          <h1 className="text-lg font-semibold text-ink-900">{t('cal.title')}</h1>
 
           <div className="flex items-center gap-1 ml-3">
             <button onClick={goPrev}
-              className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100">‹</button>
+              className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100"
+              aria-label={t('cal.previous')}>‹</button>
             <button onClick={goToday}
-              className="px-2 h-7 rounded-md text-xs font-medium text-ink-700 hover:bg-ink-100">Today</button>
+              className="px-2 h-7 rounded-md text-xs font-medium text-ink-700 hover:bg-ink-100">{t('cal.today')}</button>
             <button onClick={goNext}
-              className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100">›</button>
+              className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100"
+              aria-label={t('cal.next')}>›</button>
             <span className="ml-2 text-sm text-ink-700 font-medium">{headerLabel}</span>
           </div>
 
@@ -712,7 +728,7 @@ export function CalendarView() {
                     ? 'bg-sky2-50 text-skype-deep ring-1 ring-inset ring-sky2-100'
                     : 'text-ink-500 hover:text-skype-deep hover:bg-sky2-50/60',
                 )}
-              >{m}</button>
+              >{t(`cal.${m}`)}</button>
             ))}
           </div>
 
@@ -725,7 +741,7 @@ export function CalendarView() {
             }}
           >
             <IPlus className="w-4 h-4" strokeWidth={2.5} />
-            New
+            {t('cal.newEvent')}
           </button>
         </div>
 
@@ -738,29 +754,29 @@ export function CalendarView() {
       <aside className="border-l border-ink-100 flex flex-col min-h-0">
         <div className="px-4 py-4 border-b border-ink-100 flex items-center gap-2 shrink-0">
           <IClock className="w-4 h-4 text-ink-500" />
-          <h2 className="text-sm font-semibold text-ink-700">Upcoming</h2>
+          <h2 className="text-sm font-semibold text-ink-700">{t('cal.upcoming')}</h2>
           <div className="flex-1" />
-          <span className="text-xs text-ink-400">{agenda.length} item{agenda.length === 1 ? '' : 's'}</span>
+          <span className="text-xs text-ink-400">{t(agenda.length === 1 ? 'cal.itemsOne' : 'cal.itemsOther', { count: agenda.length })}</span>
         </div>
         <div className="flex-1 min-h-0 overflow-auto px-3 py-2 space-y-2">
           {!loaded && (
-            <div className="text-sm text-ink-400 px-1 py-2">Loading…</div>
+            <div className="text-sm text-ink-400 px-1 py-2">{t('common.loading')}</div>
           )}
           {loaded && agenda.length === 0 && (
             <div className="px-1 py-6 text-center">
-              <div className="text-sm text-ink-500 mb-2">Nothing scheduled for the next 30 days.</div>
+              <div className="text-sm text-ink-500 mb-2">{t('cal.empty30')}</div>
               <button
                 onClick={() => openNew()}
                 className="text-xs text-skype font-medium hover:underline"
-              >Schedule something →</button>
+              >{t('cal.scheduleCta')}</button>
             </div>
           )}
           {agenda.map((it, idx) => {
             const assignee = it.event.assigneeId ? byId[it.event.assigneeId] : null
             const day = sameDay(it.occurrence, new Date())
-              ? 'Today'
+              ? t('cal.today')
               : sameDay(it.occurrence, new Date(Date.now() + DAY_MS))
-                ? 'Tomorrow'
+                ? t('cal.tomorrow')
                 : formatDateLong(it.occurrence)
             return (
               <div key={`${it.event.id}-${idx}`}
@@ -776,14 +792,14 @@ export function CalendarView() {
                           <span className="opacity-50">·</span>
                           <span className="inline-flex items-center gap-0.5 text-skype-deep">
                             <IRepeat className="w-3 h-3" />
-                            {describeRecurrence(it.event.recurrence)}
+                            {describeRecurrence(it.event.recurrence, t)}
                           </span>
                         </>
                       )}
                       {it.event.isPrivate && (
                         <>
                           <span className="opacity-50">·</span>
-                          <span title="Private event — only the creator and assignee can see this. The workspace owner can also see private events that involve an agent.">🔒</span>
+                          <span title={t('cal.privateHint')}>🔒</span>
                         </>
                       )}
                     </div>
@@ -797,7 +813,7 @@ export function CalendarView() {
                         <span className="text-xs text-ink-600">→ {assignee.name}</span>
                         {it.event.targetConversationId && convosById[it.event.targetConversationId] && (
                           <span className="text-xs text-ink-400 truncate">
-                            in #{convosById[it.event.targetConversationId]}
+                            {t('cal.inConversation', { name: convosById[it.event.targetConversationId] })}
                           </span>
                         )}
                       </div>
@@ -806,18 +822,18 @@ export function CalendarView() {
                   <div className="flex flex-col gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                     {it.event.kind === 'agent_task' && (
                       <button
-                        title="Run now"
+                        title={t('cal.runNow')}
                         onClick={async () => {
                           try { await runNow(it.event.id) } catch (err) { console.warn('[calendar] run-now failed', err) }
                         }}
                         className="text-[10px] text-skype-deep px-1.5 py-0.5 rounded hover:bg-sky2-100"
-                      >Run now</button>
+                      >{t('cal.runNow')}</button>
                     )}
                     {(it.event.createdBy === meId) && (
                       <button
-                        title="Delete event"
+                        title={t('cal.deleteEvent')}
                         onClick={async () => {
-                          if (!confirm(`Delete "${it.event.title}"?`)) return
+                          if (!confirm(t('cal.deleteEventConfirm', { title: it.event.title }))) return
                           try { await remove(it.event.id) } catch (err) { console.warn('[calendar] delete failed', err) }
                         }}
                         className="text-ink-400 hover:text-coral-deep p-0.5 rounded"

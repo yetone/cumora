@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react'
+import { translate, useLocaleStore } from '@/lib/i18n'
 
 interface Props { children: ReactNode }
 interface State { error: Error | null; resetKey: number }
@@ -18,16 +19,17 @@ export class ErrorBoundary extends Component<Props, State> {
 
   render(): ReactNode {
     if (this.state.error) {
+      const locale = useLocaleStore.getState().locale
+      const t = (key: Parameters<typeof translate>[1]) => translate(locale, key)
       return (
         <div className="fixed inset-0 grid place-items-center bg-paper p-8">
           <div className="max-w-[460px] text-center">
             <div className="font-display font-medium text-[32px] tracking-tight text-ink-900 mb-2"
               style={{ letterSpacing: '-0.025em' }}>
-              Something cracked.
+              {t('errorBoundary.somethingCracked')}
             </div>
             <div className="font-display italic text-[14px] text-ink-500 leading-relaxed mb-5">
-              The view hit an unexpected state. Your data is safe — this is
-              just the screen reacting badly.
+              {t('errorBoundary.fallbackBody')}
             </div>
             <pre
               className="text-left text-[11.5px] font-mono text-ink-700 bg-cloud rounded-[10px] py-2.5 px-3 mb-5 overflow-x-auto whitespace-pre-wrap break-words"
@@ -43,12 +45,12 @@ export class ErrorBoundary extends Component<Props, State> {
                   background: 'linear-gradient(135deg, var(--skype), var(--skype-deep))',
                   boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.45)',
                 }}
-              >Reset view</button>
+              >{t('errorBoundary.resetView')}</button>
               <button
                 onClick={() => window.location.reload()}
                 className="py-2 px-4 rounded-[10px] text-[13px] font-semibold text-ink-700 bg-cloud"
                 style={{ border: '1px solid var(--ink-100)' }}
-              >Reload</button>
+              >{t('errorBoundary.reload')}</button>
             </div>
           </div>
         </div>

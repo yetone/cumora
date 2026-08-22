@@ -18,6 +18,7 @@ import { api, type ApiMessage } from '@/api/client'
 import { MessageRow } from '@/components/Message'
 import { Composer } from '@/desktop/ChatPane'
 import type { Message, Participant } from '@/types'
+import { useT } from '@/lib/i18n'
 
 function apiToMessage(m: ApiMessage): Message {
   const raw = m as unknown as {
@@ -46,6 +47,7 @@ function apiToMessage(m: ApiMessage): Message {
 }
 
 export function ThreadDrawer() {
+  const t = useT()
   const openThread = useApp((s) => s.openThread)
   const close = useApp((s) => s.closeThreadView)
   const byId = useParticipants((s) => s.byId)
@@ -120,14 +122,14 @@ export function ThreadDrawer() {
     >
       <header className="flex items-center justify-between px-4 pt-4 pb-3 border-b border-ink-100">
         <div>
-          <div className="text-[10.5px] font-bold uppercase tracking-[0.14em] text-ink-400">Thread</div>
+          <div className="text-[10.5px] font-bold uppercase tracking-[0.14em] text-ink-400">{t('thread.title')}</div>
           <div className="text-[13px] text-ink-700 font-semibold mt-0.5">
-            {visibleReplies.length} {visibleReplies.length === 1 ? 'reply' : 'replies'}
+            {visibleReplies.length} {t(visibleReplies.length === 1 ? 'thread.reply' : 'thread.replyPlural')}
           </div>
         </div>
         <button
           onClick={close}
-          aria-label="Close thread"
+          aria-label={t('thread.close')}
           className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition"
         >×</button>
       </header>
@@ -138,13 +140,13 @@ export function ThreadDrawer() {
           <MessageRow msg={root} author={rootAuthor ?? fallbackAuthor} />
         </div>
         <div className="text-[10.5px] font-bold uppercase tracking-wider text-ink-400 pt-1 border-t border-ink-100 -mb-2">
-          Replies
+          {t('thread.replies')}
         </div>
 
-        {loading && <div className="text-[12px] text-ink-400 italic">loading replies…</div>}
+        {loading && <div className="text-[12px] text-ink-400 italic">{t('thread.loading')}</div>}
         {err && <div className="text-[12px] text-coral-deep">{err}</div>}
         {!loading && !err && visibleReplies.length === 0 && (
-          <div className="text-[12px] text-ink-400 italic">No replies yet — be the first.</div>
+          <div className="text-[12px] text-ink-400 italic">{t('thread.empty')}</div>
         )}
         {visibleReplies.map((m) => {
           const a = byId[m.authorId] ?? { ...fallbackAuthor, id: m.authorId, name: m.authorId, initial: (m.authorId[0] ?? '?').toUpperCase() }
@@ -154,13 +156,13 @@ export function ThreadDrawer() {
 
       <div className="border-t border-ink-100 bg-cloud px-3 py-3">
         <div className="text-[10.5px] text-ink-400 mb-1.5">
-          Replying to <span className="text-skype-deep font-semibold">{rootAuthor?.name ?? root.authorId}</span>
+          {t('thread.replyingTo')} <span className="text-skype-deep font-semibold">{rootAuthor?.name ?? root.authorId}</span>
         </div>
         <Composer
           convoId={openThread.convoId}
           typingNames={[]}
           threadRootId={openThread.rootId}
-          placeholder="Reply in thread…"
+          placeholder={t('thread.placeholder')}
         />
       </div>
     </aside>

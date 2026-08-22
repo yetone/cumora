@@ -20,6 +20,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type {
   AppUpdateInfo, AutoUpdateStatus, UpdateReleasePayload,
 } from '@/lib/runtime'
+import { useT } from '@/lib/i18n'
 
 /* ============== Shared hook ============== */
 
@@ -111,6 +112,7 @@ interface BannerProps {
 /** Slim status banner that hovers above the chat when an update is
  *  available or being downloaded. Dismissable for this session. */
 export function UpdateBanner({ forceOpen, onOpen }: BannerProps) {
+  const t = useT()
   const { status, releaseInfo } = useUpdater()
   const [dismissed, setDismissed] = useState(false)
 
@@ -160,7 +162,7 @@ export function UpdateBanner({ forceOpen, onOpen }: BannerProps) {
       </span>
       <div className="flex-1 min-w-0">
         <div className="text-[13px] font-semibold text-ink-900 truncate">
-          {isDownloaded ? 'Update ready' : isDownloading ? 'Updating Cumora' : 'New Cumora available'}
+          {isDownloaded ? t('updater.bannerUpdateReady') : isDownloading ? t('updater.bannerUpdating') : t('updater.bannerNewAvailable')}
           {version && <span className="ml-1.5 text-ink-500 font-normal">v{version}</span>}
         </div>
         {isDownloading && status.percent !== undefined && (
@@ -174,13 +176,13 @@ export function UpdateBanner({ forceOpen, onOpen }: BannerProps) {
         className="px-3 py-1.5 rounded-[8px] text-[12px] font-semibold text-white transition shrink-0"
         style={{ background: 'var(--skype)' }}
       >
-        {isDownloaded ? 'Restart' : isDownloading ? 'View' : 'Update'}
+        {isDownloaded ? t('updater.bannerRestart') : isDownloading ? t('updater.bannerView') : t('updater.bannerUpdate')}
       </button>
       {!isDownloading && (
         <button
           onClick={() => setDismissed(true)}
           className="w-6 h-6 rounded-[6px] grid place-items-center text-ink-400 hover:text-ink-700 hover:bg-cloud transition text-[14px] shrink-0"
-          aria-label="Dismiss"
+          aria-label={t('updater.bannerDismiss')}
         >×</button>
       )}
       </div>
@@ -196,6 +198,7 @@ interface DialogProps {
 }
 
 export function UpdaterDialog({ open, onClose }: DialogProps) {
+  const t = useT()
   const { appInfo, status, releaseInfo, check, download, install } = useUpdater()
 
   useEffect(() => {
@@ -232,17 +235,17 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
       >
         <div className="px-6 py-5 border-b border-ink-100">
           <h2 className="font-display font-medium text-[18px] tracking-tight text-ink-900">
-            Cumora Update
+            {t('updater.title')}
           </h2>
           <div className="mt-1 text-[12.5px] text-ink-500 italic font-display">
-            {kind === 'idle' && 'You\'re on the latest version.'}
-            {kind === 'checking' && 'Checking for updates…'}
-            {kind === 'update-not-available' && 'You\'re on the latest version.'}
-            {kind === 'update-available' && 'A new version is ready to download.'}
-            {kind === 'downloading' && 'Downloading the update…'}
-            {kind === 'update-downloaded' && 'Update downloaded. Restart to install.'}
-            {kind === 'error' && 'Update check failed.'}
-            {isUnsupported && 'Auto-update is not available in this build.'}
+            {kind === 'idle' && t('updater.latestVersion')}
+            {kind === 'checking' && t('updater.checkingUpdates')}
+            {kind === 'update-not-available' && t('updater.latestVersion')}
+            {kind === 'update-available' && t('updater.newVersionReady')}
+            {kind === 'downloading' && t('updater.downloadingUpdate')}
+            {kind === 'update-downloaded' && t('updater.updateDownloaded')}
+            {kind === 'error' && t('updater.checkFailed')}
+            {isUnsupported && t('updater.unsupported')}
           </div>
         </div>
 
@@ -262,7 +265,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           {changelog && (
             <div>
               <div className="text-[10.5px] font-bold uppercase tracking-wider text-ink-500 mb-2">
-                What's new
+                {t('updater.whatsNew')}
               </div>
               <div
                 className="text-[13px] text-ink-700 max-h-44 overflow-y-auto leading-relaxed rounded-[8px] p-3"
@@ -277,7 +280,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           {kind === 'downloading' && (
             <div>
               <div className="flex justify-between text-[11.5px] text-ink-500 mb-1.5 font-display italic">
-                <span>Downloading</span>
+                <span>{t('updater.downloadingLabel')}</span>
                 <span className="font-mono text-ink-700">
                   {(status.percent ?? 0).toFixed(0)}% · {fmtBytes(status.transferred ?? 0)} / {fmtBytes(status.total ?? 0)}
                 </span>
@@ -304,7 +307,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
               style={{ background: 'rgba(110, 197, 106, 0.08)', color: '#2d8c72', border: '1px solid rgba(110, 197, 106, 0.25)' }}
             >
               <span className="font-bold">✓</span>
-              <span>Ready to install — Cumora will restart at the new version.</span>
+              <span>{t('updater.readyToInstall')}</span>
             </div>
           )}
 
@@ -326,7 +329,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 hover:bg-paper transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >
-            {kind === 'update-downloaded' ? 'Later' : 'Close'}
+            {kind === 'update-downloaded' ? t('updater.laterAction') : t('updater.closeAction')}
           </button>
           <div className="flex-1" />
 
@@ -335,14 +338,14 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
               onClick={() => void check()}
               className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition"
               style={{ background: 'var(--skype)' }}
-            >Check again</button>
+            >{t('updater.checkAgain')}</button>
           )}
           {kind === 'checking' && (
             <button
               disabled
               className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-white opacity-60"
               style={{ background: 'var(--skype)' }}
-            >Checking…</button>
+            >{t('updater.checkingEllipsis')}</button>
           )}
           {kind === 'update-available' && (
             <button
@@ -352,14 +355,14 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
                 background: 'var(--skype)',
                 boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)',
               }}
-            >Download</button>
+            >{t('updater.download')}</button>
           )}
           {kind === 'downloading' && (
             <button
               disabled
               className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white opacity-60"
               style={{ background: 'var(--skype)' }}
-            >Downloading…</button>
+            >{t('updater.downloadingEllipsis')}</button>
           )}
           {kind === 'update-downloaded' && (
             <button
@@ -369,7 +372,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
                 background: 'var(--skype)',
                 boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)',
               }}
-            >Restart now</button>
+            >{t('updater.restartNow')}</button>
           )}
         </div>
       </div>

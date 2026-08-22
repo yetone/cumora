@@ -16,6 +16,7 @@
  */
 import { useEffect, useState } from 'react'
 import { useAuth } from '@/stores/auth'
+import { useT } from '@/lib/i18n'
 import { CloudLogo } from '@/components/Avatar'
 import { adminApi, type AdminStats } from './api'
 import { UsersPage } from './UsersPage'
@@ -51,6 +52,7 @@ function hrefFor(target: Route): string {
 }
 
 export function AdminApp() {
+  const t = useT()
   const user = useAuth((s) => s.user)
   const clear = useAuth((s) => s.clear)
   const [route, setRoute] = useState<Route>(parseRoute)
@@ -86,17 +88,17 @@ export function AdminApp() {
   }, [verified, route])
 
   if (verified === 'checking') {
-    return <FullScreenNote tone="muted">Checking admin access…</FullScreenNote>
+    return <FullScreenNote tone="muted">{t('admin.checking')}</FullScreenNote>
   }
   if (verified === 'denied') {
     return (
       <FullScreenNote tone="warn">
-        <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>Not authorized</div>
+        <div style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>{t('admin.notAuthorized')}</div>
         <div style={{ fontSize: 14, opacity: 0.7, marginBottom: 16 }}>
-          Signed in as <code>{user?.email ?? '(unknown)'}</code>.
+          {t('admin.signedInAs', { email: user?.email ?? '(unknown)' })}
         </div>
         <button className="btn" onClick={() => { clear() }}>
-          Sign out and switch account
+          {t('admin.signOutSwitch')}
         </button>
       </FullScreenNote>
     )
@@ -105,7 +107,7 @@ export function AdminApp() {
   return (
     <div className={`admin-shell${navOpen ? ' nav-open' : ''}`}>
       <header className="admin-topbar">
-        <button className="admin-topbar-burger" onClick={() => setNavOpen((v) => !v)} aria-label="Toggle navigation">
+        <button className="admin-topbar-burger" onClick={() => setNavOpen((v) => !v)} aria-label={t('admin.toggleNav')}>
           <span /><span /><span />
         </button>
         <div className="admin-topbar-brand">
@@ -124,13 +126,13 @@ export function AdminApp() {
           </div>
         </div>
         <nav className="admin-nav">
-          <NavLink current={route} target="users"         label="Users"         badge={stats?.users.total} />
-          <NavLink current={route} target="waitlist"      label="Waitlist"      badge={stats?.waitlist.pending || undefined} highlight={!!stats?.waitlist.pending} />
-          <NavLink current={route} target="observability" label="Observability" />
-          <NavLink current={route} target="settings"      label="Settings" />
+          <NavLink current={route} target="users"         label={t('admin.users')}         badge={stats?.users.total} />
+          <NavLink current={route} target="waitlist"      label={t('admin.waitlist')}      badge={stats?.waitlist.pending || undefined} highlight={!!stats?.waitlist.pending} />
+          <NavLink current={route} target="observability" label={t('admin.observability')} />
+          <NavLink current={route} target="settings"      label={t('admin.settings')} />
         </nav>
         <div className="admin-sidebar-foot">
-          <button className="btn-ghost" onClick={() => { clear() }}>Sign out</button>
+          <button className="btn-ghost" onClick={() => { clear() }}>{t('admin.signOut')}</button>
         </div>
       </aside>
       <main className="admin-main">

@@ -17,6 +17,7 @@
  * Auto-dismiss after AUTO_DISMISS_MS; hover pauses the timer.
  */
 import { useEffect, useRef, useState } from 'react'
+import { useT } from '@/lib/i18n'
 import { AnimatePresence, motion } from 'framer-motion'
 import type { NotificationPushPayload } from '@/lib/runtime'
 
@@ -260,6 +261,7 @@ function AuthorAvatar({ toast }: { toast: Toast }) {
 }
 
 function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () => void; onDismiss: () => void }) {
+  const t = useT()
   const [hovered, setHovered] = useState(false)
   useEffect(() => {
     if (hovered) return
@@ -307,7 +309,7 @@ function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () =>
       <button
         type="button"
         onClick={(e) => { e.stopPropagation(); onDismiss() }}
-        aria-label="Dismiss"
+        aria-label={t('notif.dismissAria')}
         className="absolute grid place-items-center rounded-full text-ink-500 hover:bg-ink-100 hover:text-ink-900 transition"
         style={{
           top: 6, right: 6,

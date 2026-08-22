@@ -16,6 +16,7 @@ import { IDoc, IBoard, ICalendar, IPlus } from '@/components/icons'
 import { MobileCalendar } from './MobileCalendar'
 import { EventEditor } from '@/components/EventEditor'
 import { cn } from '@/lib/utils'
+import { useT, type MessageKey, useTLabel } from '@/lib/i18n'
 
 type LibTab = 'documents' | 'boards' | 'calendar'
 
@@ -24,8 +25,16 @@ const TABS: Array<{ key: LibTab; label: string; Icon: typeof IDoc }> = [
   { key: 'boards', label: 'Boards', Icon: IBoard },
   { key: 'calendar', label: 'Calendar', Icon: ICalendar },
 ]
+// i18n: parallel lookup so the TABS shape above stays upstream-mergeable.
+const TAB_LABEL_KEY: Record<LibTab, MessageKey> = {
+  documents: 'moblib.tabDocuments',
+  boards: 'moblib.tabBoards',
+  calendar: 'moblib.tabCalendar',
+}
 
 export function MobileLibrary() {
+  // i18n: prefer the translated key, fall back to the inline English.
+  const tLabel = useTLabel()
   const [tab, setTab] = useState<LibTab>('documents')
   const create = useDocuments((s) => s.create)
   const createBoard = useBoards((s) => s.createBoard)
@@ -43,10 +52,10 @@ export function MobileLibrary() {
     setCreating(true)
     try {
       if (tab === 'documents') {
-        const d = await create({ title: 'Untitled' })
+        const d = await create({ title: tLabel('docs.untitled', 'Untitled') })
         openDocumentPeek(d.id)
       } else if (tab === 'boards') {
-        const id = await createBoard('Untitled board')
+        const id = await createBoard(tLabel('moblib.untitledBoard', 'Untitled board'))
         openBoardPeek(id, null)
       }
     } catch (err) {
@@ -83,7 +92,7 @@ export function MobileLibrary() {
                 )}
               >
                 <Icon className="w-[14px] h-[14px]" strokeWidth={active ? 2 : 1.6} />
-                {label}
+                {tLabel(TAB_LABEL_KEY[key], label)}
               </button>
             )
           })}
@@ -128,15 +137,17 @@ export function MobileLibrary() {
   )
 }
 
-function timeAgo(iso: string): string {
+function timeAgo(iso: string, t: ReturnType<typeof useT>): string {
   const ms = Date.now() - new Date(iso).getTime()
-  if (ms < 60_000) return 'just now'
-  if (ms < 3600_000) return `${Math.floor(ms / 60_000)}m ago`
-  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`
+  if (ms < 60_000) return t('docs.justNow')
+  if (ms < 3600_000) return t('docs.minutesAgo', { n: Math.floor(ms / 60_000) })
+  if (ms < 86_400_000) return t('docs.hoursAgo', { n: Math.floor(ms / 3_600_000) })
   return new Date(iso).toLocaleDateString()
 }
 
 function DocumentsList() {
+  const t = useT()
+  const tLabel = useTLabel()
   const list = useDocuments((s) => s.list)
   const loaded = useDocuments((s) => s.loaded)
   const load = useDocuments((s) => s.load)
@@ -149,7 +160,7 @@ function DocumentsList() {
   return (
     <div className="pb-24">
       {!loaded && (
-        <div className="px-6 py-10 text-center text-[13px] text-ink-300 font-display italic">Loading…</div>
+        <div className="px-6 py-10 text-center text-[13px] text-ink-300 font-display italic">{t('common.loading')}</div>
       )}
       {loaded && list.length === 0 && (
         <div className="px-6 py-12 text-center text-[13px] text-ink-500 font-display italic leading-relaxed">
@@ -170,9 +181,9 @@ function DocumentsList() {
                 <IDoc className="w-[18px] h-[18px]" />
               </div>
               <div className="min-w-0">
-                <div className="text-[14px] font-semibold text-ink-900 truncate">{d.title || 'Untitled'}</div>
+                <div className="text-[14px] font-semibold text-ink-900 truncate">{d.title || tLabel('docs.untitled', 'Untitled')}</div>
                 <div className="text-[11.5px] text-ink-500 truncate font-display italic">
-                  {authorName} · {timeAgo(d.updatedAt)}
+                  {authorName} · {timeAgo(d.updatedAt, t)}
                 </div>
               </div>
               <span className="self-center text-ink-300 text-[18px]">›</span>
@@ -185,6 +196,8 @@ function DocumentsList() {
 }
 
 function BoardsList() {
+  const t = useT()
+  const tLabel = useTLabel()
   const list = useBoards((s) => s.list)
   const loadingList = useBoards((s) => s.loadingList)
   const loadList = useBoards((s) => s.loadList)
@@ -197,7 +210,7 @@ function BoardsList() {
   return (
     <div className="pb-24">
       {loadingList && list.length === 0 && (
-        <div className="px-6 py-10 text-center text-[13px] text-ink-300 font-display italic">Loading…</div>
+        <div className="px-6 py-10 text-center text-[13px] text-ink-300 font-display italic">{t('common.loading')}</div>
       )}
       {!loadingList && list.length === 0 && (
         <div className="px-6 py-12 text-center text-[13px] text-ink-500 font-display italic leading-relaxed">
@@ -219,9 +232,9 @@ function BoardsList() {
                 <IBoard className="w-[18px] h-[18px]" />
               </div>
               <div className="min-w-0">
-                <div className="text-[14px] font-semibold text-ink-900 truncate">{b.title || 'Untitled board'}</div>
+                <div className="text-[14px] font-semibold text-ink-900 truncate">{b.title || tLabel('moblib.untitledBoard', 'Untitled board')}</div>
                 <div className="text-[11.5px] text-ink-500 truncate font-display italic">
-                  {b.description ? b.description : `${authorName} · ${timeAgo(b.updatedAt)}`}
+                  {b.description ? b.description : `${authorName} · ${timeAgo(b.updatedAt, t)}`}
                 </div>
               </div>
               <span className="self-center text-ink-300 text-[18px]">›</span>

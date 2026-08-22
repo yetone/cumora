@@ -6,10 +6,12 @@ import { useCallback, useEffect, useState } from 'react'
 import { adminApi, type AdminUser, type AdminUserDetail, type AdminStats, type Tier } from './api'
 import { Pager } from './Pager'
 import { useAuth } from '@/stores/auth'
+import { useT } from '@/lib/i18n'
 
 const PAGE = 50
 
 export function UsersPage({ stats }: { stats: AdminStats | null }) {
+  const t = useT()
   const meId = useAuth((s) => s.user?.id ?? null)
   const [q, setQ] = useState('')
   const [tier, setTier] = useState<Tier | ''>('')
@@ -42,25 +44,31 @@ export function UsersPage({ stats }: { stats: AdminStats | null }) {
     try {
       const updated = await adminApi.patchUser(u.id, { tier: next })
       setItems((rows) => rows.map((r) => (r.id === u.id ? updated : r)))
-    } catch (e) { alert(`tier update failed: ${e instanceof Error ? e.message : e}`) }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      alert(t('users.tierUpdateFailed', { error: msg }))
+    }
   }
 
   const onAdminToggle = async (u: AdminUser) => {
     if (u.id === meId && u.isAdmin) {
-      alert("You can't remove your own admin bit.")
+      alert(t('users.cantRemoveOwnAdmin'))
       return
     }
     try {
       const updated = await adminApi.patchUser(u.id, { isAdmin: !u.isAdmin })
       setItems((rows) => rows.map((r) => (r.id === u.id ? updated : r)))
-    } catch (e) { alert(`admin toggle failed: ${e instanceof Error ? e.message : e}`) }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      alert(t('users.adminToggleFailed', { error: msg }))
+    }
   }
 
   /** Suspend / unsuspend. The server enforces "can't suspend self" too —
    *  this client-side guard just spares the operator the round-trip + alert. */
   const onSuspendToggle = async (u: AdminUser): Promise<AdminUser | null> => {
     if (u.id === meId && !u.suspended) {
-      alert("You can't suspend yourself.")
+      alert(t('users.cantSuspendSelf'))
       return null
     }
     try {
@@ -73,17 +81,15 @@ export function UsersPage({ stats }: { stats: AdminStats | null }) {
       // suspended screen so it helps to be specific. Cancelling the
       // prompt aborts the action entirely. Empty string OK (means
       // "no reason given").
-      const reason = window.prompt(
-        `Suspend ${u.name} (${u.email})?\n\nOptional reason — shown to the user on the lockout screen:`,
-        '',
-      )
+      const reason = window.prompt(t('users.suspendPrompt', { name: u.name, email: u.email }), '')
       if (reason === null) return null
       const trimmed = reason.trim()
       const updated = await adminApi.suspendUser(u.id, trimmed || null)
       setItems((rows) => rows.map((r) => (r.id === u.id ? updated : r)))
       return updated
     } catch (e) {
-      alert(`suspension toggle failed: ${e instanceof Error ? e.message : e}`)
+      const msg = e instanceof Error ? e.message : String(e)
+      alert(t('users.suspendFailed', { error: msg }))
       return null
     }
   }
@@ -92,23 +98,23 @@ export function UsersPage({ stats }: { stats: AdminStats | null }) {
     <div className="admin-page">
       <header className="admin-page-head">
         <div>
-          <h1 className="admin-h1">Users</h1>
+          <h1 className="admin-h1">{t('users.title')}</h1>
           <div className="admin-sub">
             {stats
-              ? <>{stats.users.total} total · {stats.users.admins} admin · {stats.users.tiers.free} free · {stats.users.tiers.pro} pro · {stats.users.tiers.max} max</>
+              ? t('users.statsSummary', { total: stats.users.total, admins: stats.users.admins, free: stats.users.tiers.free, pro: stats.users.tiers.pro, max: stats.users.tiers.max })
               : <>&nbsp;</>}
           </div>
         </div>
         <div className="admin-filters">
           <input
-            type="search" placeholder="email or name" className="admin-input"
+            type="search" placeholder={t('users.searchPh')} className="admin-input"
             value={q} onChange={(e) => setQ(e.target.value)}
           />
           <select className="admin-select" value={tier} onChange={(e) => setTier(e.target.value as Tier | '')}>
-            <option value="">All tiers</option>
-            <option value="free">Free</option>
-            <option value="pro">Pro</option>
-            <option value="max">Max</option>
+            <option value="">{t('users.allTiers')}</option>
+            <option value="free">{t('users.tierFree')}</option>
+            <option value="pro">{t('users.tierPro')}</option>
+            <option value="max">{t('users.tierMax')}</option>
           </select>
         </div>
       </header>
@@ -117,15 +123,15 @@ export function UsersPage({ stats }: { stats: AdminStats | null }) {
 
       <div className="admin-table">
         <div className="admin-thead">
-          <div>User</div>
-          <div>Tier</div>
-          <div>Admin</div>
-          <div>Companies</div>
-          <div>Joined</div>
-          <div>Last login</div>
+          <div>{t('users.colUser')}</div>
+          <div>{t('users.colTier')}</div>
+          <div>{t('users.colAdmin')}</div>
+          <div>{t('users.colCompanies')}</div>
+          <div>{t('users.colJoined')}</div>
+          <div>{t('users.colLastLogin')}</div>
         </div>
-        {loading && items.length === 0 && <div className="admin-row admin-empty">Loading…</div>}
-        {!loading && items.length === 0 && <div className="admin-row admin-empty">No users match.</div>}
+        {loading && items.length === 0 && <div className="admin-row admin-empty">{t('users.loadingDetails')}</div>}
+        {!loading && items.length === 0 && <div className="admin-row admin-empty">{t('users.noUsers')}</div>}
         {items.map((u) => (
           <UserRow
             key={u.id} u={u} expanded={expandedId === u.id}
@@ -154,14 +160,21 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
 }) {
   const [detail, setDetail] = useState<AdminUserDetail | null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
+  const t = useT()
 
   useEffect(() => {
     if (!expanded || detail) return
     setLoadingDetail(true)
     adminApi.getUser(u.id)
       .then(setDetail)
-      .catch((e) => alert(`load failed: ${e instanceof Error ? e.message : e}`))
+      .catch((e) => {
+        const msg = e instanceof Error ? e.message : String(e)
+        alert(t('users.loadFailed', { error: msg }))
+      })
       .finally(() => setLoadingDetail(false))
+    // `t` is deliberately NOT a dependency: useT returns a fresh closure
+    // every render, and this effect must not re-fetch on unrelated
+    // re-renders.
   }, [expanded, detail, u.id])
 
   // Detail drawer's suspend action — keep the AdminUserDetail snapshot in
@@ -182,52 +195,52 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
           <div className="admin-cell-user-text">
             <div className="admin-cell-user-name">
               {u.name}
-              {isMe && <span className="admin-pill admin-pill-soft" style={{ marginLeft: 8 }}>you</span>}
-              {u.suspended && <span className="admin-pill admin-pill-warn" style={{ marginLeft: 8 }}>suspended</span>}
+              {isMe && <span className="admin-pill admin-pill-soft" style={{ marginLeft: 8 }}>{t('users.youBadge')}</span>}
+              {u.suspended && <span className="admin-pill admin-pill-warn" style={{ marginLeft: 8 }}>{t('users.suspendedBadge')}</span>}
             </div>
             <div className="admin-cell-user-email">{u.email}</div>
           </div>
         </div>
-        <div onClick={(e) => e.stopPropagation()} data-label="Tier">
+        <div onClick={(e) => e.stopPropagation()} data-label={t('users.colTier')}>
           <select className="admin-select admin-select-sm"
             value={u.tier} onChange={(e) => onTierChange(e.target.value as Tier)}>
-            <option value="free">Free</option>
-            <option value="pro">Pro</option>
-            <option value="max">Max</option>
+            <option value="free">{t('users.tierFree')}</option>
+            <option value="pro">{t('users.tierPro')}</option>
+            <option value="max">{t('users.tierMax')}</option>
           </select>
         </div>
-        <div onClick={(e) => e.stopPropagation()} data-label="Admin">
+        <div onClick={(e) => e.stopPropagation()} data-label={t('users.colAdmin')}>
           <button
             className={`admin-toggle ${u.isAdmin ? 'is-on' : ''}`}
             onClick={onAdminToggle}
             disabled={isMe && u.isAdmin}
-            title={isMe && u.isAdmin ? "Can't remove your own admin" : ''}
+            title={isMe && u.isAdmin ? t('users.cantRemoveOwnAdminTitle') : ''}
           >
-            {u.isAdmin ? 'admin' : '—'}
+            {u.isAdmin ? t('users.adminBadge') : '—'}
           </button>
         </div>
-        <div data-label="Companies">{u.companyCount}</div>
-        <div className="admin-cell-mono" data-label="Joined">{fmtDate(u.createdAt)}</div>
-        <div className="admin-cell-mono" data-label="Last login">{u.lastLoginAt ? fmtDate(u.lastLoginAt) : '—'}</div>
+        <div data-label={t('users.colCompanies')}>{u.companyCount}</div>
+        <div className="admin-cell-mono" data-label={t('users.colJoined')}>{fmtDate(u.createdAt)}</div>
+        <div className="admin-cell-mono" data-label={t('users.colLastLogin')}>{u.lastLoginAt ? fmtDate(u.lastLoginAt) : '—'}</div>
       </div>
       {expanded && (
         <div className="admin-row-detail">
-          {loadingDetail && <div className="admin-empty">Loading details…</div>}
+          {loadingDetail && <div className="admin-empty">{t('users.loadingDetails')}</div>}
           {detail && (
             <div className="admin-detail-grid">
-              <DetailField label="User ID" value={detail.id} mono />
-              <DetailField label="sub2api ID" value={detail.sub2apiUserId ? String(detail.sub2apiUserId) : '—'} mono />
-              <DetailField label="Created"   value={fmtDateTime(detail.createdAt)} mono />
-              <DetailField label="Last login" value={detail.lastLoginAt ? fmtDateTime(detail.lastLoginAt) : '—'} mono />
+              <DetailField label={t('users.userId')} value={detail.id} mono />
+              <DetailField label={t('users.sub2apiId')} value={detail.sub2apiUserId ? String(detail.sub2apiUserId) : '—'} mono />
+              <DetailField label={t('users.created')}   value={fmtDateTime(detail.createdAt)} mono />
+              <DetailField label={t('users.colLastLogin')} value={detail.lastLoginAt ? fmtDateTime(detail.lastLoginAt) : '—'} mono />
               {/* Suspension card — only shown when the row IS suspended. We
                   surface the reason, who suspended them, and when, so the
                   operator has all the context before deciding to unsuspend. */}
               {detail.suspended && (
                 <div className="admin-detail-suspended">
-                  <div className="admin-detail-label">Suspended</div>
+                  <div className="admin-detail-label">{t('users.suspendedLabel')}</div>
                   <div className="admin-detail-suspended-meta">
                     {detail.suspendedAt ? fmtDateTime(detail.suspendedAt) : '—'}
-                    {detail.suspendedBy ? <> · by <span className="admin-cell-mono">{detail.suspendedBy}</span></> : null}
+                    {detail.suspendedBy ? <> · {t('users.suspendedBy')} <span className="admin-cell-mono">{detail.suspendedBy}</span></> : null}
                   </div>
                   {detail.suspensionReason && (
                     <div className="admin-detail-suspended-reason">{detail.suspensionReason}</div>
@@ -239,21 +252,21 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
                   className={`btn-ghost ${detail.suspended ? '' : 'admin-btn-danger'}`}
                   onClick={handleSuspendClick}
                   disabled={isMe && !detail.suspended}
-                  title={isMe && !detail.suspended ? "You can't suspend yourself" : ''}
+                  title={isMe && !detail.suspended ? t('users.cantSuspendSelfTitle') : ''}
                 >
-                  {detail.suspended ? 'Unsuspend' : 'Suspend account'}
+                  {detail.suspended ? t('users.unsuspend') : t('users.suspendAccount')}
                 </button>
               </div>
               <div className="admin-detail-companies">
-                <div className="admin-detail-label">Companies ({detail.companies.length})</div>
-                {detail.companies.length === 0 && <div className="admin-empty">No companies.</div>}
+                <div className="admin-detail-label">{t('users.companiesCount', { count: detail.companies.length })}</div>
+                {detail.companies.length === 0 && <div className="admin-empty">{t('users.noCompanies')}</div>}
                 {detail.companies.map((c) => (
                   <div key={c.id} className="admin-detail-company">
                     <div>
                       <div style={{ fontWeight: 600 }}>{c.name}</div>
-                      <div className="admin-cell-user-email">{c.slug} · {c.role}</div>
+                      <div className="admin-cell-user-email">{t('users.companySlugRole', { slug: c.slug, role: c.role })}</div>
                     </div>
-                    <div className="admin-cell-mono">{c.agentCount} agents</div>
+                    <div className="admin-cell-mono">{t('users.agentCount', { count: c.agentCount })}</div>
                   </div>
                 ))}
               </div>

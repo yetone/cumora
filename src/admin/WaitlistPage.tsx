@@ -6,12 +6,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import { adminApi, type AdminWaitlistEntry } from './api'
 import { Pager } from './Pager'
+import { useT } from '@/lib/i18n'
 
 type Tab = 'pending' | 'approved' | 'rejected'
 
 const PAGE = 50
 
 export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
+  const t = useT()
   const [tab, setTab] = useState<Tab>('pending')
   const [q, setQ] = useState('')
   const [items, setItems] = useState<AdminWaitlistEntry[]>([])
@@ -32,26 +34,26 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
   }, [tab, q])
 
   useEffect(() => {
-    const t = setTimeout(() => { void load(0) }, q ? 250 : 0)
-    return () => clearTimeout(t)
+    const debounce = setTimeout(() => { void load(0) }, q ? 250 : 0)
+    return () => clearTimeout(debounce)
   }, [q, tab, load])
 
   const approve = async (entry: AdminWaitlistEntry) => {
     if (busyId) return
-    if (!confirm(`Approve ${entry.email}?\nThis creates a real user + workspace + sub2api account.`)) return
+    if (!confirm(t('waitlist.approveConfirm', { email: entry.email }))) return
     setBusyId(entry.id)
     try {
       await adminApi.approveWaitlist(entry.id)
       await load(offset)
       onChanged()
     } catch (e) {
-      alert(`approve failed: ${e instanceof Error ? e.message : e}`)
+      alert(t('waitlist.approveFail', { err: e instanceof Error ? e.message : String(e) }))
     } finally { setBusyId(null) }
   }
 
   const reject = async (entry: AdminWaitlistEntry) => {
     if (busyId) return
-    const note = prompt(`Reject ${entry.email}? Optional note:`, '')
+    const note = prompt(t('waitlist.rejectPrompt', { email: entry.email }), '')
     if (note === null) return
     setBusyId(entry.id)
     try {
@@ -59,7 +61,7 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
       await load(offset)
       onChanged()
     } catch (e) {
-      alert(`reject failed: ${e instanceof Error ? e.message : e}`)
+      alert(t('waitlist.rejectFail', { err: e instanceof Error ? e.message : String(e) }))
     } finally { setBusyId(null) }
   }
 
@@ -67,15 +69,15 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
     <div className="admin-page">
       <header className="admin-page-head">
         <div>
-          <h1 className="admin-h1">Waitlist</h1>
+          <h1 className="admin-h1">{t('waitlist.pageTitle')}</h1>
           <div className="admin-sub">
-            Decide who gets in. Approve provisions the account end-to-end.
+            {t('waitlist.pageSub')}
           </div>
         </div>
         <div className="admin-filters">
           <input
             type="search"
-            placeholder="email, name, provider, note"
+            placeholder={t('waitlist.searchPh')}
             className="admin-input"
             value={q}
             onChange={(e) => setQ(e.target.value)}
@@ -84,12 +86,12 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
       </header>
 
       <div className="admin-tabs">
-        {(['pending', 'approved', 'rejected'] as Tab[]).map((t) => (
-          <button key={t}
-            className={`admin-tab${tab === t ? ' is-active' : ''}`}
-            onClick={() => setTab(t)}
+        {(['pending', 'approved', 'rejected'] as Tab[]).map((tabKey) => (
+          <button key={tabKey}
+            className={`admin-tab${tab === tabKey ? ' is-active' : ''}`}
+            onClick={() => setTab(tabKey)}
           >
-            {t}
+            {t(tabKey === 'pending' ? 'waitlist.tabPending' : tabKey === 'approved' ? 'waitlist.tabApproved' : 'waitlist.tabRejected')}
           </button>
         ))}
       </div>
@@ -98,18 +100,18 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
 
       <div className="admin-table">
         <div className="admin-thead admin-thead-waitlist">
-          <div>User</div>
-          <div>Provider</div>
-          <div>Requested</div>
-          <div>Decided</div>
-          <div>Actions</div>
+          <div>{t('waitlist.colUser')}</div>
+          <div>{t('waitlist.colProvider')}</div>
+          <div>{t('waitlist.colRequested')}</div>
+          <div>{t('waitlist.colDecided')}</div>
+          <div>{t('waitlist.colActions')}</div>
         </div>
-        {loading && items.length === 0 && <div className="admin-row admin-empty">Loading…</div>}
+        {loading && items.length === 0 && <div className="admin-row admin-empty">{t('waitlist.loading')}</div>}
         {!loading && items.length === 0 && (
           <div className="admin-row admin-empty">
             {q
-              ? `No ${tab} entries match.`
-              : tab === 'pending' ? 'No pending requests.' : `No ${tab} entries.`}
+              ? t('waitlist.noEntriesMatch', { tab: t(tab === 'pending' ? 'waitlist.tabPending' : tab === 'approved' ? 'waitlist.tabApproved' : 'waitlist.tabRejected').toLowerCase() })
+              : tab === 'pending' ? t('waitlist.noPending') : t('waitlist.noEntries', { tab: t(tab === 'approved' ? 'waitlist.tabApproved' : 'waitlist.tabRejected').toLowerCase() })}
           </div>
         )}
         {items.map((entry) => (
@@ -119,15 +121,15 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
               <div className="admin-cell-user-text">
                 <div className="admin-cell-user-name">{entry.displayName}</div>
                 <div className="admin-cell-user-email">{entry.email}</div>
-                {entry.note && <div className="admin-note">note: {entry.note}</div>}
+                {entry.note && <div className="admin-note">{t('waitlist.notePrefix', { note: entry.note })}</div>}
               </div>
             </div>
-            <div data-label="Provider">
+            <div data-label={t('waitlist.colProvider')}>
               <span className={`admin-pill admin-pill-${entry.provider}`}>{entry.provider}</span>
             </div>
-            <div className="admin-cell-mono" data-label="Requested">{fmtDateTime(entry.requestedAt)}</div>
-            <div className="admin-cell-mono" data-label="Decided">
-              {entry.decidedAt ? fmtDateTime(entry.decidedAt) : '—'}
+            <div className="admin-cell-mono" data-label={t('waitlist.colRequested')}>{fmtDateTime(entry.requestedAt)}</div>
+            <div className="admin-cell-mono" data-label={t('waitlist.colDecided')}>
+              {entry.decidedAt ? fmtDateTime(entry.decidedAt) : '\u2014'}
             </div>
             <div className="admin-row-actions">
               {tab === 'pending' ? (
@@ -136,13 +138,13 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
                     disabled={busyId === entry.id}
                     onClick={() => approve(entry)}
                   >
-                    {busyId === entry.id ? '…' : 'Approve'}
+                    {busyId === entry.id ? t('waitlist.approveBusy') : t('waitlist.approve')}
                   </button>
                   <button className="btn-ghost"
                     disabled={busyId === entry.id}
                     onClick={() => reject(entry)}
                   >
-                    Reject
+                    {t('waitlist.reject')}
                   </button>
                 </>
               ) : (

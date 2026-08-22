@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 /**
@@ -36,12 +37,18 @@ export function Combobox<T extends string = string>({
   value,
   options,
   onValueChange,
-  placeholder = 'Select',
-  searchPlaceholder = 'Search…',
+  placeholder: placeholderProp,
+  searchPlaceholder: searchPlaceholderProp,
   ariaLabel,
   className,
-  emptyText = 'No matches',
+  emptyText: emptyTextProp,
 }: ComboboxProps<T>) {
+  const t = useT()
+  // Defaults resolve through t() so they follow the active locale;
+  // callers that pass explicit strings are untouched.
+  const placeholder = placeholderProp ?? t('combobox.select')
+  const searchPlaceholder = searchPlaceholderProp ?? t('combobox.search')
+  const emptyText = emptyTextProp ?? t('combobox.noMatches')
   const id = useId()
   const rootRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -129,7 +136,7 @@ export function Combobox<T extends string = string>({
         )}
         <button
           type="button"
-          aria-label="Toggle menu"
+          aria-label={t('combobox.toggleMenu')}
           tabIndex={-1}
           onMouseDown={(e) => e.preventDefault()}
           onClick={() => { if (open) { setOpen(false); setQuery('') } else openMenu() }}

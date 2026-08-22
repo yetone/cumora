@@ -5,10 +5,12 @@ import { WhisperRoom } from '@/components/WhisperRoom'
 import { HiveAvatar } from '@/components/HiveAvatar'
 import { ResizeHandle } from '@/components/ResizeHandle'
 import { cn } from '@/lib/utils'
+import { useT } from '@/lib/i18n'
 import { useResizableWidth } from '@/lib/useResizableWidth'
 import type { Participant } from '@/types'
 
 function StubRoom() {
+  const t = useT()
   return (
     <main className="grid place-items-center text-center"
       style={{
@@ -16,10 +18,10 @@ function StubRoom() {
       }}>
       <div>
         <div className="font-display font-medium text-[28px] text-ink-900 mb-2" style={{ letterSpacing: '-0.02em' }}>
-          No whispers yet
+          {t('whispers.noWhispers')}
         </div>
         <div className="font-display italic text-[14px] text-ink-500 max-w-md leading-relaxed">
-          Whispers form when an agent decides — after their public reply — that they need to align with another teammate privately.
+          {t('whispers.noWhispersBody')}
         </div>
       </div>
     </main>
@@ -27,6 +29,7 @@ function StubRoom() {
 }
 
 export function WhispersView() {
+  const t = useT()
   const list = useWhispers((s) => s.list)
   const byId = useParticipants((s) => s.byId)
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -46,16 +49,16 @@ export function WhispersView() {
       <aside className="relative flex flex-col overflow-hidden border-r border-ink-100 bg-paper">
         <div className="px-[18px] pt-[18px] pb-3">
           <h1 className="font-display font-medium text-[26px] tracking-tight text-ink-900 leading-none mb-1">
-            Whispers
+            {t('whispers.title')}
           </h1>
           <div className="text-[12px] text-ink-500 font-display italic">
-            channels you can peek into · <b className="not-italic text-whisper-deep font-semibold">{list.length}</b>
+            {t('whispers.subtitle')} · <b className="not-italic text-whisper-deep font-semibold">{list.length}</b>
           </div>
         </div>
         <div className="flex-1 overflow-y-auto px-2 pb-[18px]">
           {list.length === 0 && (
             <div className="px-3 py-4 text-[12px] text-ink-300 italic font-display">
-              Send a message in a group to nudge an agent to whisper.
+              {t('whispers.empty')}
             </div>
           )}
           {list.map((w) => {
@@ -71,8 +74,8 @@ export function WhispersView() {
             const namesLabel = ms.length <= 2
               ? null
               : ms.length === 3
-                ? `${ms[0].name}, ${ms[1].name} & 1 more`
-                : `${ms[0].name}, ${ms[1].name} & ${ms.length - 2} more`
+                ? t('whispers.andOneMore', { a: ms[0].name, b: ms[1].name })
+                : t('whispers.andNMore', { a: ms[0].name, b: ms[1].name, n: ms.length - 2 })
             return (
               <button
                 key={w.id}
@@ -104,7 +107,7 @@ export function WhispersView() {
                   <div className="text-[11.5px] text-ink-500 leading-[1.4] truncate font-display italic">
                     {isGroup && namesLabel
                       ? namesLabel
-                      : (w.about ?? 'private thread')}
+                      : (w.about ?? t('whispers.privateThread'))}
                     <span className="not-italic text-ink-300"> · {w.msgCount}</span>
                   </div>
                 </div>

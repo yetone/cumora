@@ -7,10 +7,33 @@ import { useConversations } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { IBoard, ICalendar, IClock, IRepeat } from '@/components/icons'
 import { cn } from '@/lib/utils'
+import { useT, type MessageKey } from '@/lib/i18n'
 import { EventEditor } from '@/components/EventEditor'
 import type { BoardCard, CalendarEvent, RecurrenceRule } from '@/types'
 
-const WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const RECURRING_KEYS: Record<RecurrenceRule['freq'], MessageKey> = {
+  daily: 'peek.recurringDaily',
+  weekly: 'peek.recurringWeekly',
+  monthly: 'peek.recurringMonthly',
+  yearly: 'peek.recurringYearly',
+}
+
+const RECURRING_INTERVAL_KEYS: Record<RecurrenceRule['freq'], MessageKey> = {
+  daily: 'peek.recurringIntervalDaily',
+  weekly: 'peek.recurringIntervalWeekly',
+  monthly: 'peek.recurringIntervalMonthly',
+  yearly: 'peek.recurringIntervalYearly',
+}
+
+const WEEKDAY_KEYS = [
+  'peek.weekdaySun',
+  'peek.weekdayMon',
+  'peek.weekdayTue',
+  'peek.weekdayWed',
+  'peek.weekdayThu',
+  'peek.weekdayFri',
+  'peek.weekdaySat',
+] as const satisfies readonly MessageKey[]
 
 function OpenFullIcon() {
   return (
@@ -45,6 +68,7 @@ function PeekHeader({
   onClose: () => void
   onOpenFull?: () => void
 }) {
+  const t = useT()
   return (
     <header className="shrink-0 border-b border-ink-100 bg-gradient-to-b from-white to-sky2-50/35 px-4 py-3">
       <div className="flex items-start gap-3 min-w-0">
@@ -61,8 +85,8 @@ function PeekHeader({
             type="button"
             onClick={onOpenFull}
             className="h-8 w-8 rounded-[8px] grid place-items-center text-ink-500 hover:text-skype-deep hover:bg-sky2-100 transition"
-            title="Open full workspace"
-            aria-label="Open full workspace"
+            title={t('peek.openFull')}
+            aria-label={t('peek.openFull')}
           >
             <OpenFullIcon />
           </button>
@@ -71,8 +95,8 @@ function PeekHeader({
           type="button"
           onClick={onClose}
           className="h-8 w-8 rounded-[8px] grid place-items-center text-ink-400 hover:text-ink-900 hover:bg-ink-100/70 transition"
-          title="Close artifact"
-          aria-label="Close artifact"
+          title={t('peek.closeArtifact')}
+          aria-label={t('peek.closeArtifact')}
         >
           <CloseIcon />
         </button>
@@ -105,6 +129,7 @@ function PeekUnavailable({
   detail: string
   onClose: () => void
 }) {
+  const t = useT()
   return (
     <div className="h-full bg-cloud grid place-items-center px-8 text-center">
       <div className="max-w-[280px]">
@@ -118,16 +143,16 @@ function PeekUnavailable({
           onClick={onClose}
           className="mt-4 h-8 px-3 rounded-[8px] text-[12px] font-semibold text-ink-600 border border-ink-100 hover:bg-sky2-50 transition"
         >
-          Close
+          {t('peek.closeButton')}
         </button>
       </div>
     </div>
   )
 }
 
-function formatShortDate(iso: string): string {
+function formatShortDate(iso: string, t: ReturnType<typeof useT>): string {
   const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return 'recently'
+  if (Number.isNaN(d.getTime())) return t('peek.recently')
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
@@ -135,9 +160,9 @@ function formatTime(d: Date): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function formatEventRange(event: CalendarEvent): string {
+function formatEventRange(event: CalendarEvent, t: ReturnType<typeof useT>): string {
   const start = new Date(event.startAt)
-  if (Number.isNaN(start.getTime())) return event.allDay ? 'All day' : 'Time unavailable'
+  if (Number.isNaN(start.getTime())) return event.allDay ? t('peek.allDay') : t('peek.timeUnavailable')
   if (event.allDay) return start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })
   const startLabel = `${start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })} - ${formatTime(start)}`
   if (!event.endAt) return startLabel
@@ -149,13 +174,14 @@ function formatEventRange(event: CalendarEvent): string {
     : `${startLabel}-${end.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} ${formatTime(end)}`
 }
 
-function describeRecurrence(r: RecurrenceRule | null): string {
-  if (!r) return 'one-shot'
-  const every = r.interval > 1 ? `every ${r.interval} ` : 'every '
-  const freqMap = { daily: 'day', weekly: 'week', monthly: 'month', yearly: 'year' } as const
-  const base = `${every}${freqMap[r.freq]}${r.interval > 1 ? 's' : ''}`
+function describeRecurrence(r: RecurrenceRule | null, t: ReturnType<typeof useT>): string {
+  if (!r) return t('peek.oneShot')
+  const base = r.interval === 1
+    ? t(RECURRING_KEYS[r.freq])
+    : t(RECURRING_INTERVAL_KEYS[r.freq], { n: r.interval })
   if (r.freq === 'weekly' && r.byweekday && r.byweekday.length) {
-    return `${base} - ${r.byweekday.map((d) => WEEK[d]).join('/')}`
+    const days = r.byweekday.map((d) => t(WEEKDAY_KEYS[d])).join(t('peek.weekdaySeparator'))
+    return t('peek.recurringWeeklyDays', { base, days })
   }
   return base
 }
@@ -171,6 +197,7 @@ export function BoardPeekContent({
   onClose: () => void
   onOpenFull?: () => void
 }) {
+  const t = useT()
   const list = useBoards((s) => s.list)
   const loadingList = useBoards((s) => s.loadingList)
   const loadList = useBoards((s) => s.loadList)
@@ -210,15 +237,15 @@ export function BoardPeekContent({
   const isBoardPending = !snap && (loadingBoardId === boardId || loadingList || requestedBoardId.current !== boardId)
 
   if (isBoardPending) {
-    return <PeekLoading icon={<IBoard className="w-5 h-5" />} label="Opening board..." />
+    return <PeekLoading icon={<IBoard className="w-5 h-5" />} label={t('peek.openingBoard')} />
   }
 
   if (!snap) {
     return (
       <PeekUnavailable
         icon={<IBoard className="w-5 h-5" />}
-        title="Board unavailable"
-        detail="This board may have been deleted or moved out of this workspace."
+        title={t('peek.boardUnavailable')}
+        detail={t('peek.boardUnavailableDetail')}
         onClose={onClose}
       />
     )
@@ -228,9 +255,13 @@ export function BoardPeekContent({
     <div className="h-full min-h-0 flex flex-col bg-cloud">
       <PeekHeader
         icon={<IBoard className="w-5 h-5" />}
-        label="Kanban board"
+        label={t('peek.labelBoard')}
         title={snap.title}
-        meta={`${snap.columns.length} columns - ${snap.cards.length} cards - updated ${formatShortDate(snap.updatedAt)}`}
+        meta={t('peek.boardMeta', {
+          columns: snap.columns.length,
+          cards: snap.cards.length,
+          time: formatShortDate(snap.updatedAt, t),
+        })}
         onClose={onClose}
         onOpenFull={onOpenFull}
       />
@@ -252,7 +283,7 @@ export function BoardPeekContent({
                 <div className="flex-1 min-h-0 overflow-y-auto p-2 space-y-2">
                   {cards.length === 0 && (
                     <div className="rounded-[8px] border border-dashed border-ink-100 px-3 py-4 text-center text-[11.5px] text-ink-400">
-                      Empty
+                      {t('peek.empty')}
                     </div>
                   )}
                   {cards.map((card) => (
@@ -269,6 +300,7 @@ export function BoardPeekContent({
 }
 
 function BoardPeekCard({ card, focused }: { card: BoardCard; focused: boolean }) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const assignee = card.assigneeId ? byId[card.assigneeId] : null
   const ref = useRef<HTMLElement | null>(null)
@@ -293,7 +325,7 @@ function BoardPeekCard({ card, focused }: { card: BoardCard; focused: boolean })
     >
       {focused && (
         <div className="mb-1.5 inline-flex rounded-full bg-sky2-100 px-1.5 py-0.5 text-[9.5px] font-bold uppercase tracking-[0.12em] text-skype-deep">
-          Opened from chat
+          {t('peek.openedFromChat')}
         </div>
       )}
       <div className="text-[12.5px] font-medium leading-snug text-ink-800 line-clamp-3">{card.title}</div>
@@ -305,7 +337,7 @@ function BoardPeekCard({ card, focused }: { card: BoardCard; focused: boolean })
               <span className="truncate">{assignee.name}</span>
             </span>
           )}
-          {card.commentCount > 0 && <span className="ml-auto shrink-0">{card.commentCount} comments</span>}
+          {card.commentCount > 0 && <span className="ml-auto shrink-0">{t('peek.commentsCount', { count: card.commentCount })}</span>}
           {!assignee && card.mentions.length > 0 && <span className="truncate">@{card.mentions.slice(0, 2).join(' @')}</span>}
         </div>
       )}
@@ -322,6 +354,7 @@ export function CalendarEventPeekContent({
   onClose: () => void
   onOpenFull?: () => void
 }) {
+  const t = useT()
   const loadingEventId = useCalendar((s) => s.loadingEventId)
   const loadEvent = useCalendar((s) => s.loadEvent)
   const removeEvent = useCalendar((s) => s.remove)
@@ -348,15 +381,15 @@ export function CalendarEventPeekContent({
   }, [event, eventId, loadEvent, loadingEventId])
 
   if (!event && !failed) {
-    return <PeekLoading icon={<ICalendar className="w-5 h-5" />} label="Opening event..." />
+    return <PeekLoading icon={<ICalendar className="w-5 h-5" />} label={t('peek.openingEvent')} />
   }
 
   if (!event) {
     return (
       <PeekUnavailable
         icon={<ICalendar className="w-5 h-5" />}
-        title="Event unavailable"
-        detail={failed || 'This calendar event may have been deleted or moved out of this workspace.'}
+        title={t('peek.eventUnavailable')}
+        detail={failed || t('peek.eventUnavailableDetail')}
         onClose={onClose}
       />
     )
@@ -366,9 +399,12 @@ export function CalendarEventPeekContent({
     <div className="h-full min-h-0 flex flex-col bg-cloud">
       <PeekHeader
         icon={<ICalendar className="w-5 h-5" />}
-        label="Calendar event"
-        title={event.title || 'Untitled event'}
-        meta={`${event.kind === 'agent_task' ? 'Agent task' : 'Personal'} - ${event.status}`}
+        label={t('peek.labelCalendarEvent')}
+        title={event.title || t('peek.untitledEvent')}
+        meta={t('peek.eventMeta', {
+          kind: event.kind === 'agent_task' ? t('peek.agentTask') : t('peek.personal'),
+          status: event.status,
+        })}
         onClose={onClose}
         onOpenFull={onOpenFull}
       />
@@ -376,11 +412,11 @@ export function CalendarEventPeekContent({
         <section className="rounded-[12px] border border-ink-100 bg-white/75 p-4">
           <div className="flex items-center gap-2 text-[12.5px] font-medium text-ink-800">
             <IClock className="w-4 h-4 text-skype-deep" />
-            <span>{formatEventRange(event)}</span>
+            <span>{formatEventRange(event, t)}</span>
           </div>
           <div className="mt-3 flex items-center gap-2 text-[12px] text-ink-500">
             <IRepeat className="w-3.5 h-3.5" />
-            <span>{describeRecurrence(event.recurrence)}</span>
+            <span>{describeRecurrence(event.recurrence, t)}</span>
           </div>
           {event.description && (
             <p className="mt-4 text-[13px] leading-relaxed text-ink-700 whitespace-pre-wrap">{event.description}</p>
@@ -390,7 +426,7 @@ export function CalendarEventPeekContent({
         <div className="mt-3 grid gap-3">
           {assignee && (
             <section className="rounded-[12px] border border-ink-100 bg-white/65 p-3">
-              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-ink-400">Assignee</div>
+              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-ink-400">{t('peek.assignee')}</div>
               <div className="mt-2 flex items-center gap-2">
                 <AvatarMini p={assignee} size={24} />
                 <div className="min-w-0">
@@ -403,7 +439,7 @@ export function CalendarEventPeekContent({
 
           {targetConversation && (
             <section className="rounded-[12px] border border-ink-100 bg-white/65 p-3">
-              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-ink-400">Conversation</div>
+              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-ink-400">{t('peek.conversation')}</div>
               <div className="mt-1 truncate text-[13px] font-semibold text-ink-900">{targetConversation.title}</div>
               {targetConversation.subtitle && (
                 <div className="mt-0.5 truncate text-[11.5px] text-ink-500">{targetConversation.subtitle}</div>
@@ -413,7 +449,7 @@ export function CalendarEventPeekContent({
 
           {event.agentPrompt && (
             <section className="rounded-[12px] border border-sky2-100 bg-sky2-50/45 p-3">
-              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">Agent prompt</div>
+              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-skype-deep">{t('peek.agentPrompt')}</div>
               <p className="mt-2 text-[12.5px] leading-relaxed text-ink-700 whitespace-pre-wrap">{event.agentPrompt}</p>
             </section>
           )}
@@ -423,7 +459,7 @@ export function CalendarEventPeekContent({
         style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 12px)' }}
       >
         <div className="flex-1 min-w-0 text-[11px] text-ink-400 truncate">
-          Created {formatShortDate(event.createdAt)} - Updated {formatShortDate(event.updatedAt)}
+          {t('peek.createdUpdated', { a: formatShortDate(event.createdAt, t), b: formatShortDate(event.updatedAt, t) })}
         </div>
         {event.kind === 'agent_task' && (
           <button
@@ -436,18 +472,18 @@ export function CalendarEventPeekContent({
             }}
             disabled={busy !== null}
             className="py-1.5 px-3 text-[12px] font-semibold rounded-full bg-sky2-50 text-skype-deep border border-sky2-100 active:bg-sky2-100 transition disabled:opacity-60"
-          >{busy === 'run' ? 'Running…' : 'Run now'}</button>
+          >{busy === 'run' ? t('peek.running') : t('peek.runNow')}</button>
         )}
         <button
           type="button"
           onClick={() => setEditing(true)}
           className="py-1.5 px-3 text-[12px] font-semibold rounded-full bg-cloud text-ink-700 border border-ink-100 active:bg-sky2-50 transition"
-        >Edit</button>
+        >{t('peek.edit')}</button>
         <button
           type="button"
           onClick={async () => {
             if (busy) return
-            if (!confirm(`Delete “${event.title || 'Untitled event'}”?`)) return
+            if (!confirm(t('peek.deleteConfirm', { title: event.title || t('peek.untitledEvent') }))) return
             setBusy('delete')
             try {
               await removeEvent(event.id)
@@ -459,7 +495,7 @@ export function CalendarEventPeekContent({
           }}
           disabled={busy !== null}
           className="py-1.5 px-3 text-[12px] font-semibold rounded-full text-coral-deep border border-coral-soft active:bg-coral-soft/40 transition disabled:opacity-60"
-        >Delete</button>
+        >{t('peek.delete')}</button>
       </div>
       {editing && (
         <EventEditor event={event} onClose={() => setEditing(false)} />

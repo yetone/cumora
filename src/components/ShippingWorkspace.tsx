@@ -5,11 +5,19 @@ import { useParticipants } from '@/stores/participants'
 import { IBack, IPlus, IShip } from '@/components/icons'
 import { cn } from '@/lib/utils'
 import { posthog } from '@/lib/observability'
+import { useT, type MessageKey } from '@/lib/i18n'
 
-const STATUS_LABEL: Record<ShippingFeatureStatus, string> = {
-  draft: 'Draft', contract: 'Contract', building: 'Building', verifying: 'Verifying',
-  ready: 'Ready', releasing: 'Releasing', watching: 'Watching', learned: 'Learned',
-  paused: 'Paused', archived: 'Archived',
+const STATUS_LABEL_KEY: Record<ShippingFeatureStatus, MessageKey> = {
+  draft: 'ship.statusDraft',
+  contract: 'ship.statusContract',
+  building: 'ship.statusBuilding',
+  verifying: 'ship.statusVerifying',
+  ready: 'ship.statusReady',
+  releasing: 'ship.statusReleasing',
+  watching: 'ship.statusWatching',
+  learned: 'ship.statusLearned',
+  paused: 'ship.statusPaused',
+  archived: 'ship.statusArchived',
 }
 
 const NEXT_STATUS: Partial<Record<ShippingFeatureStatus, ShippingFeatureStatus>> = {
@@ -57,6 +65,7 @@ function featureProgress(feature: { requiredSquares: number; passedSquares: numb
 }
 
 export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
+  const t = useT()
   const overview = useShipping((s) => s.overview)
   const selectedId = useShipping((s) => s.selectedId)
   const detail = useShipping((s) => s.selectedId ? s.details[s.selectedId] : undefined)
@@ -69,11 +78,12 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
 
   useEffect(() => { void load() }, [load])
 
-  if (loading && !overview) return <Centered title="Loading the shipping loop…" />
-  if (!overview) return <Centered title="Shipping workspace unavailable" detail={error ?? undefined} retry={() => void load(true)} />
+  if (loading && !overview) return <Centered title={t('ship.loading')} />
+  if (!overview) return <Centered title={t('ship.unavailable')} detail={error ?? undefined} retry={() => void load(true)} />
 
   const showList = !compact || !selectedId
   const showDetail = !compact || Boolean(selectedId)
+  const dueReadbacks = overview.dueReadbacks.length
   return (
     <div className={cn('h-full min-h-0 bg-[#F7FAFC]', compact ? 'relative overflow-hidden' : 'grid grid-cols-[300px_minmax(0,1fr)]')}>
       {showList && (
@@ -81,17 +91,17 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
           <div className="sticky top-0 z-10 border-b border-ink-100 bg-cloud/95 px-4 py-4 backdrop-blur">
             <div className="flex items-center justify-between">
               <div>
-                <h1 className="text-[18px] font-semibold text-ink-900">Ship</h1>
-                <p className="mt-0.5 text-[11px] text-ink-400">Evidence, release, readback, learning.</p>
+                <h1 className="text-[18px] font-semibold text-ink-900">{t('nav.ship')}</h1>
+                <p className="mt-0.5 text-[11px] text-ink-400">{t('ship.subtitle')}</p>
               </div>
-              <button onClick={() => setCreating(true)} className="grid h-9 w-9 place-items-center rounded-xl bg-skype text-white shadow-soft" aria-label="New feature" title="New shipping feature"><IPlus className="h-4 w-4" /></button>
+              <button onClick={() => setCreating(true)} className="grid h-9 w-9 place-items-center rounded-xl bg-skype text-white shadow-soft" aria-label={t('ship.newFeature')} title={t('ship.newFeatureTitle')}><IPlus className="h-4 w-4" /></button>
             </div>
           </div>
           {creating && <CreateFeature onClose={() => setCreating(false)} />}
-          {overview.dueReadbacks.length > 0 && (
+          {dueReadbacks > 0 && (
             <div className="mx-3 mt-3 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2.5">
-              <div className="text-[11px] font-bold text-amber-800">{overview.dueReadbacks.length} production readback{overview.dueReadbacks.length === 1 ? '' : 's'} due</div>
-              <div className="mt-1 text-[10px] text-amber-700">A release is not learned until production evidence comes back.</div>
+              <div className="text-[11px] font-bold text-amber-800">{t('ship.readbacksDue', { n: dueReadbacks, plural: dueReadbacks === 1 ? '' : 's' })}</div>
+              <div className="mt-1 text-[10px] text-amber-700">{t('ship.readbacksDueHint')}</div>
             </div>
           )}
           <div className="p-2">
@@ -101,23 +111,23 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
                 <button key={feature.id} onClick={() => void select(feature.id)} className={cn('mb-1 w-full rounded-xl px-3 py-3 text-left transition', selectedId === feature.id ? 'bg-sky2-50 ring-1 ring-sky2-200' : 'hover:bg-ink-50')}>
                   <div className="flex items-start justify-between gap-2">
                     <span className="min-w-0 truncate text-[13px] font-semibold text-ink-900">{feature.title}</span>
-                    <Pill tone={feature.failedSquares ? 'bad' : feature.status === 'learned' ? 'good' : 'blue'}>{STATUS_LABEL[feature.status]}</Pill>
+                    <Pill tone={feature.failedSquares ? 'bad' : feature.status === 'learned' ? 'good' : 'blue'}>{t(STATUS_LABEL_KEY[feature.status])}</Pill>
                   </div>
                   <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-ink-100"><div className="h-full rounded-full bg-skype transition-all" style={{ width: `${progress}%` }} /></div>
-                  <div className="mt-1.5 flex justify-between text-[10px] text-ink-400"><span>{feature.passedSquares}/{feature.requiredSquares} required squares</span><span>{feature.riskLevel} risk</span></div>
+                  <div className="mt-1.5 flex justify-between text-[10px] text-ink-400"><span>{t('ship.requiredSquares', { passed: feature.passedSquares, required: feature.requiredSquares })}</span><span>{t('ship.riskLabel', { risk: feature.riskLevel })}</span></div>
                 </button>
               )
             })}
             {overview.features.length === 0 && (
-              <div className="px-6 py-16 text-center"><IShip className="mx-auto h-9 w-9 text-ink-300" /><div className="mt-3 text-[13px] font-semibold text-ink-700">No shipping contracts yet</div><p className="mt-1 text-[11px] leading-relaxed text-ink-400">Start with the problem, desired outcome, and builders. Cumora will seed the non-negotiable evidence squares.</p></div>
+              <div className="px-6 py-16 text-center"><IShip className="mx-auto h-9 w-9 text-ink-300" /><div className="mt-3 text-[13px] font-semibold text-ink-700">{t('ship.empty')}</div><p className="mt-1 text-[11px] leading-relaxed text-ink-400">{t('ship.emptyDetail')}</p></div>
             )}
           </div>
         </aside>
       )}
       {showDetail && (
         <main className={cn('h-full min-w-0 overflow-y-auto', compact && 'absolute inset-0 bg-[#F7FAFC]')}>
-          {compact && <button onClick={() => void select(null)} className="sticky top-0 z-20 flex h-11 w-full items-center gap-1 border-b border-ink-100 bg-cloud/95 px-3 text-[12px] font-semibold text-skype-deep backdrop-blur"><IBack className="h-4 w-4" /> All features</button>}
-          {loadingFeatureId === selectedId && !detail ? <Centered title="Opening shipping contract…" /> : detail ? <FeatureDetail feature={detail} /> : <Centered title="Select a feature to open its shipping contract" />}
+          {compact && <button onClick={() => void select(null)} className="sticky top-0 z-20 flex h-11 w-full items-center gap-1 border-b border-ink-100 bg-cloud/95 px-3 text-[12px] font-semibold text-skype-deep backdrop-blur"><IBack className="h-4 w-4" /> {t('ship.allFeatures')}</button>}
+          {loadingFeatureId === selectedId && !detail ? <Centered title={t('ship.openingContract')} /> : detail ? <FeatureDetail feature={detail} /> : <Centered title={t('ship.pickOne')} />}
         </main>
       )}
     </div>
@@ -125,10 +135,12 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
 }
 
 function Centered({ title, detail, retry }: { title: string; detail?: string; retry?: () => void }) {
-  return <div className="grid h-full place-items-center p-8 text-center"><div><IShip className="mx-auto h-10 w-10 text-ink-300" /><div className="mt-3 text-[13px] font-semibold text-ink-700">{title}</div>{detail && <p className="mt-2 max-w-md text-[11px] text-coral-deep">{detail}</p>}{retry && <Button onClick={retry} className="mt-3">Retry</Button>}</div></div>
+  const t = useT()
+  return <div className="grid h-full place-items-center p-8 text-center"><div><IShip className="mx-auto h-10 w-10 text-ink-300" /><div className="mt-3 text-[13px] font-semibold text-ink-700">{title}</div>{detail && <p className="mt-2 max-w-md text-[11px] text-coral-deep">{detail}</p>}{retry && <Button onClick={retry} className="mt-3">{t('ship.retry')}</Button>}</div></div>
 }
 
 function CreateFeature({ onClose }: { onClose: () => void }) {
+  const t = useT()
   const create = useShipping((s) => s.createFeature)
   const saving = useShipping((s) => s.saving)
   const byId = useParticipants((s) => s.byId)
@@ -144,20 +156,21 @@ function CreateFeature({ onClose }: { onClose: () => void }) {
     } catch { /* the store keeps the form open and renders the API error */ }
   }
   return <form onSubmit={(e) => void submit(e)} className="m-3 rounded-2xl border border-sky2-200 bg-sky2-50/60 p-3 shadow-soft">
-    <div className="text-[12px] font-bold text-ink-800">New shipping contract</div>
-    <input className={cn(fieldClass(), 'mt-2')} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder="Feature title" autoFocus />
-    <textarea className={cn(fieldClass(), 'mt-2 min-h-16')} value={form.problem} onChange={(e) => setForm({ ...form, problem: e.target.value })} placeholder="What problem are we solving?" />
-    <textarea className={cn(fieldClass(), 'mt-2 min-h-16')} value={form.desiredOutcome} onChange={(e) => setForm({ ...form, desiredOutcome: e.target.value })} placeholder="What observable outcome should change?" />
-    <textarea className={cn(fieldClass(), 'mt-2 min-h-16')} value={form.contractSummary} onChange={(e) => setForm({ ...form, contractSummary: e.target.value })} placeholder="Scope, constraints, non-goals" />
-    <div className="mt-2 text-[10px] font-bold uppercase tracking-wide text-ink-400">Builders</div>
+    <div className="text-[12px] font-bold text-ink-800">{t('ship.newContract')}</div>
+    <input className={cn(fieldClass(), 'mt-2')} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} placeholder={t('ship.fieldTitle')} autoFocus />
+    <textarea className={cn(fieldClass(), 'mt-2 min-h-16')} value={form.problem} onChange={(e) => setForm({ ...form, problem: e.target.value })} placeholder={t('ship.fieldProblem')} />
+    <textarea className={cn(fieldClass(), 'mt-2 min-h-16')} value={form.desiredOutcome} onChange={(e) => setForm({ ...form, desiredOutcome: e.target.value })} placeholder={t('ship.fieldOutcome')} />
+    <textarea className={cn(fieldClass(), 'mt-2 min-h-16')} value={form.contractSummary} onChange={(e) => setForm({ ...form, contractSummary: e.target.value })} placeholder={t('ship.fieldScope')} />
+    <div className="mt-2 text-[10px] font-bold uppercase tracking-wide text-ink-400">{t('ship.builders')}</div>
     <div className="mt-1 max-h-28 overflow-auto rounded-xl border border-ink-100 bg-white p-2">
       {participants.map((p) => <label key={p.id} className="flex items-center gap-2 py-1 text-[11px] text-ink-700"><input type="checkbox" checked={form.builderIds.includes(p.id)} onChange={(e) => setForm({ ...form, builderIds: e.target.checked ? [...form.builderIds, p.id] : form.builderIds.filter((id) => id !== p.id) })} /> {p.name} <span className="text-ink-400">@{p.id}</span></label>)}
     </div>
-    <div className="mt-3 flex justify-end gap-2"><Button onClick={onClose}>Cancel</Button><Button type="submit" tone="primary" disabled={saving || !form.title.trim()}>Create contract</Button></div>
+    <div className="mt-3 flex justify-end gap-2"><Button onClick={onClose}>{t('common.cancel')}</Button><Button type="submit" tone="primary" disabled={saving || !form.title.trim()}>{t('ship.createContract')}</Button></div>
   </form>
 }
 
 function FeatureDetail({ feature }: { feature: ShippingFeatureDetail }) {
+  const t = useT()
   const transition = useShipping((s) => s.transition)
   const saving = useShipping((s) => s.saving)
   const error = useShipping((s) => s.error)
@@ -167,8 +180,8 @@ function FeatureDetail({ feature }: { feature: ShippingFeatureDetail }) {
   return <div className="mx-auto max-w-[1100px] px-4 py-5 md:px-7 md:py-7">
     <header className="rounded-2xl border border-ink-100 bg-white p-5 shadow-soft">
       <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><Pill tone="blue">{STATUS_LABEL[feature.status]}</Pill><Pill tone={feature.riskLevel === 'critical' || feature.riskLevel === 'high' ? 'warn' : 'neutral'}>{feature.riskLevel} risk</Pill></div><h1 className="mt-2 text-[22px] font-semibold tracking-tight text-ink-900">{feature.title}</h1><p className="mt-1 text-[11px] text-ink-400">{passed}/{required.length} required evidence squares passed · updated {new Date(feature.updatedAt).toLocaleString()}</p></div>
-        {next && feature.status !== 'ready' && feature.status !== 'releasing' && <Button tone="primary" disabled={saving} onClick={() => runAction(transition(next), () => event('shipping_feature_transitioned', { from: feature.status, to: next }))}>Move to {STATUS_LABEL[next]}</Button>}
+        <div className="min-w-0"><div className="flex flex-wrap items-center gap-2"><Pill tone="blue">{t(STATUS_LABEL_KEY[feature.status])}</Pill><Pill tone={feature.riskLevel === 'critical' || feature.riskLevel === 'high' ? 'warn' : 'neutral'}>{t('ship.riskLabel', { risk: feature.riskLevel })}</Pill></div><h1 className="mt-2 text-[22px] font-semibold tracking-tight text-ink-900">{feature.title}</h1><p className="mt-1 text-[11px] text-ink-400">{t('ship.evidenceProgress', { passed, required: required.length, time: new Date(feature.updatedAt).toLocaleString() })}</p></div>
+        {next && feature.status !== 'ready' && feature.status !== 'releasing' && <Button tone="primary" disabled={saving} onClick={() => runAction(transition(next), () => event('shipping_feature_transitioned', { from: feature.status, to: next }))}>{t('ship.moveTo', { next: t(STATUS_LABEL_KEY[next]) })}</Button>}
       </div>
       {error && <div role="alert" className="mt-3 rounded-xl border border-coral/20 bg-coral-soft/20 px-3 py-2 text-[11px] text-coral-deep">{error}</div>}
     </header>
@@ -185,40 +198,44 @@ function Section({ title, eyebrow, children, action }: { title: string; eyebrow:
 }
 
 function ContractSection({ feature }: { feature: ShippingFeatureDetail }) {
+  const t = useT()
   const update = useShipping((s) => s.updateFeature)
   const saving = useShipping((s) => s.saving)
   const byId = useParticipants((s) => s.byId)
   const participants = useMemo(() => Object.values(byId).filter((p) => !p.departedAt), [byId])
   const [form, setForm] = useState({ title: feature.title, problem: feature.problem, desiredOutcome: feature.desiredOutcome, contractSummary: feature.contractSummary, builderIds: feature.builderIds, priority: feature.priority, riskLevel: feature.riskLevel, releaseTarget: feature.releaseTarget ?? '' })
   useEffect(() => setForm({ title: feature.title, problem: feature.problem, desiredOutcome: feature.desiredOutcome, contractSummary: feature.contractSummary, builderIds: feature.builderIds, priority: feature.priority, riskLevel: feature.riskLevel, releaseTarget: feature.releaseTarget ?? '' }), [feature])
-  return <Section eyebrow="01 · Define" title="Feature contract" action={<Button tone="primary" disabled={saving} onClick={() => runAction(update(form), () => event('shipping_contract_saved'))}>Save contract</Button>}>
-    <div className="grid gap-3 md:grid-cols-2"><label className="text-[11px] font-semibold text-ink-600">Title<input className={cn(fieldClass(), 'mt-1')} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label><label className="text-[11px] font-semibold text-ink-600">Release target<input className={cn(fieldClass(), 'mt-1')} value={form.releaseTarget} onChange={(e) => setForm({ ...form, releaseTarget: e.target.value })} placeholder="e.g. 2026-W31 / v0.2" /></label></div>
-    <div className="mt-3 grid gap-3 md:grid-cols-3">{([['Problem', 'problem'], ['Desired outcome', 'desiredOutcome'], ['Scope & constraints', 'contractSummary']] as const).map(([label, key]) => <label key={key} className="text-[11px] font-semibold text-ink-600">{label}<textarea className={cn(fieldClass(), 'mt-1 min-h-28 resize-y')} value={form[key]} onChange={(e) => setForm({ ...form, [key]: e.target.value })} /></label>)}</div>
-    <div className="mt-3 grid gap-3 md:grid-cols-2"><div><div className="text-[11px] font-semibold text-ink-600">Priority & risk</div><div className="mt-1 flex gap-2"><select className={fieldClass()} value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value as typeof form.priority })}>{['critical','high','medium','low'].map((v) => <option key={v}>{v}</option>)}</select><select className={fieldClass()} value={form.riskLevel} onChange={(e) => setForm({ ...form, riskLevel: e.target.value as typeof form.riskLevel })}>{['critical','high','medium','low'].map((v) => <option key={v}>{v}</option>)}</select></div></div><div><div className="text-[11px] font-semibold text-ink-600">Builders (cannot verify their own squares)</div><div className="mt-1 max-h-24 overflow-auto rounded-xl border border-ink-100 p-2">{participants.map((p) => <label key={p.id} className="mr-3 inline-flex items-center gap-1.5 py-1 text-[11px]"><input type="checkbox" checked={form.builderIds.includes(p.id)} onChange={(e) => setForm({ ...form, builderIds: e.target.checked ? [...form.builderIds, p.id] : form.builderIds.filter((id) => id !== p.id) })} />{p.name}</label>)}</div></div></div>
+  return <Section eyebrow={t('ship.sectionDefine')} title={t('ship.contractTitle')} action={<Button tone="primary" disabled={saving} onClick={() => runAction(update(form), () => event('shipping_contract_saved'))}>{t('ship.saveContract')}</Button>}>
+    <div className="grid gap-3 md:grid-cols-2"><label className="text-[11px] font-semibold text-ink-600">{t('ship.labelTitle')}<input className={cn(fieldClass(), 'mt-1')} value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></label><label className="text-[11px] font-semibold text-ink-600">{t('ship.labelReleaseTarget')}<input className={cn(fieldClass(), 'mt-1')} value={form.releaseTarget} onChange={(e) => setForm({ ...form, releaseTarget: e.target.value })} placeholder={t('ship.releaseTargetPh')} /></label></div>
+    <div className="mt-3 grid gap-3 md:grid-cols-3">{([['ship.labelProblem', 'problem'], ['ship.labelDesiredOutcome', 'desiredOutcome'], ['ship.labelScopeConstraints', 'contractSummary']] as const).map(([labelKey, key]) => <label key={key} className="text-[11px] font-semibold text-ink-600">{t(labelKey)}<textarea className={cn(fieldClass(), 'mt-1 min-h-28 resize-y')} value={form[key]} onChange={(e) => setForm({ ...form, [key]: e.target.value })} /></label>)}</div>
+    <div className="mt-3 grid gap-3 md:grid-cols-2"><div><div className="text-[11px] font-semibold text-ink-600">{t('ship.priorityRisk')}</div><div className="mt-1 flex gap-2"><select className={fieldClass()} value={form.priority} onChange={(e) => setForm({ ...form, priority: e.target.value as typeof form.priority })}>{['critical','high','medium','low'].map((v) => <option key={v}>{v}</option>)}</select><select className={fieldClass()} value={form.riskLevel} onChange={(e) => setForm({ ...form, riskLevel: e.target.value as typeof form.riskLevel })}>{['critical','high','medium','low'].map((v) => <option key={v}>{v}</option>)}</select></div></div><div><div className="text-[11px] font-semibold text-ink-600">{t('ship.buildersCantVerify')}</div><div className="mt-1 max-h-24 overflow-auto rounded-xl border border-ink-100 p-2">{participants.map((p) => <label key={p.id} className="mr-3 inline-flex items-center gap-1.5 py-1 text-[11px]"><input type="checkbox" checked={form.builderIds.includes(p.id)} onChange={(e) => setForm({ ...form, builderIds: e.target.checked ? [...form.builderIds, p.id] : form.builderIds.filter((id) => id !== p.id) })} />{p.name}</label>)}</div></div></div>
   </Section>
 }
 
 function InvariantsSection({ feature }: { feature: ShippingFeatureDetail }) {
+  const t = useT()
   const mutate = useShipping((s) => s.mutateSelected)
   const [title, setTitle] = useState('')
   const [kind, setKind] = useState('behavior')
-  return <Section eyebrow="02 · Constrain" title="Invariants" action={<div className="text-[10px] text-ink-400">What must remain true</div>}>
+  return <Section eyebrow={t('ship.sectionConstrain')} title={t('ship.invariantsTitle')} action={<div className="text-[10px] text-ink-400">{t('ship.whatMustRemain')}</div>}>
     <div className="grid gap-2 md:grid-cols-2">{feature.invariants.map((i) => <div key={i.id} className="rounded-xl border border-ink-100 bg-[#FAFCFD] p-3"><div className="flex items-center justify-between gap-2"><div className="text-[12px] font-semibold text-ink-800">{i.title}</div><Pill tone={i.required ? 'warn' : 'neutral'}>{i.kind}</Pill></div>{i.description && <p className="mt-1 text-[11px] leading-relaxed text-ink-500">{i.description}</p>}</div>)}</div>
-    <form className="mt-3 flex flex-col gap-2 md:flex-row" onSubmit={(e) => { e.preventDefault(); if (!title.trim()) return; runAction(mutate((id) => api.createShippingInvariant(id, { title, kind })), () => { setTitle(''); event('shipping_invariant_created', { kind }) }) }}><input className={cn(fieldClass(), 'flex-1')} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Add an invariant: e.g. retries never duplicate a charge" /><select className={cn(fieldClass(), 'md:w-40')} value={kind} onChange={(e) => setKind(e.target.value)}>{['behavior','architecture','data','security','performance','ux','operability'].map((v) => <option key={v}>{v}</option>)}</select><Button type="submit" disabled={!title.trim()}><IPlus className="mr-1 inline h-3 w-3" /> Add</Button></form>
+    <form className="mt-3 flex flex-col gap-2 md:flex-row" onSubmit={(e) => { e.preventDefault(); if (!title.trim()) return; runAction(mutate((id) => api.createShippingInvariant(id, { title, kind })), () => { setTitle(''); event('shipping_invariant_created', { kind }) }) }}><input className={cn(fieldClass(), 'flex-1')} value={title} onChange={(e) => setTitle(e.target.value)} placeholder={t('ship.addInvariantPh')} /><select className={cn(fieldClass(), 'md:w-40')} value={kind} onChange={(e) => setKind(e.target.value)}>{['behavior','architecture','data','security','performance','ux','operability'].map((v) => <option key={v}>{v}</option>)}</select><Button type="submit" disabled={!title.trim()}><IPlus className="mr-1 inline h-3 w-3" /> {t('ship.addBtn')}</Button></form>
   </Section>
 }
 
 function VerificationsSection({ feature }: { feature: ShippingFeatureDetail }) {
+  const t = useT()
   const mutate = useShipping((s) => s.mutateSelected)
   const [title, setTitle] = useState('')
   const [method, setMethod] = useState('property')
-  return <Section eyebrow="03 · Verify" title="Independent evidence squares" action={<div className="text-[10px] text-ink-400">Builder ≠ verifier · evidence required</div>}>
+  return <Section eyebrow={t('ship.sectionVerify')} title={t('ship.verificationsTitle')} action={<div className="text-[10px] text-ink-400">{t('ship.builderNotVerifier')}</div>}>
     <div className="space-y-2">{feature.verifications.map((square) => <VerificationCard key={square.id} feature={feature} square={square} />)}</div>
-    <form className="mt-3 flex flex-col gap-2 md:flex-row" onSubmit={(e) => { e.preventDefault(); if (!title.trim()) return; runAction(mutate((id) => api.createShippingVerification(id, { title, method })), () => { setTitle(''); event('shipping_square_created', { method }) }) }}><input className={cn(fieldClass(), 'flex-1')} value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Add a verification square" /><select className={cn(fieldClass(), 'md:w-48')} value={method} onChange={(e) => setMethod(e.target.value)}>{['user_path','property','trace','data_reconciliation','design_qa','security','performance','release_note'].map((v) => <option key={v}>{v.replaceAll('_', ' ')}</option>)}</select><Button type="submit" disabled={!title.trim()}>Add square</Button></form>
+    <form className="mt-3 flex flex-col gap-2 md:flex-row" onSubmit={(e) => { e.preventDefault(); if (!title.trim()) return; runAction(mutate((id) => api.createShippingVerification(id, { title, method })), () => { setTitle(''); event('shipping_square_created', { method }) }) }}><input className={cn(fieldClass(), 'flex-1')} value={title} onChange={(e) => setTitle(e.target.value)} placeholder={t('ship.addVerificationPh')} /><select className={cn(fieldClass(), 'md:w-48')} value={method} onChange={(e) => setMethod(e.target.value)}>{['user_path','property','trace','data_reconciliation','design_qa','security','performance','release_note'].map((v) => <option key={v}>{v.replaceAll('_', ' ')}</option>)}</select><Button type="submit" disabled={!title.trim()}>{t('ship.addSquareBtn')}</Button></form>
   </Section>
 }
 
 function VerificationCard({ feature, square }: { feature: ShippingFeatureDetail; square: ShippingVerification }) {
+  const t = useT()
   const mutate = useShipping((s) => s.mutateSelected)
   const byId = useParticipants((s) => s.byId)
   const participants = useMemo(() => Object.values(byId).filter((p) => !p.departedAt && !square.builderIds.includes(p.id)), [byId, square.builderIds])
@@ -233,10 +250,11 @@ function VerificationCard({ feature, square }: { feature: ShippingFeatureDetail;
     ...(notes.trim() ? { notes: notes.trim() } : {}),
   }))
   const tone = square.status === 'passed' ? 'good' : square.status === 'failed' ? 'bad' : square.status === 'running' ? 'blue' : square.status === 'waived' ? 'warn' : 'neutral'
-  return <details className="group rounded-xl border border-ink-100 bg-[#FAFCFD]" open={square.status === 'failed'}><summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-3"><span className={cn('grid h-6 w-6 place-items-center rounded-full border text-[11px] font-bold', square.status === 'passed' ? 'border-emerald-300 bg-emerald-50 text-emerald-700' : square.status === 'failed' ? 'border-coral/30 bg-coral-soft text-coral-deep' : 'border-ink-200 bg-white text-ink-400')}>{square.status === 'passed' ? '✓' : square.status === 'failed' ? '!' : '·'}</span><div className="min-w-0 flex-1"><div className="truncate text-[12px] font-semibold text-ink-800">{square.title}</div><div className="mt-0.5 text-[10px] text-ink-400">{square.method.replaceAll('_', ' ')} · {square.required ? 'required' : 'optional'} · {square.ownerId ? `owner @${square.ownerId}` : 'unowned'}</div></div><Pill tone={tone}>{square.status}</Pill></summary><div className="border-t border-ink-100 px-3 py-3"><div className="grid gap-2 md:grid-cols-[220px_1fr]"><label className="text-[10px] font-bold uppercase tracking-wide text-ink-400">Independent owner<select className={cn(fieldClass(), 'mt-1')} value={ownerId} onChange={(e) => setOwnerId(e.target.value)}><option value="">Unassigned</option>{participants.map((p) => <option value={p.id} key={p.id}>{p.name} (@{p.id})</option>)}</select></label><label className="text-[10px] font-bold uppercase tracking-wide text-ink-400">Evidence / link / observation<input className={cn(fieldClass(), 'mt-1')} value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder="What did you inspect and what did it prove?" /></label></div><label className="mt-2 block text-[10px] font-bold uppercase tracking-wide text-ink-400">Notes<input className={cn(fieldClass(), 'mt-1')} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Required when waiving" /></label><div className="mt-3 flex flex-wrap gap-2"><Button onClick={() => runAction(patch())}>Save owner</Button><Button tone="primary" onClick={() => runAction(patch('running'))}>Start</Button><Button tone="success" disabled={!evidence.trim()} onClick={() => runAction(patch('passed'), () => event('shipping_square_completed', { method: square.method, result: 'passed' }))}>Pass with evidence</Button><Button tone="danger" disabled={!evidence.trim()} onClick={() => runAction(patch('failed'), () => event('shipping_square_completed', { method: square.method, result: 'failed' }))}>Fail with evidence</Button><Button disabled={!notes.trim()} onClick={() => runAction(patch('waived'))}>Waive</Button></div>{square.evidence.length > 0 && <pre className="mt-3 max-h-28 overflow-auto rounded-lg bg-ink-900 p-2 text-[10px] text-white/80">{JSON.stringify(square.evidence, null, 2)}</pre>}</div></details>
+  return <details className="group rounded-xl border border-ink-100 bg-[#FAFCFD]" open={square.status === 'failed'}><summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-3"><span className={cn('grid h-6 w-6 place-items-center rounded-full border text-[11px] font-bold', square.status === 'passed' ? 'border-emerald-300 bg-emerald-50 text-emerald-700' : square.status === 'failed' ? 'border-coral/30 bg-coral-soft text-coral-deep' : 'border-ink-200 bg-white text-ink-400')}>{square.status === 'passed' ? '✓' : square.status === 'failed' ? '!' : '·'}</span><div className="min-w-0 flex-1"><div className="truncate text-[12px] font-semibold text-ink-800">{square.title}</div><div className="mt-0.5 text-[10px] text-ink-400">{square.method.replaceAll('_', ' ')} · {square.required ? t('common.required') : t('common.optional')} · {square.ownerId ? `owner @${square.ownerId}` : t('common.unassigned')}</div></div><Pill tone={tone}>{square.status}</Pill></summary><div className="border-t border-ink-100 px-3 py-3"><div className="grid gap-2 md:grid-cols-[220px_1fr]"><label className="text-[10px] font-bold uppercase tracking-wide text-ink-400">{t('ship.independentOwner')}<select className={cn(fieldClass(), 'mt-1')} value={ownerId} onChange={(e) => setOwnerId(e.target.value)}><option value="">{t('common.unassigned')}</option>{participants.map((p) => <option value={p.id} key={p.id}>{p.name} (@{p.id})</option>)}</select></label><label className="text-[10px] font-bold uppercase tracking-wide text-ink-400">{t('ship.evidenceLabel')}<input className={cn(fieldClass(), 'mt-1')} value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder={t('ship.evidencePh')} /></label></div><label className="mt-2 block text-[10px] font-bold uppercase tracking-wide text-ink-400">{t('ship.notesLabel')}<input className={cn(fieldClass(), 'mt-1')} value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={t('ship.notesPh')} /></label><div className="mt-3 flex flex-wrap gap-2"><Button onClick={() => runAction(patch())}>{t('ship.saveOwner')}</Button><Button tone="primary" onClick={() => runAction(patch('running'))}>{t('ship.start')}</Button><Button tone="success" disabled={!evidence.trim()} onClick={() => runAction(patch('passed'), () => event('shipping_square_completed', { method: square.method, result: 'passed' }))}>{t('ship.passEvidence')}</Button><Button tone="danger" disabled={!evidence.trim()} onClick={() => runAction(patch('failed'), () => event('shipping_square_completed', { method: square.method, result: 'failed' }))}>{t('ship.failEvidence')}</Button><Button disabled={!notes.trim()} onClick={() => runAction(patch('waived'))}>{t('ship.waive')}</Button></div>{square.evidence.length > 0 && <pre className="mt-3 max-h-28 overflow-auto rounded-lg bg-ink-900 p-2 text-[10px] text-white/80">{JSON.stringify(square.evidence, null, 2)}</pre>}</div></details>
 }
 
 function ReleaseSection({ feature }: { feature: ShippingFeatureDetail }) {
+  const t = useT()
   const mutate = useShipping((s) => s.mutateSelected)
   const [show, setShow] = useState(false)
   const [form, setForm] = useState({ environment: 'staging', version: '', commitSha: '', releaseNotes: '', rollbackPlan: '', baseline: '' })
@@ -245,13 +263,14 @@ function ReleaseSection({ feature }: { feature: ShippingFeatureDetail }) {
     event('shipping_release_planned', { environment: form.environment })
     setShow(false)
   }
-  return <Section eyebrow="04 · Release" title="Ignition, smoke, and production readback" action={<Button onClick={() => setShow((v) => !v)}>{show ? 'Close planner' : 'Plan release'}</Button>}>
-    {show && <div className="mb-4 rounded-xl border border-sky2-200 bg-sky2-50/50 p-3"><div className="grid gap-2 md:grid-cols-3"><select className={fieldClass()} value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}>{['staging','canary','production'].map((v) => <option key={v}>{v}</option>)}</select><input className={fieldClass()} value={form.version} onChange={(e) => setForm({ ...form, version: e.target.value })} placeholder="Version" /><input className={fieldClass()} value={form.commitSha} onChange={(e) => setForm({ ...form, commitSha: e.target.value })} placeholder="Commit SHA" /></div><textarea className={cn(fieldClass(), 'mt-2 min-h-20')} value={form.releaseNotes} onChange={(e) => setForm({ ...form, releaseNotes: e.target.value })} placeholder="Release notes: user-visible change and known gaps" /><textarea className={cn(fieldClass(), 'mt-2 min-h-20')} value={form.rollbackPlan} onChange={(e) => setForm({ ...form, rollbackPlan: e.target.value })} placeholder="Rollback plan: exact trigger and command/path" /><input className={cn(fieldClass(), 'mt-2')} value={form.baseline} onChange={(e) => setForm({ ...form, baseline: e.target.value })} placeholder="Production baseline metric (required for production approval)" /><div className="mt-2 flex justify-end"><Button tone="primary" onClick={() => runAction(create())}>Create release gate</Button></div></div>}
-    <div className="space-y-2">{feature.releases.map((release) => <ReleaseCard key={release.id} featureId={feature.id} release={release} />)}{feature.releases.length === 0 && <p className="text-[11px] text-ink-400">No releases yet. Prove staging before production; production approval also requires release notes, rollback plan, and baseline.</p>}</div>
+  return <Section eyebrow={t('ship.sectionRelease')} title={t('ship.releaseSectionTitle')} action={<Button onClick={() => setShow((v) => !v)}>{show ? t('ship.closePlanner') : t('ship.planRelease')}</Button>}>
+    {show && <div className="mb-4 rounded-xl border border-sky2-200 bg-sky2-50/50 p-3"><div className="grid gap-2 md:grid-cols-3"><select className={fieldClass()} value={form.environment} onChange={(e) => setForm({ ...form, environment: e.target.value })}>{['staging','canary','production'].map((v) => <option key={v}>{v}</option>)}</select><input className={fieldClass()} value={form.version} onChange={(e) => setForm({ ...form, version: e.target.value })} placeholder={t('ship.versionPh')} /><input className={fieldClass()} value={form.commitSha} onChange={(e) => setForm({ ...form, commitSha: e.target.value })} placeholder={t('ship.commitShaPh')} /></div><textarea className={cn(fieldClass(), 'mt-2 min-h-20')} value={form.releaseNotes} onChange={(e) => setForm({ ...form, releaseNotes: e.target.value })} placeholder={t('ship.releaseNotesPh')} /><textarea className={cn(fieldClass(), 'mt-2 min-h-20')} value={form.rollbackPlan} onChange={(e) => setForm({ ...form, rollbackPlan: e.target.value })} placeholder={t('ship.rollbackPlanPh')} /><input className={cn(fieldClass(), 'mt-2')} value={form.baseline} onChange={(e) => setForm({ ...form, baseline: e.target.value })} placeholder={t('ship.baselinePh')} /><div className="mt-2 flex justify-end"><Button tone="primary" onClick={() => runAction(create())}>{t('ship.createReleaseGate')}</Button></div></div>}
+    <div className="space-y-2">{feature.releases.map((release) => <ReleaseCard key={release.id} featureId={feature.id} release={release} />)}{feature.releases.length === 0 && <p className="text-[11px] text-ink-400">{t('ship.noReleasesYet')}</p>}</div>
   </Section>
 }
 
 function ReleaseCard({ featureId, release }: { featureId: string; release: ShippingRelease }) {
+  const t = useT()
   const mutate = useShipping((s) => s.mutateSelected)
   const [evidence, setEvidence] = useState('')
   const action = async (name: string) => {
@@ -261,10 +280,11 @@ function ReleaseCard({ featureId, release }: { featureId: string; release: Shipp
     setEvidence('')
   }
   const actions = release.status === 'planned' ? ['approve'] : release.status === 'approved' ? ['start'] : release.status === 'running' ? ['succeed','fail'] : release.status === 'succeeded' && release.environment === 'production' && ['pending','overdue'].includes(release.readbackStatus) ? ['readback_pass','readback_fail','rollback'] : release.status === 'succeeded' ? ['rollback'] : []
-  return <details className="rounded-xl border border-ink-100 bg-[#FAFCFD]"><summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-3"><Pill tone={release.status === 'succeeded' ? 'good' : release.status === 'failed' || release.status === 'rolled_back' ? 'bad' : release.status === 'running' ? 'blue' : 'warn'}>{release.environment}</Pill><div className="min-w-0 flex-1"><div className="text-[12px] font-semibold text-ink-800">{release.version || release.commitSha || 'Unversioned release'}</div><div className="mt-0.5 text-[10px] text-ink-400">{release.status} · readback {release.readbackStatus}{release.readbackDueAt ? ` · due ${new Date(release.readbackDueAt).toLocaleString()}` : ''}</div></div></summary><div className="border-t border-ink-100 p-3"><div className="grid gap-2 text-[11px] text-ink-600 md:grid-cols-2"><div><b>Release notes</b><p className="mt-1 whitespace-pre-wrap">{release.releaseNotes || '—'}</p></div><div><b>Rollback plan</b><p className="mt-1 whitespace-pre-wrap">{release.rollbackPlan || '—'}</p></div></div>{actions.length > 0 && <><input className={cn(fieldClass(), 'mt-3')} value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder={actions.includes('approve') || actions.includes('start') ? 'Optional note' : 'Smoke/readback evidence or rollback reason'} /><div className="mt-2 flex flex-wrap gap-2">{actions.map((name) => <Button key={name} tone={name.includes('fail') || name === 'rollback' ? 'danger' : name.includes('pass') || name === 'succeed' ? 'success' : 'primary'} disabled={['succeed','fail','readback_pass','readback_fail','rollback'].includes(name) && !evidence.trim()} onClick={() => runAction(action(name))}>{name.replaceAll('_', ' ')}</Button>)}</div></>}</div></details>
+  return <details className="rounded-xl border border-ink-100 bg-[#FAFCFD]"><summary className="flex cursor-pointer list-none items-center gap-3 px-3 py-3"><Pill tone={release.status === 'succeeded' ? 'good' : release.status === 'failed' || release.status === 'rolled_back' ? 'bad' : release.status === 'running' ? 'blue' : 'warn'}>{release.environment}</Pill><div className="min-w-0 flex-1"><div className="text-[12px] font-semibold text-ink-800">{release.version || release.commitSha || t('ship.unversioned')}</div><div className="mt-0.5 text-[10px] text-ink-400">{release.status} · readback {release.readbackStatus}{release.readbackDueAt ? ` · due ${new Date(release.readbackDueAt).toLocaleString()}` : ''}</div></div></summary><div className="border-t border-ink-100 p-3"><div className="grid gap-2 text-[11px] text-ink-600 md:grid-cols-2"><div><b>{t('ship.releaseNotesLabel')}</b><p className="mt-1 whitespace-pre-wrap">{release.releaseNotes || '—'}</p></div><div><b>{t('ship.rollbackPlanLabel')}</b><p className="mt-1 whitespace-pre-wrap">{release.rollbackPlan || '—'}</p></div></div>{actions.length > 0 && <><input className={cn(fieldClass(), 'mt-3')} value={evidence} onChange={(e) => setEvidence(e.target.value)} placeholder={actions.includes('approve') || actions.includes('start') ? t('ship.optionalNote') : t('ship.smokeEvidence')} /><div className="mt-2 flex flex-wrap gap-2">{actions.map((name) => <Button key={name} tone={name.includes('fail') || name === 'rollback' ? 'danger' : name.includes('pass') || name === 'succeed' ? 'success' : 'primary'} disabled={['succeed','fail','readback_pass','readback_fail','rollback'].includes(name) && !evidence.trim()} onClick={() => runAction(action(name))}>{name.replaceAll('_', ' ')}</Button>)}</div></>}</div></details>
 }
 
 function LearningSection({ feature }: { feature: ShippingFeatureDetail }) {
+  const t = useT()
   const mutate = useShipping((s) => s.mutateSelected)
   const [friction, setFriction] = useState('')
   const [regression, setRegression] = useState('')
@@ -276,24 +296,24 @@ function LearningSection({ feature }: { feature: ShippingFeatureDetail }) {
     await api.createShippingFriction({ featureId, title: friction, description: friction, frequency: 'once' })
     return api.getShippingFeature(featureId)
   })
-  return <Section eyebrow="05 · Learn" title="Friction and regression memory">
+  return <Section eyebrow={t('ship.sectionLearn')} title={t('ship.frictionMemory')}>
     <div className="grid gap-4 md:grid-cols-2">
       <div>
-        <div className="text-[11px] font-bold text-ink-700">Friction inbox</div>
+        <div className="text-[11px] font-bold text-ink-700">{t('ship.frictionInbox')}</div>
         <div className="mt-2 space-y-2">
           {feature.frictions.map((item) => <div key={item.id} className="rounded-xl border border-ink-100 p-3">
             <div className="flex justify-between gap-2"><span className="text-[11px] font-semibold text-ink-800">{item.title}</span><Pill tone={item.severity === 'critical' || item.severity === 'high' ? 'bad' : 'warn'}>{item.occurrenceCount}× {item.status}</Pill></div>
             <p className="mt-1 text-[10px] text-ink-500">{item.description}</p>
-            {!['resolved','dismissed'].includes(item.status) && <Button className="mt-2" onClick={() => runAction(resolveFriction(item.id))}>Resolve</Button>}
+            {!['resolved','dismissed'].includes(item.status) && <Button className="mt-2" onClick={() => runAction(resolveFriction(item.id))}>{t('ship.resolve')}</Button>}
           </div>)}
         </div>
         <form className="mt-2 flex gap-2" onSubmit={(e) => { e.preventDefault(); if (!friction.trim()) return; runAction(captureFriction(), () => { setFriction(''); event('shipping_friction_reported') }) }}>
-          <input className={fieldClass()} value={friction} onChange={(e) => setFriction(e.target.value)} placeholder="Where did the work feel harder than it should?" />
-          <Button type="submit">Capture</Button>
+          <input className={fieldClass()} value={friction} onChange={(e) => setFriction(e.target.value)} placeholder={t('ship.frictionPh')} />
+          <Button type="submit">{t('ship.capture')}</Button>
         </form>
       </div>
       <div>
-        <div className="text-[11px] font-bold text-ink-700">Regression assets</div>
+        <div className="text-[11px] font-bold text-ink-700">{t('ship.regressionAssets')}</div>
         <div className="mt-2 space-y-2">
           {feature.regressions.map((item) => <div key={item.id} className="rounded-xl border border-ink-100 p-3">
             <div className="flex justify-between gap-2"><span className="text-[11px] font-semibold text-ink-800">{item.title}</span><Pill tone={item.status === 'passing' ? 'good' : item.status === 'failing' ? 'bad' : 'blue'}>{item.kind} · {item.status}</Pill></div>
@@ -301,8 +321,8 @@ function LearningSection({ feature }: { feature: ShippingFeatureDetail }) {
           </div>)}
         </div>
         <form className="mt-2 flex gap-2" onSubmit={(e) => { e.preventDefault(); if (!regression.trim()) return; runAction(mutate((id) => api.createShippingRegression(id, { title: regression, kind: 'manual_replay', expected: 'Previously verified behavior remains true' })), () => { setRegression(''); event('shipping_regression_created') }) }}>
-          <input className={fieldClass()} value={regression} onChange={(e) => setRegression(e.target.value)} placeholder="Turn a lesson into a replayable check" />
-          <Button type="submit">Harden</Button>
+          <input className={fieldClass()} value={regression} onChange={(e) => setRegression(e.target.value)} placeholder={t('ship.regressionPh')} />
+          <Button type="submit">{t('ship.harden')}</Button>
         </form>
       </div>
     </div>

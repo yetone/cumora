@@ -14,41 +14,42 @@ import { ResizeHandle } from '@/components/ResizeHandle'
 import { RichBody, CodeBlock } from '@/components/Message'
 import { useParticipants } from '@/stores/participants'
 import { useResizableWidth } from '@/lib/useResizableWidth'
+import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 type StatusFilter = ApiAgentRunStatus | 'all'
 type DevPanel = 'traces' | 'workspace' | 'triage'
 const DEV_PANELS: DevPanel[] = ['traces', 'workspace', 'triage']
-const PANEL_LABEL: Record<DevPanel, string> = { traces: 'Traces', workspace: 'Workspace', triage: 'Triage $' }
-const TRIAGE_WINDOWS: { hours: number; label: string }[] = [
-  { hours: 6, label: '6h' }, { hours: 24, label: '24h' }, { hours: 72, label: '3d' }, { hours: 168, label: '7d' },
+const PANEL_LABEL_KEY: Record<DevPanel, MessageKey> = { traces: 'obs.panelTraces', workspace: 'obs.panelWorkspace', triage: 'obs.panelTriage' }
+const TRIAGE_WINDOWS: { hours: number; key: MessageKey }[] = [
+  { hours: 6, key: 'obs.window6h' }, { hours: 24, key: 'obs.window24h' }, { hours: 72, key: 'obs.window3d' }, { hours: 168, key: 'obs.window7d' },
 ]
 
 const STATUS_OPTIONS: StatusFilter[] = ['all', 'running', 'stalled', 'failed', 'completed', 'skipped']
 
-const STATUS_STYLE: Record<ApiAgentRunStatus, { label: string; cls: string; dot: string }> = {
+const STATUS_STYLE: Record<ApiAgentRunStatus, { key: MessageKey; cls: string; dot: string }> = {
   running: {
-    label: 'Running',
+    key: 'obs.statusRunning',
     cls: 'bg-sky2-50 text-skype-deep border-sky2-100',
     dot: 'var(--skype)',
   },
   stalled: {
-    label: 'Stalled',
+    key: 'obs.statusStalled',
     cls: 'bg-coral-soft text-coral-deep border-coral-soft',
     dot: 'var(--coral-deep)',
   },
   failed: {
-    label: 'Failed',
+    key: 'obs.statusFailed',
     cls: 'bg-coral-soft text-coral-deep border-coral-soft',
     dot: 'var(--coral-deep)',
   },
   completed: {
-    label: 'Completed',
+    key: 'obs.statusCompleted',
     cls: 'bg-cloud text-ink-700 border-ink-100',
     dot: 'var(--avail)',
   },
   skipped: {
-    label: 'Skipped',
+    key: 'obs.statusSkipped',
     cls: 'bg-ink-100 text-ink-600 border-ink-100',
     dot: 'var(--ink-300)',
   },
@@ -74,12 +75,12 @@ function elapsed(ms: number): string {
   return `${m}m ${rest}s`
 }
 
-function relative(ts: string): string {
+function relative(ts: string, t: ReturnType<typeof useT>): string {
   const delta = Date.now() - new Date(ts).getTime()
-  if (delta < 5000) return 'just now'
-  if (delta < 60_000) return `${Math.round(delta / 1000)}s ago`
-  if (delta < 3_600_000) return `${Math.round(delta / 60_000)}m ago`
-  return `${Math.round(delta / 3_600_000)}h ago`
+  if (delta < 5000) return t('obs.justNow')
+  if (delta < 60_000) return t('obs.secondsAgo', { n: Math.round(delta / 1000) })
+  if (delta < 3_600_000) return t('obs.minutesAgo', { n: Math.round(delta / 60_000) })
+  return t('obs.hoursAgo', { n: Math.round(delta / 3_600_000) })
 }
 
 function pretty(value: unknown): string {
@@ -117,31 +118,34 @@ function MetaGrid({ items }: { items: Array<{ label: string; value: unknown }> }
   )
 }
 
-function PayloadBlock({ label, value, empty = '(empty)' }: { label: string; value: unknown; empty?: string }) {
+function PayloadBlock({ label, value, empty }: { label: string; value: unknown; empty?: string }) {
+  const t = useT()
   const traced = asTraceText(value)
   const text = traced ? traced.text : typeof value === 'undefined' ? '' : pretty(value)
+  const emptyText = empty ?? t('obs.payloadEmpty')
   return (
     <div>
       <div className="mb-1 flex items-center justify-between gap-3">
         <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">{label}</div>
         {traced?.length !== undefined && (
           <div className="font-mono text-[10px] text-ink-300">
-            {traced.length.toLocaleString()} chars{traced.truncated ? ' / truncated' : ''}
+            {t('obs.payloadChars', { n: traced.length })}{traced.truncated ? t('obs.payloadTruncated') : ''}
           </div>
         )}
       </div>
       <pre className="max-h-[360px] overflow-auto rounded-[10px] border border-ink-100 bg-ink-900 p-3 text-[11px] leading-[1.55] text-sky2-50">
-        {text || empty}
+        {text || emptyText}
       </pre>
     </div>
   )
 }
 
 function TraceInputView({ value }: { value: unknown }) {
-  if (!Array.isArray(value)) return <PayloadBlock label="Input" value={value} />
+  const t = useT()
+  if (!Array.isArray(value)) return <PayloadBlock label={t('obs.labelInput')} value={value} />
   return (
     <div className="space-y-2">
-      <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">Input messages</div>
+      <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">{t('obs.labelInputMessages')}</div>
       {value.map((item, idx) => {
         const rec = isRecord(item) ? item : {}
         const content = Array.isArray(rec.content) ? rec.content : []
@@ -154,7 +158,7 @@ function TraceInputView({ value }: { value: unknown }) {
               {rec.callId !== undefined && <span>call={String(rec.callId)}</span>}
             </div>
             <div className="space-y-2">
-              {rec.output !== undefined && <PayloadBlock label="Function output" value={rec.output} />}
+              {rec.output !== undefined && <PayloadBlock label={t('obs.labelFunctionOutput')} value={rec.output} />}
               {content.map((part, partIdx) => {
                 const p = isRecord(part) ? part : {}
                 const type = String(p.type ?? `part ${partIdx + 1}`)
@@ -162,13 +166,13 @@ function TraceInputView({ value }: { value: unknown }) {
                 if (type === 'input_image') {
                   return (
                     <div key={partIdx} className="rounded-[9px] border border-sky2-100 bg-sky2-50 px-3 py-2 font-mono text-[11px] text-skype-deep">
-                      image / {String(p.detail ?? 'auto')} / {String(p.imageUrl ?? '')}
+                      {t('obs.imageAuto', { detail: String(p.detail ?? t('obs.imageAutoDefault')), url: String(p.imageUrl ?? '') })}
                     </div>
                   )
                 }
                 return <PayloadBlock key={partIdx} label={type} value={p} />
               })}
-              {content.length === 0 && rec.content !== undefined && <PayloadBlock label="Content" value={rec.content} />}
+              {content.length === 0 && rec.content !== undefined && <PayloadBlock label={t('obs.labelContent')} value={rec.content} />}
             </div>
           </div>
         )
@@ -178,74 +182,78 @@ function TraceInputView({ value }: { value: unknown }) {
 }
 
 function ModelRequestDetails({ data }: { data: Record<string, unknown> }) {
+  const t = useT()
   const request = isRecord(data.request) ? data.request : {}
   return (
     <div className="mt-3 space-y-3">
       <MetaGrid items={[
-        { label: 'model', value: data.model },
-        { label: 'hop', value: data.hop },
-        { label: 'previous', value: data.previousResponseId },
-        { label: 'max tokens', value: request.maxOutputTokens },
+        { label: t('obs.metaModel'), value: data.model },
+        { label: t('obs.metaHop'), value: data.hop },
+        { label: t('obs.metaPrevious'), value: data.previousResponseId },
+        { label: t('obs.metaMaxTokens'), value: request.maxOutputTokens },
       ]} />
-      <PayloadBlock label="Instructions" value={data.instructions} />
+      <PayloadBlock label={t('obs.labelInstructions')} value={data.instructions} />
       <TraceInputView value={data.input} />
     </div>
   )
 }
 
 function ModelResponseDetails({ data }: { data: Record<string, unknown> }) {
+  const t = useT()
   const usage = isRecord(data.usage) ? data.usage : {}
   const toolCalls = Array.isArray(data.toolCalls) ? data.toolCalls : []
   return (
     <div className="mt-3 space-y-3">
       <MetaGrid items={[
-        { label: 'model', value: data.model },
-        { label: 'hop', value: data.hop },
-        { label: 'response', value: data.responseId },
-        { label: 'status', value: data.status },
-        { label: 'input tokens', value: usage.input_tokens },
-        { label: 'output tokens', value: usage.output_tokens },
+        { label: t('obs.metaModel'), value: data.model },
+        { label: t('obs.metaHop'), value: data.hop },
+        { label: t('obs.metaResponse'), value: data.responseId },
+        { label: t('obs.metaStatus'), value: data.status },
+        { label: t('obs.metaInputTokens'), value: usage.input_tokens },
+        { label: t('obs.metaOutputTokens'), value: usage.output_tokens },
       ]} />
-      <PayloadBlock label="Output text" value={data.outputText} empty="(no assistant text; tool-only response)" />
+      <PayloadBlock label={t('obs.labelOutputText')} value={data.outputText} empty={t('obs.noAssistantText')} />
       {toolCalls.length > 0 && (
         <div className="space-y-2">
-          <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">Tool calls requested</div>
+          <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">{t('obs.labelToolCalls')}</div>
           {toolCalls.map((call, idx) => {
             const rec = isRecord(call) ? call : {}
             return (
               <div key={idx} className="rounded-[10px] border border-ink-100 bg-paper p-3">
                 <div className="mb-2 flex flex-wrap items-center gap-2 font-mono text-[10.5px] text-ink-400">
-                  <span>{String(rec.name ?? 'tool')}</span>
+                  <span>{String(rec.name ?? t('obs.toolDefault'))}</span>
                   {rec.callId !== undefined && <span>{String(rec.callId)}</span>}
                 </div>
-                <PayloadBlock label="Arguments" value={rec.arguments ?? rec.rawArguments} />
+                <PayloadBlock label={t('obs.labelArguments')} value={rec.arguments ?? rec.rawArguments} />
               </div>
             )
           })}
         </div>
       )}
-      <PayloadBlock label="Response output items" value={data.output} />
+      <PayloadBlock label={t('obs.labelResponseOutputItems')} value={data.output} />
     </div>
   )
 }
 
 function ToolDetails({ data }: { data: Record<string, unknown> }) {
+  const t = useT()
   return (
     <div className="mt-3 space-y-3">
       <MetaGrid items={[
-        { label: 'hop', value: data.hop },
-        { label: 'call', value: data.callId },
-        { label: 'duration', value: typeof data.durationMs === 'number' ? elapsed(data.durationMs) : undefined },
-        { label: 'ok', value: data.ok },
+        { label: t('obs.metaHop'), value: data.hop },
+        { label: t('obs.metaCall'), value: data.callId },
+        { label: t('obs.metaDuration'), value: typeof data.durationMs === 'number' ? elapsed(data.durationMs) : undefined },
+        { label: t('obs.metaOk'), value: data.ok },
       ]} />
-      {data.args !== undefined && <PayloadBlock label="Arguments" value={data.args} />}
-      {data.output !== undefined && <PayloadBlock label="Output" value={data.output} />}
-      {data.error !== undefined && data.error !== null && <PayloadBlock label="Error" value={data.error} />}
+      {data.args !== undefined && <PayloadBlock label={t('obs.labelArguments')} value={data.args} />}
+      {data.output !== undefined && <PayloadBlock label={t('obs.labelOutput')} value={data.output} />}
+      {data.error !== undefined && data.error !== null && <PayloadBlock label={t('obs.labelError')} value={data.error} />}
     </div>
   )
 }
 
 function EventDetails({ event }: { event: ApiAgentEvent }) {
+  const t = useT()
   const data = event.data ?? {}
   const specialized = event.kind === 'model.request'
     ? <ModelRequestDetails data={data} />
@@ -260,7 +268,7 @@ function EventDetails({ event }: { event: ApiAgentEvent }) {
     <div>
       {specialized}
       <details className="mt-3" open={!specialized && defaultOpen}>
-        <summary className="cursor-pointer select-none text-[11px] font-semibold text-skype-deep">Raw data</summary>
+        <summary className="cursor-pointer select-none text-[11px] font-semibold text-skype-deep">{t('obs.labelRawData')}</summary>
         <pre className="mt-2 max-h-[260px] overflow-auto rounded-[9px] bg-ink-900 p-3 text-[11px] leading-[1.45] text-sky2-50">
           {pretty(data)}
         </pre>
@@ -276,16 +284,18 @@ function bytes(size: number): string {
 }
 
 function StatusPill({ status }: { status: ApiAgentRunStatus }) {
+  const t = useT()
   const tone = STATUS_STYLE[status]
   return (
     <span className={cn('inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10.5px] font-bold', tone.cls)}>
       <span className="h-1.5 w-1.5 rounded-full" style={{ background: tone.dot }} />
-      {tone.label}
+      {t(tone.key)}
     </span>
   )
 }
 
 function RefreshButton({ loading, onClick }: { loading: boolean; onClick: () => void }) {
+  const t = useT()
   return (
     <button
       onClick={onClick}
@@ -307,7 +317,7 @@ function RefreshButton({ loading, onClick }: { loading: boolean; onClick: () => 
             : 'border-sky2-200 bg-sky2-50 shadow-[inset_0_0_0_4px_rgba(255,255,255,0.72)]',
         )}
       />
-      <span>Refresh</span>
+      <span>{t('obs.refresh')}</span>
     </button>
   )
 }
@@ -328,6 +338,7 @@ function AgentDot({ run }: { run: ApiAgentRun }) {
 }
 
 function RunRow({ run, active, onClick }: { run: ApiAgentRun; active: boolean; onClick: () => void }) {
+  const t = useT()
   return (
     <button
       onClick={onClick}
@@ -357,14 +368,14 @@ function RunRow({ run, active, onClick }: { run: ApiAgentRun; active: boolean; o
             )}
           </div>
           <div className="mt-2 line-clamp-2 text-[12px] leading-[1.45] text-ink-600">
-            {run.error || run.summary || `${run.inboxCount} unread inputs`}
+            {run.error || run.summary || t('obs.unreadInputs', { n: run.inboxCount })}
           </div>
           <div className="mt-2 flex items-center gap-1.5 text-[10.5px] font-semibold text-ink-400">
-            <span>{run.inboxCount} inbox</span>
+            <span>{run.inboxCount} {t('obs.inbox')}</span>
             <span>/</span>
-            <span>{run.toolCallCount} tools</span>
+            <span>{run.toolCallCount} {t('obs.tools')}</span>
             <span>/</span>
-            <span>{run.tokenCount} tokens</span>
+            <span>{run.tokenCount} {t('obs.tokens')}</span>
           </div>
         </div>
       </div>
@@ -373,6 +384,7 @@ function RunRow({ run, active, onClick }: { run: ApiAgentRun; active: boolean; o
 }
 
 function EventRow({ event }: { event: ApiAgentEvent }) {
+  const t = useT()
   return (
     <div className="relative grid grid-cols-[98px_18px_minmax(0,1fr)] gap-3">
       <div className="pt-1 text-right font-mono text-[11px] text-ink-400">{clock(event.createdAt)}</div>
@@ -392,7 +404,7 @@ function EventRow({ event }: { event: ApiAgentEvent }) {
               {event.level}
             </span>
             <span className="font-mono text-[11px] text-ink-400">{event.kind}</span>
-            <span className="ml-auto text-[11px] text-ink-400">{relative(event.createdAt)}</span>
+            <span className="ml-auto text-[11px] text-ink-400">{relative(event.createdAt, t)}</span>
           </div>
           <div className="mt-2 text-[13px] font-semibold text-ink-900">{event.title}</div>
           {Object.keys(event.data ?? {}).length > 0 && <EventDetails event={event} />}
@@ -580,8 +592,9 @@ function FileTree({ nodes, depth, expanded, onToggle, selectedPath, onSelect }: 
  *   - `.json` / `.ts` / `.py` / etc → CodeBlock (syntax-highlit)
  *   - anything else → wrapped plain text in paper theme */
 function FileViewer({ path, body }: { path: string; body: string }) {
+  const t = useT()
   const ext = path.includes('.') ? path.split('.').pop()!.toLowerCase() : ''
-  if (!body) return <div className="text-[13px] italic text-ink-400">(empty file)</div>
+  if (!body) return <div className="text-[13px] italic text-ink-400">{t('obs.emptyFile')}</div>
   if (ext === 'md' || ext === 'markdown') {
     return (
       <div className="cumora-prose font-display text-[14px] leading-[1.7] text-ink-900">
@@ -630,6 +643,7 @@ function StatCard({ label, value, sub, tone }: {
  *  the user knows the rates the estimates rest on. Role is a heuristic on the id
  *  (haiku/mini = cerebellum/small; everything else = main/big). */
 function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cachedInPer1M: number; outPer1M: number; estimated: boolean }[] }) {
+  const t = useT()
   if (rows.length === 0) return null
   // Fixed cerebellum aliases: claude→haiku, codex→gpt-5.4-mini,
   // grok→grok-4.5. Cursor has no fixed cheap alias and reports the model its
@@ -637,15 +651,15 @@ function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cach
   const isSmall = (m: string) => /haiku|mini|grok-4\.5/i.test(m)
   return (
     <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
-      <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">Token unit prices · small brain vs big brain (per 1M tokens — all ESTIMATES unless you set CUMORA_MODEL_PRICES_JSON)</div>
+      <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.priceMenu')}</div>
       <table className="mt-2 w-full text-[11.5px]">
         <thead className="text-[9px] font-bold uppercase tracking-[0.1em] text-ink-400">
           <tr>
-            <th className="py-1 text-left">Tier</th>
-            <th className="py-1 text-left">Model</th>
-            <th className="py-1 text-right">Input</th>
-            <th className="py-1 text-right">Cache-read</th>
-            <th className="py-1 text-right">Output</th>
+            <th className="py-1 text-left">{t('obs.colTier')}</th>
+            <th className="py-1 text-left">{t('obs.colModel')}</th>
+            <th className="py-1 text-right">{t('obs.colInput')}</th>
+            <th className="py-1 text-right">{t('obs.colCacheRead')}</th>
+            <th className="py-1 text-right">{t('obs.colOutput')}</th>
             <th className="py-1" />
           </tr>
         </thead>
@@ -654,14 +668,14 @@ function PriceMenuTable({ rows }: { rows: { model: string; inPer1M: number; cach
             <tr key={p.model}>
               <td className="py-1">
                 <span className={cn('rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase', isSmall(p.model) ? 'bg-ink-100 text-ink-600' : 'bg-sky2-50 text-skype-deep')}>
-                  {isSmall(p.model) ? 'small brain' : 'big brain'}
+                  {isSmall(p.model) ? t('obs.tierSmall') : t('obs.tierBig')}
                 </span>
               </td>
               <td className="py-1 font-mono text-ink-700">{p.model}</td>
               <td className="py-1 text-right tabular-nums text-ink-600">${p.inPer1M}</td>
               <td className="py-1 text-right tabular-nums text-ink-600">${p.cachedInPer1M}</td>
               <td className="py-1 text-right tabular-nums text-ink-600">${p.outPer1M}</td>
-              <td className="py-1 text-right">{p.estimated && <span className="rounded bg-coral-soft px-1.5 py-0.5 text-[9px] font-bold uppercase text-coral-deep">est</span>}</td>
+              <td className="py-1 text-right">{p.estimated && <span className="rounded bg-coral-soft px-1.5 py-0.5 text-[9px] font-bold uppercase text-coral-deep">{t('obs.est')}</span>}</td>
             </tr>
           ))}
         </tbody>
@@ -686,6 +700,7 @@ function TriageEconomicsPanel(props: {
   err: string | null
   onRefresh: () => void
 }) {
+  const t = useT()
   const { data } = props
   const net = data?.estimatedNetSavingsUsd ?? 0
   return (
@@ -693,9 +708,9 @@ function TriageEconomicsPanel(props: {
       <div className="border-b border-ink-100 px-6 py-4">
         <div className="flex items-start justify-between gap-3">
           <div>
-            <h1 className="font-display text-[25px] font-medium tracking-tight text-ink-900">Triage Economics</h1>
+            <h1 className="font-display text-[25px] font-medium tracking-tight text-ink-900">{t('obs.triageTitle')}</h1>
             <div className="mt-1 text-[12px] text-ink-500">
-              Does the small-brain gate save money? Each triage is a cold session (uncached input); the big-brain turns it shields are cache-warm.
+              {t('obs.triageSubtitle')}
             </div>
           </div>
           <RefreshButton loading={props.loading} onClick={props.onRefresh} />
@@ -711,25 +726,25 @@ function TriageEconomicsPanel(props: {
                   props.panel === item ? 'bg-sky2-50 text-skype-deep shadow-soft' : 'text-ink-500 hover:text-ink-700',
                 )}
               >
-                {PANEL_LABEL[item]}
+                {t(PANEL_LABEL_KEY[item])}
               </button>
             ))}
           </div>
           <label className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
-            Agent
+            {t('obs.agent')}
             <Select
               value={props.agentId}
               onValueChange={props.setAgentId}
-              options={[{ value: 'all', label: 'All agents' }, ...props.agents.map((a) => ({ value: a.id, label: a.name }))]}
+              options={[{ value: 'all', label: t('obs.allAgents') }, ...props.agents.map((a) => ({ value: a.id, label: a.name }))]}
               className="mt-1 w-44 normal-case tracking-normal"
             />
           </label>
           <label className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
-            Window
+            {t('obs.window')}
             <Select<string>
               value={String(props.hours)}
               onValueChange={(v) => props.setHours(Number(v))}
-              options={TRIAGE_WINDOWS.map((w) => ({ value: String(w.hours), label: w.label }))}
+              options={TRIAGE_WINDOWS.map((w) => ({ value: String(w.hours), label: t(w.key) }))}
               className="mt-1 w-24 normal-case tracking-normal"
             />
           </label>
@@ -742,19 +757,19 @@ function TriageEconomicsPanel(props: {
 
       <div className="min-h-0 flex-1 overflow-auto px-6 py-5">
         {!data ? (
-          <div className="grid h-full place-items-center text-[13px] text-ink-400">{props.loading ? 'Loading…' : 'No data.'}</div>
+          <div className="grid h-full place-items-center text-[13px] text-ink-400">{props.loading ? t('common.loading') : t('common.noData')}</div>
         ) : (
           <div className="mx-auto max-w-[1100px] space-y-5">
             {/* ALWAYS-ON disclaimer: every $ here is an estimate. */}
             <div className="rounded-[10px] border border-coral-soft bg-coral-soft px-3.5 py-2.5 text-[11.5px] leading-[1.6] text-coral-deep">
-              <b>⚠ Every dollar on this page is an ESTIMATE</b> and may differ substantially from your real cost. Reason: we do not authoritatively know the per-token unit prices. The cloud model aliases (gpt-5.*) are <b>guesses</b>; the Claude tiers are list prices from memory that may be stale or wrong for your exact model variant; and on a flat-rate plan the $ is not a bill at all (see below). The token counts are real — the prices applied to them are not. Set <code className="rounded bg-paper/60 px-1">CUMORA_MODEL_PRICES_JSON</code> with your real contracted rates to make these exact.
+              {t('obs.triageEstimateWarn')}
             </div>
 
             {data.triageCount === 0 ? (
               <>
                 <PriceMenuTable rows={data.priceTable ?? []} />
                 <div className="rounded-[10px] border border-ink-100 bg-cloud px-3.5 py-3 text-[12px] leading-[1.6] text-ink-500">
-                  No triage recorded in this window yet. Triage cost is captured on the next agent wake (cloud immediately; BYOA after the daemon reports usage). The table above is the reference these estimates will use.
+                  {t('obs.triageNoData')}
                 </div>
               </>
             ) : (
@@ -762,35 +777,35 @@ function TriageEconomicsPanel(props: {
             {/* The headline: estimated net savings = avoided big-brain spend − triage spend. */}
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
               <StatCard
-                label="Est. net savings"
+                label={t('obs.statNetSavings')}
                 value={`${net >= 0 ? '+' : ''}${fmtUsd(net)}`}
                 tone={net >= 0 ? 'pos' : 'neg'}
-                sub={net >= 0 ? 'gate is paying off (estimate)' : 'gate COSTS more than it saves (estimate)'}
+                sub={net >= 0 ? t('obs.statNetSavingsPos') : t('obs.statNetSavingsNeg')}
               />
               <StatCard
-                label="Avoided big-brain $"
+                label={t('obs.statAvoided')}
                 value={fmtUsd(data.estimatedAvoidedUsd)}
                 tone="pos"
-                sub={`${data.triageSkipCount} skips × avg turn ${fmtUsd(data.avgTurnCostUsd)} (est.)`}
+                sub={t('obs.statAvoidedSub', { skips: data.triageSkipCount, cost: fmtUsd(data.avgTurnCostUsd) })}
               />
-              <StatCard label="Triage spend" value={fmtUsd(data.triageCostUsd)} sub={`${data.triageCount} triages · ${data.triageMeasuredCount} measured`} />
-              <StatCard label="Overhead (woke brain)" value={fmtUsd(data.triageOverheadUsd)} tone={data.triageOverheadUsd > 0 ? 'warn' : undefined} sub={`${data.triageWakeCount} paid the gate AND ran the turn`} />
-              <StatCard label="Big-brain cache-hit" value={fmtPct(data.turnCacheHitRate)} sub={`${data.turnCount} turns · avg ${fmtUsd(data.avgTurnCostUsd)}`} />
-              <StatCard label="Skip rate" value={data.triageCount > 0 ? fmtPct(data.triageSkipCount / data.triageCount) : '—'} sub={`triage tokens: ${fmtTok(data.triageInputTokens ?? 0)} uncached in`} />
+              <StatCard label={t('obs.statTriageSpend')} value={fmtUsd(data.triageCostUsd)} sub={t('obs.statTriageSpendSub', { n: data.triageCount, measured: data.triageMeasuredCount })} />
+              <StatCard label={t('obs.statOverhead')} value={fmtUsd(data.triageOverheadUsd)} tone={data.triageOverheadUsd > 0 ? 'warn' : undefined} sub={t('obs.statOverheadSub', { n: data.triageWakeCount })} />
+              <StatCard label={t('obs.statCacheHit')} value={fmtPct(data.turnCacheHitRate)} sub={t('obs.statCacheHitSub', { turns: data.turnCount, cost: fmtUsd(data.avgTurnCostUsd) })} />
+              <StatCard label={t('obs.statSkipRate')} value={data.triageCount > 0 ? fmtPct(data.triageSkipCount / data.triageCount) : '—'} sub={t('obs.statSkipRateSub', { tokens: fmtTok(data.triageInputTokens ?? 0) })} />
             </div>
 
             {/* The actual per-token unit prices the estimates rest on (table). */}
             {(data.unitPrices?.length ?? 0) > 0 && (
               <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
-                <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">Unit prices used · per 1M tokens (all ESTIMATES unless you set CUMORA_MODEL_PRICES_JSON)</div>
+                <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.priceMenuShort')}</div>
                 <table className="mt-2 w-full text-[11.5px]">
                   <thead className="text-[9px] font-bold uppercase tracking-[0.1em] text-ink-400">
                     <tr>
-                      <th className="py-1 text-left">Brain</th>
-                      <th className="py-1 text-left">Model</th>
-                      <th className="py-1 text-right">Input</th>
-                      <th className="py-1 text-right">Cache-read</th>
-                      <th className="py-1 text-right">Output</th>
+                      <th className="py-1 text-left">{t('obs.colBrain')}</th>
+                      <th className="py-1 text-left">{t('obs.colModel')}</th>
+                      <th className="py-1 text-right">{t('obs.colInput')}</th>
+                      <th className="py-1 text-right">{t('obs.colCacheRead')}</th>
+                      <th className="py-1 text-right">{t('obs.colOutput')}</th>
                       <th className="py-1" />
                     </tr>
                   </thead>
@@ -801,13 +816,13 @@ function TriageEconomicsPanel(props: {
                           <span className={cn(
                             'rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase',
                             p.role === 'triage' ? 'bg-ink-100 text-ink-600' : 'bg-sky2-50 text-skype-deep',
-                          )}>{p.role === 'triage' ? 'small brain' : 'big brain'}</span>
+                          )}>{p.role === 'triage' ? t('obs.tierSmall') : t('obs.tierBig')}</span>
                         </td>
                         <td className="py-1 font-mono text-ink-700">{p.model}</td>
                         <td className="py-1 text-right tabular-nums text-ink-600">${p.inPer1M}</td>
                         <td className="py-1 text-right tabular-nums text-ink-600">${p.cachedInPer1M}</td>
                         <td className="py-1 text-right tabular-nums text-ink-600">${p.outPer1M}</td>
-                        <td className="py-1 text-right">{p.estimated && <span className="rounded bg-coral-soft px-1.5 py-0.5 text-[9px] font-bold uppercase text-coral-deep">est</span>}</td>
+                        <td className="py-1 text-right">{p.estimated && <span className="rounded bg-coral-soft px-1.5 py-0.5 text-[9px] font-bold uppercase text-coral-deep">{t('obs.est')}</span>}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -817,13 +832,13 @@ function TriageEconomicsPanel(props: {
 
             {data.byoaShare > 0 && (
               <div className="rounded-[10px] border border-gold bg-cloud px-3.5 py-2.5 text-[11px] leading-[1.6] text-gold-deep">
-                <b>{fmtPct(data.byoaShare)} of these run on BYOA</b> (your own local engine). If that's a flat-rate plan (e.g. Claude Max), these dollars are <b>meter-equivalent</b> — what the same tokens would cost on the pay-as-you-go API, <b>NOT your real bill</b> (which is ≈ $0 marginal until you hit your plan's rate limit). For a flat-rate plan the real, plan-independent cost is the <b>tokens / quota</b>, not the $. The $ is still a faithful RELATIVE measure of triage-vs-turn.
+                {t('obs.byoaNote', { share: fmtPct(data.byoaShare) })}
               </div>
             )}
 
             <div className="rounded-[10px] border border-ink-100 bg-cloud px-3.5 py-2.5 text-[11px] leading-[1.6] text-ink-500">
-              <b className="text-ink-700">What "saved" means &amp; why it's an estimate:</b> a SKIP prevents a big-brain turn, so the saving is the <b>big-brain token cost that turn would have incurred</b> — which we can't know exactly (it didn't run). We approximate it with each agent's OWN mean effective turn cost in this window: <b>avoided = Σ(skips × that agent's avg turn $)</b>, then <b>net = avoided − triage spend</b>. Caveat: skipping can also let the big brain's prompt cache go cold (5-min TTL), so a later real turn may pay full uncached input — savings shift, they don't vanish. Everything except the avoided figure is measured; cache-aware (cache-reads ~10× cheaper than fresh input).
-              {data.costEstimated && <> Prices are <b>list-price estimates</b> — set <code className="rounded bg-paper px-1">CUMORA_MODEL_PRICES_JSON</code> for your real contracted rates.</>}
+              <b className="text-ink-700">{t('obs.savedExplainHead')}</b> {t('obs.savedExplainBody')}
+              {data.costEstimated && t('obs.pricesListEstimate')}
             </div>
 
             {/* Per-agent breakdown. */}
@@ -832,13 +847,13 @@ function TriageEconomicsPanel(props: {
                 <table className="w-full text-[11.5px]">
                   <thead className="bg-cloud text-[9.5px] font-bold uppercase tracking-[0.1em] text-ink-400">
                     <tr>
-                      <th className="px-3 py-2 text-left">Agent</th>
-                      <th className="px-3 py-2 text-right">Triages</th>
-                      <th className="px-3 py-2 text-right">Skip %</th>
-                      <th className="px-3 py-2 text-right">Triage $</th>
-                      <th className="px-3 py-2 text-right">Avg turn $</th>
-                      <th className="px-3 py-2 text-right">Cache-hit</th>
-                      <th className="px-3 py-2 text-right">Est. net</th>
+                      <th className="px-3 py-2 text-left">{t('obs.colAgent')}</th>
+                      <th className="px-3 py-2 text-right">{t('obs.colTriages')}</th>
+                      <th className="px-3 py-2 text-right">{t('obs.colSkipPct')}</th>
+                      <th className="px-3 py-2 text-right">{t('obs.colTriageDollar')}</th>
+                      <th className="px-3 py-2 text-right">{t('obs.colAvgTurn')}</th>
+                      <th className="px-3 py-2 text-right">{t('obs.colCacheHit')}</th>
+                      <th className="px-3 py-2 text-right">{t('obs.colEstNet')}</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-ink-100">
@@ -862,31 +877,30 @@ function TriageEconomicsPanel(props: {
 
             {/* Recent per-triage ledger. */}
             <div>
-              <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">Recent triages</div>
+              <div className="mb-2 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-400">{t('obs.recentTriages')}</div>
               <div className="space-y-1">
-                {(data.recent ?? []).map((t) => (
-                  <div key={t.id} className="flex items-center gap-3 rounded-[8px] border border-ink-100 bg-paper px-3 py-1.5 text-[11.5px]">
-                    <span className="w-[58px] shrink-0 tabular-nums text-ink-400">{clock(t.createdAt)}</span>
-                    <span className="w-[90px] shrink-0 truncate text-ink-700">{t.agentName}</span>
+                                {(data.recent ?? []).map((row) => (
+                  <div key={row.id} className="flex items-center gap-3 rounded-[8px] border border-ink-100 bg-paper px-3 py-1.5 text-[11.5px]">
+                    <span className="w-[58px] shrink-0 tabular-nums text-ink-400">{clock(row.createdAt)}</span>
+                    <span className="w-[90px] shrink-0 truncate text-ink-700">{row.agentName}</span>
                     <span className={cn(
                       'w-[52px] shrink-0 rounded-full px-1.5 py-0.5 text-center text-[9.5px] font-bold uppercase',
-                      t.actionable ? 'bg-sky2-50 text-skype-deep' : 'bg-ink-100 text-ink-500',
-                    )}>{t.actionable ? 'wake' : 'skip'}</span>
-                    <span className="w-[88px] shrink-0 truncate text-[10px] text-ink-400">{t.source}</span>
-                    <span className="w-[80px] shrink-0 text-right tabular-nums text-ink-600">{t.measured ? fmtUsd(t.costUsd) : '—'}</span>
+                      row.actionable ? 'bg-sky2-50 text-skype-deep' : 'bg-ink-100 text-ink-500',
+                    )}>{row.actionable ? t('obs.actionWake') : t('obs.actionSkip')}</span>
+                    <span className="w-[88px] shrink-0 truncate text-[10px] text-ink-400">{row.source}</span>
+                    <span className="w-[80px] shrink-0 text-right tabular-nums text-ink-600">{row.measured ? fmtUsd(row.costUsd) : '—'}</span>
                     <span className="w-[120px] shrink-0 text-right text-[10px] tabular-nums text-ink-400">
-                      {t.measured ? `${fmtTok(t.inputTokens)} in · ${fmtTok(t.cachedInputTokens)} cache` : 'unmeasured'}
+                      {row.measured ? t('obs.triageTokenDetail', { uncached: fmtTok(row.inputTokens), cache: fmtTok(row.cachedInputTokens) }) : t('obs.unmeasured')}
                     </span>
                     <span className="flex-1 truncate text-right text-[10px] text-ink-400">
-                      {!t.actionable && t.estSavingUsd != null
-                        ? <span style={t.estSavingUsd >= 0 ? { color: 'var(--avail)' } : undefined} className={t.estSavingUsd < 0 ? 'text-coral-deep' : undefined}>
-                            est. {t.estSavingUsd >= 0 ? 'saved ' : 'lost '}{fmtUsd(Math.abs(t.estSavingUsd))}
+                      {!row.actionable && row.estSavingUsd != null
+                        ? <span style={row.estSavingUsd >= 0 ? { color: 'var(--avail)' } : undefined} className={row.estSavingUsd < 0 ? 'text-coral-deep' : undefined}>
+                            {(row.estSavingUsd >= 0 ? t('obs.estSaved', { amount: fmtUsd(Math.abs(row.estSavingUsd)) }) : t('obs.estLost', { amount: fmtUsd(Math.abs(row.estSavingUsd)) }))}
                           </span>
-                        : <span className="truncate">{t.reason ?? ''}</span>}
+                        : <span className="truncate">{row.reason ?? ''}</span>}
                     </span>
                   </div>
-                ))}
-              </div>
+                ))}              </div>
             </div>
             </>
             )}
@@ -898,6 +912,7 @@ function TriageEconomicsPanel(props: {
 }
 
 export function ObservabilityView() {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const loaded = useParticipants((s) => s.loaded)
   const { width: sidebarWidth, onResizeStart } = useResizableWidth('sidebar:observability', 380, { min: 280, max: 600 })
@@ -1084,8 +1099,8 @@ export function ObservabilityView() {
         <div className="border-b border-ink-100 px-5 py-4">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h1 className="font-display text-[25px] font-medium tracking-tight text-ink-900">Agent Observability</h1>
-              <div className="mt-1 text-[12px] text-ink-500">Backend traces for every agent turn.</div>
+              <h1 className="font-display text-[25px] font-medium tracking-tight text-ink-900">{t('obs.title')}</h1>
+              <div className="mt-1 text-[12px] text-ink-500">{t('obs.subtitle')}</div>
             </div>
             <RefreshButton
               loading={panel === 'traces' ? loading : workspaceLoading}
@@ -1103,7 +1118,7 @@ export function ObservabilityView() {
                   panel === item ? 'bg-sky2-50 text-skype-deep shadow-soft' : 'text-ink-500 hover:text-ink-700',
                 )}
               >
-                {PANEL_LABEL[item]}
+                {t(PANEL_LABEL_KEY[item])}
               </button>
             ))}
           </div>
@@ -1112,25 +1127,25 @@ export function ObservabilityView() {
             <>
               <div className="mt-4 grid grid-cols-2 gap-2">
                 <label className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
-                  Agent
+                  {t('obs.agent')}
                   <Select
                     value={agentId}
                     onValueChange={setAgentId}
                     options={[
-                      { value: 'all', label: 'All agents' },
+                      { value: 'all', label: t('obs.allAgents') },
                       ...agents.map((agent) => ({ value: agent.id, label: agent.name })),
                     ]}
                     className="mt-1 normal-case tracking-normal"
                   />
                 </label>
                 <label className="text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
-                  Status
+                  {t('obs.status')}
                   <Select<StatusFilter>
                     value={status}
                     onValueChange={setStatus}
                     options={STATUS_OPTIONS.map((s) => ({
                       value: s,
-                      label: s === 'all' ? 'All statuses' : STATUS_STYLE[s].label,
+                      label: s === 'all' ? t('obs.allStatuses') : t(STATUS_STYLE[s].key),
                     }))}
                     className="mt-1 normal-case tracking-normal"
                   />
@@ -1140,14 +1155,14 @@ export function ObservabilityView() {
               <Checkbox
                 checked={autoRefresh}
                 onCheckedChange={setAutoRefresh}
-                label="Auto refresh"
-                description="Keep the trace list live while this panel is open"
+                label={t('obs.autoRefresh')}
+                description={t('obs.autoRefreshSub')}
                 className="mt-3"
               />
             </>
           ) : (
             <label className="mt-4 block text-[10.5px] font-bold uppercase tracking-[0.12em] text-ink-400">
-              Agent workspace
+              {t('obs.agentWorkspace')}
               <Select
                 value={workspaceAgentId}
                 onValueChange={(next) => {
@@ -1157,7 +1172,7 @@ export function ObservabilityView() {
                 }}
                 options={agents.length > 0
                   ? agents.map((agent) => ({ value: agent.id, label: agent.name }))
-                  : [{ value: '', label: 'No agents yet', disabled: true }]}
+                  : [{ value: '', label: t('obs.noAgents'), disabled: true }]}
                 disabled={agents.length === 0}
                 className="mt-1 normal-case tracking-normal"
               />
@@ -1176,7 +1191,7 @@ export function ObservabilityView() {
           {panel === 'workspace' ? (
             workspaceFiles.length === 0 ? (
               <div className="grid h-full place-items-center px-8 text-center text-[13px] leading-[1.6] text-ink-400">
-                This agent workspace has no files yet.
+                {t('obs.workspaceEmpty')}
               </div>
             ) : (
               <FileTree
@@ -1191,7 +1206,7 @@ export function ObservabilityView() {
           ) : (
             runs.length === 0 ? (
               <div className="grid h-full place-items-center px-8 text-center text-[13px] leading-[1.6] text-ink-400">
-                No agent traces yet. Send a message to an agent conversation and the next wake will appear here.
+                {t('obs.noTraces')}
               </div>
             ) : (
               <div className="space-y-2">
@@ -1212,24 +1227,24 @@ export function ObservabilityView() {
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div className="min-w-0">
                   <h2 className="truncate font-display text-[24px] font-medium text-ink-900">
-                    {workspaceFile?.path ?? 'Agent Workspace'}
+                    {workspaceFile?.path ?? t('obs.workspaceHeaderFallback')}
                   </h2>
                   <div className="mt-1 flex flex-wrap items-center gap-2 font-mono text-[11px] text-ink-400">
-                    <span>{workspaceAgentId || 'no-agent'}</span>
+                    <span>{workspaceAgentId || t('obs.noAgentId')}</span>
                     {workspaceFile && (
                       <>
                         <span>/</span>
                         <span>{bytes(workspaceFile.size)}</span>
                         <span>/</span>
-                        <span>{workspaceFile.lineCount} lines</span>
+                        <span>{workspaceFile.lineCount} {t('obs.lines')}</span>
                         <span>/</span>
-                        <span>updated {relative(workspaceFile.updatedAt)}</span>
+                        <span>{t('obs.metaUpdatedAt', { time: relative(workspaceFile.updatedAt, t) })}</span>
                       </>
                     )}
                   </div>
                 </div>
                 <div className="rounded-[10px] border border-ink-100 bg-paper px-3 py-2">
-                  <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">Files</div>
+                  <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.workspaceFiles')}</div>
                   <div className="mt-1 font-mono text-[13px] text-ink-900">{workspaceFiles.length}</div>
                 </div>
               </div>
@@ -1244,7 +1259,7 @@ export function ObservabilityView() {
                 </article>
               ) : (
                 <div className="grid h-full place-items-center text-[13px] text-ink-400">
-                  Select a workspace file to inspect its contents.
+                  {t('obs.pickFile')}
                 </div>
               )}
             </div>
@@ -1266,7 +1281,7 @@ export function ObservabilityView() {
                         <span>/</span>
                         <span>{clock(selected.startedAt)}</span>
                         <span>/</span>
-                        <span>{selected.stage ?? 'idle'}</span>
+                        <span>{selected.stage ?? t('common.idle')}</span>
                       </div>
                     </div>
                   </div>
@@ -1278,19 +1293,19 @@ export function ObservabilityView() {
                 </div>
                 <div className="grid min-w-[360px] grid-cols-4 gap-2">
                   <div className="rounded-[10px] border border-ink-100 bg-paper px-3 py-2">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">Duration</div>
+                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.metaDuration')}</div>
                     <div className="mt-1 font-mono text-[13px] text-ink-900">{elapsed(selected.durationMs)}</div>
                   </div>
                   <div className="rounded-[10px] border border-ink-100 bg-paper px-3 py-2">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">Inbox</div>
+                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.metaInbox')}</div>
                     <div className="mt-1 font-mono text-[13px] text-ink-900">{selected.inboxCount}</div>
                   </div>
                   <div className="rounded-[10px] border border-ink-100 bg-paper px-3 py-2">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">Tools</div>
+                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.metaTools')}</div>
                     <div className="mt-1 font-mono text-[13px] text-ink-900">{selected.toolCallCount}</div>
                   </div>
                   <div className="rounded-[10px] border border-ink-100 bg-paper px-3 py-2">
-                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">Tokens</div>
+                    <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.metaTokens')}</div>
                     <div className="mt-1 font-mono text-[13px] text-ink-900">{selected.tokenCount}</div>
                   </div>
                 </div>
@@ -1299,7 +1314,7 @@ export function ObservabilityView() {
 
             <div className="min-h-0 overflow-auto px-6 py-5">
               {events.length === 0 ? (
-                <div className="grid h-full place-items-center text-[13px] text-ink-400">No events recorded for this run.</div>
+                <div className="grid h-full place-items-center text-[13px] text-ink-400">{t('obs.noEvents')}</div>
               ) : (
                 <div className="max-w-[1040px]">
                   {events.map((event) => (
@@ -1310,7 +1325,7 @@ export function ObservabilityView() {
             </div>
           </div>
         ) : (
-          <div className="grid h-full place-items-center text-[13px] text-ink-400">Select a run to inspect the timeline.</div>
+          <div className="grid h-full place-items-center text-[13px] text-ink-400">{t('obs.pickRun')}</div>
         )}
       </section>
     </main>

@@ -4,9 +4,11 @@
  * a fast double-click doesn't race the server.
  */
 import { useEffect, useState } from 'react'
+import { useT } from '@/lib/i18n'
 import { adminApi, type AdminSettings } from './api'
 
 export function SettingsPage() {
+  const t = useT()
   const [s, setS] = useState<AdminSettings | null>(null)
   const [busyKey, setBusyKey] = useState<keyof AdminSettings | null>(null)
   const [err, setErr] = useState<string | null>(null)
@@ -32,8 +34,8 @@ export function SettingsPage() {
     <div className="admin-page">
       <header className="admin-page-head">
         <div>
-          <h1 className="admin-h1">Settings</h1>
-          <div className="admin-sub">Global toggles. Changes apply instantly.</div>
+          <h1 className="admin-h1">{t('adminSettings.title')}</h1>
+          <div className="admin-sub">{t('adminSettings.sub')}</div>
         </div>
       </header>
 
@@ -41,16 +43,16 @@ export function SettingsPage() {
 
       <div className="admin-settings">
         <SettingRow
-          title="Waitlist"
-          desc="When ON, new OAuth signups land on the waitlist instead of creating an account. Existing users sign in normally. Bootstrap admins (env allow-list) bypass the gate."
+          title={t('adminSettings.waitlistTitle')}
+          desc={t('adminSettings.waitlistDesc')}
           on={!!s?.waitlist_enabled}
           busy={busyKey === 'waitlist_enabled'}
           disabled={!s}
           onToggle={() => void flip('waitlist_enabled')}
         />
         <SettingRow
-          title="Signups paused"
-          desc="When ON, the waitlist itself also stops accepting new entries — useful for emergencies (LLM bill spike, prod incident). Existing waitlist entries can still be approved."
+          title={t('adminSettings.signupsPausedTitle')}
+          desc={t('adminSettings.signupsPausedDesc')}
           on={!!s?.signups_paused}
           busy={busyKey === 'signups_paused'}
           disabled={!s}

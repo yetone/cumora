@@ -23,11 +23,13 @@ import { PollComposer } from '@/components/PollComposer'
 import { ScrollToLatestButton } from '@/components/ScrollToLatestButton'
 import { ISearch, IPin, IClip, IAt, ISmile, ISend, IConvene } from '@/components/icons'
 import type { Participant } from '@/types'
+import { useT } from '@/lib/i18n'
 
 /** Soft "Coming soon" popover anchored beneath the trigger. Auto-dismisses
  *  after a beat; also closes on outside-click or Escape. The sparkle
  *  drifts gently so the bubble feels alive rather than static. */
 function ComingSoonPop({ onClose }: { onClose: () => void }) {
+  const t = useT()
   useEffect(() => {
     // Defer outside-click + key listeners by one tick so the click that
     // opened the bubble doesn't immediately close it again.
@@ -69,9 +71,9 @@ function ComingSoonPop({ onClose }: { onClose: () => void }) {
             style={{ animation: 'cumora-sparkle-drift 2.4s ease-in-out infinite' }}
           >✨</span>
           <div className="min-w-0">
-            <div className="text-[12.5px] font-semibold text-ink-900 leading-tight">Coming soon</div>
+            <div className="text-[12.5px] font-semibold text-ink-900 leading-tight">{t('chat.comingSoon')}</div>
             <div className="text-[11.5px] text-ink-500 font-display italic leading-snug mt-0.5">
-              Live working sessions are still on the way.
+              {t('chat.conveneSoon')}
             </div>
           </div>
         </div>
@@ -97,6 +99,7 @@ function ChatHeader({
   onToggleSearch: () => void
   searchOpen: boolean
 }) {
+  const t = useT()
   void onConvene
   const c = useConversations((s) => s.list.find((x) => x.id === convoId))
   const byId = useParticipants((s) => s.byId)
@@ -204,7 +207,7 @@ function ChatHeader({
           ) : (
             <span
               className={cn('truncate', canRename && 'cursor-text hover:text-skype-deep transition')}
-              title={canRename ? 'Click to rename group' : c.title}
+              title={canRename ? t('chat.renameHint') : c.title}
               onClick={canRename ? startEditTitle : undefined}
             >{c.title}</span>
           )}
@@ -216,7 +219,7 @@ function ChatHeader({
                 color: c.projectColor ? 'white' : 'var(--ink-700)',
                 border: c.projectColor ? 'none' : '1px solid var(--ink-100)',
               }}
-              title={`Part of project: ${c.projectName}`}
+              title={t('chat.partOfProject', { name: c.projectName })}
             >{c.projectName}</span>
           )}
         </h2>
@@ -225,7 +228,7 @@ function ChatHeader({
           {humanCount > 0 && (
             <>
               <span className="w-1 h-1 rounded-full bg-ink-300 shrink-0" />
-              <span className="shrink-0">+ {humanCount === 1 ? 'you' : `${humanCount} humans`}</span>
+              <span className="shrink-0">+ {humanCount === 1 ? t('chat.youInHeader') : t('chat.humansCount', { n: humanCount })}</span>
             </>
           )}
           {!c.topic && !editingTopic && (
@@ -234,8 +237,8 @@ function ChatHeader({
               <button
                 onClick={startEditTopic}
                 className="text-ink-300 italic font-display hover:text-skype-deep transition shrink-0"
-                title="Set a topic"
-              >+ topic</button>
+                title={t('chat.setTopic')}
+              >{t('chat.addTopic')}</button>
             </>
           )}
         </div>
@@ -253,7 +256,7 @@ function ChatHeader({
               if (e.key === 'Enter') { e.preventDefault(); void saveTopic() }
               if (e.key === 'Escape') setEditingTopic(false)
             }}
-            placeholder="What's this group for?"
+            placeholder={t('chat.topicPlaceholder')}
             className="mt-0.5 w-full bg-transparent text-[12px] text-ink-700 italic placeholder:text-ink-300 outline-none border-b border-sky2-200 focus:border-skype-deep transition pb-0.5"
             maxLength={200}
           />
@@ -265,7 +268,7 @@ function ChatHeader({
             // final character. pr-1 + max-w-full keeps the layout
             // honest while leaving room for the slant.
             className="mt-0.5 text-[12px] text-ink-500 italic hover:text-skype-deep transition truncate text-left max-w-full font-display pr-1 block leading-[1.5]"
-            title="Click to edit topic"
+            title={t('chat.editTopic')}
           >
             {c.topic}
           </button>
@@ -283,7 +286,7 @@ function ChatHeader({
           'rounded-full transition hover:opacity-80 active:scale-95 shrink-0 hidden lg:block focus-visible:outline focus-visible:outline-2 focus-visible:outline-sky2-300',
           membersAnchor && 'opacity-100',
         )}
-        title="Show conversation members"
+        title={t('chat.showMembers')}
       >
         <AvatarStack ps={agentMembers} size={28} max={4} />
       </button>
@@ -301,8 +304,8 @@ function ChatHeader({
       <div className="flex gap-1 text-ink-500 shrink-0">
         <button
           onClick={onToggleSearch}
-          title="Search in this conversation"
-          aria-label="Search in this conversation"
+          title={t('chat.search')}
+          aria-label={t('chat.search')}
           className={cn(
             'w-9 h-9 rounded-[9px] hidden md:grid place-items-center transition',
             searchOpen ? 'bg-sky2-100 text-skype-deep' : 'hover:bg-sky2-50 hover:text-skype-deep',
@@ -326,8 +329,8 @@ function ChatHeader({
               }))
             }
           }}
-          title={c.pinned ? 'Unpin from top' : 'Pin to top'}
-          aria-label={c.pinned ? 'Unpin from top' : 'Pin to top'}
+          title={c.pinned ? t('chat.unpinFromTop') : t('chat.pinToTop')}
+          aria-label={c.pinned ? t('chat.unpinFromTop') : t('chat.pinToTop')}
           className={cn(
             'w-9 h-9 rounded-[9px] hidden md:grid place-items-center transition',
             c.pinned ? 'bg-gold/15 text-gold-deep' : 'hover:bg-sky2-50 hover:text-skype-deep',
@@ -338,12 +341,12 @@ function ChatHeader({
         <div className="relative">
           <button
             onClick={() => setShowConveneSoon((v) => !v)}
-            title="Convene"
+            title={t('chat.convene')}
             className="px-3.5 inline-flex items-center gap-1.5 font-semibold text-[12.5px] rounded-full text-white"
             style={{ height: 36, background: 'var(--skype)', boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.5)' }}
           >
             <IConvene className="w-4 h-4" />
-            <span>Convene</span>
+            <span>{t('chat.convene')}</span>
           </button>
           {showConveneSoon && (
             <ComingSoonPop onClose={() => setShowConveneSoon(false)} />
@@ -372,6 +375,7 @@ function readInitialEmojiTab(): EmojiTab {
 }
 
 function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClose: () => void }) {
+  const t = useT()
   const ref = useRef<HTMLDivElement | null>(null)
   // Remember the last-used tab across opens (and across app restarts).
   // The persisted choice survives reloads — most users settle into one
@@ -415,7 +419,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
               'flex-1 text-[11px] font-semibold uppercase tracking-wider py-1 rounded-[6px] transition',
               tab === k ? 'bg-sky2-100 text-skype-deep' : 'text-ink-500 hover:bg-sky2-50',
             )}
-          >{k === 'std' ? 'Standard' : 'Skype'}</button>
+          >{k === 'std' ? t('chat.emojiStandard') : t('chat.emojiSkype')}</button>
         ))}
       </div>
       {tab === 'std' ? (
@@ -556,6 +560,7 @@ export function Composer({
   threadRootId?: string | null
   placeholder?: string
 }) {
+  const t = useT()
   const isThread = threadRootId !== null
   // Draft scope key — distinct namespace for thread mode so swapping between
   // the main composer and a thread drawer doesn't share text.
@@ -846,8 +851,8 @@ export function Composer({
   const slashCommands = useMemo<SlashCommand[]>(() => [
     {
       id: 'poll',
-      label: 'Poll',
-      hint: '发起一次投票，agents 和人都能参与',
+      label: t('chat.slashPoll'),
+      hint: t('chat.slashPollHint'),
       keywords: ['poll', 'vote', '投票', 'p'],
       run: () => openPollComposer(),
     },
@@ -1035,12 +1040,12 @@ export function Composer({
             <button
               onClick={() => setAttachment(null)}
               className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
-              aria-label="Remove attachment"
+              aria-label={t('chat.removeAttachment')}
             >×</button>
           </div>
         )}
         {uploading && (
-          <div className="mb-2 text-[11.5px] text-ink-500 italic">uploading…</div>
+          <div className="mb-2 text-[11.5px] text-ink-500 italic">{t('chat.uploading')}</div>
         )}
         {uploadError && (
           <div className="mb-2 text-[11.5px] py-1 px-2 rounded-md text-coral-deep bg-coral-soft inline-block max-w-full truncate">
@@ -1052,7 +1057,7 @@ export function Composer({
             <div className="w-[3px] rounded bg-skype shrink-0" />
             <div className="min-w-0 flex-1 flex flex-col gap-0.5">
               <div className="text-[10.5px] font-bold uppercase tracking-wider text-skype-deep">
-                Replying to {byId[replyingToMsg?.authorId ?? '']?.name ?? replyingToMsg?.authorId ?? '…'}
+                {t('chat.replyingTo', { name: byId[replyingToMsg?.authorId ?? '']?.name ?? replyingToMsg?.authorId ?? '…' })}
               </div>
               {/* CJK text has no whitespace, so `truncate` (white-space: nowrap)
                   blocks any soft break and the flex item's min-content equals
@@ -1066,14 +1071,14 @@ export function Composer({
               >
                 {replyingToMsg
                   ? <PreviewText body={replyingToMsg.body.slice(0, 140).replace(/\n/g, ' ')} />
-                  : '(loading…)'}
+                  : t('chat.replyingToLoading')}
               </div>
             </div>
             <button
               onClick={() => setReplyingTo(convoId, null)}
               className="w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0 self-center"
-              aria-label="Cancel reply"
-              title="Cancel reply (Esc)"
+              aria-label={t('chat.cancelReply')}
+              title={t('chat.cancelReplyEsc')}
             >×</button>
           </div>
         )}
@@ -1081,8 +1086,8 @@ export function Composer({
           <RichInput
             ref={editorRef}
             defaultValue={draft}
-            placeholder={placeholder ?? 'Message the team. Type @ to summon, drop a file to attach.'}
-            ariaLabel="Message composer"
+            placeholder={placeholder ?? t('chat.composerPlaceholder')}
+            ariaLabel={t('chat.composerAriaLabel')}
             className="rich-input whitespace-pre-wrap w-full bg-transparent text-[14px] text-ink-900 leading-[1.5]"
             style={{ minHeight: '1.5em' }}
             maxHeight={200}
@@ -1098,7 +1103,7 @@ export function Composer({
               const p = byId[id]
               if (!p) return null
               return {
-                name: p.id === meId ? 'you' : p.name,
+                name: p.id === meId ? t('chat.youInHeader') : p.name,
                 initial: p.initial || p.name.charAt(0).toUpperCase(),
                 avatarBg: typeof p.avatarBg === 'string' ? p.avatarBg : 'var(--ink-300)',
                 kind: p.kind,
@@ -1115,7 +1120,7 @@ export function Composer({
               onMouseDown={(e) => e.preventDefault()}
             >
               <div className="px-3 pt-1.5 pb-1 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">
-                Slash command {slashQuery ? `· "/${slashQuery}"` : ''}
+                {slashQuery ? t('chat.slashCommandTitleQuery', { query: slashQuery }) : t('chat.slashCommandTitle')}
               </div>
               {filteredSlashCommands.map((cmd, i) => {
                 const active = i === slashIndex
@@ -1155,7 +1160,7 @@ export function Composer({
               onMouseDown={(e) => e.preventDefault()}
             >
               <div className="px-3 pt-1.5 pb-1 text-[10px] font-bold uppercase tracking-[0.12em] text-ink-300">
-                Mention {mention.query ? `· "${mention.query}"` : ''}
+                {mention.query ? t('chat.mentionTitleQuery', { query: mention.query }) : t('chat.mentionTitle')}
               </div>
               {filteredMentions.map((entry, i) => {
                 const active = i === mentionIndex
@@ -1177,8 +1182,8 @@ export function Composer({
                         className="w-[26px] h-[26px] rounded-full object-cover"
                       />
                       <div className="flex-1 min-w-0">
-                        <div className="text-[12.5px] font-semibold text-ink-900 truncate">Everyone</div>
-                        <div className="text-[10.5px] text-ink-500 truncate">Notify all members of this room</div>
+                        <div className="text-[12.5px] font-semibold text-ink-900 truncate">{t('chat.everyone')}</div>
+                        <div className="text-[10.5px] text-ink-500 truncate">{t('chat.everyoneHint')}</div>
                       </div>
                     </button>
                   )
@@ -1220,13 +1225,13 @@ export function Composer({
           <button
             onClick={() => fileRef.current?.click()}
             className="w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition"
-            title="Attach file"
+            title={t('chat.attachFile')}
           ><IClip className="w-[17px] h-[17px]" /></button>
           <button
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => insertAtCursor('@')}
             className="w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition"
-            title="Mention"
+            title={t('chat.mention')}
           ><IAt className="w-[17px] h-[17px]" /></button>
           <div className="relative">
             <button
@@ -1235,7 +1240,7 @@ export function Composer({
                 'w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition',
                 emojiOpen && 'bg-sky2-50 text-skype-deep',
               )}
-              title="Emoji"
+              title={t('chat.emoji')}
             ><ISmile className="w-[17px] h-[17px]" /></button>
             {emojiOpen && (
               <EmojiPopover
@@ -1253,7 +1258,7 @@ export function Composer({
               boxShadow: canSend ? '0 4px 12px -3px rgba(0, 168, 240, 0.5)' : 'none',
             }}
           >
-            Send <ISend className="w-3.5 h-3.5" strokeWidth={2} />
+            {t('chat.send')} <ISend className="w-3.5 h-3.5" strokeWidth={2} />
           </button>
         </div>
       </div>
@@ -1262,6 +1267,7 @@ export function Composer({
 }
 
 function ThreadLoader() {
+  const t = useT()
   return (
     <div
       className="grid place-items-center py-16"
@@ -1293,7 +1299,7 @@ function ThreadLoader() {
           </div>
         </div>
         <div className="font-display italic text-[13px] text-ink-500 tracking-tight">
-          Gathering messages…
+          {t('chat.gathering')}
         </div>
       </div>
     </div>
@@ -1301,6 +1307,7 @@ function ThreadLoader() {
 }
 
 function ThreadError({ message, onRetry }: { message: string; onRetry: () => void }) {
+  const t = useT()
   const [retrying, setRetrying] = useState(false)
   const handleRetry = async () => {
     if (retrying) return
@@ -1337,7 +1344,7 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
           </svg>
         </div>
         <div className="font-display font-medium text-[15px] tracking-tight text-ink-700">
-          Couldn't load messages
+          {t('chat.loadFailed')}
         </div>
         <div className="text-[12.5px] text-ink-500 leading-relaxed break-words">
           {message}
@@ -1354,7 +1361,7 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
           {retrying ? (
             <>
               <span className="w-3 h-3 rounded-full border-2 border-white/40 border-t-white animate-spin" />
-              Retrying…
+              {t('chat.retrying')}
             </>
           ) : (
             <>
@@ -1364,7 +1371,7 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
                   stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"
                 />
               </svg>
-              Try again
+              {t('chat.tryAgain')}
             </>
           )}
         </button>
@@ -1374,6 +1381,7 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
 }
 
 function EmptyConversationState() {
+  const t = useT()
   // Live counts pulled straight from the store so the empty stage carries
   // one tiny piece of "alive" data at the bottom — matches the inline
   // italic counter pattern in WhispersView's sidebar header.
@@ -1506,7 +1514,7 @@ function EmptyConversationState() {
                 <button
                   type="button"
                   onClick={onCloudPoke}
-                  aria-label="Hello cloud"
+                  aria-label={t('chat.helloCloud')}
                   className="cumora-cloud-poke group block w-full h-full cursor-pointer p-0 border-0 bg-transparent focus:outline-none"
                   style={{
                     // Silky-spring transition. The hover-state CSS rule
@@ -1643,22 +1651,22 @@ function EmptyConversationState() {
               className="font-display font-medium text-[28px] text-ink-900 leading-[1.12]"
               style={{ letterSpacing: '-0.025em' }}
             >
-              Pick up where you left off
+              {t('chat.emptyTitle')}
             </h2>
             <p className="mt-2.5 font-display italic text-[14px] text-ink-500 leading-relaxed max-w-[360px]">
-              Choose a thread on the left to slip back in.
+              {t('chat.emptySub')}
             </p>
 
             {total > 0 && (
               <div className="mt-6 text-[12px] text-ink-400 font-display italic flex items-center gap-1.5">
                 <span className="text-gold leading-none not-italic" style={{ fontSize: 10 }}>★</span>
                 <b className="not-italic text-ink-700 font-semibold tabular-nums">{total}</b>
-                <span>{total === 1 ? 'thread waiting' : 'threads waiting'}</span>
+                <span>{t(total === 1 ? 'chat.threadWaiting' : 'chat.threadsWaiting')}</span>
                 {unread > 0 && (
                   <>
                     <span className="text-ink-200" aria-hidden>·</span>
                     <b className="not-italic text-coral-deep font-semibold tabular-nums">{unread}</b>
-                    <span>unread</span>
+                    <span>{t('chat.unread')}</span>
                   </>
                 )}
               </div>
@@ -1671,6 +1679,7 @@ function EmptyConversationState() {
 }
 
 export function ChatPane() {
+  const t = useT()
   const convoId = useApp((s) => s.selectedConversationId)
   const setView = useApp((s) => s.setView)
   // Atomic selectors — primitive / stable refs
@@ -1949,12 +1958,12 @@ export function ChatPane() {
                 if ((e.key === 'Enter' && e.shiftKey) || e.key === 'ArrowUp') { e.preventDefault(); setMatchIdx((i) => (i - 1 + n) % n); return }
                 if (e.key === 'ArrowDown') { e.preventDefault(); setMatchIdx((i) => (i + 1) % n) }
               }}
-              placeholder="Search in this conversation…"
+              placeholder={t('chat.searchPlaceholder')}
               className="flex-1 min-w-0 bg-transparent outline-none text-ink-900 placeholder:text-ink-300"
             />
             <span className="shrink-0 font-mono text-[11px] tabular-nums text-ink-300">
               {matchedIds.length === 0
-                ? (searchQuery.trim() ? 'no matches' : '')
+                ? (searchQuery.trim() ? t('chat.searchNoMatch') : '')
                 : `${matchIdx + 1} / ${matchedIds.length}`}
             </span>
           </div>
@@ -1962,7 +1971,7 @@ export function ChatPane() {
             type="button"
             onClick={() => setMatchIdx((i) => (i - 1 + matchedIds.length) % Math.max(1, matchedIds.length))}
             disabled={matchedIds.length === 0}
-            title="Previous match (Shift+Enter / ↑)"
+            title={t('chat.prevMatch')}
             className="w-8 h-8 rounded-[8px] grid place-items-center text-ink-500 hover:bg-sky2-50 hover:text-skype-deep transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-ink-500"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
@@ -1973,7 +1982,7 @@ export function ChatPane() {
             type="button"
             onClick={() => setMatchIdx((i) => (i + 1) % Math.max(1, matchedIds.length))}
             disabled={matchedIds.length === 0}
-            title="Next match (Enter / ↓)"
+            title={t('chat.nextMatch')}
             className="w-8 h-8 rounded-[8px] grid place-items-center text-ink-500 hover:bg-sky2-50 hover:text-skype-deep transition disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-ink-500"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="w-4 h-4">
@@ -1983,7 +1992,7 @@ export function ChatPane() {
           <button
             type="button"
             onClick={() => { setSearchOpen(false); setSearchQuery('') }}
-            title="Close (Esc)"
+            title={t('chat.closeEsc')}
             className="w-8 h-8 rounded-[8px] grid place-items-center text-ink-500 hover:bg-sky2-50 transition"
           >
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" className="w-4 h-4">
@@ -2031,12 +2040,12 @@ export function ChatPane() {
                 <div className="px-6 pt-6 flex flex-col gap-2">
                   {hasMoreOlder ? (
                     <div className="self-center py-1 px-2.5 rounded-full text-[10.5px] font-medium text-ink-400">
-                      {loadingOlder ? 'Loading earlier…' : ' '}
+                      {loadingOlder ? t('chat.loadingEarlier') : ' '}
                     </div>
                   ) : (
                     <div className="flex items-center gap-3 text-ink-300 text-[11px] font-bold tracking-[0.08em] uppercase">
                       <span className="flex-1 h-px bg-gradient-to-r from-transparent via-ink-100 to-transparent" />
-                      Beginning
+                      {t('chat.beginning')}
                       <span className="flex-1 h-px bg-gradient-to-r from-transparent via-ink-100 to-transparent" />
                     </div>
                   )}

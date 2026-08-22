@@ -21,6 +21,7 @@ import { DocumentsView } from './DocumentsView'
 import { ObservabilityView } from './ObservabilityView'
 import { MeView } from './MeView'
 import { EmailComposer } from '@/components/EmailComposer'
+import { useT } from '@/lib/i18n'
 
 const ShippingView = lazy(() => import('./ShippingView').then((module) => ({ default: module.ShippingView })))
 
@@ -61,6 +62,7 @@ function ConversationsLayout() {
 }
 
 export function DesktopApp() {
+  const t = useT()
   const view = useApp((s) => s.view)
   const setView = useApp((s) => s.setView)
   const devtoolsEnabled = useDevtools((s) => s.enabled)
@@ -105,7 +107,7 @@ export function DesktopApp() {
         {view === 'boards' && <BoardsView />}
         {view === 'calendar' && <CalendarView />}
         {view === 'documents' && <DocumentsView />}
-        {view === 'shipping' && <Suspense fallback={<div className="h-full grid place-items-center text-sm text-ink-400">Opening Ship…</div>}><ShippingView /></Suspense>}
+        {view === 'shipping' && <Suspense fallback={<div className="h-full grid place-items-center text-sm text-ink-400">{t('desktop.openingShip')}</div>}><ShippingView /></Suspense>}
         {view === 'observability' && devtoolsEnabled && <ObservabilityView />}
         {view === 'me' && <MeView />}
       </div>

@@ -16,6 +16,7 @@
  * - Soft de-dup: never toast messages authored by the current user.
  */
 import { useEffect, useRef, useState } from 'react'
+import { useT } from '@/lib/i18n'
 import { ws } from '@/api/client'
 import { useApp } from '@/stores/app'
 import { useMe } from '@/stores/auth'
@@ -347,6 +348,7 @@ export function NotificationToasts() {
 }
 
 function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () => void; onDismiss: () => void }) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const author = byId[toast.authorId]
   const [hovered, setHovered] = useState(false)
@@ -412,7 +414,7 @@ function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () =>
               {toast.kind === 'calendar.reminder' ? toast.conversationTitle : (author?.name ?? toast.authorId)}
             </span>
             <span className="text-[10.5px] text-ink-300 italic font-display truncate">
-              {toast.kind === 'calendar.reminder' ? 'Calendar reminder' : toast.conversationTitle}
+              {toast.kind === 'calendar.reminder' ? t('notif.calendarReminder') : toast.conversationTitle}
             </span>
             {toast.count > 1 && (
               <span

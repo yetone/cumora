@@ -31,6 +31,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Select } from '@/components/Select'
 import { Combobox } from '@/components/Combobox'
+import { useLocale, useT, tLabel, type MessageKey } from '@/lib/i18n'
 import {
   adminApi,
   type LlmCallPurpose,
@@ -77,6 +78,43 @@ const PURPOSE_META: Record<LlmCallPurpose, PurposeMeta> = {
   'gender':               { label: 'Gender inference',   blurb: 'Avatar-pipeline gender pick.',                                swatch: '#BA8418' },
   'avatar-image':         { label: 'Avatar image',       blurb: 'Image gen at agent creation / regeneration.',                 swatch: '#D49520' },
   'agent-image':          { label: 'Agent image tool',   blurb: 'Image gen invoked by an agent mid-turn.',                     swatch: '#E8A030' },
+}
+
+// i18n: parallel lookup tables for the 12 LlmCallPurpose values. The
+// original PURPOSE_META keeps English text as the fallback so existing
+// product copy keeps rendering even if a key is missing. These tables
+// just give t() a MessageKey to resolve; the underlying data shape
+// (label/blurb/swatch) is untouched, so author edits to PURPOSE_META
+// stay in sync automatically.
+const PURPOSE_LABEL_KEY: Record<LlmCallPurpose, MessageKey> = {
+  'agent-turn':           'adminobs.purposeAgentTurn',
+  'convene-speech':       'adminobs.purposeConveneSpeech',
+  'inbox-triage':         'adminobs.purposeInboxTriage',
+  'synthetic-wake-gate':  'adminobs.purposeSyntheticWakeGate',
+  'agenda':               'adminobs.purposeAgenda',
+  'compaction':           'adminobs.purposeCompaction',
+  'completion-verify':    'adminobs.purposeCompletionVerify',
+  'steer-summary':        'adminobs.purposeSteerSummary',
+  'convene-decision':     'adminobs.purposeConveneDecision',
+  'palette':              'adminobs.purposePalette',
+  'gender':               'adminobs.purposeGender',
+  'avatar-image':         'adminobs.purposeAvatarImage',
+  'agent-image':          'adminobs.purposeAgentImage',
+}
+const PURPOSE_BLURB_KEY: Record<LlmCallPurpose, MessageKey> = {
+  'agent-turn':           'adminobs.purposeAgentTurnBlurb',
+  'convene-speech':       'adminobs.purposeConveneSpeechBlurb',
+  'inbox-triage':         'adminobs.purposeInboxTriageBlurb',
+  'synthetic-wake-gate':  'adminobs.purposeSyntheticWakeGateBlurb',
+  'agenda':               'adminobs.purposeAgendaBlurb',
+  'compaction':           'adminobs.purposeCompactionBlurb',
+  'completion-verify':    'adminobs.purposeCompletionVerifyBlurb',
+  'steer-summary':        'adminobs.purposeSteerSummaryBlurb',
+  'convene-decision':     'adminobs.purposeConveneDecisionBlurb',
+  'palette':              'adminobs.purposePaletteBlurb',
+  'gender':               'adminobs.purposeGenderBlurb',
+  'avatar-image':         'adminobs.purposeAvatarImageBlurb',
+  'agent-image':          'adminobs.purposeAgentImageBlurb',
 }
 
 const FALLBACK_SWATCH = '#94A8BC'
@@ -147,6 +185,14 @@ const REFRESH_INTERVALS: Array<{ label: string; ms: number }> = [
   { label: 'Every 1m',  ms: 60_000 },
   { label: 'Every 5m',  ms: 300_000 },
 ]
+// i18n lookup by ms cadence. English label stays as fallback for any
+// future cadence the author adds before we have a key wired up.
+const REFRESH_LABEL_KEY: Record<number, MessageKey> = {
+  0:       'adminobs.refreshOff',
+  30000:  'adminobs.refresh30s',
+  60000:  'adminobs.refresh1m',
+  300000: 'adminobs.refresh5m',
+}
 
 // ─── Source filter ───────────────────────────────────────────────────────
 //
@@ -167,7 +213,23 @@ const SOURCE_FILTERS: Array<{ key: SourceFilter; label: string }> = [
   { key: 'cloud', label: 'Cloud' },
   { key: 'byoa',  label: 'BYOA' },
 ]
+// i18n lookup by SourceFilter key.
+const SOURCE_LABEL_KEY: Record<SourceFilter, MessageKey> = {
+  'all':   'adminobs.sourceAll',
+  'cloud': 'adminobs.sourceCloud',
+  'byoa':  'adminobs.sourceByoa',
+}
 const isByoaSource = (s: string): boolean => s.startsWith('byoa-')
+
+// i18n helpers — shared by the page and its module-scope card/table
+// components. `tLabel` prefers the translated key but always falls back to
+// the inline English source-of-truth, so upstream copy edits keep rendering
+// even before a translation lands.
+type TFn = ReturnType<typeof useT>
+const purposeLabel = (t: TFn, p: LlmCallPurpose | string): string =>
+  tLabel(t, (PURPOSE_LABEL_KEY as Partial<Record<string, MessageKey>>)[p], metaFor(p).label)
+const purposeBlurb = (t: TFn, p: LlmCallPurpose | string): string =>
+  tLabel(t, (PURPOSE_BLURB_KEY as Partial<Record<string, MessageKey>>)[p], metaFor(p).blurb)
 
 // ─── Component ───────────────────────────────────────────────────────────
 
@@ -182,6 +244,7 @@ type DrillDown =
   | { kind: 'agent'; agentId: string; agentName: string | null }
 
 export function ObservabilityPage() {
+  const t = useT()
   const [sinceDays, setSinceDays] = useState<number>(30)
   const [modelFilter, setModelFilter] = useState<string>('')
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all')
@@ -281,16 +344,16 @@ export function ObservabilityPage() {
     <div className="admin-page obs-page">
       <header className="admin-page-head">
         <div>
-          <h1 className="admin-h1">Observability</h1>
+          <h1 className="admin-h1">{t('adminobs.title')}</h1>
           <div className="admin-sub">
-            Every LLM call — cloud AND BYOA — attributed to the business logic that spent it.
+            {t('adminobs.subtitle')}
             {data?.summary && (
-              <> Window: last {data.summary.sinceDays}d · {fmtInt(data.summary.activeTenants)} active tenants.</>
+              <> {t('adminobs.windowSummary', { sinceDays: data.summary.sinceDays, activeTenants: fmtInt(data.summary.activeTenants) })}</>
             )}
           </div>
         </div>
         <div className="admin-filters obs-filters">
-          <div className="obs-pills" role="tablist" aria-label="Time range">
+          <div className="obs-pills" role="tablist" aria-label={t('adminobs.rangeAria')}>
             {RANGES.map((r) => (
               <button
                 key={r.days}
@@ -301,7 +364,7 @@ export function ObservabilityPage() {
               >{r.label}</button>
             ))}
           </div>
-          <div className="obs-pills" role="tablist" aria-label="Source">
+          <div className="obs-pills" role="tablist" aria-label={t('adminobs.sourceAria')}>
             {SOURCE_FILTERS.map((s) => (
               <button
                 key={s.key}
@@ -309,12 +372,12 @@ export function ObservabilityPage() {
                 aria-selected={sourceFilter === s.key}
                 className={`obs-pill${sourceFilter === s.key ? ' is-active' : ''}`}
                 onClick={() => setSourceFilter(s.key)}
-              >{s.label}</button>
+              >{tLabel(t, SOURCE_LABEL_KEY[s.key], s.label)}</button>
             ))}
           </div>
           {/* Unit toggle — $ are seeded estimates; tokens are the platform-
               neutral truth (the whole reason BYOA can't trust the $). */}
-          <div className="obs-pills" role="tablist" aria-label="Unit">
+          <div className="obs-pills" role="tablist" aria-label={t('adminobs.unitAria')}>
             {UNITS.map((u) => (
               <button
                 key={u.key}
@@ -322,13 +385,13 @@ export function ObservabilityPage() {
                 aria-selected={unit === u.key}
                 className={`obs-pill${unit === u.key ? ' is-active' : ''}`}
                 onClick={() => setUnit(u.key)}
-                title={u.key === 'usd' ? 'Cost in USD — seeded per-model estimates, not your real platform rate' : 'Raw token counts — exact, platform-independent'}
-              >{u.label}</button>
+                title={u.key === 'usd' ? t('adminobs.unitUsdTitle') : t('adminobs.unitTokensTitle')}
+              >{u.key === 'usd' ? tLabel(t, 'adminobs.unitUsd', u.label) : tLabel(t, 'adminobs.unitTokens', u.label)}</button>
             ))}
           </div>
           <input
             className="admin-input obs-model-input"
-            placeholder="Filter model (e.g. gpt-5.4-mini)"
+            placeholder={t('adminobs.modelPh')}
             value={modelFilter}
             onChange={(e) => setModelFilter(e.target.value)}
           />
@@ -337,6 +400,7 @@ export function ObservabilityPage() {
             value={companyFilter}
             unit={unit}
             onChange={setCompanyFilter}
+            t={t}
           />
           {/* Refresh controls — manual button + auto-refresh cadence. Both force
               a fresh (cache-bypassing) re-fetch with the CURRENT filters. */}
@@ -346,58 +410,58 @@ export function ObservabilityPage() {
               className="obs-refresh-btn"
               onClick={triggerRefresh}
               disabled={refreshing}
-              title={lastUpdated ? `Last updated ${new Date(lastUpdated).toLocaleTimeString()} — click to refresh` : 'Refresh'}
-              aria-label="Refresh now"
+              title={lastUpdated ? t('adminobs.refreshedTitle', { time: new Date(lastUpdated).toLocaleTimeString() }) : t('adminobs.refreshTitle')}
+              aria-label={t('adminobs.refreshAria')}
             >
               <span className={`obs-refresh-icon${refreshing ? ' is-spinning' : ''}`} aria-hidden>↻</span>
             </button>
             <Select
               value={String(autoRefreshMs)}
               onValueChange={(v) => setAutoRefreshMs(Number(v))}
-              options={REFRESH_INTERVALS.map((r) => ({ value: String(r.ms), label: r.label }))}
-              ariaLabel="Auto-refresh interval"
+              options={REFRESH_INTERVALS.map((r) => ({ value: String(r.ms), label: tLabel(t, REFRESH_LABEL_KEY[r.ms], r.label) }))}
+              ariaLabel={tLabel(t, 'adminobs.autoRefreshAria', 'Auto-refresh interval')}
               className="min-w-[150px]"
             />
           </div>
         </div>
         {lastUpdated && (
           <div className="obs-updated" aria-live="polite">
-            Updated {new Date(lastUpdated).toLocaleTimeString()}
-            {autoRefreshMs > 0 && <> · auto every {REFRESH_INTERVALS.find((r) => r.ms === autoRefreshMs)?.label.replace('Every ', '')}</>}
-            {refreshing && <> · refreshing…</>}
+            {t('adminobs.updatedAt', { time: new Date(lastUpdated).toLocaleTimeString() })}
+            {autoRefreshMs > 0 && <> · {t('adminobs.autoEvery', { label: (() => { const found = REFRESH_INTERVALS.find((r) => r.ms === autoRefreshMs); return found ? tLabel(t, REFRESH_LABEL_KEY[found.ms], found.label).replace(/^(Every |每 )/, '') : '' })() })}</>}
+            {refreshing && <> · {t('adminobs.refreshing')}</>}
           </div>
         )}
       </header>
 
-      {error && <div className="obs-error">Failed to load: {error}</div>}
+      {error && <div className="obs-error">{t('adminobs.loadFailed', { error })}</div>}
 
       {/* Hero KPIs — paper-toned, with one richly-treated "Spend" tile as
           the visual anchor. The four cards always render so the page doesn't
           jump around between loading / loaded states. */}
       <section className="obs-hero">
-        <HeroSpendCard summary={data?.summary} unit={unit} loading={loading} />
+        <HeroSpendCard summary={data?.summary} unit={unit} loading={loading} t={t} />
         <HeroStatCard
-          label="Total calls"
+          label={t('adminobs.totalCalls')}
           value={data?.summary ? fmtInt(data.summary.totalCalls) : '—'}
           sub={data?.summary
-            ? `${fmtInt(data.summary.rateLimitedCalls)} rate-limited`
+            ? t('adminobs.rateLimitedSub', { n: fmtInt(data.summary.rateLimitedCalls) })
             : ' '}
           loading={loading}
         />
         <HeroStatCard
-          label="Top burner"
-          value={topBurner ? metaFor(topBurner.purpose).label : '—'}
+          label={t('adminobs.topBurner')}
+          value={topBurner ? purposeLabel(t, topBurner.purpose) : '—'}
           sub={topBurner
-            ? `${fmtAmount(unit, topBurner.usd, topBurner.tokens)} of the window`
+            ? t('adminobs.ofWindow', { amount: fmtAmount(unit, topBurner.usd, topBurner.tokens) })
             : ' '}
           accent={topBurner ? metaFor(topBurner.purpose).swatch : undefined}
           loading={loading}
         />
         <HeroStatCard
-          label="Failure rate"
+          label={t('adminobs.failureRate')}
           value={data?.summary ? fmtPct(data.summary.failureRate) : '—'}
           sub={data?.summary
-            ? `${fmtTokens(data.summary.totalOutputTokens)} out · ${fmtTokens(data.summary.totalCachedInputTokens)} cached in`
+            ? t('adminobs.failSub', { out: fmtTokens(data.summary.totalOutputTokens), cached: fmtTokens(data.summary.totalCachedInputTokens) })
             : ' '}
           accent={data?.summary && data.summary.failureRate > 0.05 ? 'var(--coral-deep)' : undefined}
           loading={loading}
@@ -410,27 +474,27 @@ export function ObservabilityPage() {
       <section className="obs-card obs-trend-card">
         <div className="obs-card-head">
           <div>
-            <div className="obs-card-title">{unit === 'usd' ? 'Daily cost by purpose' : 'Daily input tokens by purpose'}</div>
-            <div className="obs-card-sub">UTC days · stacked by purpose · {modelFilter ? `model = ${modelFilter}` : 'all models'}{unit !== 'usd' && ' · cached + uncached input'}</div>
+            <div className="obs-card-title">{unit === 'usd' ? t('adminobs.trendCostTitle') : t('adminobs.trendTokensTitle')}</div>
+            <div className="obs-card-sub">{t('adminobs.trendSub', { modelPart: modelFilter ? t('adminobs.trendSubModel', { model: modelFilter }) : t('adminobs.trendSubAllModels'), tokenPart: unit !== 'usd' ? t('adminobs.trendSubTokens') : '' })}</div>
           </div>
         </div>
-        <TrendChart buckets={data?.trend ?? []} unit={unit} loading={loading} />
+        <TrendChart buckets={data?.trend ?? []} unit={unit} loading={loading} t={t} />
         <PurposeLegend rollup={filtered?.rollup ?? []} unit={unit} />
       </section>
 
       {/* Cache health — the single biggest optimization vector. Every uncached
           input token costs ~10× the cached rate; this card tells the operator
           how much they're leaving on the table and which purpose to target. */}
-      <CacheHealthCard summary={data?.summary} trend={data?.trend ?? []} rollup={filtered?.rollup ?? []} unit={unit} loading={loading} />
+      <CacheHealthCard summary={data?.summary} trend={data?.trend ?? []} rollup={filtered?.rollup ?? []} unit={unit} loading={loading} t={t} />
 
       {/* Per-purpose rollup. The reason this page exists. */}
       <section className="obs-card">
         <div className="obs-card-head">
           <div>
-            <div className="obs-card-title">{unit === 'usd' ? 'Spend' : 'Tokens'} by purpose × model × source</div>
+            <div className="obs-card-title">{t('adminobs.rollupTitle', { unit: unit === 'usd' ? t('adminobs.spendLabel') : t('adminobs.tokensLabel') })}</div>
             <div className="obs-card-sub">
-              Sorted by {unit === 'usd' ? 'cost' : 'tokens'} desc · click a column to re-sort
-              {sourceFilter !== 'all' && <> · filtered to <strong>{SOURCE_FILTERS.find((s) => s.key === sourceFilter)?.label}</strong></>}
+              {t('adminobs.rollupSub', { unit: unit === 'usd' ? t('adminobs.spendLabel') : t('adminobs.tokensLabel') })}
+              {sourceFilter !== 'all' && <> · {t('adminobs.rollupFiltered', { label: (() => { const found = SOURCE_FILTERS.find((s) => s.key === sourceFilter); return found ? tLabel(t, SOURCE_LABEL_KEY[found.key], found.label) : '' })() })}</>}
             </div>
           </div>
         </div>
@@ -439,6 +503,7 @@ export function ObservabilityPage() {
           unit={unit}
           loading={loading}
           onDrill={(r) => setDrill({ kind: 'bucket', purpose: r.purpose, model: r.model, source: r.source })}
+          t={t}
         />
       </section>
 
@@ -448,8 +513,8 @@ export function ObservabilityPage() {
       <section className="obs-card">
         <div className="obs-card-head">
           <div>
-            <div className="obs-card-title">Top spenders</div>
-            <div className="obs-card-sub">By agent · top 20 over the window</div>
+            <div className="obs-card-title">{t('adminobs.topSpendersTitle')}</div>
+            <div className="obs-card-sub">{t('adminobs.topSpendersSub')}</div>
           </div>
         </div>
         <TopAgentsTable
@@ -457,6 +522,7 @@ export function ObservabilityPage() {
           unit={unit}
           loading={loading}
           onDrill={(r) => r.agentId && setDrill({ kind: 'agent', agentId: r.agentId, agentName: r.agentName })}
+          t={t}
         />
       </section>
 
@@ -468,14 +534,15 @@ export function ObservabilityPage() {
       <section className="obs-card">
         <div className="obs-card-head">
           <div>
-            <div className="obs-card-title">By daemon version</div>
-            <div className="obs-card-sub">Spend × cache behaviour per agent-cli release · drill into a row to see its calls</div>
+            <div className="obs-card-title">{t('adminobs.daemonTitle')}</div>
+            <div className="obs-card-sub">{t('adminobs.daemonSub')}</div>
           </div>
         </div>
         <DaemonVersionTable
           rows={data?.daemonVersions ?? []}
           unit={unit}
           loading={loading}
+          t={t}
         />
       </section>
 
@@ -492,6 +559,7 @@ export function ObservabilityPage() {
         onClose={() => setDrill(null)}
         onJumpToRun={(runId) => setDrill({ kind: 'run', runId })}
         onJumpToAgent={(agentId, agentName) => setDrill({ kind: 'agent', agentId, agentName })}
+        t={t}
       />
     </div>
   )
@@ -499,7 +567,7 @@ export function ObservabilityPage() {
 
 // ─── Hero spend card ─────────────────────────────────────────────────────
 
-function HeroSpendCard({ summary, unit, loading }: { summary: LlmObservabilityPayload['summary'] | undefined; unit: Unit; loading: boolean }) {
+function HeroSpendCard({ summary, unit, loading, t }: { summary: LlmObservabilityPayload['summary'] | undefined; unit: Unit; loading: boolean; t: ReturnType<typeof useT> }) {
   const totalUsd = summary?.totalCostUsd ?? 0
   // Tokens headline counts every billable token (cached input included); the
   // sub then splits it so the cached share — which bills ~10× less — is never
@@ -511,13 +579,13 @@ function HeroSpendCard({ summary, unit, loading }: { summary: LlmObservabilityPa
   return (
     <div className="obs-hero-card obs-hero-spend">
       <div className="obs-hero-spend-shine" aria-hidden />
-      <div className="obs-hero-label">{unit === 'usd' ? 'Spend' : 'Tokens'} · last {summary?.sinceDays ?? 30}d</div>
+      <div className="obs-hero-label">{t('adminobs.heroSpendPrefix', { unit: unit === 'usd' ? t('adminobs.spendLabel') : t('adminobs.tokensLabel'), days: summary?.sinceDays ?? 30 })}</div>
       <div className="obs-hero-value">{loading ? '—' : unit === 'usd' ? fmtUsd(totalUsd, totalUsd < 100 ? 4 : 2) : fmtTokens(totalTok)}</div>
       <div className="obs-hero-sub">
         {summary
           ? (unit === 'usd'
-              ? <>{fmtTokens(uncachedIn + cachedIn)} input · {fmtTokens(out)} output</>
-              : <>{fmtTokens(uncachedIn)} in · {fmtTokens(cachedIn)} cached · {fmtTokens(out)} out</>)
+              ? t('adminobs.heroSubUsd', { in: fmtTokens(uncachedIn + cachedIn), out: fmtTokens(out) })
+              : t('adminobs.heroSubTokens', { in: fmtTokens(uncachedIn), cached: fmtTokens(cachedIn), out: fmtTokens(out) }))
           : <> </>}
       </div>
     </div>
@@ -546,7 +614,7 @@ function HeroStatCard({ label, value, sub, accent, loading }: {
  *   - The page is admin-only; pulling in recharts would be a runtime tax for
  *     a page two people will ever load.
  *   - Inline SVG gives us pixel-perfect control over the paper palette. */
-function TrendChart({ buckets, unit, loading }: { buckets: LlmTrendBucket[]; unit: Unit; loading: boolean }) {
+function TrendChart({ buckets, unit, loading, t }: { buckets: LlmTrendBucket[]; unit: Unit; loading: boolean; t: ReturnType<typeof useT> }) {
   // Trend buckets carry $ and input tokens (cached + uncached) but no output —
   // so the token series is total INPUT tokens, which the card sub spells out.
   const val = (b: LlmTrendBucket): number => unit === 'usd' ? b.costUsd : b.inputTokens + b.cachedInputTokens
@@ -584,8 +652,8 @@ function TrendChart({ buckets, unit, loading }: { buckets: LlmTrendBucket[]; uni
     return { purposes, series, totalByDay, maxStack }
   }, [buckets, days, unit])
 
-  if (loading) return <div className="obs-chart-empty">Loading…</div>
-  if (days.length === 0) return <div className="obs-chart-empty">No data in this window.</div>
+  if (loading) return <div className="obs-chart-empty">{t('adminobs.loading')}</div>
+  if (days.length === 0) return <div className="obs-chart-empty">{t('adminobs.noData')}</div>
 
   const innerW = W - PADL - PADR
   const innerH = H - PADT - PADB
@@ -651,7 +719,7 @@ function TrendChart({ buckets, unit, loading }: { buckets: LlmTrendBucket[]; uni
           const m = metaFor(l.purpose)
           return (
             <path key={l.purpose} d={l.path} fill={m.swatch} fillOpacity={0.85} stroke={m.swatch} strokeWidth={0.5}>
-              <title>{m.label}</title>
+              <title>{purposeLabel(t, l.purpose)}</title>
             </path>
           )
         })}
@@ -665,6 +733,7 @@ function TrendChart({ buckets, unit, loading }: { buckets: LlmTrendBucket[]; uni
 }
 
 function PurposeLegend({ rollup, unit }: { rollup: LlmRollupRow[]; unit: Unit }) {
+  const t = useT()
   // Aggregate by purpose so legend dots show the TOTAL too — answers "which
   // color is the big one?" without re-scanning the chart. Uses the active unit.
   const totals = new Map<LlmCallPurpose, number>()
@@ -676,9 +745,9 @@ function PurposeLegend({ rollup, unit }: { rollup: LlmRollupRow[]; unit: Unit })
       {sorted.map(([p, cost]) => {
         const m = metaFor(p)
         return (
-          <span key={p} className="obs-legend-chip" title={m.blurb}>
+          <span key={p} className="obs-legend-chip" title={purposeBlurb(t, p)}>
             <span className="obs-legend-dot" style={{ background: m.swatch }} />
-            <span className="obs-legend-label">{m.label}</span>
+            <span className="obs-legend-label">{purposeLabel(t, p)}</span>
             <span className="obs-legend-cost">{unit === 'usd' ? fmtUsd(cost) : fmtTokens(cost)}</span>
           </span>
         )
@@ -703,12 +772,13 @@ function PurposeLegend({ rollup, unit }: { rollup: LlmRollupRow[]; unit: Unit })
 // subtle sky→coral gradient through the threshold (>50% sky, <20% coral) so
 // the operator's eye finds the bad rows without reading labels.
 
-function CacheHealthCard({ summary, trend, rollup, unit, loading }: {
+function CacheHealthCard({ summary, trend, rollup, unit, loading, t }: {
   summary: LlmObservabilityPayload['summary'] | undefined
   trend: LlmTrendBucket[]
   rollup: LlmRollupRow[]
   unit: Unit
   loading: boolean
+  t: ReturnType<typeof useT>
 }) {
   // Per-purpose aggregation from the rollup (already source-filtered upstream).
   const perPurpose = useMemo(() => {
@@ -757,43 +827,43 @@ function CacheHealthCard({ summary, trend, rollup, unit, loading }: {
     <section className="obs-card obs-cache-card">
       <div className="obs-card-head">
         <div>
-          <div className="obs-card-title">Cache health</div>
+          <div className="obs-card-title">{t('adminobs.cacheHealthTitle')}</div>
           <div className="obs-card-sub">
-            How much you're paying for tokens the cache could have served.
+            {t('adminobs.cacheHealthSub')}
           </div>
         </div>
       </div>
 
       <div className="obs-cache-hero">
         <div className="obs-cache-hero-main">
-          <div className="obs-cache-hero-label">Overall hit rate</div>
+          <div className="obs-cache-hero-label">{t('adminobs.cacheHitLabel')}</div>
           <div className={`obs-cache-hero-value ${cacheToneClass(hit)}`}>
             {hit != null ? fmtPct(hit, 1) : '—'}
           </div>
           <div className="obs-cache-hero-sub">
             {hit != null
-              ? <>of {fmtTokens((summary?.totalInputTokens ?? 0) + (summary?.totalCachedInputTokens ?? 0))} input tokens served from cache</>
+              ? t('adminobs.cacheHeroSub', { n: fmtTokens((summary?.totalInputTokens ?? 0) + (summary?.totalCachedInputTokens ?? 0)) })
               : '—'}
           </div>
         </div>
         <div className="obs-cache-hero-aside">
-          <div className="obs-cache-hero-label">{unit === 'usd' ? 'Money on the table' : 'Cacheable tokens'}</div>
+          <div className="obs-cache-hero-label">{unit === 'usd' ? t('adminobs.moneyOnTable') : t('adminobs.cacheableTokens')}</div>
           <div className="obs-cache-hero-value obs-cache-tone-warn">
             {loading ? '—' : unit === 'usd' ? fmtUsd(savable, savable < 1 ? 4 : 2) : fmtTokens(summary?.totalInputTokens ?? 0)}
           </div>
           <div className="obs-cache-hero-sub">
-            upper bound · {unit === 'usd' ? 'if every input were cached' : 'uncached input tokens'}
+            {t('adminobs.upperBoundPrefix')}{unit === 'usd' ? t('adminobs.upperBoundUsd') : t('adminobs.upperBoundTokens')}
           </div>
         </div>
       </div>
 
-      <CacheDailyChart days={daily} loading={loading} />
+      <CacheDailyChart days={daily} loading={loading} t={t} />
 
       <div className="obs-cache-bars">
-        <div className="obs-cache-bars-head">By purpose · sorted by {unit === 'usd' ? 'savable $' : 'cacheable tokens'}</div>
-        {perPurpose.length === 0 && <div className="obs-empty">No input traffic in this window.</div>}
+        <div className="obs-cache-bars-head">{t('adminobs.cacheBarsHead', { k: unit === 'usd' ? t('adminobs.savableUsd') : t('adminobs.cacheableTokens') })}</div>
+        {perPurpose.length === 0 && <div className="obs-empty">{t('adminobs.noInputTraffic')}</div>}
         {perPurpose.map((p) => (
-          <CachePurposeBar key={p.purpose} {...p} unit={unit} />
+          <CachePurposeBar key={p.purpose} {...p} unit={unit} t={t} />
         ))}
       </div>
     </section>
@@ -813,16 +883,17 @@ function cacheToneClass(hitRate: number | null | undefined): string {
 /** Single-line area chart of daily cache hit rate. 0–100% Y axis (fixed), so
  *  a long flat low line reads as "you're not caching, do something". Soft
  *  area fill under the line + a faint 50% midline as a target. */
-function CacheDailyChart({ days, loading }: {
+function CacheDailyChart({ days, loading, t }: {
   days: Array<{ day: string; hitRate: number | null }>
   loading: boolean
+  t: ReturnType<typeof useT>
 }) {
   const W = 1000, H = 160, PADL = 56, PADR = 16, PADT = 16, PADB = 32
   const innerW = W - PADL - PADR
   const innerH = H - PADT - PADB
 
-  if (loading) return <div className="obs-chart-empty obs-cache-chart-empty">Loading…</div>
-  if (days.length === 0) return <div className="obs-chart-empty obs-cache-chart-empty">No daily data yet.</div>
+  if (loading) return <div className="obs-chart-empty obs-cache-chart-empty">{t('adminobs.loading')}</div>
+  if (days.length === 0) return <div className="obs-chart-empty obs-cache-chart-empty">{t('adminobs.noDailyData')}</div>
 
   // Points; skip nulls (no traffic) so the line interpolates instead of dropping to 0.
   const points = days
@@ -887,7 +958,7 @@ function CacheDailyChart({ days, loading }: {
 /** One horizontal bar — purpose dot + label, then a progress-style bar
  *  whose fill width is the hit rate. The right side shows savable $ — the
  *  actionable number. */
-function CachePurposeBar({ purpose, hitRate, savableUsd, costUsd, uncachedIn, cachedIn, unit }: {
+function CachePurposeBar({ purpose, hitRate, savableUsd, costUsd, uncachedIn, cachedIn, unit, t }: {
   purpose: LlmCallPurpose
   hitRate: number | null
   savableUsd: number
@@ -895,15 +966,16 @@ function CachePurposeBar({ purpose, hitRate, savableUsd, costUsd, uncachedIn, ca
   uncachedIn: number
   cachedIn: number
   unit: Unit
+  t: ReturnType<typeof useT>
 }) {
   const m = metaFor(purpose)
   const ratePct = hitRate != null ? Math.max(0, Math.min(1, hitRate)) * 100 : 0
   const total = uncachedIn + cachedIn
   return (
-    <div className="obs-cache-bar-row" title={`${fmtTokens(cachedIn)} of ${fmtTokens(total)} input tokens cached`}>
+    <div className="obs-cache-bar-row" title={t('adminobs.cacheBarTitle', { cached: fmtTokens(cachedIn), total: fmtTokens(total) })}>
       <div className="obs-cache-bar-purpose">
         <span className="obs-dot" style={{ background: m.swatch }} aria-hidden />
-        <span className="obs-cache-bar-label">{m.label}</span>
+        <span className="obs-cache-bar-label">{purposeLabel(t, purpose)}</span>
       </div>
       <div className="obs-cache-bar-track">
         <div
@@ -932,7 +1004,7 @@ function CachePurposeBar({ purpose, hitRate, savableUsd, costUsd, uncachedIn, ca
 
 type SortKey = 'costUsd' | 'totalTok' | 'calls' | 'inputTokens' | 'outputTokens' | 'failureRate' | 'cacheHitRate'
 
-function RollupTable({ rows, unit, loading, onDrill }: { rows: LlmRollupRow[]; unit: Unit; loading: boolean; onDrill: (r: LlmRollupRow) => void }) {
+function RollupTable({ rows, unit, loading, onDrill, t }: { rows: LlmRollupRow[]; unit: Unit; loading: boolean; onDrill: (r: LlmRollupRow) => void; t: ReturnType<typeof useT> }) {
   // The headline column re-keys with the unit so the default sort always
   // matches what's on screen ($ desc in USD, total tokens desc in tokens).
   const headlineKey: SortKey = unit === 'usd' ? 'costUsd' : 'totalTok'
@@ -963,20 +1035,20 @@ function RollupTable({ rows, unit, loading, onDrill }: { rows: LlmRollupRow[]; u
     </button>
   )
 
-  if (loading && rows.length === 0) return <div className="obs-empty">Loading…</div>
-  if (!loading && rows.length === 0) return <div className="obs-empty">No spend in this window. (Either no traffic, or the ledger hasn’t recorded any calls yet.)</div>
+  if (loading && rows.length === 0) return <div className="obs-empty">{t('adminobs.loading')}</div>
+  if (!loading && rows.length === 0) return <div className="obs-empty">{t('adminobs.noSpendWindow')}</div>
 
   return (
     <div className="obs-table">
       <div className="obs-thead">
-        <div className="obs-th-left">Purpose</div>
-        <div className="obs-th-left">Model · source</div>
-        <div>{unit === 'usd' ? head('Cost', 'costUsd') : head('Tokens', 'totalTok')}</div>
-        <div>{head('Calls', 'calls')}</div>
-        <div>{head('Input', 'inputTokens')}</div>
-        <div>{head('Output', 'outputTokens')}</div>
-        <div>{head('Cache hit', 'cacheHitRate')}</div>
-        <div>{head('Failed', 'failureRate')}</div>
+        <div className="obs-th-left">{t('adminobs.colPurpose')}</div>
+        <div className="obs-th-left">{t('adminobs.colModelSource')}</div>
+        <div>{unit === 'usd' ? head(t('adminobs.colCost'), 'costUsd') : head(t('adminobs.tokensLabel'), 'totalTok')}</div>
+        <div>{head(t('adminobs.colCalls'), 'calls')}</div>
+        <div>{head(t('adminobs.colInput'), 'inputTokens')}</div>
+        <div>{head(t('adminobs.colOutput'), 'outputTokens')}</div>
+        <div>{head(t('adminobs.colCacheHit'), 'cacheHitRate')}</div>
+        <div>{head(t('adminobs.colFailed'), 'failureRate')}</div>
       </div>
       {sorted.map((r, i) => {
         const m = metaFor(r.purpose)
@@ -986,13 +1058,13 @@ function RollupTable({ rows, unit, loading, onDrill }: { rows: LlmRollupRow[]; u
             className="obs-row obs-row-button"
             key={`${r.purpose}-${r.model}-${r.source}-${i}`}
             onClick={() => onDrill(r)}
-            title="Click to see every call in this bucket"
+            title={t('adminobs.rollupRowTitle')}
           >
             <div className="obs-cell-purpose">
               <span className="obs-dot" style={{ background: m.swatch }} aria-hidden />
               <div className="obs-cell-purpose-text">
-                <div className="obs-cell-purpose-label">{m.label}</div>
-                <div className="obs-cell-purpose-blurb">{m.blurb}</div>
+                <div className="obs-cell-purpose-label">{purposeLabel(t, r.purpose)}</div>
+                <div className="obs-cell-purpose-blurb">{purposeBlurb(t, r.purpose)}</div>
               </div>
             </div>
             <div className="obs-cell-model">
@@ -1003,15 +1075,15 @@ function RollupTable({ rows, unit, loading, onDrill }: { rows: LlmRollupRow[]; u
                     cost on the metered API. The operator's actual bill is a
                     flat subscription. Flagging this on the row keeps the $
                     column honest without hiding the comparable signal. */}
-                {unit === 'usd' && isByoaSource(r.source) && <span className="obs-meter-flag" title="BYOA spend is meter-equivalent (what these tokens would cost on the metered API) — operator's actual bill is a flat subscription">·meter</span>}
-                {unit === 'usd' && r.costEstimated && <span className="obs-est-flag" title="Cost computed from a seeded estimate, not an operator-supplied rate">·est</span>}
+                {unit === 'usd' && isByoaSource(r.source) && <span className="obs-meter-flag" title={t('adminobs.meterFlagTitle')}>·meter</span>}
+                {unit === 'usd' && r.costEstimated && <span className="obs-est-flag" title={t('adminobs.estFlagTitle')}>·est</span>}
               </div>
             </div>
             <div className="obs-cell-num obs-cell-cost">{unit === 'usd' ? fmtUsd(r.costUsd, r.costUsd < 1 ? 4 : 2) : fmtTokens(r.totalTok)}</div>
             <div className="obs-cell-num">{fmtInt(r.calls)}</div>
             <div className="obs-cell-num">
               {fmtTokens(r.inputTokens + r.cachedInputTokens)}
-              {r.cachedInputTokens > 0 && <span className="obs-cell-sub"> · {fmtTokens(r.cachedInputTokens)} cached</span>}
+              {r.cachedInputTokens > 0 && <span className="obs-cell-sub"> · {fmtTokens(r.cachedInputTokens)} {t('adminobs.cachedSuffix')}</span>}
             </div>
             <div className="obs-cell-num">{fmtTokens(r.outputTokens)}</div>
             <div className="obs-cell-num">{r.cacheHitRate > 0 ? fmtPct(r.cacheHitRate, 0) : '—'}</div>
@@ -1019,7 +1091,7 @@ function RollupTable({ rows, unit, loading, onDrill }: { rows: LlmRollupRow[]; u
               {r.failureRate > 0
                 ? <span style={{ color: r.failureRate > 0.1 ? 'var(--coral-deep)' : 'var(--ink-700)' }}>{fmtPct(r.failureRate, 1)}</span>
                 : '—'}
-              {r.rateLimitedCalls > 0 && <span className="obs-cell-sub"> · {r.rateLimitedCalls} rl</span>}
+              {r.rateLimitedCalls > 0 && <span className="obs-cell-sub"> · {r.rateLimitedCalls} {t('adminobs.rlSuffix')}</span>}
             </div>
           </button>
         )
@@ -1043,22 +1115,22 @@ function AgentAvatar({ url, initial, bg, size = 26 }: { url: string | null; init
   )
 }
 
-function TopAgentsTable({ rows, unit, loading, onDrill }: { rows: LlmObservabilityPayload['topAgents']; unit: Unit; loading: boolean; onDrill: (r: LlmTopAgentRow) => void }) {
+function TopAgentsTable({ rows, unit, loading, onDrill, t }: { rows: LlmObservabilityPayload['topAgents']; unit: Unit; loading: boolean; onDrill: (r: LlmTopAgentRow) => void; t: ReturnType<typeof useT> }) {
   // Server ranks by $ desc; in token mode re-rank client-side (only ~20 rows)
   // so the biggest token consumer — not the biggest spender — sits on top.
   const sorted = useMemo(
     () => unit === 'usd' ? rows : [...rows].sort((a, b) => totalTokens(b) - totalTokens(a)),
     [rows, unit],
   )
-  if (loading && rows.length === 0) return <div className="obs-empty">Loading…</div>
-  if (!loading && rows.length === 0) return <div className="obs-empty">No agent-attributed spend in this window.</div>
+  if (loading && rows.length === 0) return <div className="obs-empty">{t('adminobs.loading')}</div>
+  if (!loading && rows.length === 0) return <div className="obs-empty">{t('adminobs.noAgentSpend')}</div>
   return (
     <div className="obs-table obs-table-compact">
       <div className="obs-thead obs-thead-compact">
-        <div className="obs-th-left">Agent</div>
-        <div className="obs-th-left">Company</div>
-        <div className="obs-th-right">{unit === 'usd' ? 'Cost' : 'Tokens'}</div>
-        <div className="obs-th-right">Calls</div>
+        <div className="obs-th-left">{t('adminobs.colAgent')}</div>
+        <div className="obs-th-left">{t('adminobs.colCompany')}</div>
+        <div className="obs-th-right">{unit === 'usd' ? t('adminobs.colCost') : t('adminobs.tokensLabel')}</div>
+        <div className="obs-th-right">{t('adminobs.colCalls')}</div>
       </div>
       {sorted.map((r, i) => (
         <button
@@ -1067,7 +1139,7 @@ function TopAgentsTable({ rows, unit, loading, onDrill }: { rows: LlmObservabili
           key={`${r.agentId ?? 'anon'}-${i}`}
           onClick={() => r.agentId && onDrill(r)}
           disabled={!r.agentId}
-          title={r.agentId ? "Click to see every call this agent made" : "Anonymous bucket — not drillable"}
+          title={r.agentId ? t('adminobs.agentRowTitle') : t('adminobs.agentRowTitleAnon')}
         >
           <div className="obs-cell-agent">
             {r.agentId && <AgentAvatar url={r.agentAvatarUrl} initial={r.agentInitial} bg={r.agentAvatarBg} />}
@@ -1081,7 +1153,7 @@ function TopAgentsTable({ rows, unit, loading, onDrill }: { rows: LlmObservabili
           </div>
           <div className="obs-cell-num obs-cell-cost">
             {unit === 'usd' ? fmtUsd(r.costUsd, r.costUsd < 1 ? 4 : 2) : fmtTokens(totalTokens(r))}
-            {unit !== 'usd' && r.cachedInputTokens > 0 && <span className="obs-cell-sub"> · {fmtTokens(r.cachedInputTokens)} cached</span>}
+            {unit !== 'usd' && r.cachedInputTokens > 0 && <span className="obs-cell-sub"> · {fmtTokens(r.cachedInputTokens)} {t('adminobs.cachedSuffix')}</span>}
           </div>
           <div className="obs-cell-num">{fmtInt(r.calls)}</div>
         </button>
@@ -1102,28 +1174,29 @@ function TopAgentsTable({ rows, unit, loading, onDrill }: { rows: LlmObservabili
 // "last seen" column shows a relative timestamp so the operator immediately
 // knows whether a version is still live.
 
-function DaemonVersionTable({ rows, unit, loading }: {
+function DaemonVersionTable({ rows, unit, loading, t }: {
   rows: LlmDaemonVersionRow[]
   unit: Unit
   loading: boolean
+  t: ReturnType<typeof useT>
 }) {
-  if (loading && rows.length === 0) return <div className="obs-empty">Loading…</div>
+  if (loading && rows.length === 0) return <div className="obs-empty">{t('adminobs.loading')}</div>
   if (!loading && rows.length === 0) return (
     <div className="obs-empty">
-      No daemon-version data yet. Operators' daemons start populating this once they upgrade to the version that reports it.
+      {t('adminobs.noDaemonData')}
     </div>
   )
   return (
     <div className="obs-table obs-table-daemon">
       <div className="obs-thead obs-thead-daemon">
-        <div className="obs-th-left">Version</div>
-        <div className="obs-th-left">Source</div>
-        <div className="obs-th-right">Calls</div>
-        <div className="obs-th-right">{unit === 'usd' ? 'Cost' : 'Tokens'}</div>
-        <div className="obs-th-right">Cache hit</div>
-        <div className="obs-th-right">Avg / call</div>
-        <div className="obs-th-right">Failed</div>
-        <div className="obs-th-right">Last seen</div>
+        <div className="obs-th-left">{t('adminobs.colVersion')}</div>
+        <div className="obs-th-left">{t('adminobs.colSource')}</div>
+        <div className="obs-th-right">{t('adminobs.colCalls')}</div>
+        <div className="obs-th-right">{unit === 'usd' ? t('adminobs.colCost') : t('adminobs.tokensLabel')}</div>
+        <div className="obs-th-right">{t('adminobs.colCacheHit')}</div>
+        <div className="obs-th-right">{t('adminobs.colAvgCall')}</div>
+        <div className="obs-th-right">{t('adminobs.colFailed')}</div>
+        <div className="obs-th-right">{t('adminobs.colLastSeen')}</div>
       </div>
       {rows.map((r, i) => {
         const totalIn = r.inputTokens + r.cachedInputTokens
@@ -1134,7 +1207,7 @@ function DaemonVersionTable({ rows, unit, loading }: {
         return (
           <div className="obs-row obs-row-daemon" key={`${r.daemonVersion}-${r.source}-${i}`}>
             <div className="obs-cell-version">
-              <span className="obs-cell-purpose-label">v{r.daemonVersion}</span>
+              <span className="obs-cell-purpose-label">{t('adminobs.versionPrefix', { version: r.daemonVersion })}</span>
             </div>
             <div className="obs-cell-source">{r.source}{isByoaSource(r.source) && <span className="obs-meter-flag">·meter</span>}</div>
             <div className="obs-cell-num">{fmtInt(r.calls)}</div>
@@ -1142,7 +1215,7 @@ function DaemonVersionTable({ rows, unit, loading }: {
             <div className="obs-cell-num">{hitRate != null ? <span className={cacheToneClass(hitRate)}>{fmtPct(hitRate, 1)}</span> : '—'}</div>
             <div className="obs-cell-num">{unit === 'usd' ? fmtUsd(avgCost, 6) : fmtTokens(avgTok)}</div>
             <div className="obs-cell-num">{r.failureRate > 0 ? <span style={{ color: r.failureRate > 0.1 ? 'var(--coral-deep)' : 'var(--ink-700)' }}>{fmtPct(r.failureRate, 1)}</span> : '—'}</div>
-            <div className="obs-cell-num obs-cell-sub-only" title={new Date(r.lastSeen).toLocaleString()}>{relativeTime(r.lastSeen)}</div>
+            <div className="obs-cell-num obs-cell-sub-only" title={new Date(r.lastSeen).toLocaleString()}>{relativeTime(r.lastSeen, t)}</div>
           </div>
         )
       })}
@@ -1152,14 +1225,14 @@ function DaemonVersionTable({ rows, unit, loading }: {
 
 /** Tiny "now-3h" / "2d ago" formatter for the "Last seen" column. The full
  *  timestamp lives in the title attribute. */
-function relativeTime(iso: string): string {
-  const t = new Date(iso).getTime()
-  if (!Number.isFinite(t)) return '—'
-  const ms = Date.now() - t
-  if (ms < 60_000) return `${Math.max(0, Math.floor(ms / 1000))}s ago`
-  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`
-  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`
-  return `${Math.floor(ms / 86_400_000)}d ago`
+function relativeTime(iso: string, t: ReturnType<typeof useT>): string {
+  const ts = new Date(iso).getTime()
+  if (!Number.isFinite(ts)) return '—'
+  const ms = Date.now() - ts
+  if (ms < 60_000) return t('adminobs.timeAgoSec', { n: Math.max(0, Math.floor(ms / 1000)) })
+  if (ms < 3_600_000) return t('adminobs.timeAgoMin', { n: Math.floor(ms / 60_000) })
+  if (ms < 86_400_000) return t('adminobs.timeAgoHour', { n: Math.floor(ms / 3_600_000) })
+  return t('adminobs.timeAgoDay', { n: Math.floor(ms / 86_400_000) })
 }
 
 // ─── Drill-down panel ────────────────────────────────────────────────────
@@ -1178,8 +1251,14 @@ function relativeTime(iso: string): string {
 // objects from outside refetches but keeps the sort UI sticky.
 
 type CallSort = 'cost' | 'latency' | 'hop' | 'created'
+const SORT_LABEL: Record<CallSort, MessageKey> = {
+  cost: 'adminobs.sortCost',
+  latency: 'adminobs.sortLatency',
+  hop: 'adminobs.sortHop',
+  created: 'adminobs.sortCreated',
+}
 
-function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose, onJumpToRun, onJumpToAgent }: {
+function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose, onJumpToRun, onJumpToAgent, t }: {
   drill: DrillDown | null
   sinceDays: number
   /** Inherits the page's tenant scope so a clicked rollup row stays inside
@@ -1192,6 +1271,7 @@ function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose,
   onClose: () => void
   onJumpToRun: (runId: string) => void
   onJumpToAgent: (agentId: string, agentName: string | null) => void
+  t: ReturnType<typeof useT>
 }) {
   const [rows, setRows] = useState<LlmCallRow[] | null>(null)
   const [loading, setLoading] = useState(false)
@@ -1229,9 +1309,9 @@ function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose,
 
   const meta = drill.kind === 'bucket' ? metaFor(drill.purpose) : null
   const title =
-    drill.kind === 'bucket' ? meta!.label
-    : drill.kind === 'run'   ? 'Run trail'
-    : drill.kind === 'agent' ? (drill.agentName ?? 'Agent')
+    drill.kind === 'bucket' ? purposeLabel(t, drill.purpose)
+    : drill.kind === 'run'   ? t('adminobs.drillRunTitle')
+    : drill.kind === 'agent' ? (drill.agentName ?? t('adminobs.drillAgentTitle'))
     : '—'
   const subtitle =
     drill.kind === 'bucket' ? <><span className="obs-mono">{drill.model}</span> · {drill.source}</>
@@ -1251,25 +1331,25 @@ function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose,
               <div className="obs-drill-sub">{subtitle}</div>
             </div>
           </div>
-          <button type="button" className="obs-drill-close" onClick={onClose} aria-label="Close">×</button>
+          <button type="button" className="obs-drill-close" onClick={onClose} aria-label={t('adminobs.closeAria')}>×</button>
         </header>
 
         <div className="obs-drill-sortbar">
-          <span className="obs-drill-sortbar-label">Sort</span>
-          {(['cost', 'latency', 'hop', 'created'] as CallSort[]).map((s) => (
+          <span className="obs-drill-sortbar-label">{t('adminobs.sortLabel')}</span>
+          {(Object.entries(SORT_LABEL) as [CallSort, MessageKey][]).map(([s, labelKey]) => (
             <button
               key={s}
               type="button"
               className={`obs-pill${sortBy === s ? ' is-active' : ''}`}
               onClick={() => setSortBy(s)}
-            >{s}</button>
+            >{t(labelKey)}</button>
           ))}
         </div>
 
         <div className="obs-drill-body">
-          {err && <div className="obs-error">Failed to load: {err}</div>}
-          {loading && !rows && <div className="obs-empty">Loading…</div>}
-          {rows && rows.length === 0 && <div className="obs-empty">No calls in this window.</div>}
+          {err && <div className="obs-error">{t('adminobs.loadFailed', { error: err })}</div>}
+          {loading && !rows && <div className="obs-empty">{t('adminobs.loading')}</div>}
+          {rows && rows.length === 0 && <div className="obs-empty">{t('adminobs.noCalls')}</div>}
           {rows && rows.map((c) => (
             <DrillCallCard
               key={c.id}
@@ -1277,6 +1357,7 @@ function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose,
               unit={unit}
               onJumpToRun={onJumpToRun}
               onJumpToAgent={onJumpToAgent}
+              t={t}
             />
           ))}
         </div>
@@ -1285,11 +1366,12 @@ function DrillPanel({ drill, sinceDays, companyId, unit, refreshSignal, onClose,
   )
 }
 
-function DrillCallCard({ call, unit, onJumpToRun, onJumpToAgent }: {
+function DrillCallCard({ call, unit, onJumpToRun, onJumpToAgent, t }: {
   call: LlmCallRow
   unit: Unit
   onJumpToRun: (runId: string) => void
   onJumpToAgent: (agentId: string, agentName: string | null) => void
+  t: ReturnType<typeof useT>
 }) {
   // Cache hit %: cached / (uncached + cached). NaN-safe.
   const totalIn = call.inputTokens + call.cachedInputTokens
@@ -1319,7 +1401,7 @@ function DrillCallCard({ call, unit, onJumpToRun, onJumpToAgent }: {
         <span className="obs-dot" style={{ background: m.swatch }} aria-hidden />
         <div className="obs-drill-card-headtext">
           <div className="obs-drill-card-title">
-            {m.label}
+            {purposeLabel(t, call.purpose)}
             <span className="obs-drill-card-when">· {new Date(call.createdAt).toLocaleString()}</span>
           </div>
           <div className="obs-drill-card-sub">
@@ -1328,8 +1410,8 @@ function DrillCallCard({ call, unit, onJumpToRun, onJumpToAgent }: {
             {unit === 'usd' && call.costEstimated && <span className="obs-est-flag">·est</span>}
             {unit === 'usd' && isByoaSource(call.source) && <span className="obs-meter-flag">·meter</span>}
             {call.daemonVersion && (
-              <span className="obs-version-flag" title={`Recorded by daemon (npm cumora) version ${call.daemonVersion}`}>
-                · v{call.daemonVersion}
+              <span className="obs-version-flag" title={t('adminobs.daemonVersionTitle', { version: call.daemonVersion })}>
+                · {t('adminobs.versionPrefix', { version: call.daemonVersion })}
               </span>
             )}
             <span className={call.status === 'ok' ? '' : 'obs-drill-status-bad'}> · {call.status}</span>
@@ -1342,31 +1424,31 @@ function DrillCallCard({ call, unit, onJumpToRun, onJumpToAgent }: {
           (hop index → tool calls → output mix → compaction diagnostic), so
           the eye scans the bottleneck first. */}
       <div className="obs-drill-chips">
-        {hopIndex != null  && <Chip label="hop"      value={`#${hopIndex}`} />}
-        {toolUses != null  && <Chip label="tools"    value={fmtInt(toolUses)} />}
-        {textChars != null && <Chip label="text"     value={`${fmtInt(textChars)}c`} />}
-        {compressionRatio  && <Chip label="compress" value={`${compressionRatio}×`} title="inputTokensBefore / outputTokens" />}
-        {itemsDropped != null && <Chip label="dropped" value={fmtInt(itemsDropped)} />}
-        {call.latencyMs && call.latencyMs > 0 && <Chip label="latency" value={`${(call.latencyMs / 1000).toFixed(1)}s`} />}
+        {hopIndex != null  && <Chip label={t('adminobs.chipHop')}      value={`#${hopIndex}`} />}
+        {toolUses != null  && <Chip label={t('adminobs.chipTools')}    value={fmtInt(toolUses)} />}
+        {textChars != null && <Chip label={t('adminobs.chipText')}     value={`${fmtInt(textChars)}c`} />}
+        {compressionRatio  && <Chip label={t('adminobs.chipCompress')} value={`${compressionRatio}×`} title={t('adminobs.compressTitle')} />}
+        {itemsDropped != null && <Chip label={t('adminobs.chipDropped')} value={fmtInt(itemsDropped)} />}
+        {call.latencyMs && call.latencyMs > 0 && <Chip label={t('adminobs.chipLatency')} value={`${(call.latencyMs / 1000).toFixed(1)}s`} />}
       </div>
 
       <div className="obs-drill-numgrid">
-        <NumCell label="input" value={fmtTokens(call.inputTokens)} />
-        <NumCell label="cached" value={fmtTokens(call.cachedInputTokens)} hint={cacheHit != null ? fmtPct(cacheHit, 0) : undefined} />
-        <NumCell label="output" value={fmtTokens(call.outputTokens)} />
-        <NumCell label="reasoning" value={call.reasoningTokens > 0 ? fmtTokens(call.reasoningTokens) : '—'} />
+        <NumCell label={t('adminobs.cellInput')} value={fmtTokens(call.inputTokens)} />
+        <NumCell label={t('adminobs.cellCached')} value={fmtTokens(call.cachedInputTokens)} hint={cacheHit != null ? fmtPct(cacheHit, 0) : undefined} />
+        <NumCell label={t('adminobs.cellOutput')} value={fmtTokens(call.outputTokens)} />
+        <NumCell label={t('adminobs.cellReasoning')} value={call.reasoningTokens > 0 ? fmtTokens(call.reasoningTokens) : '—'} />
       </div>
 
       {call.error && (
         <div className="obs-drill-err">
-          <div className="obs-drill-err-label">error</div>
+          <div className="obs-drill-err-label">{t('adminobs.errorLabel')}</div>
           <div className="obs-drill-err-body">{call.error}</div>
         </div>
       )}
 
       {otherExtras.length > 0 && (
         <details className="obs-drill-rawextras">
-          <summary>extras ({otherExtras.length})</summary>
+          <summary>{t('adminobs.extrasLabel', { n: otherExtras.length })}</summary>
           <dl>
             {otherExtras.map(([k, v]) => (
               <div key={k} className="obs-drill-kv">
@@ -1381,12 +1463,12 @@ function DrillCallCard({ call, unit, onJumpToRun, onJumpToAgent }: {
       <footer className="obs-drill-card-foot">
         {call.runId && (
           <button type="button" className="obs-drill-link" onClick={() => onJumpToRun(call.runId!)}>
-            run trail <span className="obs-mono">{call.runId.slice(0, 8)}…</span>
+            {t('adminobs.runTrailLabel', { id: call.runId.slice(0, 8) + '…' })}
           </button>
         )}
         {call.agentId && (
           <button type="button" className="obs-drill-link" onClick={() => onJumpToAgent(call.agentId!, call.agentName)}>
-            agent {call.agentName ?? <span className="obs-mono">{call.agentId.slice(0, 8)}…</span>}
+            {call.agentName ?? t('adminobs.agentLabel', { name: call.agentId.slice(0, 8) + '…' })}
           </button>
         )}
       </footer>
@@ -1426,12 +1508,14 @@ function NumCell({ label, value, hint }: { label: string; value: string; hint?: 
 // the operator types to filter). Options are cost/token-ranked with the spend
 // in the right-aligned `hint`, "All accounts" first.
 
-function TenantPicker({ tenants, value, unit, onChange }: {
+function TenantPicker({ tenants, value, unit, onChange, t }: {
   tenants: LlmTenantRow[]
   value: string
   unit: Unit
   onChange: (companyId: string) => void
+  t: ReturnType<typeof useT>
 }) {
+  const locale = useLocale()
   // Stable label per tenant so a partially-resolved companies join doesn't
   // surface bare ids in the picker. Format: "Name · $cost" / "Name · NtokT"
   // depending on the active unit; falls back to the company id when unnamed.
@@ -1443,7 +1527,7 @@ function TenantPicker({ tenants, value, unit, onChange }: {
     const sorted = [...tenants].sort((a, b) =>
       unit === 'usd' ? b.costUsd - a.costUsd : totalTokens(b) - totalTokens(a))
     return [
-      { value: '', label: `All accounts (${tenants.length})` },
+      { value: '', label: t('adminobs.allAccountsCount', { n: tenants.length }) },
       // amount goes in `hint` (right-aligned, never truncated) so the per-tenant
       // spend stays visible even when the workspace name is long — the label
       // truncates, the number doesn't.
@@ -1453,15 +1537,17 @@ function TenantPicker({ tenants, value, unit, onChange }: {
         hint: fmtAmount(unit, t.costUsd, totalTokens(t)),
       })),
     ]
-  }, [tenants, unit])
+    // locale in the deps so the baked-in "All accounts" label re-renders
+    // on a language switch (t itself is identity-unstable, locale is not).
+  }, [tenants, unit, locale])
   return (
     <Combobox
       value={value}
       onValueChange={onChange}
       options={options}
-      ariaLabel="Filter by tenant"
-      placeholder="All accounts"
-      searchPlaceholder="Search workspaces…"
+      ariaLabel={tLabel(t, 'adminobs.tenantFilterAria', 'Filter by tenant')}
+      placeholder={t('adminobs.allAccountsLabel')}
+      searchPlaceholder={t('adminobs.searchWorkspaces')}
       className="w-[320px]"
     />
   )

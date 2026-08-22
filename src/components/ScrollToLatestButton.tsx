@@ -17,6 +17,7 @@
  * - aria: a real button with a descriptive label, focus ring matches the
  *   app's `outline-sky2-300` convention.
  */
+import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
 interface Props {
@@ -29,13 +30,14 @@ interface Props {
 }
 
 export function ScrollToLatestButton({ visible, onClick, bottomOffset = 16 }: Props) {
+  const t = useT()
   if (!visible) return null
   return (
     <button
       type="button"
       onClick={onClick}
-      aria-label="Scroll to latest message"
-      title="Latest message"
+      aria-label={t('scroll.scrollToLatest')}
+      title={t('scroll.latestTitle')}
       className={cn(
         // Positioning: absolute within the chat stream's relative container.
         'absolute right-4 z-20 grid place-items-center',

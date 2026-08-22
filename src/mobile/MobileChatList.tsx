@@ -20,8 +20,14 @@ import { SwipeableRow, type SwipeAction } from './SwipeableRow'
 import { PullToRefresh } from './PullToRefresh'
 import { Virtuoso } from 'react-virtuoso'
 import type { Conversation, Participant } from '@/types'
+import { translate, useLocaleStore, useT, type MessageKey } from '@/lib/i18n'
 
-const filters = ['All', 'Agents', 'Whispers', 'Humans'] as const
+const filters: ReadonlyArray<'All' | 'Agents' | 'Whispers' | 'Humans'> = ['All', 'Agents', 'Whispers', 'Humans']
+const filterKey = (f: typeof filters[number]) =>
+  f === 'All' ? 'mclist.filterAll'
+  : f === 'Agents' ? 'mclist.filterAgents'
+  : f === 'Whispers' ? 'mclist.filterWhispers'
+  : 'mclist.filterHumans'
 type Filter = (typeof filters)[number]
 
 function TeamFallback() {
@@ -99,8 +105,9 @@ function ConvoAvatar({ c, size = 48 }: { c: Conversation; size?: number }) {
 /** Small bell-off glyph for muted conversation rows. Same shape as
  *  the desktop pane's indicator — Slack / iOS Messages convention. */
 function MutedGlyph() {
+  const t = useT()
   return (
-    <span className="inline-flex items-center justify-center w-3.5 h-3.5 shrink-0 text-ink-300" aria-label="Muted">
+    <span className="inline-flex items-center justify-center w-3.5 h-3.5 shrink-0 text-ink-300" aria-label={t('mclist.muted')}>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
         <path d="M13.73 21a2 2 0 0 1-3.46 0" />
         <path d="M18.63 13A17.9 17.9 0 0 1 18 8" />
@@ -117,6 +124,7 @@ function MobileRow({ c, onTap, onLongPress }: {
   onTap: () => void
   onLongPress: (coords: { x: number; y: number }) => void
 }) {
+  const t = useT()
   const isFresh = c.tag === 'fresh-pulled'
   const muted = isMuted(c)
   const typingIds = useMessages((s) => s.typing[c.id])
@@ -132,7 +140,7 @@ function MobileRow({ c, onTap, onLongPress }: {
       const p = byId[id]
       if (!p) return null
       const name = p.name?.trim()
-      return name || (p.kind === 'agent' ? 'An agent' : 'Someone')
+      return name || (p.kind === 'agent' ? t('mclist.fallbackAgent') : t('mclist.fallbackSomeone'))
     })
     .filter((n): n is string => Boolean(n))
   return (
@@ -166,7 +174,7 @@ function MobileRow({ c, onTap, onLongPress }: {
           )}>{c.title}</span>
           {muted && <MutedGlyph />}
           {isFresh && (
-            <span className="text-[8.5px] font-bold tracking-wider uppercase py-0.5 px-1.5 rounded text-gold-deep bg-[rgba(244,183,64,0.18)] shrink-0">NEW</span>
+            <span className="text-[8.5px] font-bold tracking-wider uppercase py-0.5 px-1.5 rounded text-gold-deep bg-[rgba(244,183,64,0.18)] shrink-0">{t('mclist.badgeNew')}</span>
           )}
           {c.tag === 'human' && <HumanBadge />}
         </div>
@@ -179,10 +187,10 @@ function MobileRow({ c, onTap, onLongPress }: {
             </span>
             <span className="truncate">
               {typingNames.length === 1
-                ? `${typingNames[0]} is typing…`
+                ? t('mclist.typingOne', { name: typingNames[0] })
                 : typingNames.length === 2
-                  ? `${typingNames[0]} and ${typingNames[1]} are typing…`
-                  : `${typingNames[0]} and ${typingNames.length - 1} more are typing…`}
+                  ? t('mclist.typingTwo', { a: typingNames[0], b: typingNames[1] })
+                  : t('mclist.typingMore', { name: typingNames[0], n: typingNames.length - 1 })}
             </span>
           </div>
         ) : (
@@ -268,10 +276,15 @@ function PinnedTile({ c, onSelect, onLongPress }: {
 function convoSwipeActions(c: Conversation): SwipeAction[] {
   const reload = () => useConversations.getState().reload()
   const muted = isMuted(c)
+  // The translate hook lives inside React — calling useT() here would
+  // break the helper's call site. Snapshot the locale once and translate
+  // imperatively, same pattern as SuspendedScreen's class counterpart.
+  const locale = useLocaleStore.getState().locale
+  const t = (k: MessageKey, vars?: Record<string, string | number>) => translate(locale, k, vars)
   const actions: SwipeAction[] = []
   if (c.unread !== undefined && c.unread > 0) {
     actions.push({
-      label: 'Read',
+      label: t('mclist.swipeRead'),
       background: 'var(--skype)',
       onClick: async () => {
         try { await api.markRead(c.id); await reload() }
@@ -280,7 +293,7 @@ function convoSwipeActions(c: Conversation): SwipeAction[] {
     })
   }
   actions.push({
-    label: muted ? 'Unmute' : 'Mute',
+    label: muted ? t('mclist.swipeUnmute') : t('mclist.swipeMute'),
     background: 'var(--ink-500)',
     onClick: async () => {
       try { await api.setMute(c.id, !muted); await reload() }
@@ -288,7 +301,7 @@ function convoSwipeActions(c: Conversation): SwipeAction[] {
     },
   })
   actions.push({
-    label: c.pinned ? 'Unpin' : 'Pin',
+    label: c.pinned ? t('mclist.swipeUnpin') : t('mclist.swipePin'),
     background: 'var(--gold)',
     color: 'var(--ink-900)',
     onClick: async () => {
@@ -298,10 +311,10 @@ function convoSwipeActions(c: Conversation): SwipeAction[] {
   })
   if (c.kind !== 'whisper') {
     actions.push({
-      label: 'Leave',
+      label: t('mclist.swipeLeave'),
       background: 'var(--coral)',
       onClick: async () => {
-        if (!confirm(`Leave “${c.title}”? Agents will continue without you.`)) return
+        if (!confirm(t('mclist.confirmLeave', { title: c.title }))) return
         try { await api.leaveConversation(c.id); await reload() }
         catch (err) { console.warn('leave failed', err) }
       },
@@ -327,6 +340,11 @@ function convoMenuItems(
 ): ContextMenuItem[] {
   const reload = () => useConversations.getState().reload()
   const muted = isMuted(c)
+  // Hook order: snapshot locale imperatively — this helper is called from
+  // a parent render so we can't call useT() here. Same pattern as
+  // convoSwipeActions right above.
+  const locale = useLocaleStore.getState().locale
+  const t = (k: MessageKey, vars?: Record<string, string | number>) => translate(locale, k, vars)
   const items: ContextMenuItem[] = []
 
   if (c.kind === 'direct') {
@@ -334,7 +352,7 @@ function convoMenuItems(
     const other = otherId ? ctx.byId[otherId] : undefined
     if (other) {
       items.push({
-        label: `Create group with ${other.name}…`,
+        label: t('mclist.menuCreateGroupWith', { name: other.name }),
         onClick: () => ctx.onCreateGroupWith(other.id),
       })
     }
@@ -342,11 +360,11 @@ function convoMenuItems(
 
   items.push(
     {
-      label: 'Open',
+      label: t('mclist.menuOpen'),
       onClick: () => useApp.getState().selectConversation(c.id),
     },
     {
-      label: c.pinned ? 'Unpin from top' : 'Pin to top',
+      label: c.pinned ? t('mclist.menuUnpinFromTop') : t('mclist.menuPinToTop'),
       onClick: async () => {
         try {
           await api.togglePin(c.id, !c.pinned)
@@ -355,7 +373,7 @@ function convoMenuItems(
       },
     },
     {
-      label: muted ? 'Unmute' : 'Mute notifications',
+      label: muted ? t('mclist.menuUnmute') : t('mclist.menuMute'),
       onClick: async () => {
         try {
           await api.setMute(c.id, !muted)
@@ -366,7 +384,7 @@ function convoMenuItems(
   )
   if (c.unread !== undefined && c.unread > 0) {
     items.push({
-      label: 'Mark as read',
+      label: t('mclist.menuMarkRead'),
       onClick: async () => {
         try {
           await api.markRead(c.id)
@@ -377,10 +395,10 @@ function convoMenuItems(
   }
   if (c.kind !== 'whisper') {
     items.push({
-      label: 'Leave conversation',
+      label: t('mclist.menuLeave'),
       destructive: true,
       onClick: async () => {
-        if (!confirm(`Leave “${c.title}”? Agents will continue without you.`)) return
+        if (!confirm(t('mclist.confirmLeave', { title: c.title }))) return
         try {
           await api.leaveConversation(c.id)
           await reload()
@@ -392,6 +410,7 @@ function convoMenuItems(
 }
 
 export function MobileChatList() {
+  const t = useT()
   const select = useApp((s) => s.selectConversation)
   const list = useConversations((s) => s.list)
   const byId = useParticipants((s) => s.byId)
@@ -502,7 +521,7 @@ export function MobileChatList() {
               'ml-auto w-9 h-9 rounded-full grid place-items-center text-ink-700 border',
               searchOpen ? 'bg-sky2-50 border-sky2-200 text-skype-deep' : 'bg-cloud border-ink-100',
             )}
-            aria-label={searchOpen ? 'Close search' : 'Open search'}
+            aria-label={searchOpen ? t('mclist.closeSearch') : t('mclist.openSearch')}
           >
             <ISearch className="w-[18px] h-[18px]" />
           </Pressable>
@@ -518,7 +537,7 @@ export function MobileChatList() {
                 type="search"
                 value={searchQ}
                 onChange={(e) => setSearchQ(e.target.value)}
-                placeholder="Search conversations, agents…"
+                placeholder={t('mclist.searchPh')}
                 className="flex-1 bg-transparent outline-none text-[14px] text-ink-900 placeholder:text-ink-300"
                 autoCapitalize="none"
                 autoCorrect="off"
@@ -528,7 +547,7 @@ export function MobileChatList() {
                 <Pressable
                   onClick={() => setSearchQ('')}
                   className="text-ink-500 px-1.5 text-[18px] leading-none"
-                  aria-label="Clear"
+                  aria-label={t('mclist.clearSearch')}
                 >×</Pressable>
               )}
             </div>
@@ -553,7 +572,7 @@ export function MobileChatList() {
                   borderColor: 'var(--sky-200)',
                   boxShadow: '0 1px 2px -1px rgba(0, 120, 200, 0.12)',
                 } : undefined}
-              >{f}</Pressable>
+              >{t(filterKey(f))}</Pressable>
             )
           })}
         </div>
@@ -578,7 +597,7 @@ export function MobileChatList() {
                 and the gesture-bound `y` transform keep working. */}
             <div className="px-0 pt-1.5 pb-1">
               {byRecency.length === 0 ? (
-                <div className="px-3 py-6 text-center text-[13px] text-ink-300 font-display italic">no conversations yet</div>
+                <div className="px-3 py-6 text-center text-[13px] text-ink-300 font-display italic">{t('mclist.empty')}</div>
               ) : scroller ? (
                 <Virtuoso
                   customScrollParent={scroller}

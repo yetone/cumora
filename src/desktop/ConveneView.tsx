@@ -5,6 +5,7 @@ import { useParticipants } from '@/stores/participants'
 import { Avatar } from '@/components/Avatar'
 import { api, ws, type ApiConveneSession, type ApiConveneTranscript } from '@/api/client'
 import { cn } from '@/lib/utils'
+import { useT } from '@/lib/i18n'
 
 interface ConveneState {
   session: ApiConveneSession | null
@@ -12,6 +13,7 @@ interface ConveneState {
 }
 
 export function ConveneView() {
+  const t = useT()
   const convoId = useApp((s) => s.selectedConversationId)
   const conversations = useConversations((s) => s.list)
   const c = useMemo(() => conversations.find((x) => x.id === convoId), [conversations, convoId])
@@ -55,7 +57,7 @@ export function ConveneView() {
   const startConvene = async () => {
     if (!convoId) return
     try {
-      const session = await api.startConvene(convoId, c?.title ?? 'live work session')
+      const session = await api.startConvene(convoId, c?.title ?? t('convene.sessionTitleFallback'))
       setState({ session, transcript: [] })
     } catch (err) { console.warn(err) }
   }
@@ -66,10 +68,10 @@ export function ConveneView() {
         style={{ background: 'radial-gradient(ellipse 80% 50% at 50% 100%, rgba(143, 211, 247, 0.18), transparent 60%), var(--paper)' }}>
         <div className="text-center">
           <div className="font-display font-medium text-[24px] text-ink-900 mb-2" style={{ letterSpacing: '-0.02em' }}>
-            Pick a conversation
+            {t('convene.pickConvo')}
           </div>
           <div className="font-display italic text-[14px] text-ink-500">
-            Convene runs from a chat. Select one and click Convene to bring agents into a live session.
+            {t('convene.pickConvoSub')}
           </div>
         </div>
       </main>
@@ -82,16 +84,16 @@ export function ConveneView() {
         style={{ background: 'radial-gradient(ellipse 80% 50% at 50% 100%, rgba(143, 211, 247, 0.18), transparent 60%), var(--paper)' }}>
         <div className="text-center max-w-sm">
           <div className="font-display font-medium text-[24px] text-ink-900 mb-2" style={{ letterSpacing: '-0.02em' }}>
-            {state.session ? 'Last convene wrapped' : 'No live convene'}
+            {state.session ? t('convene.lastWrapped') : t('convene.noLive')}
           </div>
           <div className="font-display italic text-[14px] text-ink-500 mb-5">
-            Pull every agent in <b className="text-ink-700 font-semibold">{c.title}</b> into a live work session — each takes a turn, decisions are summarized at the end.
+            {t('convene.ctaSub', { title: c.title })}
           </div>
           <button
             onClick={startConvene}
             className="py-3 px-5 rounded-full text-white text-[13.5px] font-semibold inline-flex items-center gap-2"
             style={{ background: 'linear-gradient(135deg, var(--skype), var(--skype-deep))', boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)' }}>
-            ▶ Start a Convene
+            {t('convene.startBtn')}
           </button>
         </div>
       </main>
@@ -104,7 +106,7 @@ export function ConveneView() {
         style={{ background: 'linear-gradient(90deg, rgba(255, 122, 107, 0.08) 0%, rgba(0, 168, 240, 0.06) 100%)' }}>
         <div className="inline-flex items-center gap-2 py-1.5 px-3 bg-coral-deep text-white rounded-full text-[10.5px] font-extrabold tracking-[0.12em] uppercase">
           <span className="w-1.5 h-1.5 rounded-full bg-white animate-pulse-soft" />
-          LIVE
+          {t('convene.live')}
         </div>
         <div className="font-display font-medium text-[17px] text-ink-900" style={{ letterSpacing: '-0.01em' }}>
           {state.session.title}
@@ -113,7 +115,7 @@ export function ConveneView() {
           <em className="italic text-coral-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>{state.session.flair}</em>
         )}
         <div className="text-[12px] text-ink-500 ml-auto">
-          started {new Date(state.session.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+          {t('convene.startedAt', { time: new Date(state.session.started_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) })}
         </div>
       </div>
 
@@ -138,7 +140,13 @@ export function ConveneView() {
                 <div className="text-[11.5px] font-semibold flex items-center gap-1.5"
                   style={{ color: isSpeaking ? 'var(--skype-deep)' : `var(--${p.status})` }}>
                   <span className="w-1.5 h-1.5 rounded-full animate-pulse-soft" style={{ background: isSpeaking ? 'var(--skype)' : `var(--${p.status})` }} />
-                  {isSpeaking ? 'speaking' : (p.status === 'thinking' ? 'thinking' : p.status === 'working' ? 'working' : 'listening')}
+                  {isSpeaking
+                    ? t('convene.statusSpeaking')
+                    : p.status === 'thinking'
+                      ? t('convene.statusThinking')
+                      : p.status === 'working'
+                        ? t('convene.statusWorking')
+                        : t('convene.statusListening')}
                 </div>
               </div>
             )
@@ -146,29 +154,29 @@ export function ConveneView() {
         </section>
 
         <div className="flex-1 overflow-y-auto p-6 max-w-3xl mx-auto w-full">
-          {state.transcript.map((t) => {
-            if (t.kind === 'decision' && t.decision) {
+          {state.transcript.map((entry) => {
+            if (entry.kind === 'decision' && entry.decision) {
               return (
-                <div key={t.id} className="my-4 py-3.5 px-4 rounded-[12px] relative"
+                <div key={entry.id} className="my-4 py-3.5 px-4 rounded-[12px] relative"
                   style={{ background: 'linear-gradient(135deg, var(--whisper-50), rgba(255,255,255,0.5))', border: '1.5px solid var(--whisper)' }}>
                   <div className="absolute -top-2.5 left-4 bg-whisper text-white text-[9.5px] font-extrabold tracking-[0.15em] py-1 px-2.5 rounded">
-                    DECISION
+                    {t('convene.decision')}
                   </div>
                   <div className="font-display font-medium text-[16px] text-ink-900 mt-1.5 mb-1">
-                    {t.decision.headline}
+                    {entry.decision.headline}
                   </div>
-                  <div className="text-[13px] text-ink-500 leading-[1.55]">{t.decision.body}</div>
+                  <div className="text-[13px] text-ink-500 leading-[1.55]">{entry.decision.body}</div>
                 </div>
               )
             }
-            const author = byId[t.authorId]
+            const author = byId[entry.authorId]
             if (!author) return null
             return (
-              <div key={t.id} className="grid grid-cols-[40px_1fr] gap-3 mb-4 items-start animate-rise">
+              <div key={entry.id} className="grid grid-cols-[40px_1fr] gap-3 mb-4 items-start animate-rise">
                 <Avatar p={author} size={36} />
                 <div>
                   <div className="font-bold text-[13px] text-ink-900 mb-0.5">{author.name}</div>
-                  <div className="text-[14px] text-ink-700 leading-[1.55]">{t.body}</div>
+                  <div className="text-[14px] text-ink-700 leading-[1.55]">{entry.body}</div>
                 </div>
               </div>
             )
@@ -180,20 +188,20 @@ export function ConveneView() {
         style={{ background: 'linear-gradient(180deg, #FBFDFE, #F4F8FC)' }}>
         <div className="py-3.5 px-[18px] pb-2.5 border-b border-ink-100">
           <h4 className="font-display font-medium text-[16px] tracking-tight mb-1">
-            Live <em className="italic text-skype-deep" style={{ fontWeight: 400 }}>transcript</em>
+            {t('convene.transcriptTitle')} <em className="italic text-skype-deep" style={{ fontWeight: 400 }}>{t('convene.transcriptEm')}</em>
           </h4>
-          <div className="text-[11px] text-ink-500">{state.transcript.length} entries</div>
+          <div className="text-[11px] text-ink-500">{t('convene.entries', { count: state.transcript.length })}</div>
         </div>
         <div className="py-3 px-[18px] pb-2 space-y-2">
-          {state.transcript.map((t) => {
-            const author = byId[t.authorId]
+          {state.transcript.map((entry) => {
+            const author = byId[entry.authorId]
             if (!author) return null
             return (
-              <div key={t.id} className="text-[12px] leading-[1.5]">
+              <div key={entry.id} className="text-[12px] leading-[1.5]">
                 <div className="font-bold text-ink-900 text-[11px]">
-                  {author.name} <span className="text-ink-300 font-normal ml-2 font-mono">{new Date(t.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  {author.name} <span className="text-ink-300 font-normal ml-2 font-mono">{new Date(entry.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
                 </div>
-                <div className={cn('text-ink-700', t.kind === 'decision' && 'text-whisper-deep font-semibold')}>{t.body}</div>
+                <div className={cn('text-ink-700', entry.kind === 'decision' && 'text-whisper-deep font-semibold')}>{entry.body}</div>
               </div>
             )
           })}

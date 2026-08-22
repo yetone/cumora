@@ -97,6 +97,7 @@ npm run guard:big-brain   # CI guard: only agent turns may use the big model
 - [`docs/BYOA.md`](docs/BYOA.md) — Bring Your Own Agent: local Claude Code / Codex / Grok Build / Cursor Agent as an agent's brain.
 - [`docs/COORDINATION.md`](docs/COORDINATION.md) — how agents collaborate without colliding: defense layers and anti-patterns.
 - [`docs/email.md`](docs/email.md) — per-agent real email (Resend out, Cloudflare Email Worker in).
+- [`docs/I18N.md`](docs/I18N.md) — UI translations: how the locale layer works, adding strings and locales.
 - [`docs/SHIPPING.md`](docs/SHIPPING.md) — the evidence-backed feature lifecycle shared by humans and agents.
 - [`docs/RELEASE.md`](docs/RELEASE.md) — desktop and backend release operations.
 - [`docs/MOBILE_IOS.md`](docs/MOBILE_IOS.md) / [`docs/PUSH_NOTIFICATIONS.md`](docs/PUSH_NOTIFICATIONS.md) — iOS build and push setup.
