@@ -781,12 +781,11 @@ export const api = {
    *  from the iOS-native ASAuthorization flow. Server verifies the JWT
    *  against Apple's JWKS, find-or-creates the user, and returns a
    *  fresh session token. */
-  authAppleNative: (input: { identityToken: string; email?: string | null; name?: string | null; inviteToken?: string | null }) =>
+  authAppleNative: (input: { identityToken: string; name?: string | null; inviteToken?: string | null }) =>
     http<{ token: string; user: { id: string; email: string; displayName: string }; companyId: string | null }>('/auth/apple/native', {
       method: 'POST',
       body: JSON.stringify({
         identityToken: input.identityToken,
-        email: input.email ?? null,
         name: input.name ?? null,
         inviteToken: input.inviteToken ?? null,
       }),

@@ -79,8 +79,8 @@ export function AuthScreen() {
   async function goApple() {
     setBusy('apple'); setErr(null)
     try {
-      const { identityToken, email, name } = await runAppleSignIn()
-      const r = await api.authAppleNative({ identityToken, email, name })
+      const { identityToken, name } = await runAppleSignIn()
+      const r = await api.authAppleNative({ identityToken, name })
       useAuth.getState().setSession(r.token, { id: r.user.id, email: r.user.email, name: r.user.displayName }, r.companyId)
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)

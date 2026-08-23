@@ -623,16 +623,14 @@ export async function handleCallback(args: {
  *  browser redirect involved (this is a fetch from the native app).
  *
  *  Apple-specific subtleties handled here:
- *   - `email` and `name` are only populated by Apple on the user's
- *     FIRST sign-in to our app — subsequent sign-ins return a JWT
- *     with `sub` only. Clients can pass cached email/name as a
- *     fallback for users who reinstalled the app, but the primary
- *     identifier is always `sub` via the user_identities lookup. */
+ *   - Apple's standalone credential metadata is first-authorization-only;
+ *     the signed JWT normally keeps carrying email while name remains
+ *     client metadata. Returning users resolve solely through the persisted
+ *     `sub` identity; an unlinked user must present a verified email claim in
+ *     the signed token. Client-provided names never participate in identity
+ *     matching. */
 export async function handleAppleNativeSignIn(args: {
   identityToken: string
-  /** Email passed from the JS layer on FIRST sign-in only, when
-   *  Apple's native callback populated it. Lowercased before use. */
-  fallbackEmail?: string | null
   /** Name passed from the JS layer on FIRST sign-in only. Used only
    *  when creating a brand-new user row. */
   fallbackName?: string | null
@@ -645,24 +643,22 @@ export async function handleAppleNativeSignIn(args: {
   ip: string | null
   userAgent: string | null
 }): Promise<{ token: string; userId: string; email: string; displayName: string; companyId: string | null }> {
-  const { verifyAppleIdentityToken } = await import('./apple.js')
+  const { resolveTrustedAppleEmail, verifyAppleIdentityToken } = await import('./apple.js')
   const claims = await verifyAppleIdentityToken(args.identityToken, args.audiences)
-  // Email: from JWT if Apple included it; otherwise the client's
-  // cached fallback. Throw if neither — Apple flat-out won't tell us
-  // and we need *something* for the user record on first sign-in.
-  // (After path A exists, neither email is needed — the linked
-  // user_identities row resolves the user by `sub` alone, and we
-  // pass the still-required `email` placeholder through to finalize.)
-  const linked = await pool.query<{ user_id: string; email_lower: string }>(
-    `SELECT user_id, email_lower FROM user_identities
+  // Resolve the stable identity first. Returning users do not need an email
+  // claim; first sign-ins may create/cross-link an account only from Apple's
+  // signed, verified claim — never from request-body metadata.
+  const linked = await pool.query<{ email_lower: string }>(
+    `SELECT email_lower FROM user_identities
       WHERE provider = $1 AND provider_id = $2`,
     ['apple', claims.sub],
   )
   const knownEmail = linked.rows[0]?.email_lower ?? null
-  const email = (claims.email ?? args.fallbackEmail ?? knownEmail ?? '').toLowerCase().trim()
-  if (!email) {
-    throw new Error('apple sign-in: email not available (first-time sign-ins must include the email Apple returned)')
-  }
+  const email = resolveTrustedAppleEmail({
+    linkedEmail: knownEmail,
+    tokenEmail: claims.email,
+    tokenEmailVerified: claims.emailVerified,
+  })
   const displayName = (args.fallbackName ?? email.split('@')[0] ?? 'You').trim() || 'You'
 
   let result: CompletionResult

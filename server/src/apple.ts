@@ -20,10 +20,11 @@
  *   - `email_verified` is always `"true"` (a string in JWT) on
  *      successful native flows.
  *
- * Crucial Apple-quirk: `email` is only present on the FIRST sign-in
- * with this Apple ID + this app id. Subsequent sign-ins return a JWT
- * with `sub` but no `email`. Callers must remember the linkage by
- * `sub` and not depend on email being there every time.
+ * Apple's standalone credential/user metadata is only returned on the first
+ * authorization, but the signed identity token normally keeps carrying the
+ * email claim on later authorizations. Managed school accounts may have an
+ * empty email claim, so returning users still resolve by their persisted
+ * `sub` linkage rather than depending on email being present every time.
  */
 import { createPublicKey, createVerify, type JsonWebKey } from 'node:crypto'
 
@@ -83,6 +84,29 @@ export interface AppleClaims {
   /** Audience the token was minted for. Always our bundle id on the
    *  native iOS path. Verified before this object is returned. */
   aud: string
+}
+
+/** Select the only email values that are safe to use for account lookup.
+ *
+ * A linked Apple `sub` is already the account identity, so its persisted
+ * email wins even if a later token contains a different value. For an
+ * unlinked `sub`, only an email attested by the signed Apple token may create
+ * or cross-link an account. Client callback fields are deliberately absent
+ * from this boundary: native credential metadata is display data, not proof
+ * of email ownership. */
+export function resolveTrustedAppleEmail(input: {
+  linkedEmail: string | null
+  tokenEmail: string | null
+  tokenEmailVerified: boolean
+}): string {
+  const linkedEmail = (input.linkedEmail ?? '').toLowerCase().trim()
+  if (linkedEmail) return linkedEmail
+
+  const tokenEmail = (input.tokenEmail ?? '').toLowerCase().trim()
+  if (!tokenEmail || !input.tokenEmailVerified) {
+    throw new Error('apple sign-in: verified email not available for unlinked identity')
+  }
+  return tokenEmail
 }
 
 /** Verify an Apple identity_token. Throws on any tamper / expiry /

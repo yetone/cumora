@@ -718,11 +718,10 @@ api.get('/auth/callback/:provider', safe(async (req, res) => {
 api.post('/auth/apple/native', safe(async (req, res) => {
   const { handleAppleNativeSignIn, WaitlistedError, SuspendedError } = await import('../oauth.js')
   const body = (req.body ?? {}) as {
-    identityToken?: unknown; email?: unknown; name?: unknown; inviteToken?: unknown
+    identityToken?: unknown; name?: unknown; inviteToken?: unknown
   }
   const identityToken = typeof body.identityToken === 'string' ? body.identityToken : ''
   if (!identityToken) { res.status(400).json({ error: 'identityToken required' }); return }
-  const fallbackEmail = typeof body.email === 'string' ? body.email : null
   const fallbackName = typeof body.name === 'string' ? body.name : null
   const inviteToken = typeof body.inviteToken === 'string' ? body.inviteToken : null
   const ip = req.socket.remoteAddress ?? null
@@ -730,7 +729,6 @@ api.post('/auth/apple/native', safe(async (req, res) => {
   try {
     const r = await handleAppleNativeSignIn({
       identityToken,
-      fallbackEmail,
       fallbackName,
       // Only our bundle id is accepted. If we later ship an Android
       // app or web SIWA fallback they'll get distinct audiences.
