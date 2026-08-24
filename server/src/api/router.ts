@@ -1,5 +1,8 @@
 import { Router, type Request, type Response, type NextFunction } from 'express'
-import { storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey, storageKeyFromPublicUrl } from '../storage.js'
+import {
+  storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
+  storageKeyFromPublicUrl, messageAttachmentStorageKey,
+} from '../storage.js'
 import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, publish } from '../redis.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
@@ -3295,16 +3298,28 @@ api.post('/conversations/:id/messages', async (req, res) => {
   if (rawAttachment && typeof rawAttachment === 'object') {
     const a = rawAttachment as Record<string, unknown>
     if (typeof a.url === 'string' && typeof a.name === 'string') {
+      // URLs are display data and may be client-controlled or expired. Resolve
+      // the server-generated object key, then mint the URL ourselves so a chat
+      // attachment can never turn an agent wake into an arbitrary server fetch.
+      const key = messageAttachmentStorageKey(a)
+      if (!key) {
+        res.status(400).json({ error: 'attachment must reference Cumora storage' })
+        return
+      }
+      let url: string
+      try {
+        url = await storage.publicUrl(key)
+      } catch {
+        res.status(400).json({ error: 'attachment storage reference is invalid' })
+        return
+      }
       attachment = {
-        url: a.url,
-        name: a.name,
+        url,
+        name: a.name.trim().slice(0, 200),
         kind: (a.kind === 'pdf' || a.kind === 'file' || a.kind === 'fig' ? a.kind : 'img') as AttachmentPayload['kind'],
         mime: typeof a.mime === 'string' ? a.mime : undefined,
         size: typeof a.size === 'number' ? a.size : undefined,
-        // Preserve the storage `key` so we can later re-sign the URL on
-        // every read — without it, signed URLs would expire and break
-        // historical message bubbles after their TTL window.
-        key: typeof a.key === 'string' ? a.key : undefined,
+        key,
       }
     }
   }

@@ -20,6 +20,7 @@
 import type { ResponseInputItem, ResponseStreamEvent } from 'openai/resources/responses/responses'
 import { env } from '../env.js'
 import { redis } from '../redis.js'
+import { messageAttachmentStorageKey } from '../storage-keys.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
@@ -388,17 +389,25 @@ function publicUrlFor(url: string): string {
   return base.replace(/\/+$/, '') + url
 }
 
-/** Re-sign an attachment URL just-in-time for the agent's wake — the URL
- *  stored in messages.attachment.url could be hours/days old. With HMAC
- *  signing on, an expired URL would 403 when the agent (or OpenAI vision)
- *  tries to fetch. We resolve via the storage layer at the moment of use. */
-async function freshAttachmentUrl(att: InboxAttachment): Promise<string> {
-  if (!att.key) return att.url
+interface TrustedAttachmentSource {
+  key: string
+  url: string
+  mode: 'local' | 'r2'
+}
+
+/** Resolve message content exclusively from Cumora storage. The persisted URL
+ *  is presentation data and must never select a server-side fetch target;
+ *  regenerate it from the validated key and fail closed for legacy/external
+ *  references. External image links remain visible in text context, but are
+ *  deliberately not downloaded by this process. */
+async function trustedAttachmentSource(att: InboxAttachment): Promise<TrustedAttachmentSource | null> {
+  const key = messageAttachmentStorageKey(att, env.R2_PUBLIC_BASE)
+  if (!key) return null
   try {
     const { storage } = await import('../storage.js')
-    return await storage.publicUrl(att.key)
+    return { key, url: await storage.publicUrl(key), mode: storage.mode }
   } catch {
-    return att.url
+    return null
   }
 }
 
@@ -704,27 +713,32 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
   const looksTextual = mime.startsWith('text/') || TEXT_LIKE_MIMES.has(mime)
   if (!looksTextual) return null
 
+  const source = await trustedAttachmentSource(att)
+  if (!source) return null
   let buf: Buffer | null = null
-  if (att.url.startsWith('/uploads/')) {
+  if (source.mode === 'local') {
     // Local-mode file — read straight from disk to avoid a needless HTTP hop.
     try {
       const { readFile } = await import('node:fs/promises')
-      const { join } = await import('node:path')
+      const { resolve, sep } = await import('node:path')
       const { UPLOAD_DIR } = await import('../storage.js')
-      const rel = att.url.replace(/^\/uploads\//, '')
-      const data = await readFile(join(UPLOAD_DIR, rel))
+      const root = resolve(UPLOAD_DIR)
+      const path = resolve(root, source.key)
+      if (!path.startsWith(`${root}${sep}`)) return null
+      const data = await readFile(path)
       buf = Buffer.from(data)
     } catch {
       return null
     }
   } else {
-    // R2 / external URL — re-sign just-in-time so an old persisted URL
-    // doesn't 403 at the Worker, then fetch with a short timeout so a
-    // flaky bucket can't stall the wake.
-    const fresh = await freshAttachmentUrl(att)
-    if (!/^https?:\/\//.test(fresh)) return null
+    // R2 URL was minted from the validated key above. Reject redirects so a
+    // compromised/misconfigured storage edge cannot pivot to a private host.
+    if (!/^https?:\/\//.test(source.url)) return null
     try {
-      const r = await fetch(fresh, { signal: AbortSignal.timeout(5000) })
+      const r = await fetch(source.url, {
+        signal: AbortSignal.timeout(5000),
+        redirect: 'error',
+      })
       if (!r.ok) return null
       buf = Buffer.from(await r.arrayBuffer())
     } catch {
@@ -765,8 +779,9 @@ async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messa
   for (const m of items) {
     const a = m.attachment
     if (!a || a.kind !== 'img' || !a.url) continue
-    const fresh = await freshAttachmentUrl(a)
-    const url = publicUrlFor(fresh)
+    const source = await trustedAttachmentSource(a)
+    if (!source) continue
+    const url = publicUrlFor(source.url)
     // Only ship images OpenAI can actually fetch. Local /uploads paths without
     // a PUBLIC_HOST get textually mentioned but not vision-fed.
     if (!/^https?:\/\//.test(url)) continue
