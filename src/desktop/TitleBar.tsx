@@ -22,7 +22,7 @@ export function TitleBar() {
       className="grid items-center px-4 border-b border-ink-100"
       style={{
         height: 44,
-        background: 'linear-gradient(180deg, #FBFDFF 0%, #F1F7FB 100%)',
+        background: 'var(--chrome)',
         gridTemplateColumns: `1fr auto 1fr`,
         ...dragStyle,
       }}

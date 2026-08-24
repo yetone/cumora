@@ -65,7 +65,7 @@ export function InfoPane() {
   return (
     <aside
       className="border-l border-ink-100 overflow-y-auto relative"
-      style={{ background: 'linear-gradient(180deg, #FBFDFE, #F4F8FC)' }}
+      style={{ background: 'var(--chrome-pane)' }}
     >
       <button
         onClick={close}

@@ -10,6 +10,7 @@ import { usePrefs } from '@/stores/preferences'
 import { CompanySwitcher } from '@/components/CompanySwitcher'
 import { getPushStatus, initPushNotifications, teardownPushNotifications, type PushStatus } from '@/lib/push'
 import { api } from '@/api/client'
+import { AppearancePicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
 import { translate, useLocale, useT, type MessageKey } from '@/lib/i18n'
 import type { Participant } from '@/types'
@@ -210,6 +211,17 @@ export function MobileMe() {
               <div className="font-display italic text-[11px] text-ink-500 mt-0.5">{t('common.languageSub')}</div>
             </div>
             <LanguagePicker className="w-[140px] shrink-0" />
+          </div>
+        </Section>
+
+        <Section title={t('mobileMe.appearance')}>
+          <div className="bg-cloud rounded-[12px] p-3.5 flex items-center gap-3"
+            style={{ border: '1px solid var(--ink-100)' }}>
+            <div className="flex-1 min-w-0">
+              <div className="font-semibold text-[13px] text-ink-900 leading-tight">{t('common.appearance')}</div>
+              <div className="font-display italic text-[11px] text-ink-500 mt-0.5">{t('common.appearanceSub')}</div>
+            </div>
+            <AppearancePicker className="w-[140px] shrink-0" />
           </div>
         </Section>
 

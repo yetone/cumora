@@ -310,7 +310,7 @@ export function WhisperInspector({ pairId }: { pairId: string }) {
   return (
     <aside className="border-l overflow-y-auto"
       style={{
-        background: 'linear-gradient(180deg, #FBFAFE, #EFE9F7)',
+        background: 'var(--chrome-whisper)',
         borderColor: 'var(--whisper-100)',
       }}>
       <div className="py-5 px-5 pb-4 text-center border-b"

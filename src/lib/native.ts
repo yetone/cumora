@@ -96,21 +96,34 @@ export function nativePlatform(): string | null {
 
 let booted = false
 
+async function applyNativeAppearance(resolved: 'light' | 'dark'): Promise<void> {
+  if (!isNativePlatform()) return
+  await StatusBar.setStyle({ style: resolved === 'dark' ? Style.Dark : Style.Light })
+  if (nativePlatform() === 'android') {
+    await StatusBar.setBackgroundColor({ color: resolved === 'dark' ? '#21252b' : '#FAFCFE' })
+  }
+}
+
 export async function bootNative(): Promise<void> {
   if (booted) return
   booted = true
   if (!isNativePlatform()) return
 
-  // Status bar — DARK glyphs on a light app background.
+  // Status bar glyphs follow the resolved appearance. Style.Light =
+  // dark glyphs on a light ground; Style.Dark = light glyphs on dark.
   try {
-    await StatusBar.setStyle({ style: Style.Light })
-    if (nativePlatform() === 'android') {
-      await StatusBar.setBackgroundColor({ color: '#FAFCFE' })
-    }
+    await applyNativeAppearance(
+      document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+    )
     await StatusBar.setOverlaysWebView({ overlay: false })
   } catch (err) {
     console.warn('[native] status bar setup failed', err)
   }
+
+  window.addEventListener('cumora:appearance', (ev) => {
+    const resolved = (ev as CustomEvent<'light' | 'dark'>).detail
+    void applyNativeAppearance(resolved)
+  })
 
   // Splash — hide once React has mounted past the launch image.
   try {

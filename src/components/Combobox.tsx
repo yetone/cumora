@@ -102,9 +102,9 @@ export function Combobox<T extends string = string>({
           'group relative flex h-11 w-full items-center rounded-[14px] border border-ink-100 bg-cloud text-left text-[13px] font-semibold text-ink-900 outline-none transition',
           'shadow-[0_1px_0_rgba(255,255,255,0.92)_inset,0_10px_24px_-24px_rgba(26,78,120,0.55)]',
           'hover:border-sky2-200 hover:bg-sky2-50/60',
-          open && 'border-sky2-300 bg-white ring-4 ring-sky2-100',
+          open && 'border-sky2-300 bg-cloud ring-4 ring-sky2-100',
         )}
-        style={{ backgroundImage: 'linear-gradient(180deg, rgba(255,255,255,0.98), rgba(246,250,253,0.94))' }}
+        style={{ backgroundImage: 'var(--select-face)' }}
       >
         <input
           ref={inputRef}
@@ -142,7 +142,7 @@ export function Combobox<T extends string = string>({
           onClick={() => { if (open) { setOpen(false); setQuery('') } else openMenu() }}
           className={cn(
             'absolute right-2 grid h-7 w-7 place-items-center rounded-[9px] border border-sky2-100 bg-sky2-50 text-skype-deep transition',
-            'group-hover:bg-white',
+            'group-hover:bg-cloud',
             open && 'border-sky2-200 bg-sky2-50',
           )}
         >

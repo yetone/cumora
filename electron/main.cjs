@@ -1389,6 +1389,22 @@ ipcMain.handle('app:is-focused', () => {
   return !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused())
 })
 
+ipcMain.on('theme:set', (_event, source) => {
+  if (source !== 'system' && source !== 'light' && source !== 'dark') return
+  nativeTheme.themeSource = source
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const dark = source === 'dark' || (source === 'system' && nativeTheme.shouldUseDarkColors)
+    mainWindow.setBackgroundColor(dark ? '#21252b' : '#E6F3FB')
+  }
+})
+
+nativeTheme.on('updated', () => {
+  if (nativeTheme.themeSource !== 'system') return
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#21252b' : '#E6F3FB')
+  }
+})
+
 // Renderer asks main to open a URL in the user's default browser
 // (used for OAuth — embedded webviews are banned by Google and the
 // experience is better in a familiar browser anyway). Restricted to
@@ -1471,9 +1487,11 @@ app.on('second-instance', (_event, argv) => {
 }
 
 app.whenReady().then(() => {
-  if (process.platform === 'darwin') {
-    nativeTheme.themeSource = 'light'
-  }
+  // Follow the OS so `prefers-color-scheme` in the renderer is honest.
+  // The renderer sends `theme:set` when the user pins light or dark.
+  // Previously this was forced to light on Darwin because the UI had
+  // no dark palette.
+  nativeTheme.themeSource = 'system'
 
   // Wire the app:// protocol handler. protocol.handle is the modern
   // API (Electron 25+) — gives us a streaming Response back so the

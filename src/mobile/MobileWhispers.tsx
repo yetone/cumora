@@ -335,7 +335,7 @@ export function MobileWhisperRoom({ pairId, onBack }: { pairId: string; onBack: 
 
   return (
     <section className="flex flex-col h-full"
-      style={{ background: 'radial-gradient(ellipse 80% 60% at 50% 0%, rgba(210, 201, 233, 0.45), transparent 60%), linear-gradient(180deg, #FBFAFE 0%, #F1ECF8 100%)' }}>
+      style={{ background: 'var(--chrome-whisper)' }}>
       <header className="sticky top-0 z-10 backdrop-blur-md border-b border-whisper-100"
         style={{ paddingTop: 'env(safe-area-inset-top)', background: 'rgba(251, 253, 251, 0.95)' }}>
         <div className="px-2 py-2.5 flex items-center gap-2">

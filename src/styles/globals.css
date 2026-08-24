@@ -3,14 +3,57 @@
 @tailwind utilities;
 
 :root {
-  --skype: #00A8F0;
-  --skype-deep: #0078C8;
-  --skype-ink: #003B6F;
-  --sky-50: #F2FAFE;
-  --sky-100: #E1F3FD;
-  --sky-200: #C2E6FB;
-  --sky-300: #8FD3F7;
-  --sky-glow: #4FC2F4;
+  color-scheme: light;
+  /* RGB channels are the source of truth so Tailwind opacity modifiers
+   * (`bg-paper/60`) keep working. `--name` is the hex-equivalent used by
+   * inline `var(--ink-900)` styles. Dark mode only remaps the channels. */
+  --skype-rgb: 0 168 240;
+  --skype-deep-rgb: 0 120 200;
+  --skype-ink-rgb: 0 59 111;
+  --sky-50-rgb: 242 250 254;
+  --sky-100-rgb: 225 243 253;
+  --sky-200-rgb: 194 230 251;
+  --sky-300-rgb: 143 211 247;
+  --sky-glow-rgb: 79 194 244;
+  --coral-rgb: 255 122 107;
+  --coral-soft-rgb: 255 217 210;
+  --coral-deep-rgb: 200 78 63;
+  --gold-rgb: 244 183 64;
+  --gold-deep-rgb: 186 132 24;
+  /* Whisper accent — a refined dusty iris / wisteria purple. Clearly
+   * reads as PURPLE (not gray, not candy), more sophisticated than the
+   * original electric #7C5CFF candy violet. Sits as the "private /
+   * intimate" register opposite the brand sky-blue and the warm coral. */
+  --whisper-rgb: 123 108 176;
+  --whisper-deep-rgb: 78 63 140;
+  --whisper-50-rgb: 247 245 251;
+  --whisper-100-rgb: 236 231 245;
+  --whisper-200-rgb: 210 201 233;
+  --avail-rgb: 110 197 106;
+  --working-rgb: 244 183 64;
+  /* Thinking = agent is mid-compute / about to act. Sits in the same
+   * purple register as --whisper but a touch more saturated so the small
+   * status dot still reads ACTIVE (not the muted resting gray). */
+  --thinking-rgb: 138 120 200;
+  --waiting-rgb: 255 122 107;
+  --resting-rgb: 184 196 209;
+  --ink-900-rgb: 10 27 46;
+  --ink-700-rgb: 35 58 83;
+  --ink-500-rgb: 91 113 134;
+  --ink-300-rgb: 148 168 188;
+  --ink-200-rgb: 197 210 222;
+  --ink-100-rgb: 229 236 242;
+  --paper-rgb: 250 252 254;
+  --cloud-rgb: 255 255 255;
+
+  --skype: rgb(var(--skype-rgb));
+  --skype-deep: rgb(var(--skype-deep-rgb));
+  --skype-ink: rgb(var(--skype-ink-rgb));
+  --sky-50: rgb(var(--sky-50-rgb));
+  --sky-100: rgb(var(--sky-100-rgb));
+  --sky-200: rgb(var(--sky-200-rgb));
+  --sky-300: rgb(var(--sky-300-rgb));
+  --sky-glow: rgb(var(--sky-glow-rgb));
   /* Aliases matching the Tailwind palette name ("sky2"). Components refer to
    * both spellings; an undefined var() here doesn't just miss a color — it
    * invalidates the whole shorthand it appears in (a `border: 1.5px solid
@@ -20,36 +63,39 @@
   --sky2-200: var(--sky-200);
   --sky2-300: var(--sky-300);
   --sky2-glow: var(--sky-glow);
-  --coral: #FF7A6B;
-  --coral-soft: #FFD9D2;
-  --coral-deep: #C84E3F;
-  --gold: #F4B740;
-  --gold-deep: #BA8418;
-  /* Whisper accent — a refined dusty iris / wisteria purple. Clearly
-   * reads as PURPLE (not gray, not candy), more sophisticated than the
-   * original electric #7C5CFF candy violet. Sits as the "private /
-   * intimate" register opposite the brand sky-blue and the warm coral. */
-  --whisper: #7B6CB0;
-  --whisper-deep: #4E3F8C;
-  --whisper-50: #F7F5FB;
-  --whisper-100: #ECE7F5;
-  --whisper-200: #D2C9E9;
-  --avail: #6EC56A;
-  --working: #F4B740;
-  /* Thinking = agent is mid-compute / about to act. Sits in the same
-   * purple register as --whisper but a touch more saturated so the small
-   * status dot still reads ACTIVE (not the muted resting gray). */
-  --thinking: #8A78C8;
-  --waiting: #FF7A6B;
-  --resting: #B8C4D1;
-  --ink-900: #0A1B2E;
-  --ink-700: #233A53;
-  --ink-500: #5B7186;
-  --ink-300: #94A8BC;
-  --ink-200: #C5D2DE;
-  --ink-100: #E5ECF2;
-  --paper: #FAFCFE;
-  --cloud: #FFFFFF;
+  --coral: rgb(var(--coral-rgb));
+  --coral-soft: rgb(var(--coral-soft-rgb));
+  --coral-deep: rgb(var(--coral-deep-rgb));
+  --gold: rgb(var(--gold-rgb));
+  --gold-deep: rgb(var(--gold-deep-rgb));
+  --whisper: rgb(var(--whisper-rgb));
+  --whisper-deep: rgb(var(--whisper-deep-rgb));
+  --whisper-50: rgb(var(--whisper-50-rgb));
+  --whisper-100: rgb(var(--whisper-100-rgb));
+  --whisper-200: rgb(var(--whisper-200-rgb));
+  --avail: rgb(var(--avail-rgb));
+  --working: rgb(var(--working-rgb));
+  --thinking: rgb(var(--thinking-rgb));
+  --waiting: rgb(var(--waiting-rgb));
+  --resting: rgb(var(--resting-rgb));
+  --ink-900: rgb(var(--ink-900-rgb));
+  --ink-700: rgb(var(--ink-700-rgb));
+  --ink-500: rgb(var(--ink-500-rgb));
+  --ink-300: rgb(var(--ink-300-rgb));
+  --ink-200: rgb(var(--ink-200-rgb));
+  --ink-100: rgb(var(--ink-100-rgb));
+  --paper: rgb(var(--paper-rgb));
+  --cloud: rgb(var(--cloud-rgb));
+
+  /* Chrome washes used by the rail, titlebar, and side drawers. Dark
+   * mode collapses them to the paper surface so they don't stay a
+   * frozen light-blue gradient. */
+  --chrome: linear-gradient(180deg, #FBFDFF 0%, #F1F7FB 100%);
+  --chrome-rail: linear-gradient(180deg, #F8FBFD, #EDF4F9);
+  --chrome-pane: linear-gradient(180deg, #FBFDFE, #F4F8FC);
+  --chrome-whisper: linear-gradient(180deg, #FBFAFE, #EFE9F7);
+  --chrome-warm: linear-gradient(180deg, #FBF8F0, #F4EEDD);
+  --select-face: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(246, 250, 253, 0.94));
 
   --safe-top: env(safe-area-inset-top);
   --safe-bottom: env(safe-area-inset-bottom);
@@ -59,6 +105,53 @@
   /* Live keyboard height — set from Capacitor's keyboardWillShow event
      so bottom-anchored composers can lift above the soft keyboard. */
   --kb-height: 0px;
+}
+
+/* Dark palette is One Dark Pro's editor chrome (Atom / VS Code), mapped
+ * onto Cumora's existing token names so `bg-paper` / `text-ink-900` /
+ * `border-ink-100` flip without a `dark:` variant on every component.
+ * Accents (skype / coral / gold / whisper) become the One Dark syntax
+ * hues so status dots and brand buttons still read, just on a cooler
+ * ground. */
+html.dark {
+  color-scheme: dark;
+  --skype-rgb: 97 175 239;
+  --skype-deep-rgb: 82 139 255;
+  --skype-ink-rgb: 171 178 191;
+  --sky-50-rgb: 44 49 60;
+  --sky-100-rgb: 49 54 64;
+  --sky-200-rgb: 62 68 81;
+  --sky-300-rgb: 75 82 99;
+  --sky-glow-rgb: 97 175 239;
+  --coral-rgb: 224 108 117;
+  --coral-soft-rgb: 61 42 46;
+  --coral-deep-rgb: 224 108 117;
+  --gold-rgb: 229 192 123;
+  --gold-deep-rgb: 209 154 102;
+  --whisper-rgb: 198 120 221;
+  --whisper-deep-rgb: 198 120 221;
+  --whisper-50-rgb: 47 42 56;
+  --whisper-100-rgb: 53 45 64;
+  --whisper-200-rgb: 74 61 92;
+  --avail-rgb: 152 195 121;
+  --working-rgb: 229 192 123;
+  --thinking-rgb: 198 120 221;
+  --waiting-rgb: 224 108 117;
+  --resting-rgb: 92 99 112;
+  --ink-900-rgb: 171 178 191;
+  --ink-700-rgb: 157 165 180;
+  --ink-500-rgb: 127 132 142;
+  --ink-300-rgb: 92 99 112;
+  --ink-200-rgb: 62 68 81;
+  --ink-100-rgb: 44 49 60;
+  --paper-rgb: 33 37 43;
+  --cloud-rgb: 40 44 52;
+  --chrome: rgb(var(--paper-rgb));
+  --chrome-rail: rgb(var(--paper-rgb));
+  --chrome-pane: rgb(var(--paper-rgb));
+  --chrome-whisper: rgb(var(--whisper-50-rgb));
+  --chrome-warm: #2a2824;
+  --select-face: none;
 }
 
 /* Native-shell tweaks (iOS / Android Capacitor builds). main.tsx adds
@@ -236,6 +329,14 @@ body {
   50% { transform: translate(60px, 30px); }
 }
 
+html.dark body:not(.electron) {
+  background: var(--paper);
+}
+html.dark body:not(.electron)::before,
+html.dark body:not(.electron)::after {
+  display: none;
+}
+
 /* Toast auto-dismiss progress bar — drains right-to-left over the toast's
  * lifetime. Used by NotificationToasts; the toast pauses the animation on
  * hover so the user gets time to read longer messages. */
@@ -361,8 +462,9 @@ body {
 /* ─── Cumora code-block syntax theme ─────────────────────────────────────
  * Token colors mapped onto the brand palette (sky / coral / gold / wisteria
  * / ink) so highlighted code never visually fights the surrounding chat.
- * Used by `<CodeBlock>` in Message.tsx. Designed for a light paper-toned
- * panel; if we ever ship a dark variant we'll need a separate selector.
+ * Used by `<CodeBlock>` in Message.tsx. Light: paper-toned. Dark: One
+ * Dark Pro roles (purple keywords, green strings, blue functions) so a
+ * fenced block reads like the editor the palette came from.
  */
 .cumora-code, .cumora-code code { color: var(--ink-700); }
 .cumora-code .hljs-keyword,
@@ -402,6 +504,44 @@ body {
 .cumora-code .hljs-strong { font-weight: 700; }
 .cumora-code .hljs-addition { background: rgba(110, 197, 106, 0.12); color: #2D6F2A; }
 .cumora-code .hljs-deletion { background: rgba(255, 122, 107, 0.12); color: var(--coral-deep); }
+
+html.dark .cumora-code,
+html.dark .cumora-code code { color: #abb2bf; }
+html.dark .cumora-code .hljs-keyword,
+html.dark .cumora-code .hljs-selector-tag,
+html.dark .cumora-code .hljs-tag,
+html.dark .cumora-code .hljs-name { color: #c678dd; font-weight: 600; }
+html.dark .cumora-code .hljs-built_in { color: #56b6c2; font-weight: 600; }
+html.dark .cumora-code .hljs-literal { color: #d19a66; font-weight: 600; }
+html.dark .cumora-code .hljs-string,
+html.dark .cumora-code .hljs-regexp,
+html.dark .cumora-code .hljs-symbol,
+html.dark .cumora-code .hljs-template-tag,
+html.dark .cumora-code .hljs-template-variable { color: #98c379; }
+html.dark .cumora-code .hljs-number,
+html.dark .cumora-code .hljs-attr,
+html.dark .cumora-code .hljs-attribute { color: #d19a66; }
+html.dark .cumora-code .hljs-title,
+html.dark .cumora-code .hljs-title.class_,
+html.dark .cumora-code .hljs-title.function_,
+html.dark .cumora-code .hljs-class .hljs-title,
+html.dark .cumora-code .hljs-function .hljs-title,
+html.dark .cumora-code .hljs-type,
+html.dark .cumora-code .hljs-section { color: #61afef; font-weight: 600; }
+html.dark .cumora-code .hljs-comment,
+html.dark .cumora-code .hljs-quote { color: #5c6370; font-style: italic; }
+html.dark .cumora-code .hljs-meta,
+html.dark .cumora-code .hljs-meta .hljs-keyword,
+html.dark .cumora-code .hljs-doctag { color: #5c6370; }
+html.dark .cumora-code .hljs-variable,
+html.dark .cumora-code .hljs-property,
+html.dark .cumora-code .hljs-params { color: #e06c75; }
+html.dark .cumora-code .hljs-operator,
+html.dark .cumora-code .hljs-punctuation { color: #abb2bf; }
+html.dark .cumora-code .hljs-bullet,
+html.dark .cumora-code .hljs-link { color: #61afef; }
+html.dark .cumora-code .hljs-addition { background: rgba(152, 195, 121, 0.15); color: #98c379; }
+html.dark .cumora-code .hljs-deletion { background: rgba(224, 108, 117, 0.15); color: #e06c75; }
 
 /* Scrollbars */
 *::-webkit-scrollbar { width: 8px; height: 8px; }

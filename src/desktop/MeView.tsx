@@ -7,6 +7,7 @@ import { useDevtools } from '@/stores/devtools'
 import { useAuth } from '@/stores/auth'
 import { Avatar } from '@/components/Avatar'
 import { Checkbox } from '@/components/Checkbox'
+import { AppearancePicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
@@ -672,6 +673,7 @@ function PreferencesTab() {
         </Section>
       ))}
       <LanguageSection />
+      <AppearanceSection />
       <SkypeSoundSection />
       {devtoolsCanEnable && (
         <Section title={`↳ ${t('me.prefs.developer')}`}>
@@ -703,6 +705,24 @@ function LanguageSection() {
           </div>
         </div>
         <LanguagePicker className="w-[180px] shrink-0" />
+      </div>
+    </Section>
+  )
+}
+
+function AppearanceSection() {
+  const t = useT()
+  return (
+    <Section title={`↳ ${t('me.prefs.appearanceSection')}`}>
+      <div className="bg-cloud rounded-[14px] p-4 flex items-center gap-4"
+        style={{ border: '1px solid var(--ink-100)' }}>
+        <div className="flex-1 min-w-0">
+          <div className="font-semibold text-[13px] text-ink-900">{t('common.appearance')}</div>
+          <div className="font-display italic font-normal text-[11.5px] text-ink-500 mt-0.5">
+            {t('common.appearanceSub')}
+          </div>
+        </div>
+        <AppearancePicker className="w-[180px] shrink-0" />
       </div>
     </Section>
   )

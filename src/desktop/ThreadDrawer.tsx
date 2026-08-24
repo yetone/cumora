@@ -118,7 +118,7 @@ export function ThreadDrawer() {
   return (
     <aside
       className="border-l border-ink-100 overflow-hidden relative flex flex-col"
-      style={{ background: 'linear-gradient(180deg, #FBFDFE, #F4F8FC)' }}
+      style={{ background: 'var(--chrome-pane)' }}
     >
       <header className="flex items-center justify-between px-4 pt-4 pb-3 border-b border-ink-100">
         <div>

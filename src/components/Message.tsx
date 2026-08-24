@@ -1112,7 +1112,7 @@ function _EmailCard({ msg }: { msg: Message }) {
     <div
       className="mt-1 max-w-[min(100%,640px)] overflow-hidden"
       style={{
-        background: 'linear-gradient(180deg, #FBF8F0, #F4EEDD)',
+        background: 'var(--chrome-warm)',
         border: `1px solid ${ringColor}`,
         borderRadius: '14px',
         boxShadow: '0 1px 0 rgba(0,0,0,0.02), 0 8px 20px -16px rgba(60, 50, 30, 0.18)',

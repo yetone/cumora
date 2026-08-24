@@ -391,7 +391,7 @@ export function EmailComposer() {
       <div
         className="relative pointer-events-auto w-full max-w-[640px] h-full flex flex-col animate-slide-in-right"
         style={{
-          background: 'linear-gradient(180deg, #FBF8F0, #F4EEDD)',
+          background: 'var(--chrome-warm)',
           boxShadow: '-12px 0 32px -10px rgba(60, 50, 30, 0.18)',
         }}
         onDragEnter={onDragEnter}

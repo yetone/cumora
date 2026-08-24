@@ -1,53 +1,58 @@
 import type { Config } from 'tailwindcss'
 
+/** Tailwind color that tracks a CSS `--name-rgb` channel token so
+ *  opacity modifiers (`bg-paper/60`) and `html.dark` remaps both work. */
+const rgb = (token: string) => `rgb(var(${token}) / <alpha-value>)`
+
 const config: Config = {
+  darkMode: 'class',
   content: ['./index.html', './src/**/*.{ts,tsx}'],
   theme: {
     extend: {
       colors: {
         skype: {
-          DEFAULT: '#00A8F0',
-          deep: '#0078C8',
-          ink: '#003B6F',
+          DEFAULT: rgb('--skype-rgb'),
+          deep: rgb('--skype-deep-rgb'),
+          ink: rgb('--skype-ink-rgb'),
         },
         sky2: {
-          50: '#F2FAFE',
-          100: '#E1F3FD',
-          200: '#C2E6FB',
-          300: '#8FD3F7',
-          glow: '#4FC2F4',
+          50: rgb('--sky-50-rgb'),
+          100: rgb('--sky-100-rgb'),
+          200: rgb('--sky-200-rgb'),
+          300: rgb('--sky-300-rgb'),
+          glow: rgb('--sky-glow-rgb'),
         },
         coral: {
-          DEFAULT: '#FF7A6B',
-          soft: '#FFD9D2',
-          deep: '#C84E3F',
+          DEFAULT: rgb('--coral-rgb'),
+          soft: rgb('--coral-soft-rgb'),
+          deep: rgb('--coral-deep-rgb'),
         },
         gold: {
-          DEFAULT: '#F4B740',
-          deep: '#BA8418',
+          DEFAULT: rgb('--gold-rgb'),
+          deep: rgb('--gold-deep-rgb'),
         },
         whisper: {
-          DEFAULT: '#7C5CFF',
-          deep: '#4A2D9E',
-          50: '#F6F3FF',
-          100: '#ECE5FF',
-          200: '#D9CCFF',
+          DEFAULT: rgb('--whisper-rgb'),
+          deep: rgb('--whisper-deep-rgb'),
+          50: rgb('--whisper-50-rgb'),
+          100: rgb('--whisper-100-rgb'),
+          200: rgb('--whisper-200-rgb'),
         },
         ink: {
-          900: '#0A1B2E',
-          700: '#233A53',
-          500: '#5B7186',
-          300: '#94A8BC',
-          200: '#C5D2DE',
-          100: '#E5ECF2',
+          900: rgb('--ink-900-rgb'),
+          700: rgb('--ink-700-rgb'),
+          500: rgb('--ink-500-rgb'),
+          300: rgb('--ink-300-rgb'),
+          200: rgb('--ink-200-rgb'),
+          100: rgb('--ink-100-rgb'),
         },
-        cloud: '#FFFFFF',
-        paper: '#FAFCFE',
-        avail: '#6EC56A',
-        working: '#F4B740',
-        thinking: '#7C5CFF',
-        waiting: '#FF7A6B',
-        resting: '#B8C4D1',
+        cloud: rgb('--cloud-rgb'),
+        paper: rgb('--paper-rgb'),
+        avail: rgb('--avail-rgb'),
+        working: rgb('--working-rgb'),
+        thinking: rgb('--thinking-rgb'),
+        waiting: rgb('--waiting-rgb'),
+        resting: rgb('--resting-rgb'),
       },
       fontFamily: {
         display: ['Manrope', 'system-ui', '-apple-system', 'sans-serif'],

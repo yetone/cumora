@@ -77,7 +77,7 @@ export function Rail() {
   return (
     <aside
       className="flex flex-col items-center py-[18px] gap-1.5 border-r border-ink-100"
-      style={{ background: 'linear-gradient(180deg, #F8FBFD, #EDF4F9)' }}
+      style={{ background: 'var(--chrome-rail)' }}
     >
       <button
         className="mb-3.5 relative"

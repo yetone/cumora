@@ -19,11 +19,25 @@
      `#notifications` hash. Its window is backed by NSVisualEffectView
      (vibrancy) and must show the vibrant material straight through —
      no white flash. Inline this BEFORE any stylesheet (including
-     globals.css) loads so the body never paints opaque at any point. -->
+     globals.css) loads so the body never paints opaque at any point.
+
+     Appearance is the same constraint: without a blocking read of
+     `cumora.appearance` / prefers-color-scheme, the first paint is
+     always light and then snaps. -->
 <script>
-  if (location.hash === '#notifications') {
-    document.documentElement.classList.add('cumora-notif-window')
-  }
+  (() => {
+    if (location.hash === '#notifications') {
+      document.documentElement.classList.add('cumora-notif-window')
+      return
+    }
+    try {
+      const pref = localStorage.getItem('cumora.appearance')
+      const dark = pref === 'dark' || ((pref === 'system' || pref === null) && matchMedia('(prefers-color-scheme: dark)').matches)
+      if (dark) document.documentElement.classList.add('dark')
+    } catch {
+      /* private mode / storage disabled */
+    }
+  })()
 </script>
 <style>
   html.cumora-notif-window,

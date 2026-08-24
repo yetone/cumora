@@ -185,7 +185,7 @@ export function ConveneView() {
       </main>
 
       <aside className="border-l border-ink-100 overflow-y-auto"
-        style={{ background: 'linear-gradient(180deg, #FBFDFE, #F4F8FC)' }}>
+        style={{ background: 'var(--chrome-pane)' }}>
         <div className="py-3.5 px-[18px] pb-2.5 border-b border-ink-100">
           <h4 className="font-display font-medium text-[16px] tracking-tight mb-1">
             {t('convene.transcriptTitle')} <em className="italic text-skype-deep" style={{ fontWeight: 400 }}>{t('convene.transcriptEm')}</em>

@@ -93,6 +93,16 @@ contextBridge.exposeInMainWorld('cumora', {
   },
 
   /**
+   * Appearance preference. Mirrors the renderer's `system | light | dark`
+   * so Chromium's `prefers-color-scheme` (and the traffic lights) stay
+   * honest. Previously main forced `light` because the UI had no dark
+   * palette.
+   */
+  theme: {
+    set: (source) => ipcRenderer.send('theme:set', source),
+  },
+
+  /**
    * Auto-update bridge. Mirrors alma's pattern:
    *   - getAppInfo() — current version + autoupdate capability flag
    *   - getStatus()  — last broadcast status (idle / checking / available / downloading / downloaded / error)
