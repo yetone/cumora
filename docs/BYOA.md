@@ -1,4 +1,4 @@
-# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build / Cursor Agent / OpenCode as the engine)
+# BYOA — Bring Your Own Agent (local Claude Code / Codex / Grok Build / Cursor Agent / OpenCode / pi as the engine)
 
 Every Cumora agent has a "brain" and a host. The managed path is
 server-side: `runAgentTurn` in `server/src/agents/turn.ts` runs a
@@ -7,8 +7,8 @@ a per-agent Kubernetes pod (the `agent-computer` image).
 
 **BYOA** lets a user supply the brain instead: a long-running daemon on
 the user's own machine (laptop **or** VPS) drives a local **Claude Code**,
-**Codex CLI**, **Grok Build** (`grok`), **Cursor Agent** (`cursor-agent`), or
-**OpenCode** (`opencode`) as the reasoning engine, on the user's own provider
+**Codex CLI**, **Grok Build** (`grok`), **Cursor Agent** (`cursor-agent`),
+**OpenCode** (`opencode`), or **pi** (`pi`) as the reasoning engine, on the user's own provider
 account — the server never holds the user's provider credentials.
 One daemon hosts **many independent agents** — each with its own isolated
 home directory, memory, skills, and notes. In Cumora these still appear
@@ -39,7 +39,7 @@ managed cloud agents and local agents into the same picture.
   user to set up; it's always online.
 - **Your computers** — machines you pair (your Mac, a VPS). Each runs the
   `cumora agent computer` daemon with a local engine (Claude Code /
-  Codex / Grok Build / Cursor Agent / OpenCode). Agents you place here are BYOA agents.
+  Codex / Grok Build / Cursor Agent / OpenCode / pi). Agents you place here are BYOA agents.
 
 ```
 Computers
@@ -113,6 +113,7 @@ with rate-limit adaptation, and same-turn steering.
               │        → persistent EngineSession turn                  │
               │   claude --input/output-format stream-json …            │
               │   codex app-server / grok ACP / cursor/opencode run     │
+              │   pi --mode rpc (JSON commands + events over stdio)     │
               │   bash → cumora shim → POST /runtime/cli (per-agent JWT)│
               └─────────────────────────────────────────────────────────┘
 ```
@@ -204,20 +205,20 @@ interface EngineSession {
 }
 ```
 
-| Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent | OpenCode |
-| --- | --- | --- | --- | --- | --- |
-| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]` | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`) | `grok agent --always-approve --no-leader … stdio`, driven over ACP | none in Cursor Agent `2026.08.11-e8db854` | none in the supported OpenCode `v1.18.20` contract; a new process resumes with `--session <id>` |
-| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` | ACP `_meta.rules` | inlined into each wake | inlined into each wake |
-| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` | `grok -p … --output-format streaming-messages-json` | `cursor-agent -p --output-format stream-json --force --trust [--resume <id>]` | `opencode run --format json --auto [--session <id>] [--model provider/model]` (prompt on stdin) |
-| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure | `CUMORA_GROK_ARGS` set, `CUMORA_GROK_NO_ACP=1`, or Windows | always one-shot; `CUMORA_CURSOR_ARGS` overrides flags | always one-shot; `CUMORA_OPENCODE_ARGS` overrides run flags |
-| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` |
-| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` | `grok -p --model grok-4.5 --output-format json` | `cursor-agent --mode ask -p --output-format stream-json --trust` | `opencode run --format json --agent cumora-triage`; the injected agent denies every tool permission |
+| Concern | Claude Code | Codex CLI | Grok Build | Cursor Agent | OpenCode | pi |
+| --- | --- | --- | --- | --- | --- | --- |
+| Persistent session | `claude -p --input-format stream-json --output-format stream-json --verbose [--resume <id>] [--model X]` | `codex app-server --listen stdio://`, driven over JSON-RPC (`thread/start` / `thread/resume`) | `grok agent --always-approve --no-leader … stdio`, driven over ACP | none in Cursor Agent `2026.08.11-e8db854` | none in the supported OpenCode `v1.18.20` contract; a new process resumes with `--session <id>` | `pi --mode rpc --session-id <id> --skill <home>/.pi/skills`; a turn is a `prompt` command, done at `agent_settled`; steering is pi's native `steer` |
+| Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | `developerInstructions` on `thread/start` | ACP `_meta.rules` | inlined into each wake | inlined into each wake | `--append-system-prompt <home>/.cumora-standing-prompt.md` |
+| One-shot fallback | `claude -p … --output-format stream-json` | `codex exec … --skip-git-repo-check` | `grok -p … --output-format streaming-messages-json` | `cursor-agent -p --output-format stream-json --force --trust [--resume <id>]` | `opencode run --format json --auto [--session <id>] [--model provider/model]` (prompt on stdin) | `pi <CUMORA_PI_ARGS> --session-id <id> -p` (print mode) |
+| Fallback triggers | `CUMORA_CLAUDE_ARGS` set | `CUMORA_CODEX_ARGS` set, `CUMORA_CODEX_NO_APP_SERVER=1`, Windows, or git-init failure | `CUMORA_GROK_ARGS` set, `CUMORA_GROK_NO_ACP=1`, or Windows | always one-shot; `CUMORA_CURSOR_ARGS` overrides flags | always one-shot; `CUMORA_OPENCODE_ARGS` overrides run flags | `CUMORA_PI_ARGS` set |
+| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` | `AGENTS.md` plus `.pi/skills/` (loaded via `--skill`) |
+| Triage (small brain) | `claude -p --model haiku --output-format json` | `codex exec --model gpt-5.4-mini` | `grok -p --model grok-4.5 --output-format json` | `cursor-agent --mode ask -p --output-format stream-json --trust` | `opencode run --format json --agent cumora-triage`; the injected agent denies every tool permission | `pi --mode json --no-session --no-tools --no-extensions --no-skills --no-context-files [--model $CUMORA_TRIAGE_MODEL]` (multi-provider — no fixed cheap model; unset → pi's default) |
 
 Sessions carry a resume id (`~/.cumora/sessions/<agentId>.session`); a
 failed resume falls back to a fresh thread instead of wedging the agent.
 Engines run headless with their permission prompts disabled, scoped to
 the agent's isolated home. On Windows the daemon resolves the real
-`claude`/`codex`/`grok`/`cursor-agent`/`opencode` `.cmd` shims and routes large
+`claude`/`codex`/`grok`/`cursor-agent`/`opencode`/`pi` `.cmd` shims and routes large
 prompts via stdin. OpenCode JSONL `step_finish` events are recorded as individual
 provider hops; uncached input, output+reasoning, and cache read/write tokens map
 to Cumora's common usage ledger without double-counting. OpenCode may race its
@@ -266,6 +267,7 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
     .claude/skills/<name>/SKILL.md ← this agent's skills (Claude)
     .cursor/skills/                 ← Cursor-native skill directory
     .opencode/skills/               ← OpenCode-native skill directory
+    .pi/skills/                     ← pi-native skill directory (via --skill)
     .claude/settings.json          ← permissions (allow Bash)
     bin/cumora                     ← the shim (see below); bin/.runtime-token
     memory/MEMORY.md               ← the agent's durable memory index
@@ -295,7 +297,7 @@ credentials are keyed to that dir — so the daemon sets `cwd` to the
 agent's home and does **not** relocate config. Per-agent: project memory,
 skills, settings, notes, workspace. Shared across an owner's agents on
 one machine: the engine login and the user's global config (`~/.claude` /
-`~/.codex` / `~/.grok`, Cursor's login store, or OpenCode's config/auth store).
+`~/.codex` / `~/.grok` / `~/.pi/agent`, Cursor's login store, or OpenCode's config/auth store).
 Agents are independent in all project state and share one engine login per host.
 
 ---
@@ -309,7 +311,7 @@ CREATE TABLE computers (
   owner_user_id     TEXT,            -- null for the managed Cumora Cloud row
   name              TEXT NOT NULL,   -- "Cumora Cloud", "MacBook Pro", …
   kind              TEXT NOT NULL,   -- 'cloud' | 'local' | 'vps'
-  available_engines JSONB,           -- ['claude','codex','grok','cursor','opencode'] (daemon-detected)
+  available_engines JSONB,           -- ['claude','codex','grok','cursor','opencode','pi'] (daemon-detected)
   status            TEXT NOT NULL,   -- 'online' | 'offline' | 'busy'
   last_seen_at      TIMESTAMP,
   credential_hash   TEXT,            -- SHA256 of the device token
@@ -322,7 +324,7 @@ CREATE TABLE computers (
 
 -- participants carry their host + engine + models
 --   computer_id  TEXT   (FK → computers.id)
---   engine       TEXT   ('managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode')
+--   engine       TEXT   ('managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi')
 --   model        TEXT   (big-brain override)
 --   fast_model   TEXT   (small-brain override)
 ```
@@ -411,7 +413,7 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
 ## Boundaries
 
 - **Cost / rate limits are the operator's** (their Claude Code / Codex / Grok Build /
-  Cursor subscription or OpenCode provider account) — a stated BYOA benefit. The daemon's semaphores, spawn
+  Cursor subscription, or OpenCode / pi provider account) — a stated BYOA benefit. The daemon's semaphores, spawn
   pacing, and cooldowns exist to stay inside those limits gracefully
   (COORDINATION.md 2-4).
 - **Local inner state is not mirrored to the server.** Memory, notes,

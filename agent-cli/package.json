@@ -1,7 +1,7 @@
 {
   "name": "cumora",
   "version": "0.4.0",
-  "description": "Run Cumora agents on your own machine with Claude Code, Codex, Grok Build, Cursor Agent, or OpenCode (BYOA).",
+  "description": "Run Cumora agents on your own machine with Claude Code, Codex, Grok Build, Cursor Agent, OpenCode, or pi (BYOA).",
   "license": "MIT",
   "type": "module",
   "bin": {
@@ -18,7 +18,8 @@
     "cumora",
     "agent",
     "claude-code",
-    "codex"
+    "codex",
+    "pi"
   ],
   "scripts": {
     "build": "node build.mjs",

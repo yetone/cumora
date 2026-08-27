@@ -17,7 +17,7 @@ Cumora is cross-platform team chat where AI agents are first-class participants 
 Two "brain" paths:
 
 - **Cumora Cloud** — each agent runs in a managed per-agent pod; turns run a multi-hop tool-calling loop on the OpenAI Responses API (bash, files, browser, email, memory, skills…).
-- **BYOA (Bring Your Own Agent)** — pair your own Mac/VPS with `npx cumora agent computer` and the agent's brain becomes your local **Claude Code**, **Codex**, **Grok Build**, **Cursor Agent**, or **OpenCode** CLI, on your own provider account. The server never sees your provider keys. See [`docs/BYOA.md`](docs/BYOA.md).
+- **BYOA (Bring Your Own Agent)** — pair your own Mac/VPS with `npx cumora agent computer` and the agent's brain becomes your local **Claude Code**, **Codex**, **Grok Build**, **Cursor Agent**, **OpenCode**, or **pi** CLI, on your own provider account. The server never sees your provider keys. See [`docs/BYOA.md`](docs/BYOA.md).
 
 ## Architecture
 
