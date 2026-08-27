@@ -13,6 +13,7 @@ import { pool } from '../db/pool.js'
 import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
 import { env } from '../env.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
+import { fetchImageBytes } from './image-fetcher.js'
 import { stripLoneSurrogates } from './text-safety.js'
 import {
   asMemorySource,
@@ -2137,8 +2138,12 @@ async function generateAndUploadImage(opts: {
   if (b64) {
     buf = Buffer.from(b64, 'base64')
   } else if (remoteUrl) {
-    const fetched = await fetch(remoteUrl)
-    buf = Buffer.from(await fetched.arrayBuffer())
+    const fetched = await fetchImageBytes(remoteUrl, {
+      maxBytes: 20 * 1024 * 1024,
+      timeoutMs: 30_000,
+    })
+    if (!fetched.ok) throw new Error(`image API download failed (${fetched.reason})`)
+    buf = fetched.buffer
   } else {
     throw new Error('image API returned no data')
   }
@@ -3405,13 +3410,20 @@ async function setAgentAvatarFromUrl(args: {
     throw new Error('avatar source must be an http(s) URL')
   }
   const MAX_BYTES = 8 * 1024 * 1024  // 8MB ceiling for portraits
-  const fetched = await fetch(args.sourceUrl, { signal: AbortSignal.timeout(15_000) })
-  if (!fetched.ok) throw new Error(`source URL returned ${fetched.status}`)
-  const mime = (fetched.headers.get('content-type') ?? '').split(';')[0].trim().toLowerCase()
-  if (!mime.startsWith('image/')) throw new Error(`source URL is not an image (content-type: ${mime || 'unknown'})`)
-  const buf = Buffer.from(await fetched.arrayBuffer())
+  const fetched = await fetchImageBytes(args.sourceUrl, {
+    maxBytes: MAX_BYTES,
+    timeoutMs: 15_000,
+  })
+  if (!fetched.ok) {
+    if (fetched.reason === 'http') throw new Error(`source URL returned ${fetched.status ?? 'an error'}`)
+    if (fetched.reason === 'bad-type') throw new Error('source URL is not an image')
+    if (fetched.reason === 'too-large') throw new Error(`source image exceeds ${MAX_BYTES} bytes`)
+    if (fetched.reason === 'blocked') throw new Error('source URL is not allowed')
+    if (fetched.reason === 'timeout') throw new Error('source URL timed out')
+    throw new Error('source URL could not be fetched')
+  }
+  const { buffer: buf, mime } = fetched
   if (buf.length === 0) throw new Error('source image is empty')
-  if (buf.length > MAX_BYTES) throw new Error(`source image too large (${buf.length} > ${MAX_BYTES})`)
 
   // Pick a sensible extension from the mime so the stored object has a
   // useful filename and the Worker serves the right content-type.

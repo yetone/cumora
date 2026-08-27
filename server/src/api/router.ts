@@ -8,6 +8,7 @@ import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
+import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics } from '../agents/observability.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
@@ -2636,8 +2637,12 @@ export async function generateAndPersistAvatar(args: {
   if (b64) {
     imageBuf = Buffer.from(b64, 'base64')
   } else if (remoteUrl) {
-    const fetched = await fetch(remoteUrl)
-    imageBuf = Buffer.from(await fetched.arrayBuffer())
+    const fetched = await fetchImageBytes(remoteUrl, {
+      maxBytes: 20 * 1024 * 1024,
+      timeoutMs: 30_000,
+    })
+    if (!fetched.ok) throw new HttpError(502, `image API download failed (${fetched.reason})`)
+    imageBuf = fetched.buffer
   } else {
     throw new HttpError(502, 'image API returned no image')
   }
