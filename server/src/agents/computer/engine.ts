@@ -71,7 +71,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
       const candidate = join(dir, bin + ext)
       if (existsSync(candidate)) {
         const isBatch = /\.(cmd|bat)$/i.test(candidate)
-        return { command: candidate, shell: isBatch, wantsStdinPrompt: isBatch }
+        // When shell:true and the path contains spaces, cmd.exe will split the
+        // command at the space unless we quote it (e.g. "C:\Program Files\codex").
+        const command = isBatch && candidate.includes(' ') ? `"${candidate}"` : candidate
+        return { command, shell: isBatch, wantsStdinPrompt: isBatch }
       }
     }
   }
@@ -82,7 +85,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   for (const dir of (process.env.PATH ?? '').split(PATH_DELIMITER)) {
     if (!dir) continue
     const shim = join(dir, bin)
-    if (existsSync(shim)) return { command: shim, shell: true, wantsStdinPrompt: true }
+    if (existsSync(shim)) {
+      const command = shim.includes(' ') ? `"${shim}"` : shim
+      return { command, shell: true, wantsStdinPrompt: true }
+    }
   }
   // Not found on PATH at all — let the shell resolve it, and feed the prompt via stdin.
   return { command: bin, shell: true, wantsStdinPrompt: true }
