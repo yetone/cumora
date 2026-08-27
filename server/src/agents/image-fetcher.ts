@@ -97,6 +97,11 @@ interface RequiredImageFetchOptions {
   maxRedirects: number
 }
 
+type ImageFetchOverride = (
+  url: string,
+  options: ImageFetchOptions,
+) => Promise<ImageBytesResult>
+
 /** 10 MB per image. OpenAI's per-image limits vary by model but are
  *  typically <=20 MB on the wire; staying well under avoids edge rejection
  *  and bounds attacker leverage on attachment URLs. */
@@ -153,6 +158,7 @@ for (const [network, prefix] of [
 interface CacheEntry { at: number; result: MaterializeResult; bytes: number }
 const cache = new Map<string, CacheEntry>()
 let cacheBytes = 0
+let imageFetchOverrideForTesting: ImageFetchOverride | null = null
 
 class BlockedImageUrlError extends Error {}
 
@@ -419,11 +425,17 @@ export async function fetchImageBytes(
   url: string,
   options: ImageFetchOptions = {},
 ): Promise<ImageBytesResult> {
+  if (imageFetchOverrideForTesting) return await imageFetchOverrideForTesting(url, options)
   return await fetchImageBytesWithDependencies(url, {
     maxBytes: options.maxBytes ?? MAX_IMAGE_BYTES,
     timeoutMs: options.timeoutMs ?? FETCH_TIMEOUT_MS,
     maxRedirects: options.maxRedirects ?? MAX_REDIRECTS,
   }, productionDependencies)
+}
+
+/** Integration-test hook for call sites that consume the centralized helper. */
+export function __setImageFetchOverrideForTesting(override: ImageFetchOverride | null): void {
+  imageFetchOverrideForTesting = override
 }
 
 /** Fetch `url`, validate it's an image we can ship, and return a base64

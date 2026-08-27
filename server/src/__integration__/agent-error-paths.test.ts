@@ -13,8 +13,8 @@
  *     drives the rest of the turn.
  *   - image generation via `r.data[0].url` (the upstream returned a URL
  *     instead of inline b64): `generateAndUploadImage` fetches the URL
- *     and uploads the buffer; we mock globalThis.fetch to return a known
- *     PNG so the test stays hermetic.
+ *     and uploads the buffer; we inject a known PNG at the safe image-fetch
+ *     boundary so the test stays hermetic.
  *
  * Run via:
  *   INTEGRATION_DATABASE_URL=postgres://$USER@localhost:5432/cumora_test \
@@ -30,24 +30,24 @@ import { __setLlmClientOverrideForTesting } from '../llm.js'
 import { __setPodToolOverrideForTesting } from '../agents/runtime/pod-tools.js'
 import { runAgentTurn } from '../agents/turn.js'
 import { runCli } from '../agents/cli.js'
+import { __setImageFetchOverrideForTesting } from '../agents/image-fetcher.js'
 import type { ToolResult } from '../agents/tools-shared.js'
 
 before(async () => {
   await ensureSchemaOnce()
 })
 
-const realFetch = globalThis.fetch
 beforeEach(async () => {
   await resetAllTables()
   __setLlmClientOverrideForTesting(null)
   __setPodToolOverrideForTesting(null)
-  globalThis.fetch = realFetch
+  __setImageFetchOverrideForTesting(null)
 })
 
 after(async () => {
   __setLlmClientOverrideForTesting(null)
   __setPodToolOverrideForTesting(null)
-  globalThis.fetch = realFetch
+  __setImageFetchOverrideForTesting(null)
   await teardownAll()
 })
 
@@ -396,15 +396,21 @@ test('[integration] image_url fetch fail on attempt 0 → retry with images stri
 test('[integration] generateAndUploadImage: r.data[0].url fallback — fetches remote bytes and persists attachment', async () => {
   // When the image API returns a URL instead of inline b64, cumora's
   // `generateAndUploadImage` fetches the URL and uploads the resulting
-  // buffer. We mock globalThis.fetch to return a known PNG byte sequence
-  // so the test stays hermetic.
+  // buffer. Inject at the safe-fetch boundary so this call-site test stays
+  // hermetic while image-fetcher.test.ts owns DNS/redirect policy coverage.
   const { agentId, conversationId } = await seedDirect()
 
   let fetchedUrl: string | null = null
-  globalThis.fetch = (async (input: unknown) => {
-    fetchedUrl = typeof input === 'string' ? input : String(input)
-    return new Response(TINY_PNG_BYTES, { status: 200, headers: { 'content-type': 'image/png' } })
-  }) as typeof globalThis.fetch
+  __setImageFetchOverrideForTesting(async input => {
+    fetchedUrl = input
+    return {
+      ok: true,
+      buffer: TINY_PNG_BYTES,
+      mime: 'image/png',
+      bytes: TINY_PNG_BYTES.length,
+      finalUrl: input,
+    }
+  })
 
   __setLlmClientOverrideForTesting(async () => {
     return {
