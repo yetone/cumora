@@ -71,7 +71,7 @@ export type LlmCallPurpose =
   | 'agent-image'
 
 export type LlmCallStatus = 'ok' | 'rate_limited' | 'timeout' | 'failed'
-export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode'
+export type LlmCallSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi'
 
 /** Context bound to a tracked client. Every LLM call it makes carries this
  *  shape into the ledger. `purpose` is mandatory; everything else scopes the

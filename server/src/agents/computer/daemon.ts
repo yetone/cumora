@@ -2,7 +2,7 @@
  * `cumora agent computer` — the BYOA daemon.
  *
  * A long-running process on the user's machine (laptop or VPS) that hosts one
- * or more of their Cumora agents, using a local engine (Claude Code / Codex /
+ * or more of their Cumora agents, using a local engine (Claude Code / Codex / pi /
  * Grok Build / Cursor Agent / OpenCode) as each agent's brain. See docs/BYOA.md.
  *
  * It talks to the Cumora server only over HTTP — no DB/Redis — so it can run
@@ -630,6 +630,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'opencode') {
     return 'Open a terminal on that computer and run `opencode providers login` (or fix the selected provider/model quota), then wake the agent again.'
   }
+  if (engine === 'pi') {
+    return 'Open pi on that computer and run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
+  }
   return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
 }
 
@@ -643,6 +646,7 @@ function missingEngineMessage(): string {
     '  - Grok Build: install the `grok` CLI, then run `grok login` once',
     '  - Cursor Agent: install Cursor (the `cursor-agent` CLI ships with it), then run `cursor-agent login`',
     '  - OpenCode: install the `opencode` CLI, then run `opencode providers login` once',
+    '  - pi: `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`, then run `pi` once and `/login` a provider',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -654,7 +658,7 @@ function helpText(): string {
     'cumora agent computer — run your Cumora agents on THIS machine (BYOA)',
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
-    'engine (Claude Code, Codex, Grok Build, Cursor Agent, or OpenCode). Pair once, then it runs in the background.',
+    'engine (Claude Code, Codex, Grok Build, Cursor Agent, OpenCode, or pi). Pair once, then it runs in the background.',
     '',
     'Usage:',
     '  npx cumora@latest agent computer --pair <code> [--server <url>] [--engine <id>]',
@@ -1481,15 +1485,16 @@ class AgentRunner {
     }
   }
 
-  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor and
-   *  OpenCode have no universal cheap alias, so a reported/pinned stream model
-   *  wins and the agent model is only a fallback. */
+  /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor,
+   *  OpenCode and pi have no universal cheap alias, so a reported/pinned stream
+   *  model wins and the agent model is only a fallback. */
   private triageModel(): string {
     if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
     if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
+    if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     return this.agent.model ?? '<cursor-default>'
   }
 

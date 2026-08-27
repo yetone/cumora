@@ -241,7 +241,7 @@ export function AgentEditor({ agent, onClose }: Props) {
           <Field
             label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
             hint={isByoa
-              ? `${t('agent.modelHintByoaPrefix')} ${engine === 'codex' ? t('agent.modelHintByoaCodex') : engine === 'grok' ? t('agent.modelHintByoaGrok') : engine === 'cursor' ? t('agent.modelHintByoaCursor') : engine === 'opencode' ? t('agent.modelHintByoaOpenCode') : t('agent.modelHintByoaClaude')} ${t('agent.modelHintByoaSuffix')}`
+              ? `${t('agent.modelHintByoaPrefix')} ${engine === 'codex' ? t('agent.modelHintByoaCodex') : engine === 'grok' ? t('agent.modelHintByoaGrok') : engine === 'cursor' ? t('agent.modelHintByoaCursor') : engine === 'opencode' ? t('agent.modelHintByoaOpenCode') : engine === 'pi' ? t('agent.modelHintByoaPi') : t('agent.modelHintByoaClaude')} ${t('agent.modelHintByoaSuffix')}`
               : t('agent.modelHintCloud')}
           >
             <Input
@@ -265,7 +265,9 @@ export function AgentEditor({ agent, onClose }: Props) {
                     ? t('agent.fastHintByoaCursor')
                     : engine === 'opencode'
                       ? t('agent.fastHintByoaOpenCode')
-                      : t('agent.fastHintByoaClaude')}
+                      : engine === 'pi'
+                        ? t('agent.fastHintByoaPi')
+                        : t('agent.fastHintByoaClaude')}
             >
               <Input
                 type="text"

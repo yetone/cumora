@@ -20,7 +20,7 @@ import { publish, CH_STATUS } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -45,7 +45,7 @@ export async function announceComputerOnline(computerId: string, companyId: stri
 }
 
 /** Engines a paired (non-cloud) computer is allowed to advertise. */
-const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok', 'cursor', 'opencode'])
+const PAIRABLE_ENGINES: ReadonlySet<string> = new Set(['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi'])
 
 export interface ComputerRow {
   id: string
@@ -351,7 +351,7 @@ export async function mintAgentRuntimeToken(args: {
  *  When a row has no explicit model, fall back to the deploy-level default
  *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
  *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
- *  CUMORA_DEFAULT_OPENCODE_MODEL) so every BYOA
+ *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL) so every BYOA
  *  daemon gets a consistent pin — independent of whatever model the local
  *  engine CLI happens to default to today. Critical: a model
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
@@ -370,6 +370,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const grokDefault = process.env.CUMORA_DEFAULT_GROK_MODEL?.trim() || null
   const cursorDefault = process.env.CUMORA_DEFAULT_CURSOR_MODEL?.trim() || null
   const openCodeDefault = process.env.CUMORA_DEFAULT_OPENCODE_MODEL?.trim() || null
+  const piDefault = process.env.CUMORA_DEFAULT_PI_MODEL?.trim() || null
   return rows.map((r) => {
     if (r.model) return r
     const dflt = r.engine === 'codex'
@@ -382,7 +383,9 @@ export async function listAgentsForComputer(computerId: string): Promise<
             ? cursorDefault
             : r.engine === 'opencode'
               ? openCodeDefault
-              : null
+              : r.engine === 'pi'
+                ? piDefault
+                : null
     return dflt ? { ...r, model: dflt } : r
   })
 }
