@@ -80,7 +80,7 @@ export function lineViolations(rel, raw) {
     out.push('big-brain engine spawn (adapter.run) outside the gated daemon path')
   }
   // R4 — a supported engine binary spawned directly, outside the adapter.
-  if (/(?:spawn|execFile\w*|exec)\s*\(\s*['"`](claude|codex|grok|cursor-agent|opencode)['"`]/.test(code) && !ALLOW.engineSpawn.includes(rel)) {
+  if (/(?:spawn|execFile\w*|exec)\s*\(\s*['"`](claude|codex|grok|cursor-agent|opencode|pi)['"`]/.test(code) && !ALLOW.engineSpawn.includes(rel)) {
     out.push('engine binary spawned outside the engine adapter (bypasses the classify=small / run=big split)')
   }
   return out
