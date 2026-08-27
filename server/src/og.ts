@@ -34,6 +34,10 @@ const POSITIVE_TTL_S = 7 * 24 * 3600
 const NEGATIVE_TTL_S = 60 * 60
 
 const FETCH_TIMEOUT_MS = 6000
+/** Match fetch's bounded redirect behaviour while keeping each hop under our
+ *  own destination policy. Five hops covers common short-link chains without
+ *  allowing an attacker to keep the server in an unbounded redirect loop. */
+const MAX_REDIRECTS = 5
 /** Cap response size to keep memory bounded — OG meta lives in `<head>`,
  *  so 1 MB is plenty for any sane page. Streamed reader aborts early once
  *  this threshold is crossed. */
@@ -58,6 +62,11 @@ export class OgError extends Error {
     this.status = status
   }
 }
+
+/** URL-policy failures must reach the route as 4xx responses even when they
+ *  are discovered on a redirect hop. Network/content failures remain a
+ *  negative preview result and retain the existing short cache behaviour. */
+class OgUrlError extends OgError {}
 
 /** Fetch + parse OG metadata for a URL. Returns null when there's nothing
  *  useful to display (no title / og:title fallback path produced anything),
@@ -86,9 +95,10 @@ export async function ogPreview(rawUrl: string): Promise<OgResult | null> {
   try {
     result = await fetchAndParse(url)
   } catch (e) {
+    if (e instanceof OgUrlError) throw e
     // Network or parse failure — cache the miss briefly so we don't hammer
     // the upstream. Real protocol errors (bad host, scheme) already threw
-    // before this point.
+    // before this point or were rethrown above for a redirect target.
     console.warn(`[og] fetch failed for ${url}:`, e instanceof Error ? e.message : e)
     result = null
   }
@@ -111,10 +121,10 @@ function validateUrlString(raw: string): string {
   try {
     u = new URL(raw)
   } catch {
-    throw new OgError('invalid url')
+    throw new OgUrlError('invalid url')
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') {
-    throw new OgError('only http(s) urls are supported')
+    throw new OgUrlError('only http(s) urls are supported')
   }
   // Drop fragment for cache hit-rate (#section doesn't change OG metadata).
   u.hash = ''
@@ -122,23 +132,25 @@ function validateUrlString(raw: string): string {
 }
 
 /** Block private / loopback / link-local IP ranges. Resolves the hostname
- *  first; if the answer is a private address, refuse. Hostname literals
+ *  first; if any answer is a private address, refuse. Hostname literals
  *  that ARE IPs are checked directly. */
 async function assertPublicHost(host: string): Promise<void> {
   // Hostname literal is itself an IP — check directly, no DNS.
   if (isIP(host)) {
-    if (isBlockedIp(host)) throw new OgError('blocked private host', 403)
+    if (isBlockedIp(host)) throw new OgUrlError('blocked private host', 403)
     return
   }
   if (!host || host === 'localhost' || host.endsWith('.localhost') || host.endsWith('.local')) {
-    throw new OgError('blocked private host', 403)
+    throw new OgUrlError('blocked private host', 403)
   }
   try {
-    const { address } = await dnsLookup(host)
-    if (isBlockedIp(address)) throw new OgError('blocked private host', 403)
+    const addresses = await dnsLookup(host, { all: true })
+    if (addresses.length === 0 || addresses.some(({ address }) => isBlockedIp(address))) {
+      throw new OgUrlError('blocked private host', 403)
+    }
   } catch (e) {
-    if (e instanceof OgError) throw e
-    throw new OgError('dns lookup failed', 400)
+    if (e instanceof OgUrlError) throw e
+    throw new OgUrlError('dns lookup failed', 400)
   }
 }
 
@@ -164,17 +176,7 @@ async function fetchAndParse(url: string): Promise<OgResult> {
   const ac = new AbortController()
   const timer = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS)
   try {
-    const res = await fetch(url, {
-      signal: ac.signal,
-      redirect: 'follow',
-      headers: {
-        // A descriptive UA + Accept header improves the OG hit rate (some
-        // sites serve a stripped page to bots that look like cURL).
-        'user-agent': 'Mozilla/5.0 (compatible; CumoraBot/1.0; +https://cumora.ai)',
-        'accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
-        'accept-language': 'en-US,en;q=0.9',
-      },
-    })
+    const { response: res, finalUrl } = await fetchWithValidatedRedirects(url, ac.signal)
     if (!res.ok) throw new OgError(`upstream ${res.status}`, 502)
 
     const ct = (res.headers.get('content-type') ?? '').toLowerCase()
@@ -199,18 +201,67 @@ async function fetchAndParse(url: string): Promise<OgResult> {
     await reader.cancel().catch(() => { /* ignore — upstream may already be done */ })
     const html = Buffer.concat(chunks).toString('utf8')
 
-    const og: OgResult = { url, finalUrl: res.url }
+    const og: OgResult = { url, finalUrl }
     const title = pickMetaContent(html, 'og:title') ?? pickMetaContent(html, 'twitter:title') ?? pickHtmlTitle(html)
     if (title) og.title = decodeEntities(title).trim().slice(0, 280)
     const desc = pickMetaContent(html, 'og:description') ?? pickMetaContent(html, 'twitter:description') ?? pickMetaName(html, 'description')
     if (desc) og.description = decodeEntities(desc).trim().slice(0, 500)
     const image = pickMetaContent(html, 'og:image') ?? pickMetaContent(html, 'twitter:image') ?? pickMetaContent(html, 'twitter:image:src')
-    if (image) og.image = resolveUrl(image, res.url)
+    if (image) og.image = resolveUrl(image, finalUrl)
     const siteName = pickMetaContent(html, 'og:site_name')
     if (siteName) og.siteName = decodeEntities(siteName).trim().slice(0, 80)
     return og
   } finally {
     clearTimeout(timer)
+  }
+}
+
+async function fetchWithValidatedRedirects(
+  url: string,
+  signal: AbortSignal,
+): Promise<{ response: Response; finalUrl: string }> {
+  let currentUrl = url
+
+  for (let redirectCount = 0; ; redirectCount += 1) {
+    const response = await fetch(currentUrl, {
+      signal,
+      // Automatic following would bypass assertPublicHost for every target
+      // after the first. Resolve and validate each Location ourselves.
+      redirect: 'manual',
+      headers: {
+        // A descriptive UA + Accept header improves the OG hit rate (some
+        // sites serve a stripped page to bots that look like cURL).
+        'user-agent': 'Mozilla/5.0 (compatible; CumoraBot/1.0; +https://cumora.ai)',
+        'accept': 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5',
+        'accept-language': 'en-US,en;q=0.9',
+      },
+    })
+
+    if (!isRedirectStatus(response.status)) return { response, finalUrl: currentUrl }
+
+    const location = response.headers.get('location')
+    if (response.body) {
+      await response.body.cancel().catch(() => { /* ignore cleanup failures */ })
+    }
+    if (!location) throw new OgError('redirect missing location', 502)
+    if (redirectCount >= MAX_REDIRECTS) throw new OgError('too many redirects', 502)
+
+    const nextUrl = resolveRedirectUrl(location, currentUrl)
+    await assertPublicHost(new URL(nextUrl).hostname)
+    currentUrl = nextUrl
+  }
+}
+
+function isRedirectStatus(status: number): boolean {
+  return status === 301 || status === 302 || status === 303 || status === 307 || status === 308
+}
+
+function resolveRedirectUrl(location: string, base: string): string {
+  try {
+    return validateUrlString(new URL(location, base).toString())
+  } catch (e) {
+    if (e instanceof OgUrlError) throw e
+    throw new OgUrlError('invalid redirect url')
   }
 }
 
