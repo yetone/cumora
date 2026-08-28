@@ -650,7 +650,7 @@ async function triageWakeRecipient(agentId: string): Promise<WakeOptions | null>
     const inbox = await inprocClient.loadInbox(agentId)
     if (inbox.length === 0) return null
     const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
-    const context = await inprocClient.loadContext(agentId, convoIds)
+    const context = await inprocClient.loadContext(agentId, persona.companyId, convoIds)
     const verdict = await classifyInboxTriage({
       agentId,
       companyId: persona.companyId,

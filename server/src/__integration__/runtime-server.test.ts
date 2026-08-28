@@ -154,6 +154,14 @@ test('[integration] runtime: expired token → 401', async () => {
   assert.match(String(r.body?.error ?? ''), /expired/i)
 })
 
+test('[integration] runtime: /context requires a tenant-pinned token', async () => {
+  const { agentId } = await seedAgent()
+  const token = signAgentToken({ agentId, companyId: null })
+  const r = await call('/runtime/context', { token, body: { conversationIds: [] } })
+  assert.equal(r.status, 403)
+  assert.match(String(r.body?.error ?? ''), /companyId claim required/i)
+})
+
 test('[integration] runtime: /context enforces tenant and conversation membership', async () => {
   const { agentId, companyId, token } = await seedAgent()
   const peerId = `a-${randomUUID().slice(0, 8)}`
@@ -178,8 +186,7 @@ test('[integration] runtime: /context enforces tenant and conversation membershi
   const otherTenant = await seedAgent()
   const crossTenantId = await seedContextConversation({
     companyId: otherTenant.companyId,
-    // Deliberately include the caller's globally unique id: tenant binding
-    // must still reject a corrupt or forged cross-company members array.
+    // Even a forged members array cannot override the JWT tenant boundary.
     members: [agentId, otherTenant.agentId],
     authorId: otherTenant.agentId,
     body: 'cross-tenant-private',
@@ -199,6 +206,32 @@ test('[integration] runtime: /context enforces tenant and conversation membershi
     })),
     [{ conversationId: allowedId, companyId, body: 'member-visible' }],
   )
+})
+
+test('[integration] runtime: /context binds authorization to the JWT companyId', async () => {
+  const claimedTenant = await seedAgent()
+  const actualTenant = await seedAgent()
+  const crossTenantId = await seedContextConversation({
+    companyId: actualTenant.companyId,
+    members: [actualTenant.agentId],
+    authorId: actualTenant.agentId,
+    body: 'mismatched-claim-private',
+  })
+  // Simulate a stale or incorrectly minted but validly signed token. The old
+  // query ignored companyId and authorized solely from sub + the target row,
+  // so it returned this conversation from actualTenant.
+  const mismatchedToken = signAgentToken({
+    agentId: actualTenant.agentId,
+    companyId: claimedTenant.companyId,
+  })
+
+  const r = await call('/runtime/context', {
+    token: mismatchedToken,
+    body: { conversationIds: [crossTenantId] },
+  })
+
+  assert.equal(r.status, 200)
+  assert.deepEqual(r.body?.rows ?? [], [])
 })
 
 // ── identity pin: agentId comes from JWT, not request body ────────────

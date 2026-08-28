@@ -9,10 +9,10 @@
  * No DB or Redis access — that's the whole point. The pod's only side
  * channel is the storage layer for attachment downloads (signed URLs).
  *
- * Shape-for-shape mirror of `InProcRuntimeClient`. The agentId argument
- * on every method is the SAME id baked into the JWT — endpoints ignore
- * the body's agentId and use the token. We still take it as a param so
- * the interface signatures match (and tests can pass it through).
+ * Shape-for-shape mirror of `InProcRuntimeClient`. The agentId and companyId
+ * arguments are the SAME identity baked into the JWT — endpoints ignore
+ * caller-supplied identity and use the token. We still take them as params so
+ * the interface signatures match (and tests can pass them through).
  */
 import type {
   AgentRuntimeClient,
@@ -145,7 +145,11 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
     return out.rows
   }
 
-  async loadContext(_agentId: string, conversationIds: string[]): Promise<ContextRow[]> {
+  async loadContext(
+    _agentId: string,
+    _companyId: string,
+    conversationIds: string[],
+  ): Promise<ContextRow[]> {
     const out = await this.call<{ rows: ContextRow[] }>('POST', '/context', { conversationIds })
     return out.rows
   }

@@ -150,6 +150,7 @@ runtimeRouter.get('/inbox', withAgent(async (c, req, res) => {
 // cloud quota. This is the whole point of BYOA: local compute. NB: no regex
 // decides anything — every actionability/mode call is the small model's.
 runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
+  if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
   const persona = await inprocClient.loadPersona(c.sub)
   if (!persona) { res.status(404).json({ error: 'agent not found' }); return }
   const inbox = await inprocClient.loadInbox(c.sub)
@@ -169,7 +170,7 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
     } })
     return
   }
-  const context = await inprocClient.loadContext(c.sub, convoIds)
+  const context = await inprocClient.loadContext(c.sub, c.companyId, convoIds)
   // Authoritative "real work here" signal (active worklog claims per
   // convo) — lets the gate suppress unclaimed agent-only chatter from FACT, and
   // sets the claim-aware loop-cap tier. Same gather the cloud path uses. The
@@ -260,8 +261,9 @@ runtimeRouter.post('/memory/query', withAgent(async (c, req, res) => {
 }))
 
 runtimeRouter.post('/context', withAgent(async (c, req, res) => {
+  if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
   const body = req.body as { conversationIds?: string[] } | undefined
-  const rows = await inprocClient.loadContext(c.sub, body?.conversationIds ?? [])
+  const rows = await inprocClient.loadContext(c.sub, c.companyId, body?.conversationIds ?? [])
   res.json({ rows })
 }))
 

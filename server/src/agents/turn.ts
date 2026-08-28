@@ -160,10 +160,11 @@ async function loadMemory(
 
 async function loadContext(
   agentId: string,
+  companyId: string,
   conversationIds: string[],
   rc: AgentRuntimeClient = runtime,
 ): Promise<ContextRow[]> {
-  return rc.loadContext(agentId, conversationIds)
+  return rc.loadContext(agentId, companyId, conversationIds)
 }
 
 async function loadClimate(
@@ -1877,7 +1878,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       (options.trigger === undefined || options.trigger === 'message.new') &&
       !triageNote
     if (shouldRunInboxTriage) {
-      preloadedContext = await loadContext(agentId, convoIds)
+      preloadedContext = await loadContext(agentId, persona.companyId, convoIds)
       const verdict = await classifyInboxTriage({
         agentId,
         companyId: runCompanyId,
@@ -1958,7 +1959,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   ).slice(0, 4000)
 
   const [context, memory, climate, textExcerpts, skillsIndex] = await Promise.all([
-    preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, convoIds),
+    preloadedContext ? Promise.resolve(preloadedContext) : loadContext(agentId, persona.companyId, convoIds),
     loadMemory(agentId, memoryQuery, {}, runtime, { conversationIds: convoIds }),
     loadClimate(agentId),
     loadTextExcerpts(inbox),
