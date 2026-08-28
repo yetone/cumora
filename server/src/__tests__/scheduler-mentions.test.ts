@@ -11,9 +11,21 @@
  *
  * Run: node --import tsx --test server/src/__tests__/scheduler-mentions.test.ts
  */
-import { test } from 'node:test'
+import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mentionedAgentIds, shouldDeliverToMutedAgent } from '../agents/scheduler.js'
+import { pool } from '../db/pool.js'
+
+after(async () => {
+  // scheduler.ts transitively imports redis.ts which opens connections — without
+  // this the runner never exits and CI cancels the job rather than failing it.
+  try { await pool.end() } catch { /* ignore */ }
+  try {
+    const { redis, sub } = await import('../redis.js')
+    redis.disconnect()
+    sub.disconnect()
+  } catch { /* ignore */ }
+})
 
 const MEMBERS = ['nova-12', 'iris-9', 'atlas-7']
 
