@@ -115,6 +115,7 @@ interface InboxRow {
 }
 
 import { classifyWake } from './turn-wake.js'
+import { mentionedAgentIds } from './scheduler.js'
 
 export interface AgentTurnOptions {
   /** Why this turn was started. Message-driven turns remain the default. */
@@ -631,6 +632,18 @@ function renderContext(
       // quote target keep treating it as a general group message and
       // chime in unprompted; this puts the address signal in the
       // glance-zone of the wake prompt.
+      // An exact @-mention of the viewer is the strongest "this one is yours"
+      // signal a room carries, and it was only ever visible as raw text inside
+      // the body. Surface it in the same glance-zone as the quote tag below.
+      //
+      // Only the POSITIVE case is tagged. The mirror ("addressed to X — not
+      // you") would need the conversation's member list to tell a real
+      // participant from a stray @token, and the two errors are not
+      // symmetric: a wrong "not you" can silence the whole room, while a wrong
+      // "YOU" only costs one extra reply.
+      if (viewerAgentId && !m.is_self && mentionedAgentIds(m.body ?? '', [viewerAgentId]).length > 0) {
+        line += `  ↦ @-mentioned YOU`
+      }
       if (m.quoted_message_id && m.quoted && !m.is_self) {
         if (viewerAgentId && m.quoted.authorId === viewerAgentId) {
           line += `  ↦ addressed to YOU (quote-reply)`
