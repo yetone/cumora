@@ -27,7 +27,8 @@ import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
-import { signAgentToken } from '../agents/runtime/jwt.js'
+import { mintAgentRuntimeToken } from '../agents/computer/registry.js'
+import { signAgentToken, verifyAgentToken } from '../agents/runtime/jwt.js'
 import { pool } from '../db/pool.js'
 
 let server: Server
@@ -92,6 +93,26 @@ async function seedAgent(): Promise<{ agentId: string; companyId: string; token:
   )
   const token = signAgentToken({ agentId, companyId })
   return { agentId, companyId, token }
+}
+
+async function mintAssignedAgentRuntimeToken(args: {
+  agentId: string
+  companyId: string
+}): Promise<string> {
+  const computerId = `comp-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+       VALUES ($1, $2, $3, 'local', '["codex"]'::jsonb, 'online')`,
+    [computerId, args.companyId, `Computer ${computerId}`],
+  )
+  await pool.query(
+    `UPDATE participants SET computer_id = $1, engine = 'codex'
+      WHERE id = $2 AND company_id = $3`,
+    [computerId, args.agentId, args.companyId],
+  )
+  const minted = await mintAgentRuntimeToken({ computerId, agentId: args.agentId })
+  assert.ok(minted, 'the production BYOA path should mint a token for an assigned agent')
+  return minted.token
 }
 
 async function seedContextConversation(opts: {
@@ -208,25 +229,44 @@ test('[integration] runtime: /context enforces tenant and conversation membershi
   )
 })
 
-test('[integration] runtime: /context binds authorization to the JWT companyId', async () => {
-  const claimedTenant = await seedAgent()
-  const actualTenant = await seedAgent()
+test('[integration] runtime: /context rejects a stale production token after tenant reassignment', async () => {
+  const originalTenant = await seedAgent()
+  const currentTenant = await seedAgent()
+  const staleToken = await mintAssignedAgentRuntimeToken(originalTenant)
+
+  // Model a real stale-credential lifecycle without fabricating JWT claims:
+  // the BYOA path minted the token while the agent belonged to tenant A, then
+  // an administrative data migration moved that globally-unique agent id to
+  // tenant B. The old token remains cryptographically valid until it expires.
+  const moved = await pool.query(
+    `UPDATE participants
+        SET company_id = $1, computer_id = NULL, engine = NULL
+      WHERE id = $2 AND company_id = $3`,
+    [currentTenant.companyId, originalTenant.agentId, originalTenant.companyId],
+  )
+  assert.equal(moved.rowCount, 1)
+  const staleClaims = verifyAgentToken(staleToken)
+  assert.equal(staleClaims.sub, originalTenant.agentId)
+  assert.equal(staleClaims.companyId, originalTenant.companyId)
+
   const crossTenantId = await seedContextConversation({
-    companyId: actualTenant.companyId,
-    members: [actualTenant.agentId],
-    authorId: actualTenant.agentId,
-    body: 'mismatched-claim-private',
-  })
-  // Simulate a stale or incorrectly minted but validly signed token. The old
-  // query ignored companyId and authorized solely from sub + the target row,
-  // so it returned this conversation from actualTenant.
-  const mismatchedToken = signAgentToken({
-    agentId: actualTenant.agentId,
-    companyId: claimedTenant.companyId,
+    companyId: currentTenant.companyId,
+    members: [originalTenant.agentId, currentTenant.agentId],
+    authorId: currentTenant.agentId,
+    body: 'post-move-private',
   })
 
+  const { rows: currentAgentRows } = await pool.query<{ company_id: string }>(
+    `SELECT company_id FROM participants WHERE id = $1 AND kind = 'agent'`,
+    [originalTenant.agentId],
+  )
+  assert.deepEqual(currentAgentRows, [{ company_id: currentTenant.companyId }])
+
+  // The pre-fix query joined the requesting agent to the conversation's
+  // company instead of the JWT company. It therefore accepted this current
+  // tenant-B membership even though the still-valid token is pinned to A.
   const r = await call('/runtime/context', {
-    token: mismatchedToken,
+    token: staleToken,
     body: { conversationIds: [crossTenantId] },
   })
 
