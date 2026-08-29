@@ -1238,9 +1238,9 @@ class AgentRunner {
     if (this.wakeDebounceTimer) { clearTimeout(this.wakeDebounceTimer); this.wakeDebounceTimer = null }
   }
 
-  stop(): void {
+  stop(options: { forceEngine?: boolean } = {}): void {
     this.beginStop()
-    this.engineSession?.stop()
+    this.engineSession?.stop({ force: options.forceEngine })
     this.engineSession = null
     // Kill a one-shot engine child too. sync() tears a runner down on any
     // config change (engine/model/persona) or unassign while the daemon keeps
@@ -2667,7 +2667,9 @@ async function doRun(serverOverride?: string): Promise<void> {
     const deadline = Date.now() + SHUTDOWN_GRACE_MS
     if (anyBusy()) console.log(`[computer] ${why}: waiting up to ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s for in-flight turn(s) to finish…`)
     while (anyBusy() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500))
-    for (const runner of runners.values()) runner.stop() // now tear down engine children
+    // process.exit() follows immediately, so engine-specific delayed fallbacks
+    // cannot run. Force each child to receive its termination signal first.
+    for (const runner of runners.values()) runner.stop({ forceEngine: true })
     console.log(`[computer] shutting down (${why})`)
     process.exit(0)
   }

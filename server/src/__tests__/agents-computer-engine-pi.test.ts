@@ -39,6 +39,10 @@ const mode = argv.includes('rpc') ? 'rpc' : argv.includes('json') ? 'json' : 'te
 const sidIdx = argv.indexOf('--session-id')
 const SID = sidIdx >= 0 ? argv[sidIdx + 1] : 'fake-session-' + mode
 record({ argv, cwd: process.cwd() })
+if (scenario === 'ignore-eof') {
+  setInterval(() => {}, 1000)
+  process.on('SIGTERM', () => { record({ signal: 'SIGTERM' }); process.exit(0) })
+}
 
 // A turn's worth of events for prompt text \`text\` (same shapes as real pi).
 function emitTurn(text, extra) {
@@ -97,7 +101,7 @@ process.stdin.on('data', (d) => {
     }
   }
 })
-process.stdin.on('end', () => process.exit(0))
+process.stdin.on('end', () => { if (scenario !== 'ignore-eof') process.exit(0) })
 `
 
 interface Fixture { root: string; binDir: string; home: string; log: string; env: NodeJS.ProcessEnv }
@@ -122,7 +126,7 @@ async function fixture(scenario = 'ok'): Promise<Fixture> {
   return { root, binDir, home, log, env }
 }
 
-async function fakeLog(f: Fixture): Promise<Array<{ argv?: string[]; cmd?: { type: string; id?: string; message?: string } }>> {
+async function fakeLog(f: Fixture): Promise<Array<{ argv?: string[]; cmd?: { type: string; id?: string; message?: string }; signal?: string }>> {
   if (!existsSync(f.log)) return []
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l))
 }
@@ -269,6 +273,40 @@ test('pi run() (one-shot) drives the same rpc path for exactly one turn and repo
   const seen = await fakeLog(f)
   assert.equal(seen[0]?.argv?.[seen[0].argv.indexOf('--session-id') + 1], result.sessionId)
   await delay(100) // stdin closed → the fake exits on its own; nothing to assert beyond no hang
+})
+
+test('pi already-aborted run and json one-shot never spawn a child', { skip: IS_WIN }, async () => {
+  const f = await fixture()
+  const controller = new AbortController()
+  controller.abort()
+
+  const run = await getAdapter('pi').run({
+    home: f.home, prompt: 'wake', env: f.env, model: null, fastModel: null,
+    resumeSessionId: null, onLog: () => {}, signal: controller.signal,
+  })
+  assert.equal(run.exitCode, 130)
+  assert.match(run.error ?? '', /aborted before start/)
+
+  const classify = await getAdapter('pi').classify({
+    cwd: f.home, prompt: 'triage', env: f.env, signal: controller.signal,
+  })
+  assert.match(classify.error ?? '', /aborted before start/)
+  assert.deepEqual(await fakeLog(f), [], 'an already-cancelled owner must not launch pi')
+})
+
+test('pi forced stop signals an EOF-resistant child before the daemon can exit', { skip: IS_WIN }, async () => {
+  const f = await fixture('ignore-eof')
+  const session = getAdapter('pi').startSession?.({ home: f.home, env: f.env, model: null, fastModel: null, onLog: () => {} })
+  assert.ok(session)
+
+  // Wait until the child has started and accepted get_state, then model the
+  // daemon's final shutdown path: there is no two-second timer opportunity.
+  for (let i = 0; i < 50 && (await fakeLog(f)).length < 2; i += 1) await delay(20)
+  session.stop({ force: true })
+  for (let i = 0; i < 50 && !(await fakeLog(f)).some((entry) => entry.signal === 'SIGTERM'); i += 1) await delay(20)
+
+  assert.ok((await fakeLog(f)).some((entry) => entry.signal === 'SIGTERM'), 'force stop must dispatch SIGTERM synchronously instead of relying on the delayed fallback')
+  assert.equal(session.alive, false)
 })
 
 test('pi classify() runs a bare json one-shot and returns text + usage + the real model', { skip: IS_WIN }, async () => {

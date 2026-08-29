@@ -314,8 +314,10 @@ export interface EngineSession {
    *  daemon sends ONLY the per-turn delta; when false it inlines the standing
    *  prompt each turn (a one-shot path, or delivery failed). */
   readonly carriesStandingPrompt: boolean
-  /** Tear the process down (daemon shutdown / unrecoverable error). */
-  stop(): void
+  /** Tear the process down (daemon shutdown / unrecoverable error). `force`
+   *  skips any engine-specific graceful-exit delay when this daemon process is
+   *  itself about to exit. */
+  stop(options?: { force?: boolean }): void
 }
 
 export interface EngineAdapter {
@@ -2907,6 +2909,11 @@ function spawnPiJson(
   args: string[],
   opts: { cwd: string; env: NodeJS.ProcessEnv; signal: AbortSignal; onLog?: (line: string) => void; shell: boolean; stdinText?: string; onHopUsage?: (r: EngineHopReport) => void },
 ): Promise<EngineRunResult & { text: string }> {
+  // A queued wake can be cancelled before it reaches the engine gate. Do not
+  // start a Pi process after its owner has already gone away.
+  if (opts.signal.aborted) {
+    return Promise.resolve({ exitCode: 130, error: 'engine turn aborted before start', sessionId: null, text: '' })
+  }
   return new Promise((resolve) => {
     const tracker = new PiTurnTracker(opts.onHopUsage)
     const child = spawn(command, args, {
@@ -2919,6 +2926,9 @@ function spawnPiJson(
     }
     const onAbort = (): void => { child.kill('SIGTERM') }
     opts.signal.addEventListener('abort', onAbort, { once: true })
+    // Close the small race between the pre-spawn check above and listener
+    // registration. AbortSignal does not replay an earlier abort event.
+    if (opts.signal.aborted) onAbort()
     // StringDecoder + carried partial line, for the same reason spawnEngine has
     // them: a pipe read chops a long event (a big message_end) at an arbitrary
     // byte offset, and a naive per-chunk split would hand JSON.parse two halves.
@@ -3050,12 +3060,23 @@ class PiSession implements EngineSession {
     if (this.pending && this.alive && text.trim()) this.write({ type: 'steer', message: stripLoneSurrogates(text) })
   }
 
-  stop(): void {
+  stop(options: { force?: boolean } = {}): void {
     this.exited = true
-    if (this.stopTimer) return
+    if (this.stopTimer) {
+      if (!options.force) return
+      clearTimeout(this.stopTimer)
+      this.stopTimer = null
+    }
     // pi exits cleanly when stdin closes (it disposes the session and returns 0),
     // so close stdin first and only SIGTERM a process that hasn't gone by itself.
     try { this.child.stdin?.end() } catch { /* ignore */ }
+    // During daemon shutdown there is no event loop left to run the delayed
+    // fallback below. Dispatch SIGTERM synchronously before process.exit(), or a
+    // Pi that does not exit on EOF can be orphaned under the supervisor.
+    if (options.force) {
+      try { this.child.kill('SIGTERM') } catch { /* ignore */ }
+      return
+    }
     this.stopTimer = setTimeout(() => { try { this.child.kill('SIGTERM') } catch { /* ignore */ } }, 2000)
     this.stopTimer.unref?.()
   }
@@ -3271,6 +3292,11 @@ class PiAdapter implements EngineAdapter {
   }
 
   async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    // Unlike an abort listener registered below, this catches a turn cancelled
+    // while it was queued and avoids spawning the persistent RPC process at all.
+    if (args.signal.aborted) {
+      return { exitCode: 130, error: 'engine turn aborted before start', sessionId: args.resumeSessionId ?? null }
+    }
     const flags = extraArgs('CUMORA_PI_ARGS')
     if (flags.length) {
       // User-owned flag set → one-shot print mode with their flags. We still pin
@@ -3289,8 +3315,11 @@ class PiAdapter implements EngineAdapter {
       resumeSessionId: args.resumeSessionId, onLog: args.onLog, onHopUsage: args.onHopUsage,
     })
     if (!session) return { exitCode: 1, error: 'pi session could not be started', sessionId: args.resumeSessionId ?? null }
-    const onAbort = (): void => session.stop()
+    const onAbort = (): void => session.stop({ force: true })
     args.signal.addEventListener('abort', onAbort, { once: true })
+    // The signal may have flipped after the pre-spawn check but before the
+    // listener above was installed.
+    if (args.signal.aborted) onAbort()
     try {
       return await session.send(args.prompt)
     } finally {
