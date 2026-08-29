@@ -27,6 +27,12 @@ import { promisify } from 'node:util'
 
 const execFileP = promisify(execFile)
 import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
+import {
+  mergeWakeBackgroundBriefs,
+  parseWakeData,
+  wakeHasActionableInput,
+  type WakeBackgroundBrief,
+} from '../runtime/wake-options.js'
 import { detectEnginesWithStatus, snapshotDetectedEngines, getAdapter, ENGINE_IDS, runEngineDoctor, type EngineId, type EngineSession, type EngineRunResult, type EngineUsage, type EngineHopReport } from './engine.js'
 import { usageFromClaude, type TokenUsage } from '../cost.js'
 import { parseTriage, finalizeTriage, isRateLimited } from '../triage-core.js'
@@ -1043,6 +1049,10 @@ class AgentRunner {
   private engineBackoffUntil = 0
   private stopped = false
   private lastWakeConvo: string | null = null
+  /** Synthetic work delivered with a wake has no durable chat row. Preserve it
+   *  across debounce/coalescing so a brief-only Kanban assignment can drive the
+   *  next turn instead of falling into the empty-inbox cost gate. */
+  private pendingBackgroundBrief: WakeBackgroundBrief | null = null
   /** Pre-turn debounce timer (see WAKE_DEBOUNCE_MS). Non-null = a turn is already
    *  scheduled to start shortly; further wakes fold into it instead of stacking. */
   private wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null
@@ -1733,6 +1743,31 @@ class AgentRunner {
     ).trimEnd()
   }
 
+  /** Per-turn delta for a deliberate manual wake carrying its own work brief.
+   * Unlike a background agenda scan, this is already an actionable user/team
+   * assignment and must run even when there is no unread chat row. */
+  private manualBriefDelta(
+    brief: WakeBackgroundBrief,
+    memoryDigest: string,
+    inboxDigest: string,
+    roster?: string,
+  ): string {
+    return (
+      `Current time (UTC): ${new Date().toISOString()} — use this for any --at / deadline math.\n\n` +
+      `Someone just put this work on you directly. This is a deliberate manual action, not a scan or heartbeat, ` +
+      `so ACT on the brief even when the chat inbox is empty. Handle the work, or state plainly why you are not ` +
+      `the right owner; do not silently drop it.\n\n` +
+      `Brief: ${brief.title}\n` +
+      `Source: ${brief.source ?? 'manual'}\n\n` +
+      `${brief.body}\n\n` +
+      (inboxDigest
+        ? `Unread messages that arrived with this wake (also handle anything addressed to you):\n${inboxDigest}\n\n`
+        : '') +
+      (memoryDigest ? `Your memory index (global \`memory/MEMORY.md\` + current project, if any):\n${memoryDigest}\n\n` : '') +
+      (roster ? `Your team (use these ids for @mentions):\n${roster}\n` : '')
+    ).trimEnd()
+  }
+
   /** Per-turn AGENDA delta — dynamic bits for a proactive board-work wake; the
    *  invariant mechanics live in the standing prompt. */
   private agendaDelta(brief: string, memoryDigest: string, roster?: string): string {
@@ -1902,8 +1937,16 @@ class AgentRunner {
    *  wake ARMS a short timer; subsequent wakes within the window fold in (return
    *  early). When it fires we run ONE turn that snapshots ALL unread — so a burst
    *  becomes a single big-engine spawn. The poll path and SSE wakes route here. */
-  private scheduleWake(reason: string, convo?: string | null): void {
+  private scheduleWake(
+    reason: string,
+    convo?: string | null,
+    backgroundBrief?: WakeBackgroundBrief | null,
+  ): void {
     if (this.stopped) return
+    this.pendingBackgroundBrief = mergeWakeBackgroundBriefs(
+      this.pendingBackgroundBrief,
+      backgroundBrief,
+    )
     if (this.busy) {
       // A turn is already running. Coalesce as usual (the rerun re-reads the inbox),
       // BUT if this wake is a DIRECT ping, STEER it into the running turn so the
@@ -1992,6 +2035,7 @@ class AgentRunner {
       return
     }
     this.busy = true
+    let activeBackgroundBrief: WakeBackgroundBrief | null = null
     try {
       do {
         this.pendingRerun = false
@@ -2023,6 +2067,8 @@ class AgentRunner {
         // can't go stale the way a leftover wake value could.)
         const wakeConvo = this.lastWakeConvo
         this.lastWakeConvo = null
+        activeBackgroundBrief = this.pendingBackgroundBrief
+        this.pendingBackgroundBrief = null
         // Snapshot what's unread BEFORE triaging, so triage provably sees a
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
@@ -2042,15 +2088,11 @@ class AgentRunner {
         // the agent reads as dead: it can work for minutes — engine spawned, turn
         // running — while the room shows nothing at all.
         const convo = typingConversation(wakeConvo, seen)
-        // HARD COST GATE (content-blind, fail-closed): if nothing unread is a
-        // real human/agent message — empty, or system-only relays/status/
-        // membership notices — NEVER run triage and NEVER spawn the big engine.
-        // System chatter is not a task. Ack it so it stops re-triggering, go
-        // available, and wait for genuine content. This is the daemon-side
-        // backstop against the "stale-wake storm" (a recurring system message
-        // that otherwise woke opus on every ~20s poll). The big brain is for
-        // real content only — under no circumstances spend it on system noise.
-        if (!hasReal) {
+        // HARD COST GATE (content-blind, fail-closed): system-only inbox noise
+        // is not a task. A validated manual backgroundBrief IS a task, though:
+        // Kanban assignment/mention wakes deliberately have no chat row, and
+        // dropping that SSE payload here was why BYOA cards stayed in Todo.
+        if (!wakeHasActionableInput(hasReal, activeBackgroundBrief)) {
           await this.ackSeen(token, seen)
           await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'avail' })
           // No per-tick log: this is the idle steady state (every poll × agent),
@@ -2060,7 +2102,10 @@ class AgentRunner {
           await this.maybeAgendaTurn(token)
           continue
         }
-        const triage = await this.inboxTriage(token)
+        // A deliberate manual brief is already actionable, just like the cloud
+        // `briefedManual` path. Only ordinary inbox wakes need the small-brain
+        // triage decision.
+        const triage = activeBackgroundBrief ? null : await this.inboxTriage(token)
         const triageMs = Date.now() - turnStart // ensureToken + snapshot + triage
         // Triage was rate-limited → STOP. Do NOT retry, do NOT wake the big brain,
         // do NOT ack (the message is retried after the cooldown). Back off
@@ -2117,7 +2162,10 @@ class AgentRunner {
         // routing, one-of-us claimReply, mechanical direct-post, relay turn-claim —
         // was the divergence that broke chains and is GONE. Cost backstops remain:
         // the actionable gate above + the per-minute activation rate floor.
-        console.log(`[computer] ${this.agent.id} turn START (${reason}) — triage ${triageMs}ms, spawning ${this.adapter.id}${convo ? ` for ${convo}` : ''}`)
+        const gateLabel = activeBackgroundBrief
+          ? `manual brief ${activeBackgroundBrief.source ?? 'unknown'}`
+          : `triage ${triageMs}ms`
+        console.log(`[computer] ${this.agent.id} turn START (${reason}) — ${gateLabel}, spawning ${this.adapter.id}${convo ? ` for ${convo}` : ''}`)
         await runtimeBest(this.cfg.serverUrl, '/status', token, { status: 'thinking' })
         // "<agent> is typing…" in the conversation that woke us, refreshed
         // while the engine works (BYOA runs can be long), cleared at the end.
@@ -2146,7 +2194,18 @@ class AgentRunner {
           // first poster's message; preflight previously saw "nothing newer."
         }
         const run = (await runtimeBest(this.cfg.serverUrl, '/runs', token, {
-          trigger: { source: 'byoa', engine: this.adapter.id },
+          trigger: {
+            source: activeBackgroundBrief ? 'byoa-manual' : 'byoa',
+            engine: this.adapter.id,
+            ...(activeBackgroundBrief
+              ? {
+                  backgroundBrief: {
+                    source: activeBackgroundBrief.source ?? 'manual',
+                    title: activeBackgroundBrief.title,
+                  },
+                }
+              : {}),
+          },
         })) as { runId?: string } | null
         // Pin runId so per-hop ledger rows link back to this turn (see
         // maybeAgendaTurn for the same hook).
@@ -2171,6 +2230,7 @@ class AgentRunner {
           console.log(`[computer] ${this.agent.id} big-brain sem acquired (queue depth was ${semQueueDepth + 1} including self)`)
         }
         try {
+          const turnBackgroundBrief = activeBackgroundBrief
           const [memoryDigest, triageNote, roster] = await Promise.all([
             this.memoryDigest(projectIds),
             Promise.resolve(this.formatTriageNote(triage)),
@@ -2186,7 +2246,10 @@ class AgentRunner {
           const session = this.ensureEngineSession()
           // Standing scaffold rides the session's system-prompt file; send only the
           // small per-turn delta when it does (else inline it — see turnPrompt).
-          const prompt = this.turnPrompt(session, this.chatDelta(memoryDigest, triageNote, digest, roster))
+          const delta = turnBackgroundBrief
+            ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
+            : this.chatDelta(memoryDigest, triageNote, digest, roster)
+          const prompt = this.turnPrompt(session, delta)
           if (session) {
             // PERSISTENT path: feed this turn into the long-lived process — no cold
             // start (the first turn paid it; turns 2..N reuse the booted process).
@@ -2293,6 +2356,13 @@ class AgentRunner {
             usage: turnUsage ? usageFromClaude(turnUsage) : null,
           })
         }
+        if (engineError && activeBackgroundBrief) {
+          this.pendingBackgroundBrief = mergeWakeBackgroundBriefs(
+            activeBackgroundBrief,
+            this.pendingBackgroundBrief,
+          )
+        }
+        activeBackgroundBrief = null
         // Clean turn → ack everything this turn saw. If the engine replied it
         // already advanced these cursors (monotonic ack is a no-op then); if it
         // read the room and chose silence, this is what stops the same inbox
@@ -2308,6 +2378,13 @@ class AgentRunner {
         reason = 'rerun (coalesced wake)'
       } while (this.pendingRerun && !this.stopped)
     } catch (err) {
+      if (activeBackgroundBrief) {
+        this.pendingBackgroundBrief = mergeWakeBackgroundBriefs(
+          activeBackgroundBrief,
+          this.pendingBackgroundBrief,
+        )
+        activeBackgroundBrief = null
+      }
       // A turn-level failure — token mint 502 (e.g. a server pod rolling), a
       // runtime hiccup, a transient network drop — must NEVER escape and crash
       // the daemon, which would take EVERY hosted agent offline at once. Log it
@@ -2345,20 +2422,20 @@ class AgentRunner {
             // sees the relay with full memory of its place — so it continues
             // the sequence instead of racing on a stale snapshot. A steer that
             // lands while busy is coalesced into exactly one rerun (pendingRerun).
-            let convo: string | null = null
-            let deliveryMs: number | null = null
-            try {
-              const d = evt.data ? (JSON.parse(evt.data) as { conversationId?: string; at?: number }) : {}
-              convo = typeof d.conversationId === 'string' ? d.conversationId : null
-              // evt.at = server's publish time. The gap to now is the
-              // server→daemon delivery latency (the first place to look when
-              // "receiving a message is slow"). Includes any client/server clock
-              // skew, so read it as a trend, not an absolute.
-              if (typeof d.at === 'number') deliveryMs = Date.now() - d.at
-              if (convo) this.lastWakeConvo = convo
-            } catch { /* malformed payload — ignore */ }
-            console.log(`[computer] ${this.agent.id} SSE ${evt.event} received${convo ? ` convo=${convo}` : ''}${deliveryMs != null ? ` deliveryLatency=${deliveryMs}ms` : ''}`)
-            this.scheduleWake(`sse-${evt.event}`, convo)
+            const wake = parseWakeData(evt.data)
+            const convo = wake.conversationId
+            const backgroundBrief = evt.event === 'wake' && wake.options.trigger === 'manual'
+              ? wake.options.backgroundBrief ?? null
+              : null
+            // evt.at = server's publish time. The gap to now is the
+            // server→daemon delivery latency (the first place to look when
+            // "receiving a message is slow"). Includes any client/server clock
+            // skew, so read it as a trend, not an absolute.
+            const deliveryMs = wake.at === null ? null : Date.now() - wake.at
+            if (convo) this.lastWakeConvo = convo
+            const trigger = wake.options.trigger ? `:${wake.options.trigger}` : ''
+            console.log(`[computer] ${this.agent.id} SSE ${evt.event}${trigger} received${convo ? ` convo=${convo}` : ''}${backgroundBrief ? ` brief=${backgroundBrief.source ?? 'manual'}` : ''}${deliveryMs != null ? ` deliveryLatency=${deliveryMs}ms` : ''}`)
+            this.scheduleWake(`sse-${evt.event}${trigger}`, convo, backgroundBrief)
           }
           // 'ready' is a no-op keepalive.
         }

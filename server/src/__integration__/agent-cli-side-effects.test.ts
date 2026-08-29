@@ -1,10 +1,11 @@
-import { test, before, beforeEach, after } from 'node:test'
+import { test, before, beforeEach, afterEach, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { pool } from '../db/pool.js'
 import {
   ensureSchemaOnce, resetAllTables, seedCompanyWithAgent, teardownAll,
 } from './_helpers.js'
 import { runCli } from '../agents/cli.js'
+import { __setKanbanWakeAgentForTesting } from '../agents/kanban-wake.js'
 
 before(async () => {
   await ensureSchemaOnce()
@@ -12,6 +13,10 @@ before(async () => {
 
 beforeEach(async () => {
   await resetAllTables()
+})
+
+afterEach(() => {
+  __setKanbanWakeAgentForTesting(null)
 })
 
 after(async () => {
@@ -239,4 +244,86 @@ test('[integration] kanban board/column/comment parity emits typed CLI side effe
     companyId,
     visibleToUser: true,
   }])
+})
+
+test('[integration] every agent CLI Kanban wake carries its card brief', async () => {
+  const { companyId, agentId: actorId } = await seedCompanyWithAgent()
+  const targetId = `target-${Date.now().toString(36)}`
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status)
+     VALUES ($1, $2, 'agent', 'Target Agent', 'tester', 'T', '#abcdef', 'avail')`,
+    [targetId, companyId],
+  )
+
+  const wakes: Array<{
+    agentId: string
+    reason: string
+    conversationId: string | null
+    brief: { source?: string; title: string; body: string }
+  }> = []
+  __setKanbanWakeAgentForTesting(async (agentId, reason, conversationId, _steer, options) => {
+    wakes.push({ agentId, reason, conversationId, brief: options.backgroundBrief })
+  })
+  const waitForWakes = async (count: number): Promise<void> => {
+    for (let i = 0; i < 100 && wakes.length < count; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+    assert.equal(wakes.length, count, `expected ${count} Kanban wake(s), got ${wakes.length}`)
+  }
+
+  const board = await runCli(['--as', actorId, 'kanban', 'create', 'Wake Board'])
+  assert.equal(board.ok, true, board.text)
+  const boardId = String(board.sideEffects?.[0]?.boardId ?? '')
+  const { rows: columns } = await pool.query<{ id: string }>(
+    `SELECT id FROM board_columns WHERE board_id = $1 ORDER BY position ASC LIMIT 1`,
+    [boardId],
+  )
+  const columnId = columns[0].id
+
+  const mentioned = await runCli([
+    '--as', actorId, 'card', 'add', boardId, `@${targetId} investigate`, '--column', columnId,
+  ])
+  assert.equal(mentioned.ok, true, mentioned.text)
+  const cardId = String(mentioned.sideEffects?.[0]?.cardId ?? '')
+  await waitForWakes(1)
+
+  const assigned = await runCli(['--as', actorId, 'card', 'assign', cardId, targetId])
+  assert.equal(assigned.ok, true, assigned.text)
+  await waitForWakes(2)
+
+  const edited = await runCli([
+    '--as', actorId, 'card', 'edit', cardId, '--description', `@${targetId} please revisit`,
+  ])
+  assert.equal(edited.ok, true, edited.text)
+  await waitForWakes(3)
+
+  const commented = await runCli([
+    '--as', actorId, 'card', 'comment', cardId, `@${targetId} new evidence`,
+  ])
+  assert.equal(commented.ok, true, commented.text)
+  await waitForWakes(4)
+
+  const createdAssigned = await runCli([
+    '--as', actorId, 'card', 'add', boardId, 'Assigned directly', '--column', columnId,
+    '--assign', targetId,
+  ])
+  assert.equal(createdAssigned.ok, true, createdAssigned.text)
+  await waitForWakes(5)
+
+  assert.deepEqual(wakes.map((wake) => ({
+    agentId: wake.agentId,
+    reason: wake.reason,
+    conversationId: wake.conversationId,
+    source: wake.brief.source,
+  })), Array.from({ length: 5 }, () => ({
+    agentId: targetId,
+    reason: 'manual',
+    conversationId: null,
+    source: 'kanban',
+  })))
+  for (const wake of wakes) {
+    assert.match(wake.brief.body, /card id: card-/)
+    assert.match(wake.brief.body, /board id: board-/)
+    assert.match(wake.brief.body, /cumora card claim card-/)
+  }
 })

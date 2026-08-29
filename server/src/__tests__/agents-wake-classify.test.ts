@@ -15,7 +15,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { classifyWake } from '../agents/turn-wake.js'
+import { classifyWake, renderBriefedManualWakeContext } from '../agents/turn-wake.js'
 
 const brief = { source: 'kanban', title: 'A board card was assigned to you', body: 'card id: card-1' }
 
@@ -65,4 +65,21 @@ test('background scan and poll wakes still need their briefs', () => {
 test('a non-empty inbox runs regardless of how it was woken', () => {
   // The guard only fires on an empty inbox; classification must not change that.
   assert.equal(classifyWake({ trigger: 'message.new' }, 5).survivesEmptyInbox, false)
+})
+
+test('a coalesced manual brief keeps unread conversation context visible', () => {
+  const context = renderBriefedManualWakeContext(
+    brief,
+    'Conversation direct-1\n  Pat: Please send the result',
+    1,
+  )
+  assert.match(context, /card id: card-1/)
+  assert.match(context, /Pat: Please send the result/)
+  assert.doesNotMatch(context, /chat inbox is empty/i)
+})
+
+test('a brief-only manual wake explicitly acts without chat', () => {
+  const context = renderBriefedManualWakeContext(brief, '', 0)
+  assert.match(context, /chat inbox is empty/i)
+  assert.match(context, /act on THAT/i)
 })

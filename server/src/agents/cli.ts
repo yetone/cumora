@@ -22,6 +22,7 @@ import {
   parseMemoryPath,
 } from './memory-scope.js'
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
+import { wakeKanbanAgents } from './kanban-wake.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -4629,43 +4630,6 @@ async function publishBoardCli(args: {
   })
 }
 
-/** Same shape + intent as the REST helper: wake every agent in
- *  `mentions` who lives in `companyId` and isn't the actor. Best-effort. */
-async function wakeMentionedAgentsCli(args: {
-  companyId: string
-  mentions: string[] | undefined
-  actorId: string
-}): Promise<void> {
-  // This function is invoked as `void wakeMentionedAgentsCli(...)` from
-  // CLI command handlers (kanban/card/doc/calendar). Any throw here
-  // becomes an unhandled rejection on the cumora-server process. Wrap
-  // the whole body so a transient pool.query failure can't crash the
-  // server — the CLI command itself has already succeeded; the wakes
-  // are a best-effort side effect.
-  try {
-    if (!args.mentions || args.mentions.length === 0) return
-    const targets = args.mentions.filter((id) => id !== args.actorId)
-    if (targets.length === 0) return
-    const { rows } = await pool.query<{ id: string }>(
-      `SELECT id FROM participants
-        WHERE kind = 'agent'
-          AND company_id = $1
-          AND id = ANY($2::text[])
-          AND departed_at IS NULL`,
-      [args.companyId, targets],
-    )
-    if (rows.length === 0) return
-    const { wakeAgent } = await import('./scheduler.js')
-    for (const r of rows) {
-      wakeAgent(r.id, 'manual', null).catch((e) => {
-        console.warn(`[kanban-cli] wake ${r.id} failed`, e instanceof Error ? e.message : e)
-      })
-    }
-  } catch (err) {
-    console.warn('[kanban-cli] wakeMentionedAgentsCli failed:', err instanceof Error ? err.message : err)
-  }
-}
-
 async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
   const op = parsed.positional[0] ?? 'ls'
   const me = resolveAs(parsed)
@@ -5087,15 +5051,15 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
 
   /** Look up the boardId behind a cardId AND verify it's in our tenant.
    *  Returns null if the card doesn't exist or is cross-tenant. */
-  async function resolveCardBoard(cardId: string): Promise<{ boardId: string; columnId: string } | null> {
-    const r = await pool.query<{ board_id: string; column_id: string; company_id: string }>(
-      `SELECT c.board_id, c.column_id, b.company_id
+  async function resolveCardBoard(cardId: string): Promise<{ boardId: string; columnId: string; title: string } | null> {
+    const r = await pool.query<{ board_id: string; column_id: string; title: string; company_id: string }>(
+      `SELECT c.board_id, c.column_id, c.title, b.company_id
          FROM board_cards c JOIN boards b ON b.id = c.board_id
         WHERE c.id = $1 LIMIT 1`,
       [cardId],
     )
     if (r.rows.length === 0 || r.rows[0].company_id !== companyId) return null
-    return { boardId: r.rows[0].board_id, columnId: r.rows[0].column_id }
+    return { boardId: r.rows[0].board_id, columnId: r.rows[0].column_id, title: r.rows[0].title }
   }
 
   if (op === 'ls' || op === 'list') {
@@ -5204,9 +5168,21 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     await publishBoardCli({
       companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
     })
-    void wakeMentionedAgentsCli({ companyId, mentions, actorId: me })
+    void wakeKanbanAgents({
+      companyId, mentions, actorId: me,
+      card: {
+        boardId, cardId: id, columnId, title,
+        what: 'You were mentioned on a new board card',
+      },
+    })
     if (assignee && assignee !== me) {
-      void wakeMentionedAgentsCli({ companyId, mentions: [assignee], actorId: me })
+      void wakeKanbanAgents({
+        companyId, mentions: [assignee], actorId: me,
+        card: {
+          boardId, cardId: id, columnId, title,
+          what: 'A board card was assigned to you',
+        },
+      })
     }
     return ok(`added card ${id}: ${title}${mentions.length > 0 ? `  · mentions: ${mentions.map((m) => '@' + m).join(' ')}` : ''}`, [{
       event: 'kanban.card_created',
@@ -5274,7 +5250,13 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me,
     })
     if (assignee && assignee !== me) {
-      void wakeMentionedAgentsCli({ companyId, mentions: [assignee], actorId: me })
+      void wakeKanbanAgents({
+        companyId, mentions: [assignee], actorId: me,
+        card: {
+          boardId: home.boardId, cardId, columnId: home.columnId, title: home.title,
+          what: 'A board card was assigned to you',
+        },
+      })
     }
     return ok(assignee ? `assigned card ${cardId} → @${assignee}` : `unassigned card ${cardId}`, [{
       event: 'kanban.card_assigned',
@@ -5373,7 +5355,13 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     await publishBoardCli({
       companyId, kind: 'card.updated', boardId: home.boardId, cardId, mentions, actorId: me,
     })
-    void wakeMentionedAgentsCli({ companyId, mentions, actorId: me })
+    void wakeKanbanAgents({
+      companyId, mentions, actorId: me,
+      card: {
+        boardId: home.boardId, cardId, columnId: home.columnId, title: nextTitle,
+        what: 'You were mentioned on a board card',
+      },
+    })
     return ok(`updated card ${cardId}${mentions.length > 0 ? `  · mentions: ${mentions.map((m) => '@' + m).join(' ')}` : ''}`, [{
       event: 'kanban.card_updated',
       command: op === 'rename' ? 'card rename' : 'card edit',
@@ -5406,7 +5394,13 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     await publishBoardCli({
       companyId, kind: 'comment.created', boardId: home.boardId, cardId, commentId: id, mentions, actorId: me,
     })
-    void wakeMentionedAgentsCli({ companyId, mentions, actorId: me })
+    void wakeKanbanAgents({
+      companyId, mentions, actorId: me,
+      card: {
+        boardId: home.boardId, cardId, columnId: home.columnId, title: home.title,
+        what: 'You were mentioned in a board card comment',
+      },
+    })
     return ok(`commented on ${cardId}${mentions.length > 0 ? `  · mentions: ${mentions.map((m) => '@' + m).join(' ')}` : ''}`, [{
       event: 'kanban.comment_created',
       command: 'card comment',

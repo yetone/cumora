@@ -114,7 +114,7 @@ interface InboxRow {
   quoted: QuotedSummary | null
 }
 
-import { classifyWake } from './turn-wake.js'
+import { classifyWake, renderBriefedManualWakeContext } from './turn-wake.js'
 import { mentionedAgentIds } from './scheduler.js'
 
 export interface AgentTurnOptions {
@@ -1858,7 +1858,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
         messageIds: inbox.map((m) => m.id),
         messages: inbox.map(traceInboxMessage),
         idleReason: isIdleWake ? options.idleReason ?? 'idle heartbeat' : undefined,
-        backgroundBrief: isBackgroundScanWake
+        backgroundBrief: (isBackgroundScanWake || isBriefedManualWake)
           ? {
               source: options.backgroundBrief?.source ?? 'scanner',
               title: options.backgroundBrief?.title ?? 'Background scan',
@@ -2125,14 +2125,8 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   const renderedConversationContext = renderContext(context, inbox.length, convoIds.length, textExcerpts, agentId)
   const wakeContext = isPollUpdateWake && options.pollBrief
     ? renderPollUpdateWakeContext(options.pollBrief, renderedConversationContext)
-    : isBriefedManualWake
-    ? `Someone just put this on you directly — it is a deliberate human action, not a scan or a heartbeat.
-
-${options.backgroundBrief?.title ?? 'Assigned work'}
-
-${options.backgroundBrief?.body ?? ''}
-
-Your chat inbox is empty; this wake exists because of the action above, so act on THAT rather than looking for a message to answer. Handle the work, or say plainly why you are not the right owner. If you genuinely have nothing to do here, call set_turn_status({ status: "done", reason: "...", next_step: "" }) and explain — do not silently drop it.`
+    : isBriefedManualWake && options.backgroundBrief
+    ? renderBriefedManualWakeContext(options.backgroundBrief, renderedConversationContext, inbox.length)
     : isBackgroundScanWake
     ? `You just got an internal background scan brief. This is not a user chat message, and there is no obligation to interrupt anyone.
 

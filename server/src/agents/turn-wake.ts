@@ -40,3 +40,26 @@ export function classifyWake(options: AgentTurnOptions, inboxCount: number): {
     survivesEmptyInbox: idle || backgroundScan || pollUpdate || briefedManual,
   }
 }
+
+/** Render a deliberate manual brief without hiding chat that happened to arrive
+ * in the same debounce window. The old empty-inbox-only copy said the inbox was
+ * empty unconditionally, which could make a valid DM disappear behind a card
+ * assignment when both wakes coalesced. */
+export function renderBriefedManualWakeContext(
+  brief: NonNullable<AgentTurnOptions['backgroundBrief']>,
+  renderedConversationContext: string,
+  inboxCount: number,
+): string {
+  const inboxContext = inboxCount > 0
+    ? `This wake also contains unread conversation activity. Handle both the assignment and anything addressed to you:\n\n${renderedConversationContext}`
+    : 'Your chat inbox is empty; this wake exists because of the action above, so act on THAT rather than looking for a message to answer.'
+  return `Someone just put this on you directly — it is a deliberate human or teammate action, not a scan or a heartbeat.
+
+${brief.title || 'Assigned work'}
+
+${brief.body}
+
+${inboxContext}
+
+Handle the work, or say plainly why you are not the right owner. If you genuinely have nothing to do here, call set_turn_status({ status: "done", reason: "...", next_step: "" }) and explain — do not silently drop it.`
+}

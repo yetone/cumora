@@ -35,6 +35,7 @@ import { notifyAlert } from '../../alerting.js'
 import { pushSteer } from '../steer.js'
 import { parseSseStream, wakeStreamWasStable } from './sse-parse.js'
 import { decidePodExit } from './pod-agent-exit.js'
+import { mergeWakeTurnOptions, parseWakeData } from './wake-options.js'
 
 interface RunnerState {
   busy: boolean
@@ -61,102 +62,7 @@ const state: RunnerState = {
 let pendingTurnOptions: AgentTurnOptions | null = null
 
 function mergeTurnOptions(next: AgentTurnOptions | null): void {
-  if (!next || Object.keys(next).length === 0) return
-  if (next.trigger === 'background_scan') {
-    pendingTurnOptions = next
-    return
-  }
-  if (!pendingTurnOptions) {
-    pendingTurnOptions = next
-    return
-  }
-  pendingTurnOptions = { ...pendingTurnOptions, ...next }
-}
-
-function turnOptionsFromWakeData(raw: string | undefined): AgentTurnOptions {
-  if (!raw || raw.length > 16_384) return {}
-  try {
-    const parsed = JSON.parse(raw) as {
-      reason?: unknown
-      idleReason?: unknown
-      triageNote?: unknown
-      backgroundBrief?: unknown
-      pollBrief?: unknown
-    }
-    const reason = parsed.reason
-    if (
-      reason !== 'message.new' &&
-      reason !== 'idle' &&
-      reason !== 'manual' &&
-      reason !== 'background_scan' &&
-      reason !== 'poll.updated'
-    ) return {}
-    const out: AgentTurnOptions = { trigger: reason }
-    if (reason === 'idle' && typeof parsed.idleReason === 'string') {
-      out.idleReason = parsed.idleReason.slice(0, 500)
-    }
-    if (reason === 'message.new' && typeof parsed.triageNote === 'string') {
-      out.triageNote = parsed.triageNote.slice(0, 1800)
-    }
-    if (reason === 'background_scan' && parsed.backgroundBrief && typeof parsed.backgroundBrief === 'object') {
-      const brief = parsed.backgroundBrief as { title?: unknown; body?: unknown; source?: unknown }
-      if (typeof brief.title === 'string' && typeof brief.body === 'string') {
-        out.backgroundBrief = {
-          title: brief.title.slice(0, 200),
-          body: brief.body.slice(0, 12_000),
-          source: typeof brief.source === 'string' ? brief.source.slice(0, 128) : undefined,
-        }
-      }
-    }
-    if (reason === 'poll.updated' && parsed.pollBrief && typeof parsed.pollBrief === 'object') {
-      const brief = parsed.pollBrief as Record<string, unknown>
-      const tallies = Array.isArray(brief.tallies) ? brief.tallies.slice(0, 20).flatMap((t) => {
-        if (!t || typeof t !== 'object') return []
-        const tt = t as Record<string, unknown>
-        if (typeof tt.optionId !== 'string' || typeof tt.text !== 'string' || typeof tt.count !== 'number') return []
-        const voters = Array.isArray(tt.voters) ? tt.voters.slice(0, 50).flatMap((v) => {
-          if (!v || typeof v !== 'object') return []
-          const vv = v as Record<string, unknown>
-          if (typeof vv.id !== 'string') return []
-          return [{ id: vv.id, name: typeof vv.name === 'string' ? vv.name : vv.id }]
-        }) : []
-        return [{ optionId: tt.optionId, text: tt.text.slice(0, 200), count: tt.count, voters }]
-      }) : []
-      const pending = Array.isArray(brief.pending) ? brief.pending.slice(0, 50).flatMap((p) => {
-        if (!p || typeof p !== 'object') return []
-        const pp = p as Record<string, unknown>
-        if (typeof pp.id !== 'string') return []
-        return [{ id: pp.id, name: typeof pp.name === 'string' ? pp.name : pp.id }]
-      }) : []
-      const actor = brief.actor && typeof brief.actor === 'object'
-        ? brief.actor as Record<string, unknown>
-        : { id: null, name: null }
-      const phase = brief.phase === 'close' ? 'close' as const : 'vote' as const
-      const status = brief.status === 'closed' ? 'closed' as const : 'open' as const
-      if (typeof brief.messageId === 'string' && typeof brief.question === 'string') {
-        out.pollBrief = {
-          messageId: brief.messageId,
-          conversationId: typeof brief.conversationId === 'string' ? brief.conversationId : '',
-          question: brief.question.slice(0, 500),
-          mode: brief.mode === 'multi' ? 'multi' : 'single',
-          status,
-          closedReason: brief.closedReason === 'expired' || brief.closedReason === 'manual' ? brief.closedReason : null,
-          expiresAt: typeof brief.expiresAt === 'string' ? brief.expiresAt : null,
-          totalVotes: typeof brief.totalVotes === 'number' ? brief.totalVotes : 0,
-          tallies,
-          pending,
-          actor: {
-            id: typeof actor.id === 'string' ? actor.id : null,
-            name: typeof actor.name === 'string' ? actor.name : null,
-          },
-          phase,
-        }
-      }
-    }
-    return out
-  } catch {
-    return {}
-  }
+  pendingTurnOptions = mergeWakeTurnOptions(pendingTurnOptions, next)
 }
 
 async function drain(agentId: string, options: AgentTurnOptions | null = null): Promise<void> {
@@ -221,7 +127,7 @@ async function connectStream(agentId: string, url: string, token: string): Promi
       // Fire-and-forget: drain() handles re-entrancy + serialization.
       // We don't `await` here because the stream itself must keep
       // pulling so we don't miss subsequent events while a turn runs.
-      void drain(agentId, turnOptionsFromWakeData(evt.data))
+      void drain(agentId, parseWakeData(evt.data).options)
       continue
     }
     if (evt.event === 'steer') {
