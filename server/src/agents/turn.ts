@@ -114,7 +114,11 @@ interface InboxRow {
   quoted: QuotedSummary | null
 }
 
-import { classifyWake, renderBriefedManualWakeContext } from './turn-wake.js'
+import {
+  classifyWake,
+  describeWakeBackgroundBrief,
+  renderBriefedManualWakeContext,
+} from './turn-wake.js'
 import { mentionedAgentIds } from './scheduler.js'
 
 export interface AgentTurnOptions {
@@ -1574,6 +1578,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
   const isBackgroundScanWake = wake.backgroundScan
   const isPollUpdateWake = wake.pollUpdate
   const isBriefedManualWake = wake.briefedManual
+  const wakeBriefMetadata = describeWakeBackgroundBrief(options)
   if (inbox.length === 0 && !wake.survivesEmptyInbox) return
 
   const fingerprint = isIdleWake
@@ -1615,12 +1620,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
       source: options.trigger ?? 'scheduler',
       conversationIds: convoIds,
       idle: isIdleWake ? { reason: options.idleReason ?? 'idle heartbeat' } : undefined,
-      backgroundScan: (isBackgroundScanWake || isBriefedManualWake)
-        ? {
-            source: options.backgroundBrief?.source ?? 'scanner',
-            title: options.backgroundBrief?.title ?? 'Background scan',
-          }
-        : undefined,
+      backgroundScan: wakeBriefMetadata,
       pollUpdate: isPollUpdateWake && options.pollBrief
         ? {
             messageId: options.pollBrief.messageId,
@@ -1858,10 +1858,9 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
         messageIds: inbox.map((m) => m.id),
         messages: inbox.map(traceInboxMessage),
         idleReason: isIdleWake ? options.idleReason ?? 'idle heartbeat' : undefined,
-        backgroundBrief: (isBackgroundScanWake || isBriefedManualWake)
+        backgroundBrief: wakeBriefMetadata
           ? {
-              source: options.backgroundBrief?.source ?? 'scanner',
-              title: options.backgroundBrief?.title ?? 'Background scan',
+              ...wakeBriefMetadata,
               body: traceText(options.backgroundBrief?.body ?? ''),
             }
           : undefined,

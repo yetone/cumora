@@ -41,6 +41,24 @@ export function classifyWake(options: AgentTurnOptions, inboxCount: number): {
   }
 }
 
+/** Normalize the audit/run metadata shared by synthetic scans and deliberate
+ * manual briefs. The storage field predates manual briefs and is still named
+ * `backgroundScan`, so its fallback values must preserve the trigger kind or a
+ * source-less manual assignment is misleadingly recorded as a scanner run. */
+export function describeWakeBackgroundBrief(
+  options: AgentTurnOptions,
+): { source: string; title: string } | undefined {
+  const brief = options.backgroundBrief
+  if (!brief || (options.trigger !== 'manual' && options.trigger !== 'background_scan')) {
+    return undefined
+  }
+  const manual = options.trigger === 'manual'
+  return {
+    source: brief.source || (manual ? 'manual' : 'scanner'),
+    title: brief.title || (manual ? 'Assigned work' : 'Background scan'),
+  }
+}
+
 /** Render a deliberate manual brief without hiding chat that happened to arrive
  * in the same debounce window. The old empty-inbox-only copy said the inbox was
  * empty unconditionally, which could make a valid DM disappear behind a card

@@ -15,7 +15,11 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { classifyWake, renderBriefedManualWakeContext } from '../agents/turn-wake.js'
+import {
+  classifyWake,
+  describeWakeBackgroundBrief,
+  renderBriefedManualWakeContext,
+} from '../agents/turn-wake.js'
 
 const brief = { source: 'kanban', title: 'A board card was assigned to you', body: 'card id: card-1' }
 
@@ -46,6 +50,23 @@ test('a briefed manual wake is not misfiled as a background scan', () => {
   assert.equal(w.backgroundScan, false)
   assert.equal(w.idle, false)
   assert.equal(w.pollUpdate, false)
+})
+
+test('source-less manual brief stays manual in run and audit metadata', () => {
+  assert.deepEqual(describeWakeBackgroundBrief({
+    trigger: 'manual',
+    backgroundBrief: { title: 'Take ownership', body: 'card id: card-1' },
+  }), {
+    source: 'manual',
+    title: 'Take ownership',
+  })
+  assert.deepEqual(describeWakeBackgroundBrief({
+    trigger: 'background_scan',
+    backgroundBrief: { title: '', body: 'scan result' },
+  }), {
+    source: 'scanner',
+    title: 'Background scan',
+  })
 })
 
 test('idle only counts as an idle wake when the inbox is actually empty', () => {
