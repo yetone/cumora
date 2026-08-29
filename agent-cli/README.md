@@ -21,5 +21,5 @@ npx cumora agent computer --server <your-server-url>
 ```
 
 Requires **Node ≥ 18** and `claude` (Claude Code), `codex`, `grok` (Grok Build),
-`cursor-agent` (Cursor), `opencode`, or `pi` on your `PATH`. The daemon talks to the Cumora server over HTTPS only — it needs no
+`cursor-agent` (Cursor), `opencode`, `pi`, or `gemini` (Gemini CLI) on your `PATH`. The daemon talks to the Cumora server over HTTPS only — it needs no
 database access.

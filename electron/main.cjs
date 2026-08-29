@@ -1394,7 +1394,7 @@ ipcMain.handle('app:is-focused', () => {
 })
 
 // Keep in sync with src/lib/engines.ts. Official daemon detectEngines() only
-// probes engines with adapters (claude/cursor/codex/grok/opencode/pi). The rest
+// probes engines with adapters (claude/cursor/codex/grok/opencode/pi/gemini). The rest
 // are listed so the Me page can diagnose what is installed on THIS machine.
 const LOCAL_CLIS = [
   {

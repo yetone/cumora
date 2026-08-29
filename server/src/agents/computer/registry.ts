@@ -20,7 +20,7 @@ import { publish, CH_STATUS } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep

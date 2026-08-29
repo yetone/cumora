@@ -94,10 +94,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini']
 
 export interface EnginePersona {
   id: string
@@ -3313,6 +3313,408 @@ class PiAdapter implements EngineAdapter {
   }
 }
 
+// ── Gemini CLI ───────────────────────────────────────────────────────────────
+//
+// `gemini -o stream-json` emits JSONL, but NOT Claude Code's stream-json: the
+// envelope below is what its own StreamJsonFormatter writes (verified against
+// the shipped 0.57.0 bundle and by running the binary). Sibling forks are not
+// safe to assume compatible either — Qwen Code shares Gemini's flags and emits
+// Claude's envelope instead.
+
+interface GeminiTokenStats {
+  /** Gemini's PROMPT total. Cache reads are INCLUDED here — see geminiUsage. */
+  input_tokens?: number
+  output_tokens?: number
+  cached?: number
+  /** prompt − cached. The fresh input, and the one the ledger wants. */
+  input?: number
+}
+
+interface GeminiStats extends GeminiTokenStats {
+  total_tokens?: number
+  duration_ms?: number
+  tool_calls?: number
+  /** Per-model breakdown, keyed by the model the CLI RESOLVED (`-m flash` and a
+   *  mid-turn fallback both land here under their real ids). */
+  models?: Record<string, GeminiTokenStats>
+}
+
+interface GeminiEvent {
+  type?: string
+  session_id?: string
+  model?: string
+  role?: string
+  content?: unknown
+  status?: string
+  severity?: string
+  message?: string
+  error?: { type?: string; message?: string }
+  stats?: GeminiStats
+}
+
+/** Map Gemini's token stats onto the common (Anthropic-shaped) usage record.
+ *
+ *  The field named `input_tokens` is NOT the one to bill. uiTelemetryService
+ *  sets `tokens.prompt` from the API's `input_token_count`, which already
+ *  contains the cached prefix, and then derives `tokens.input = prompt −
+ *  cached`; `convertToStreamStats` publishes the first as `input_tokens` and
+ *  the second as `input`. Billing `input_tokens` while ALSO reporting `cached`
+ *  charges the cached prefix twice — and a BYOA agent re-sends a large stable
+ *  prefix on every wake, so that prefix is most of the prompt. */
+function geminiUsage(stats: GeminiStats | undefined): EngineUsage | undefined {
+  if (!stats || typeof stats !== 'object') return undefined
+  const num = (value: unknown): number =>
+    typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+  const cached = num(stats.cached)
+  const fresh = stats.input != null ? num(stats.input) : Math.max(0, num(stats.input_tokens) - cached)
+  const output = num(stats.output_tokens)
+  // A turn that died before its first API call reports every counter as 0 (the
+  // auth-failure shape). Reporting that as usage would put a zero-token row in
+  // the ledger for work that never happened.
+  if (!fresh && !output && !cached) return undefined
+  return {
+    input_tokens: fresh,
+    output_tokens: output,
+    cache_read_input_tokens: cached,
+    // Gemini's implicit caching is not billed as a separate write, and its
+    // stats carry no creation counter — leave it absent rather than invent 0.
+  }
+}
+
+/** The model a turn actually ran on. `init` reports what was REQUESTED; the
+ *  stats key reports what the CLI resolved (an alias like `flash`, or a
+ *  mid-turn fallback, differ). Prefer the resolved id when it is unambiguous —
+ *  cost is priced on it — and keep the requested one when several models ran. */
+function geminiResolvedModel(stats: GeminiStats | undefined, seen: string | null): string | null {
+  const names = stats?.models ? Object.keys(stats.models) : []
+  return names.length === 1 ? names[0] : seen
+}
+
+class GeminiTurnTracker {
+  text = ''
+  sessionId: string | null = null
+  model: string | null = null
+  usage: EngineUsage | undefined
+  error: string | null = null
+  private startedAt: number | null = null
+  private toolUses = 0
+  private textChars = 0
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (report: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  observe(event: GeminiEvent): void {
+    if (typeof event.session_id === 'string' && event.session_id) this.sessionId = event.session_id
+
+    if (event.type === 'init') {
+      if (typeof event.model === 'string' && event.model) this.model = event.model
+      this.startedAt = Date.now()
+      return
+    }
+
+    if (event.type === 'message') {
+      // Assistant text arrives as deltas; the user echo of our own prompt must
+      // never be folded into the reply triage reads.
+      if (event.role === 'assistant' && typeof event.content === 'string') {
+        this.text += event.content
+        this.textChars += event.content.length
+      }
+      return
+    }
+
+    if (event.type === 'tool_use') { this.toolUses += 1; return }
+
+    if (event.type === 'error') {
+      // `severity: 'warning'` is a loop-detection / blocked-tool notice the run
+      // survives. Only an error ends the turn, and the terminating `result`
+      // event carries the authoritative verdict anyway.
+      if (event.severity !== 'warning' && typeof event.message === 'string') this.error = event.message
+      return
+    }
+
+    if (event.type !== 'result') return
+    if (event.status === 'error') {
+      const detail = event.error?.message ?? event.message
+      if (typeof detail === 'string' && detail) this.error = detail
+      else if (!this.error) this.error = 'gemini reported a failed turn with no detail'
+    }
+    this.model = geminiResolvedModel(event.stats, this.model)
+    const usage = geminiUsage(event.stats)
+    if (!usage) return
+    this.usage = usage
+    if (this.onHopUsage) {
+      // Gemini publishes token stats only at the end of the turn, so — as with
+      // codex exec — this is ONE hop carrying the turn's whole usage rather
+      // than a per-round-trip trajectory. Reporting it is what keeps BYOA
+      // spend visible in the same ledger as everything else.
+      try {
+        this.onHopUsage({
+          model: this.model ?? 'gemini',
+          usage,
+          latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
+          hopIndex: 1,
+          toolUses: this.toolUses,
+          textChars: this.textChars,
+        })
+      } catch { /* ledger reporting is best-effort */ }
+    }
+  }
+}
+
+function parseGeminiLine(line: string): GeminiEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as GeminiEvent } catch { return null }
+}
+
+/** Gemini refuses to act on an untrusted folder, and — worse for an unattended
+ *  daemon — SILENTLY downgrades `--yolo` to interactive approval there
+ *  ("Approval mode overridden to 'default' because the current folder is not
+ *  trusted"), so the turn stalls waiting for a human who is not present.
+ *
+ *  The env var, not the equivalent `--skip-trust` flag: an unknown env var is
+ *  ignored by older builds, while an unknown flag is a fatal argv error. The
+ *  home really is ours to trust — the daemon created and seeded it. */
+function geminiEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, GEMINI_CLI_TRUST_WORKSPACE: 'true' }
+}
+
+async function spawnGeminiStream(
+  command: string,
+  argv: string[],
+  opts: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    prompt: string
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    shell: boolean
+    onHopUsage?: (report: EngineHopReport) => void
+    pin?: string | null
+  },
+): Promise<EngineRunResult & { text: string }> {
+  const tracker = new GeminiTurnTracker(opts.pin ?? null, opts.onHopUsage)
+  let processResult: EngineRunResult
+  try {
+    processResult = await spawnEngine(
+      command,
+      argv,
+      {
+        home: opts.cwd,
+        prompt: opts.prompt,
+        env: opts.env,
+        onLog: (line) => {
+          const event = parseGeminiLine(line)
+          if (event) tracker.observe(event)
+          opts.onLog?.(line)
+        },
+        signal: opts.signal,
+      },
+      // The prompt goes on stdin on EVERY platform: `gemini` reads it there
+      // when no -p is given, which sidesteps both argv length limits and the
+      // Windows .cmd shim's inability to carry a multi-line argument.
+      { shell: opts.shell, stdinText: opts.prompt },
+    )
+  } catch (err) {
+    return {
+      exitCode: 1,
+      error: err instanceof Error ? err.message : String(err),
+      sessionId: tracker.sessionId,
+      usage: tracker.usage,
+      model: tracker.model,
+      text: tracker.text,
+    }
+  }
+
+  const eventError = tracker.error
+    ? `engine turn error: ${tracker.error.slice(0, MAX_FAILURE_CHARS)}`
+    : null
+  const exitCode = processResult.exitCode !== 0 ? processResult.exitCode : (eventError ? 1 : 0)
+  return {
+    exitCode,
+    // Same precedence as the other stream adapters: a real process failure
+    // (auth, quota, bad flag, abort) explains more than the secondary fact that
+    // the stream reported a failed turn. Keep the event's prose alongside it so
+    // stale-session recovery can match on it without parsing JSON.
+    error: processResult.exitCode !== 0
+      ? [processResult.error, eventError].filter(Boolean).join('\n')
+      : (eventError ?? undefined),
+    sessionId: tracker.sessionId,
+    usage: tracker.usage,
+    model: tracker.model,
+    text: tracker.text,
+  }
+}
+
+/** Settings that leave the triage process with NO tools at all.
+ *
+ *  `tools.core` is an allowlist, and the registry applies it as
+ *  `coreTools.some(...)` per tool — an EMPTY array is truthy, matches nothing,
+ *  and so registers nothing. That is a stronger guarantee than triage gets on
+ *  other engines: with no tool to confirm, a headless approval prompt (which
+ *  nothing would answer) cannot arise, and the classifier stays a one-shot. */
+const GEMINI_TRIAGE_SETTINGS = JSON.stringify({ tools: { core: [] } })
+const GEMINI_TRIAGE_SETTINGS_FILE = '.cumora-gemini-triage.json'
+
+class GeminiAdapter implements EngineAdapter {
+  readonly id = 'gemini' as const
+  readonly bin = 'gemini'
+
+  /** stream-json on BOTH paths, including triage. `-o json` writes nothing to
+   *  stdout when the turn fails before the model answers (the auth-failure
+   *  case) and reports it only on stderr, while stream-json still emits a
+   *  `result` event carrying the reason. */
+  private static readonly STREAM = ['--output-format', 'stream-json']
+
+  private turn(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+    resumeSessionId?: string | null
+    onHopUsage?: (report: EngineHopReport) => void
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell } = resolveSpawn(this.bin)
+    const model = args.model ? ['--model', args.model] : []
+    // `--resume` takes "latest", a 1-based index, or a full session UUID —
+    // findSession() matches the UUID first, which is the only stable handle
+    // across wakes (an index shifts as sessions accumulate).
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    return spawnGeminiStream(
+      command,
+      [...GeminiAdapter.STREAM, '--yolo', ...resume, ...model],
+      {
+        cwd: args.cwd,
+        env: geminiEnv(args.env),
+        prompt,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        onHopUsage: args.onHopUsage,
+        pin: args.model ?? null,
+      },
+    )
+  }
+
+  private async ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineRunResult & { text: string }> {
+    const { command, shell } = resolveSpawn(this.bin)
+    const model = ['--model', args.model || triageModel('gemini-2.5-flash-lite')]
+    const settings = join(args.cwd, GEMINI_TRIAGE_SETTINGS_FILE)
+    let env = geminiEnv(args.env)
+    try {
+      await writeFile(settings, GEMINI_TRIAGE_SETTINGS, 'utf8')
+      // System scope so it wins over any user/workspace settings the operator
+      // has; it MERGES with them, so their auth config is untouched.
+      env = { ...env, GEMINI_CLI_SYSTEM_SETTINGS_PATH: settings }
+    } catch {
+      // Triage still works with tools present — the cwd is neutral and the
+      // prompt asks for a direct answer. Losing the guarantee is not worth
+      // losing the classification.
+    }
+    return spawnGeminiStream(
+      command,
+      [...GeminiAdapter.STREAM, '--yolo', ...model],
+      {
+        cwd: args.cwd,
+        env,
+        prompt,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        pin: model[1],
+      },
+    )
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // Whole user-owned override: output becomes opaque, but the prompt still
+      // travels on stdin so a Windows shim and a long prompt both survive.
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnCapture(command, flags, {
+        cwd: args.cwd,
+        env: geminiEnv(args.env),
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        stdinText: args.prompt,
+      })
+    }
+    const result = await this.ask(args.prompt, {
+      cwd: args.cwd,
+      env: args.env,
+      signal: args.signal,
+      onLog: args.onLog,
+      model: args.model,
+    })
+    return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // Concrete ids rather than Gemini's `pro` / `flash-lite` aliases: the
+    // aliases only exist in recent builds, and an operator running an older
+    // `gemini` would get a model-not-found from the doctor probe itself — a
+    // red brain that says nothing about their actual configuration.
+    const model = args.tier === 'small' ? triageModel('gemini-2.5-flash-lite') : 'gemini-2.5-pro'
+    const result = await this.ask(DOCTOR_PROMPT, {
+      cwd: args.cwd,
+      env: args.env,
+      signal: args.signal,
+      model,
+    })
+    return { text: result.text, error: result.error, usage: result.usage, model: result.model }
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The real wake is the same one-shot process probe() already exercises;
+    // --resume re-opens a conversation inside it, it is not a second protocol.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.gemini', 'skills'), { recursive: true })
+    await writeFile(
+      join(home, 'GEMINI.md'),
+      PERSONA_HEADER(persona, { personaFile: 'GEMINI.md', skillsDir: '.gemini/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_GEMINI_ARGS')
+    if (flags.length) {
+      const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnEngine(command, [...flags, ...resume], { ...args, env: geminiEnv(args.env) }, { shell, stdinText: args.prompt })
+    }
+    return this.turn(args.prompt, {
+      cwd: args.home,
+      env: args.env,
+      signal: args.signal,
+      onLog: args.onLog,
+      model: args.model,
+      resumeSessionId: args.resumeSessionId,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  // No startSession: gemini has no stream-json INPUT mode, so there is no way
+  // to feed turn N+1 into a live process. --resume re-opens the conversation in
+  // a fresh one, which is what the one-shot path already does.
+}
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
@@ -3320,6 +3722,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   cursor: new CursorAdapter(),
   opencode: new OpenCodeAdapter(),
   pi: new PiAdapter(),
+  gemini: new GeminiAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {

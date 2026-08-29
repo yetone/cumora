@@ -448,7 +448,8 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
   const source = (
     body?.source === 'byoa-claude' || body?.source === 'byoa-codex' ||
     body?.source === 'byoa-grok' || body?.source === 'byoa-cursor' ||
-    body?.source === 'byoa-opencode' || body?.source === 'byoa-pi'
+    body?.source === 'byoa-opencode' || body?.source === 'byoa-pi' ||
+    body?.source === 'byoa-gemini'
   ) ? body.source : 'byoa-claude'
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []

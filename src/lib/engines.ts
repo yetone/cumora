@@ -26,7 +26,7 @@ export const ENGINE_BIN: Record<string, string> = {
 }
 
 /** Engines Cumora can actually wake. Everything else is detect-only. */
-export const RUNNABLE_ENGINE_IDS = new Set(['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi'])
+export const RUNNABLE_ENGINE_IDS = new Set(['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini'])
 
 export function engineLabel(id: string): string {
   return ENGINE_LABEL[id] ?? id
