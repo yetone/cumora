@@ -274,6 +274,48 @@ test('[integration] runtime: /context rejects a stale production token after ten
   assert.deepEqual(r.body?.rows ?? [], [])
 })
 
+test('[integration] runtime: /faces requires a tenant-pinned token', async () => {
+  const { agentId } = await seedAgent()
+  const token = signAgentToken({ agentId, companyId: null })
+  const r = await call('/runtime/faces', { token, body: { participantIds: [agentId] } })
+  assert.equal(r.status, 403)
+  assert.match(String(r.body?.error ?? ''), /companyId claim required/i)
+})
+
+test('[integration] runtime: /faces returns participants only from the JWT tenant', async () => {
+  const caller = await seedAgent()
+  const otherTenant = await seedAgent()
+  await pool.query(
+    `UPDATE participants SET avatar_url = CASE id
+       WHEN $1 THEN 'https://cdn.example.test/caller.png'
+       WHEN $2 THEN 'https://cdn.example.test/other.png'
+     END
+     WHERE id = ANY($3::text[])`,
+    [caller.agentId, otherTenant.agentId, [caller.agentId, otherTenant.agentId]],
+  )
+
+  const r = await call('/runtime/faces', {
+    token: caller.token,
+    body: { participantIds: [caller.agentId, otherTenant.agentId] },
+  })
+
+  assert.equal(r.status, 200)
+  assert.deepEqual(
+    (r.body?.rows ?? []).map((row: { id: string; name: string; role: string | null; avatar_url: string | null }) => ({
+      id: row.id,
+      name: row.name,
+      role: row.role,
+      avatarUrl: row.avatar_url,
+    })),
+    [{
+      id: caller.agentId,
+      name: caller.agentId,
+      role: 'tester',
+      avatarUrl: 'https://cdn.example.test/caller.png',
+    }],
+  )
+})
+
 // ── identity pin: agentId comes from JWT, not request body ────────────
 
 test('[integration] runtime: /runs records the JWT subject, not whatever the body claims', async () => {

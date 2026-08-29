@@ -481,14 +481,15 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     return loadSkillsIndexImpl(agentId)
   }
 
-  /** Avatar portraits for every participant id passed in. Returns rows
-   *  in arbitrary order; caller filters out missing/local URLs before
-   *  shipping them to the LLM. */
-  async loadFaces(participantIds: string[]): Promise<FaceRow[]> {
+  /** Avatar portraits for selected participants in the authenticated tenant.
+   *  Returns rows in arbitrary order; caller filters out missing/local URLs
+   *  before shipping them to the LLM. */
+  async loadFaces(companyId: string, participantIds: string[]): Promise<FaceRow[]> {
     if (participantIds.length === 0) return []
     const { rows } = await pool.query<FaceRow>(
-      `SELECT id, name, role, avatar_url FROM participants WHERE id = ANY($1::text[])`,
-      [participantIds],
+      `SELECT id, name, role, avatar_url FROM participants
+        WHERE company_id = $1 AND id = ANY($2::text[])`,
+      [companyId, participantIds],
     )
     return rows
   }

@@ -141,6 +141,27 @@ test('loadContext: sends only conversation selectors because the JWT pins the te
   assert.deepEqual(requestBody, { conversationIds: ['convo-1'] })
 })
 
+test('loadFaces: sends only participant selectors because the JWT pins the tenant', async () => {
+  let requestBody: unknown
+  const stubFetch = ((async (_input: unknown, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body ?? 'null'))
+    return new Response(JSON.stringify({ rows: [] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }) as unknown) as typeof fetch
+  const client = new HttpRuntimeClient({
+    baseUrl: 'http://stub.invalid',
+    token: 'tenant-pinned-token',
+    fetchImpl: stubFetch,
+    timeoutMs: 1_000,
+  })
+
+  await client.loadFaces('company-from-call-site', ['participant-1'])
+
+  assert.deepEqual(requestBody, { participantIds: ['participant-1'] })
+})
+
 test('regression guard: loadInbox MUST still throw on fetch failure — turn cannot run without an inbox', async () => {
   // Symmetric defence — if someone "fixes" loadInbox to also swallow,
   // the turn would silently run with no inbox and the agent would

@@ -164,7 +164,7 @@ export class HttpRuntimeClient implements AgentRuntimeClient {
     return out.rows
   }
 
-  async loadFaces(participantIds: string[]): Promise<FaceRow[]> {
+  async loadFaces(_companyId: string, participantIds: string[]): Promise<FaceRow[]> {
     const out = await this.call<{ rows: FaceRow[] }>('POST', '/faces', { participantIds })
     return out.rows
   }

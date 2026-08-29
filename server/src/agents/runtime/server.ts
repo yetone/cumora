@@ -275,9 +275,10 @@ runtimeRouter.get('/skills', withAgent(async (c, _req, res) => {
   res.json({ rows: await inprocClient.loadSkillsIndex(c.sub) })
 }))
 
-runtimeRouter.post('/faces', withAgent(async (_c, req, res) => {
+runtimeRouter.post('/faces', withAgent(async (c, req, res) => {
+  if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
   const body = req.body as { participantIds?: string[] } | undefined
-  const rows = await inprocClient.loadFaces(body?.participantIds ?? [])
+  const rows = await inprocClient.loadFaces(c.companyId, body?.participantIds ?? [])
   res.json({ rows })
 }))
 

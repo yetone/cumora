@@ -805,8 +805,8 @@ async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messa
  * Skips participants without an AI-generated portrait, and skips local URLs
  * when no PUBLIC_HOST is configured (OpenAI can't fetch localhost).
  */
-async function loadFaces(participantIds: string[]): Promise<Array<{ id: string; name: string; role: string | null; url: string }>> {
-  const rows = await runtime.loadFaces(participantIds)
+async function loadFaces(companyId: string, participantIds: string[]): Promise<Array<{ id: string; name: string; role: string | null; url: string }>> {
+  const rows = await runtime.loadFaces(companyId, participantIds)
   const out: Array<{ id: string; name: string; role: string | null; url: string }> = []
   for (const r of rows) {
     if (!r.avatar_url) continue
@@ -2259,7 +2259,7 @@ Mechanics:
     agentId,
     ...context.map((m) => m.author_id),
   ])]
-  const faces = await loadFaces(distinctSpeakers)
+  const faces = await loadFaces(persona.companyId, distinctSpeakers)
 
   // Build structured input — text wake prompt plus any image attachments as
   // input_image content items so vision-capable models can actually see them.

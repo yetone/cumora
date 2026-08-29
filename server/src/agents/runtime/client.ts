@@ -218,9 +218,9 @@ export interface AgentRuntimeClient {
   /** Index of installed skills (name + description only — progressive
    *  disclosure; full SKILL.md loaded lazily). */
   loadSkillsIndex(agentId: string): Promise<SkillIndexEntry[]>
-  /** Participant avatar portraits — for every id passed in, returns
-   *  the public URL if a portrait exists. */
-  loadFaces(participantIds: string[]): Promise<FaceRow[]>
+  /** Participant avatar portraits within the authenticated tenant — ids are
+   *  selectors, not authorization, and must never cross company boundaries. */
+  loadFaces(companyId: string, participantIds: string[]): Promise<FaceRow[]>
 
   // === Identity (system prompt) ===
   /** Full system prompt incl. IDENTITY.md / SOUL.md, persona, global
