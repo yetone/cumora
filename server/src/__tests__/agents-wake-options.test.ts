@@ -6,7 +6,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { buildKanbanWakeBrief } from '../agents/kanban-wake.js'
+import { buildKanbanWakeBrief, resolveKanbanAssigneeChange } from '../agents/kanban-wake.js'
 import {
   mergeWakeBackgroundBriefs,
   mergeWakeTurnOptions,
@@ -103,6 +103,25 @@ test('shared Kanban brief names the card and actionable CLI commands', () => {
   assert.match(brief.body, /cumora card claim card-1/)
   assert.match(brief.body, /cumora card comment card-1/)
   assert.match(brief.body, /cumora card move card-1/)
+})
+
+test('assignee wake is emitted only for a real assignment transition', () => {
+  assert.deepEqual(resolveKanbanAssigneeChange('agent-1', 'agent-1'), {
+    nextAssigneeId: 'agent-1',
+    changed: false,
+  })
+  assert.deepEqual(resolveKanbanAssigneeChange('agent-1', '  agent-2  '), {
+    nextAssigneeId: 'agent-2',
+    changed: true,
+  })
+  assert.deepEqual(resolveKanbanAssigneeChange('agent-1', null), {
+    nextAssigneeId: null,
+    changed: true,
+  })
+  assert.deepEqual(resolveKanbanAssigneeChange('agent-1', undefined), {
+    nextAssigneeId: 'agent-1',
+    changed: false,
+  })
 })
 
 test('malformed or oversized wake payloads cannot manufacture work', () => {

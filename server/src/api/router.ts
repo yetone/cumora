@@ -10,7 +10,7 @@ import { env } from '../env.js'
 import { startConvene, getActiveConvene } from '../agents/convene.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
-import { wakeKanbanAgents } from '../agents/kanban-wake.js'
+import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
@@ -5326,9 +5326,9 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
   // against the existing title/description and decide which broadcast kind
   // to publish (card.moved vs card.updated).
   const { rows: cur } = await pool.query<{
-    title: string; description: string | null; column_id: string
+    title: string; description: string | null; column_id: string; assignee_id: string | null
   }>(
-    `SELECT title, description, column_id FROM board_cards
+    `SELECT title, description, column_id, assignee_id FROM board_cards
       WHERE id = $1 AND board_id = $2 LIMIT 1`,
     [cardId, boardId],
   )
@@ -5339,6 +5339,7 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
   let nextDesc = cur[0].description
   let nextColumnId = cur[0].column_id
   let columnChanged = false
+  const assigneeChange = resolveKanbanAssigneeChange(cur[0].assignee_id, req.body?.assigneeId)
   if (typeof req.body?.title === 'string') {
     nextTitle = req.body.title.trim().slice(0, 200)
     params.push(nextTitle); sets.push(`title = $${params.length}`)
@@ -5350,9 +5351,8 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
   if (typeof req.body?.position === 'number') {
     params.push(req.body.position); sets.push(`position = $${params.length}`)
   }
-  if (typeof req.body?.assigneeId === 'string' || req.body?.assigneeId === null) {
-    const a = req.body.assigneeId == null ? null : String(req.body.assigneeId).trim() || null
-    params.push(a); sets.push(`assignee_id = $${params.length}`)
+  if (assigneeChange.changed) {
+    params.push(assigneeChange.nextAssigneeId); sets.push(`assignee_id = $${params.length}`)
   }
   if (typeof req.body?.columnId === 'string') {
     const newCol = req.body.columnId.trim()
@@ -5395,8 +5395,8 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
     },
   })
   // A re-assignment also wakes the new assignee.
-  if (typeof req.body?.assigneeId === 'string') {
-    const newAssignee = String(req.body.assigneeId).trim()
+  if (assigneeChange.changed) {
+    const newAssignee = assigneeChange.nextAssigneeId
     if (newAssignee && newAssignee !== me) {
       void wakeKanbanAgents({
         companyId, mentions: [newAssignee], actorId: me,

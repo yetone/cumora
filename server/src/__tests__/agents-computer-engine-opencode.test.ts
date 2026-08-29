@@ -52,6 +52,16 @@ process.stdin.on('end', () => {
     process.exitCode = 2
     return
   }
+  if (scenario === 'stderr-json') {
+    // Diagnostics may happen to be JSON. They are not part of OpenCode's
+    // stdout protocol and must not alter session/error/usage state.
+    process.stderr.write(JSON.stringify({ sessionID: 'ses_stderr', type: 'step_finish', part: {
+      tokens: { input: 900, output: 90, reasoning: 9, cache: { read: 80, write: 7 } },
+    } }) + '\\n')
+    process.stderr.write(JSON.stringify({ sessionID: 'ses_stderr', type: 'error', error: {
+      data: { message: 'stderr diagnostic only' },
+    } }) + '\\n')
+  }
   out({ type: 'step_start', part: { type: 'step-start' } })
   if (scenario === 'missing-finish') {
     out({ type: 'text', part: { type: 'text', text: 'partial', time: { end: Date.now() } } })
@@ -303,6 +313,34 @@ test('opencode stream error fails a turn even when the process exits zero', { sk
   assert.equal(result.sessionId, 'ses_opencode_new')
 })
 
+test('opencode never parses JSON diagnostics from stderr as protocol events', { skip: IS_WIN }, async () => {
+  const f = await fixture('stderr-json')
+  const hops: EngineHopReport[] = []
+  const logs: string[] = []
+  const result = await getAdapter('opencode').run({
+    home: f.home,
+    prompt: 'stderr stays diagnostic',
+    env: f.env,
+    model: null,
+    fastModel: null,
+    resumeSessionId: null,
+    onLog: (line) => logs.push(line),
+    onHopUsage: (hop) => hops.push(hop),
+    signal: new AbortController().signal,
+  })
+
+  assert.equal(result.exitCode, 0, result.error)
+  assert.equal(result.sessionId, 'ses_opencode_new')
+  assert.deepEqual(result.usage, {
+    input_tokens: 100,
+    output_tokens: 15,
+    cache_read_input_tokens: 40,
+    cache_creation_input_tokens: 2,
+  })
+  assert.equal(hops.length, 1)
+  assert.ok(logs.some((line) => line.includes('stderr diagnostic only')), 'stderr stays observable')
+})
+
 test('opencode accepts a clean exit when the best-effort stream omits step_finish', { skip: IS_WIN }, async () => {
   const f = await fixture('missing-finish')
   const result = await getAdapter('opencode').run({
@@ -350,6 +388,7 @@ test('opencode custom args keep stdin and resume while making output opaque', { 
     signal: new AbortController().signal,
   })
   assert.equal(result.exitCode, 0, result.error)
+  assert.equal(result.sessionId, 'ses_custom', 'camelCase sessionID must survive the opaque override path')
   const call = (await fakeLog(f))[0]
   assert.deepEqual(call?.argv, ['run', '--pure', '--session', 'ses_custom'])
   assert.equal(call?.stdin, 'custom')

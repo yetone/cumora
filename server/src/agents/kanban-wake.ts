@@ -8,6 +8,31 @@ export interface KanbanWakeCard {
   what: string
 }
 
+export interface KanbanAssigneeChange {
+  nextAssigneeId: string | null
+  changed: boolean
+}
+
+/** Normalize the PATCH assignee field and distinguish a real reassignment
+ * from clients that echo the card's existing controlled value on every edit.
+ * Only a real transition should produce an assignment wake. */
+export function resolveKanbanAssigneeChange(
+  currentAssigneeId: string | null,
+  requestedAssigneeId: unknown,
+): KanbanAssigneeChange {
+  const specified = typeof requestedAssigneeId === 'string' || requestedAssigneeId === null
+  if (!specified) {
+    return { nextAssigneeId: currentAssigneeId, changed: false }
+  }
+  const nextAssigneeId = requestedAssigneeId === null
+    ? null
+    : requestedAssigneeId.trim() || null
+  return {
+    nextAssigneeId,
+    changed: nextAssigneeId !== currentAssigneeId,
+  }
+}
+
 export function buildKanbanWakeBrief(card: KanbanWakeCard): WakeBackgroundBrief {
   const title = card.title?.slice(0, 200) || null
   return {

@@ -481,7 +481,7 @@ function spawnEngine(
   bin: string,
   args: string[],
   { home, env, onLog, signal, onHopUsage }: EngineRunArgs,
-  spawnOpts: { shell?: boolean; stdinText?: string } = {},
+  spawnOpts: { shell?: boolean; stdinText?: string; onStdoutLine?: (line: string) => void } = {},
 ): Promise<EngineRunResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
@@ -536,10 +536,11 @@ function spawnEngine(
         // Sniff the engine's session id (to `--resume` next wake), the final
         // `result` event's usage (cache-aware cost), and the actual model id
         // (real pricing). Cheap: only parse stdout JSON objects carrying one.
-        if (stream === 'stdout' && cleaned.startsWith('{') && (cleaned.includes('"session_id"') || cleaned.includes('"usage"') || cleaned.includes('"model"'))) {
+        if (stream === 'stdout' && cleaned.startsWith('{') && (cleaned.includes('"session_id"') || cleaned.includes('"sessionID"') || cleaned.includes('"usage"') || cleaned.includes('"model"'))) {
           try {
-            const obj = JSON.parse(cleaned) as { session_id?: unknown; type?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
-            if (typeof obj.session_id === 'string' && obj.session_id) sessionId = obj.session_id
+            const obj = JSON.parse(cleaned) as { session_id?: unknown; sessionID?: unknown; type?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
+            const sniffedSessionId = typeof obj.session_id === 'string' ? obj.session_id : obj.sessionID
+            if (typeof sniffedSessionId === 'string' && sniffedSessionId) sessionId = sniffedSessionId
             // The terminal `result` event carries the authoritative turn total.
             if (obj.type === 'result' && obj.usage && typeof obj.usage === 'object') usage = obj.usage
             // assistant events carry message.model; some events carry top-level model.
@@ -562,6 +563,7 @@ function spawnEngine(
             if (obj.type === 'result') { hopStartedAt = null; hopIndex = 0 }
           } catch { /* partial / non-json line — ignore */ }
         }
+        if (stream === 'stdout') spawnOpts.onStdoutLine?.(cleaned)
         onLog(cleaned)
       }
     }
@@ -2514,13 +2516,21 @@ async function spawnOpenCodeStream(
         prompt: opts.prompt,
         env: opts.env,
         onLog: (line) => {
-          const event = parseOpenCodeLine(line)
-          if (event) tracker.observe(event)
           opts.onLog?.(line)
         },
         signal: opts.signal,
       },
-      { shell: opts.shell, stdinText: opts.prompt },
+      {
+        shell: opts.shell,
+        stdinText: opts.prompt,
+        // OpenCode's JSONL protocol is stdout-only. Stderr remains visible in
+        // logs and process-failure previews, but must never contribute usage,
+        // session state, or a stream-level provider error.
+        onStdoutLine: (line) => {
+          const event = parseOpenCodeLine(line)
+          if (event) tracker.observe(event)
+        },
+      },
     )
   } catch (err) {
     return {

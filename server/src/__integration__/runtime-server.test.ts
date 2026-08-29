@@ -274,6 +274,35 @@ test('[integration] runtime: /context rejects a stale production token after ten
   assert.deepEqual(r.body?.rows ?? [], [])
 })
 
+test('[integration] runtime: /inbox-triage/payload rejects a stale token before loading the new tenant inbox', async () => {
+  const originalTenant = await seedAgent()
+  const currentTenant = await seedAgent()
+  const staleToken = await mintAssignedAgentRuntimeToken(originalTenant)
+
+  const moved = await pool.query(
+    `UPDATE participants
+        SET company_id = $1, computer_id = NULL, engine = NULL
+      WHERE id = $2 AND company_id = $3`,
+    [currentTenant.companyId, originalTenant.agentId, originalTenant.companyId],
+  )
+  assert.equal(moved.rowCount, 1)
+
+  await seedContextConversation({
+    companyId: currentTenant.companyId,
+    members: [originalTenant.agentId, currentTenant.agentId],
+    authorId: currentTenant.agentId,
+    body: 'new-tenant-inbox-private',
+  })
+
+  const r = await call('/runtime/inbox-triage/payload', {
+    method: 'GET',
+    token: staleToken,
+  })
+
+  assert.equal(r.status, 403)
+  assert.match(String(r.body?.error ?? ''), /token tenant/i)
+})
+
 test('[integration] runtime: /faces requires a tenant-pinned token', async () => {
   const { agentId } = await seedAgent()
   const token = signAgentToken({ agentId, companyId: null })

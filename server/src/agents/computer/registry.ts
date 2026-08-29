@@ -357,40 +357,50 @@ export async function heartbeatComputer(
 ): Promise<void> {
   const v = typeof version === 'string' && version ? version.slice(0, 32) : null
   const sup = typeof supervised === 'boolean' ? supervised : null
-  // Keep the advertised engine list current WITHOUT a re-pair. The daemon is
-  // already online and re-scans PATH, so installing another supported CLI shows
-  // up here instead of requiring the user to mint a new pairing token. Only for
-  // paired computers: a cloud computer advertises 'managed' and has no PATH.
-  if (detectedEngines) {
-    const { rows } = await pool.query<{ available_engines: string[]; kind: ComputerKind }>(
-      `SELECT available_engines, kind FROM computers WHERE id = $1 AND revoked_at IS NULL`,
-      [computerId],
-    )
-    const row = rows[0]
-    if (row && row.kind !== 'cloud') {
-      const next = mergeDetectedEngines(row.available_engines ?? [], detectedEngines)
-      if (next) {
-        await pool.query(
-          `UPDATE computers SET available_engines = $2::jsonb WHERE id = $1 AND revoked_at IS NULL`,
-          [computerId, JSON.stringify(next)],
-        )
-      }
-    }
-  }
+  // Liveness is the primary heartbeat contract. Refreshing the optional PATH
+  // inventory must not run first: one transient read failure used to reject the
+  // whole request, so a healthy daemon could be swept offline even though its
+  // heartbeat reached the server.
   const bumped = await pool.query(
     `UPDATE computers SET last_seen_at = NOW(), daemon_version = COALESCE($2, daemon_version),
             daemon_supervised = COALESCE($3, daemon_supervised)
       WHERE id = $1 AND revoked_at IS NULL AND status = 'online' RETURNING 1`,
     [computerId, v, sup],
   )
-  if (bumped.rowCount) return // already online — quiet bump
-  const { rows } = await pool.query<{ company_id: string }>(
-    `UPDATE computers SET status = 'online', last_seen_at = NOW(), daemon_version = COALESCE($2, daemon_version),
-            daemon_supervised = COALESCE($3, daemon_supervised)
-      WHERE id = $1 AND revoked_at IS NULL RETURNING company_id`,
-    [computerId, v, sup],
-  )
-  if (rows[0]) await broadcastComputerStatus(computerId, rows[0].company_id, 'online')
+  if (!bumped.rowCount) {
+    const { rows } = await pool.query<{ company_id: string }>(
+      `UPDATE computers SET status = 'online', last_seen_at = NOW(), daemon_version = COALESCE($2, daemon_version),
+              daemon_supervised = COALESCE($3, daemon_supervised)
+        WHERE id = $1 AND revoked_at IS NULL RETURNING company_id`,
+      [computerId, v, sup],
+    )
+    if (rows[0]) await broadcastComputerStatus(computerId, rows[0].company_id, 'online')
+  }
+
+  // Keep the advertised engine list current WITHOUT a re-pair. This secondary
+  // refresh is best-effort: a database hiccup here must not turn a successful
+  // liveness update into an HTTP 500. Only paired computers participate; a
+  // cloud computer advertises 'managed' and has no PATH inventory.
+  if (detectedEngines) {
+    try {
+      const { rows } = await pool.query<{ available_engines: string[]; kind: ComputerKind }>(
+        `SELECT available_engines, kind FROM computers WHERE id = $1 AND revoked_at IS NULL`,
+        [computerId],
+      )
+      const row = rows[0]
+      if (row && row.kind !== 'cloud') {
+        const next = mergeDetectedEngines(row.available_engines ?? [], detectedEngines)
+        if (next) {
+          await pool.query(
+            `UPDATE computers SET available_engines = $2::jsonb WHERE id = $1 AND revoked_at IS NULL`,
+            [computerId, JSON.stringify(next)],
+          )
+        }
+      }
+    } catch (err) {
+      console.warn('[computers] heartbeat engine refresh failed:', err instanceof Error ? err.message : err)
+    }
+  }
 }
 
 /** Mark paired computers offline once their heartbeat goes stale, and

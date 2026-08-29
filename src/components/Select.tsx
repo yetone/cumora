@@ -48,8 +48,8 @@ export function Select<T extends string = string>({
   const rootRef = useRef<HTMLDivElement>(null)
   const [open, setOpen] = useState(false)
   const [animateMenu, setAnimateMenu] = useState(false)
-  const selectedIndex = Math.max(0, options.findIndex((option) => option.value === value))
-  const selected = options[selectedIndex]
+  const selectedIndex = options.findIndex((option) => option.value === value)
+  const selected = selectedIndex >= 0 ? options[selectedIndex] : undefined
   const [activeIndex, setActiveIndex] = useState(selectedIndex)
 
   useEffect(() => {
@@ -156,7 +156,7 @@ export function Select<T extends string = string>({
           backgroundImage: 'var(--select-face)',
         }}
       >
-        <span className="min-w-0 flex-1 truncate">{selected?.label ?? 'Select'}</span>
+        <span className="min-w-0 flex-1 truncate">{(selected?.label ?? value) || 'Select'}</span>
         <span
           aria-hidden="true"
           className={cn(

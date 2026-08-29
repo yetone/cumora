@@ -21,7 +21,8 @@ import { buildTriageRequest, gatherClaimsByConvo } from '../inbox-triage.js'
 import { buildTeamRosterText, getPersona } from '../personas.js'
 import { gatherAgentAgenda, classifyAgendaActionable, renderAgendaBrief, claimStallNudge, AGENDA_CLASSIFIER_ERROR } from '../agenda.js'
 import { consumeAgentTurnToken } from '../scheduler.js'
-import { touchAgentRun, recordTriage, type TriageSource } from '../observability.js'
+import { touchAgentRun, recordTriage } from '../observability.js'
+import { normalizeByoaSource } from './byoa-source.js'
 import { buildRuntimeArgv } from './cli-argv.js'
 import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
@@ -153,6 +154,14 @@ runtimeRouter.get('/inbox-triage/payload', withAgent(async (c, _req, res) => {
   if (!c.companyId) { res.status(403).json({ error: 'companyId claim required' }); return }
   const persona = await inprocClient.loadPersona(c.sub)
   if (!persona) { res.status(404).json({ error: 'agent not found' }); return }
+  // A still-valid token can outlive an administrative tenant reassignment.
+  // Pin the subject's current tenant before loading its inbox; otherwise an old
+  // tenant's daemon can ask this route to assemble prompt content from the new
+  // tenant while loadContext alone remains correctly scoped to the JWT claim.
+  if (persona.companyId !== c.companyId) {
+    res.status(403).json({ error: 'agent does not belong to token tenant' })
+    return
+  }
   const inbox = await inprocClient.loadInbox(c.sub)
   const convoIds = [...new Set(inbox.map((m) => m.conversation_id))]
   // Content-blind cost floor (NOT a loop decision). The daemon self-polls every
@@ -382,7 +391,7 @@ runtimeRouter.post('/triage', withAgent(async (c, req, res) => {
     daemonVersion?: string
   } | undefined
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
-  const source: TriageSource = (body?.source as TriageSource) ?? 'byoa-claude'
+  const source = normalizeByoaSource(body?.source)
   void recordTriage({
     agentId: c.sub,
     companyId: c.companyId,
@@ -445,12 +454,7 @@ runtimeRouter.post('/llm-calls', withAgent(async (c, req, res) => {
       extras?: Record<string, unknown>
     }>
   } | undefined
-  const source = (
-    body?.source === 'byoa-claude' || body?.source === 'byoa-codex' ||
-    body?.source === 'byoa-grok' || body?.source === 'byoa-cursor' ||
-    body?.source === 'byoa-opencode' || body?.source === 'byoa-pi' ||
-    body?.source === 'byoa-gemini'
-  ) ? body.source : 'byoa-claude'
+  const source = normalizeByoaSource(body?.source)
   const daemonVersion = typeof body?.daemonVersion === 'string' && body.daemonVersion.trim() ? body.daemonVersion.trim().slice(0, 32) : null
   const hops = Array.isArray(body?.hops) ? body!.hops : []
   if (hops.length === 0) { res.json({ ok: true, inserted: 0 }); return }

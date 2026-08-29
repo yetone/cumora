@@ -21,9 +21,11 @@ const { heartbeatComputer, mergeDetectedEngines } = await import('../agents/comp
 const { pool } = await import('../db/pool.js')
 
 const originalQuery = pool.query.bind(pool)
+const originalWarn = console.warn
 
 afterEach(() => {
   ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
+  console.warn = originalWarn
 })
 
 test('a newly installed engine is appended without re-pairing', () => {
@@ -104,4 +106,25 @@ test('heartbeat persists a successful empty detection', async () => {
   const inventoryUpdate = calls.find((c) => /UPDATE computers SET available_engines/.test(c.sql))
   assert.ok(inventoryUpdate)
   assert.equal(inventoryUpdate.params[1], '[]')
+})
+
+test('heartbeat persists liveness before a failing inventory refresh', async () => {
+  const calls: string[] = []
+  const warnings: string[] = []
+  console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')) }
+  ;(pool as unknown as {
+    query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number }>
+  }).query = async (sql: string) => {
+    calls.push(sql)
+    if (/UPDATE computers SET last_seen_at/.test(sql)) return { rows: [{ '?column?': 1 }], rowCount: 1 }
+    if (/SELECT available_engines/.test(sql)) throw new Error('transient inventory read failure')
+    throw new Error(`unexpected query: ${sql}`)
+  }
+
+  await heartbeatComputer('comp-1', '0.8.0', true, ['claude'])
+
+  assert.match(calls[0] ?? '', /UPDATE computers SET last_seen_at/)
+  assert.match(calls[1] ?? '', /SELECT available_engines/)
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0], /transient inventory read failure/)
 })
