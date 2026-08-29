@@ -22,7 +22,7 @@
  */
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { mkdir, writeFile, access, mkdtemp } from 'node:fs/promises'
+import { mkdir, writeFile, access, mkdtemp, rename } from 'node:fs/promises'
 import { existsSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join, delimiter as PATH_DELIMITER } from 'node:path'
@@ -3612,7 +3612,15 @@ class GeminiAdapter implements EngineAdapter {
     const settings = join(args.cwd, GEMINI_TRIAGE_SETTINGS_FILE)
     let env = geminiEnv(args.env)
     try {
-      await writeFile(settings, GEMINI_TRIAGE_SETTINGS, 'utf8')
+      // Write-then-rename, not writeFile onto the live path. The triage cwd is
+      // shared — the doctor hands the SAME dir to every engine's probe, and
+      // concurrent classifies land there too — and writeFile truncates before
+      // it writes, so a second caller can be mid-truncate while gemini is
+      // reading. Identical content does not save us from a zero-length read;
+      // rename is atomic, so a reader sees one whole file or the other.
+      const staged = `${settings}.${process.pid}.${randomUUID().slice(0, 8)}`
+      await writeFile(staged, GEMINI_TRIAGE_SETTINGS, 'utf8')
+      await rename(staged, settings)
       // System scope so it wins over any user/workspace settings the operator
       // has; it MERGES with them, so their auth config is untouched.
       env = { ...env, GEMINI_CLI_SYSTEM_SETTINGS_PATH: settings }

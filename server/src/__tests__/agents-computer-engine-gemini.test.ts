@@ -10,7 +10,7 @@
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine-gemini.test.ts
  */
 import { existsSync } from 'node:fs'
-import { chmod, mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 import { afterEach, test } from 'node:test'
@@ -46,6 +46,11 @@ process.stdin.on('end', () => {
       argv, stdin, cwd: process.cwd(),
       trust: process.env.GEMINI_CLI_TRUST_WORKSPACE || null,
       settingsPath: process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH || null,
+      settingsOk: (() => {
+        const p = process.env.GEMINI_CLI_SYSTEM_SETTINGS_PATH
+        if (!p) return null
+        try { JSON.parse(fs.readFileSync(p, 'utf8')); return true } catch { return false }
+      })(),
     }) + '\\n')
   }
   const out = (event) => process.stdout.write(JSON.stringify({ timestamp: new Date().toISOString(), ...event }) + '\\n')
@@ -140,6 +145,7 @@ async function fakeLog(f: Fixture): Promise<Array<{
   cwd: string
   trust: string | null
   settingsPath: string | null
+  settingsOk: boolean | null
 }>> {
   if (!existsSync(f.log)) return []
   return (await readFile(f.log, 'utf8')).split('\n').filter(Boolean).map((line) => JSON.parse(line))
@@ -298,6 +304,28 @@ test('triage runs tool-free on the cheap model', { skip: IS_WIN }, async () => {
   // answer cannot arise.
   const settings = JSON.parse(await readFile(call.settingsPath as string, 'utf8'))
   assert.deepEqual(settings, { tools: { core: [] } })
+})
+
+test('concurrent triage shares one cwd cleanly and leaves no staging files', { skip: IS_WIN }, async () => {
+  // The triage cwd is SHARED — the doctor hands the same dir to every engine's
+  // probe, and concurrent classifies land there too. The adapter stages the
+  // settings file and renames it into place rather than writeFile-ing onto the
+  // live path, because writeFile truncates first and a reader can land in that
+  // window; identical content is no defence against a zero-length read.
+  //
+  // That window is far too narrow to provoke deterministically (spawn latency
+  // dwarfs a 22-byte write), so this pins what IS observable: every concurrent
+  // caller gets a parseable file, and nothing is left behind.
+  const f = await fixture()
+  const adapter = getAdapter('gemini')
+  await Promise.all(Array.from({ length: 12 }, () =>
+    adapter.classify({ cwd: f.home, prompt: 'x', env: f.env, ...noop })))
+
+  const calls = await fakeLog(f)
+  assert.equal(calls.length, 12)
+  for (const call of calls) assert.equal(call.settingsOk, true, call.settingsPath ?? 'no settings path')
+  const stray = (await readdir(f.home)).filter((n) => n.startsWith('.cumora-gemini-triage.') && n !== '.cumora-gemini-triage.json')
+  assert.deepEqual(stray, [], 'a rename was skipped and left a staging file behind')
 })
 
 test('CUMORA_TRIAGE_MODEL overrides the triage model', { skip: IS_WIN }, async () => {
