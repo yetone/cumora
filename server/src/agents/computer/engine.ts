@@ -3422,10 +3422,40 @@ export interface EngineHealth {
   wake: WakeHealth | null
 }
 
+/** How the engines Cumora drives word a rejected flag. Taken from the real
+ *  binaries, because the shapes differ more than they look:
+ *
+ *    claude / cursor-agent   error: unknown option '--x'
+ *    codex                   error: unexpected argument '--x' found
+ *    gemini 0.1.x            Unknown argument: o
+ *
+ *  Only the first two lead with `error:`, which is what `salientError` keys on.
+ *  Gemini prints its ENTIRE help to stderr and puts the cause on the LAST line,
+ *  so without this pattern the operator's diagnosis is 280 characters of usage
+ *  text with the reason cut off the end. */
+const ARGV_REJECTION_RE =
+  /\b(?:unknown (?:argument|option|flag)s?|unrecogni[sz]ed (?:argument|option)s?|unexpected argument|invalid option)\b[^\n]*/i
+
+/** The engine rejected one of OUR flags, so it failed before doing any work.
+ *
+ *  Worth separating from every other probe failure because the fix is
+ *  different in kind: not "sign in", not "wait out the rate limit", but "the
+ *  installed CLI is older than the flag set this adapter sends". Returns the
+ *  offending line, or null when the failure was something else. */
+export function argvRejection(raw: string): string | null {
+  const m = raw.replace(ANSI_RE, '').replace(/\r/g, '').match(ARGV_REJECTION_RE)
+  return m ? m[0].replace(/\s+/g, ' ').trim().slice(0, 120) : null
+}
+
 /** Pull the most informative line out of an engine's failure output. Engines bury
  *  the real cause (usage limit / not signed in / bad model) under a multi-line
  *  startup banner, often on a different stream — lead with the line that names it. */
 function salientError(raw: string): string {
+  // Ahead of the generic scan: an argv rejection can sit BELOW a whole help
+  // dump, and the fallback (first 280 chars of everything) would show the
+  // banner instead of the cause.
+  const rejected = argvRejection(raw)
+  if (rejected) return rejected
   const clean = raw.replace(ANSI_RE, '').replace(/\r/g, '')
   const m = clean.match(
     /((?:error|fatal)\b[:\- ].*|you'?ve hit your usage limit.*|usage limit.*|rate.?limit.*|quota.*|over(?:loaded|capacity).*|insufficient (?:credit|quota).*|unauthor\w*.*|forbidden.*|invalid (?:api )?key.*|not (?:logged in|authenticated|signed in).*|(?:please )?(?:sign|log) ?in.*|authentication .*)/i,
@@ -3473,7 +3503,16 @@ export async function runEngineDoctor(opts?: {
         // The real cause is often on STDOUT (e.g. codex prints "ERROR: You've hit
         // your usage limit" to stdout while stderr holds only the startup banner),
         // so search BOTH streams and surface the salient error line — not the banner.
-        return { ok: false, ms, detail: salientError(`${r.error ?? ''}\n${r.text ?? ''}`) || 'no output' }
+        const both = `${r.error ?? ''}\n${r.text ?? ''}`
+        const rejected = argvRejection(both)
+        // Name the fix. A red brain that reads "Unknown argument: o" tells an
+        // operator nothing; the same line plus the binary it came from says
+        // which CLI to update, and rules out the auth/quota causes they would
+        // otherwise go looking for first.
+        if (rejected) {
+          return { ok: false, ms, detail: `${rejected} — \`${adapter.bin}\` is older than the flags Cumora sends; update it` }
+        }
+        return { ok: false, ms, detail: salientError(both) || 'no output' }
       }
       return { ok: true, ms, detail: r.text.replace(ANSI_RE, '').trim().slice(0, 80) }
     }
