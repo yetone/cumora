@@ -83,6 +83,44 @@ test('other stale-target phrasings are recognized', () => {
   }
 })
 
+test('a PLURAL miss is a stale resume target too', () => {
+  // gemini exits fatally on `--resume <uuid>` once its per-project chats dir is
+  // gone, and says so in the plural. Read as "not stale", the daemon keeps the
+  // dead id and hands it back on the next wake — and the one after that. The
+  // agent never runs again, which is worse than losing its context.
+  for (const phrase of [
+    'Error resuming session: No previous sessions found for this project.',
+    'Error: sessions not found',
+    'Error: invalid sessions',
+    'Error: those threads do not exist',
+  ]) {
+    assert.equal(isStaleResumeError(`local gemini failed (exit 1): ${phrase}`), true, phrase)
+  }
+})
+
+test('the singular phrasings every other engine uses still match', () => {
+  // The plural allowance must not have moved the boundary for anyone else.
+  for (const phrase of [
+    'No conversation found with session ID: abc',
+    'Error: session does not exist',
+    'Error: conversation no longer exists',
+  ]) {
+    assert.equal(isStaleResumeError(`local claude failed (exit 1): ${phrase}`), true, phrase)
+  }
+})
+
+test('a plural noun without failure wording is still not a diagnosis', () => {
+  // The guard that matters: "sessions" alone proves nothing. Only the paired
+  // failure wording does.
+  for (const phrase of [
+    'process exited with code 137',
+    'wrote 3 sessions to disk',
+    'listing sessions for this project',
+  ]) {
+    assert.equal(isStaleResumeError(`local gemini failed (exit 1): ${phrase}`), false, phrase)
+  }
+})
+
 test('an ordinary crash with no session wording is not a stale resume target', () => {
   assert.equal(isStaleResumeError('local claude failed (exit 143): process terminated by SIGTERM'), false)
 })

@@ -569,12 +569,17 @@ const POISONED_BODY_RE = /no (?:low|high) surrogate|unpaired surrogate|lone surr
 // mid-turn engine death into a "stale resume target" and threw away the session
 // id that exists to recover the interrupted turn.
 const STALE_RESUME_RE = new RegExp([
-  // "No conversation found with session ID: …", "no such session"
-  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)\b`,
+  // "No conversation found with session ID: …", "no such session",
+  // "No previous sessions found for this project" (gemini, when the whole
+  // chats dir is gone). The trailing `s?` is load-bearing: an engine that
+  // reports the miss in the PLURAL is saying the resume target is gone just as
+  // plainly as the singular, and without it the daemon kept the dead id and
+  // re-sent it every wake — a permanently wedged agent, not a degraded one.
+  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)s?\b`,
   // "Session not found", "conversation no longer exists", "thread has expired"
-  String.raw`\b(?:conversation|session|thread)(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|does not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
+  String.raw`\b(?:conversation|session|thread)s?(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|do(?:es)? not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
   // "Invalid session id", "unknown conversation", "expired thread"
-  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)\b`,
+  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)s?\b`,
   // "could not resume", "unable to resume this conversation", "failed to resume"
   String.raw`\b(?:could ?n(?:o|')?t|cannot|can't|unable to|failed to)\b[^\n]{0,24}?\bresume\b`,
   // codex app-server's own wording
