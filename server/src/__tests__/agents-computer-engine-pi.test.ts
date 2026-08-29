@@ -294,6 +294,29 @@ test('pi already-aborted run and json one-shot never spawn a child', { skip: IS_
   assert.deepEqual(await fakeLog(f), [], 'an already-cancelled owner must not launch pi')
 })
 
+test('pi abort during listener registration never dispatches a prompt or becomes an engine failure', { skip: IS_WIN }, async () => {
+  const f = await fixture()
+  const controller = new AbortController()
+  const addEventListener = controller.signal.addEventListener.bind(controller.signal)
+  Object.defineProperty(controller.signal, 'addEventListener', {
+    value: (...args: Parameters<typeof addEventListener>) => {
+      addEventListener(...args)
+      if (args[0] === 'abort') controller.abort()
+    },
+  })
+
+  const result = await getAdapter('pi').run({
+    home: f.home, prompt: 'must not be sent', env: f.env, model: null, fastModel: null,
+    resumeSessionId: null, onLog: () => {}, signal: controller.signal,
+  })
+  assert.equal(result.exitCode, 130)
+  assert.match(result.error ?? '', /aborted before start/)
+
+  await delay(100)
+  const commands = (await fakeLog(f)).map((entry) => entry.cmd).filter(Boolean)
+  assert.ok(!commands.some((command) => command?.type === 'prompt'), 'the cancelled turn must not reach session.send()')
+})
+
 test('pi forced stop signals an EOF-resistant child before the daemon can exit', { skip: IS_WIN }, async () => {
   const f = await fixture('ignore-eof')
   const session = getAdapter('pi').startSession?.({ home: f.home, env: f.env, model: null, fastModel: null, onLog: () => {} })

@@ -3321,6 +3321,12 @@ class PiAdapter implements EngineAdapter {
     // listener above was installed.
     if (args.signal.aborted) onAbort()
     try {
+      // onAbort() tears the just-created session down, but send() would then
+      // report that dead session as a generic engine failure. Keep a cancelled
+      // turn classified as cancellation and never dispatch its prompt.
+      if (args.signal.aborted) {
+        return { exitCode: 130, error: 'engine turn aborted before start', sessionId: args.resumeSessionId ?? null }
+      }
       return await session.send(args.prompt)
     } finally {
       args.signal.removeEventListener('abort', onAbort)
