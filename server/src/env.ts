@@ -69,6 +69,17 @@ export const env = {
    *  self-hosted proxy or a pinned API version. */
   NOVITA_BASE_URL: (process.env.NOVITA_BASE_URL ?? 'https://api.novita.ai/openai').replace(/\/+$/, ''),
   /**
+   * OrcaRouter LLM API key. Optional — when unset, agents configured with a
+   * `orcarouter/<model>` model id (see server/src/orcarouter.ts) fall back to
+   * the legacy/sub2api client instead, so an unconfigured deployment doesn't
+   * break the run; the model just won't resolve to OrcaRouter as intended.
+   */
+  ORCAROUTER_API_KEY: process.env.ORCAROUTER_API_KEY ?? '',
+  /** OrcaRouter's OpenAI-compatible Responses base. OrcaRouter speaks the
+   *  Responses API natively, so the `orcarouter/<model>` route is a pure
+   *  base-URL swap (no Chat-Completions translation, unlike Novita). */
+  ORCAROUTER_BASE_URL: (process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, ''),
+  /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
    * `{ content: "..." }` JSON payload. When unset, alerts are still

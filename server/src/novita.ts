@@ -17,7 +17,7 @@
  * params, translates them into Chat Completions params, calls Novita's real
  * `chat.completions.create`, and translates the result (streaming or not)
  * back into the exact Responses-API shapes every existing call site already
- * expects. Nothing outside `llm.ts` needs to change — see `withNovitaRouting`
+ * expects. Nothing outside `llm.ts` needs to change — see `withProviderRouting`
  * there for how a per-call `model` id opts into this path.
  *
  * Model selection convention: an agent (or an env default) opts into Novita
@@ -437,7 +437,7 @@ function wrapAsyncIterable(gen: AsyncGenerator<ResponseStreamEvent>): AsyncItera
 
 /** The Responses-API-shaped surface every call site actually uses off a
  *  client: `client.responses.create(...)`. Assigning this object as
- *  `client.responses` (see `withNovitaRouting` in llm.ts) is sufficient —
+ *  `client.responses` (see `withProviderRouting` in llm.ts) is sufficient —
  *  nothing in this codebase touches any other `client.responses.*` method. */
 export const novitaResponsesShim = {
   create(args: ResponsesCreateArgs, opts?: RequestOpts): unknown {
