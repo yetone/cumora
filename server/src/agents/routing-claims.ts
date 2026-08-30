@@ -114,18 +114,26 @@ function toClaim(r: RoutingClaimRow): RoutingClaim {
   return { messageId: r.messageId, companyId: r.companyId, conversationId: r.conversationId, candidates: [...r.candidates], cursor: r.cursor, status: r.status }
 }
 
-/** One sweep pass. Returns the wake the sweep decided on, if any — the caller
- *  (the interval worker) performs it, so this module stays free of the
- *  scheduler's import cycle. */
-export interface SweepWake {
-  agentId: string
-  conversationId: string
-}
+/** One sweep pass. Returns the wakes the sweep decided on, if any — the caller
+ *  (the interval worker) performs them, so this module stays free of the
+ *  scheduler's import cycle.
+ *
+ *  `advance` moves the wake to the next candidate. `exhaust` is the terminal
+ *  state: every candidate held the wake and started no turn, so the room is
+ *  handed back to the pre-election behaviour — a full fan-out of the original
+ *  lineup — rather than being left to each member's next natural wake. Wakes
+ *  are durable in the inbox, so for members already back online this is
+ *  redundant; for the ones whose laptop was shut during their window it is
+ *  the difference between the message being processed and being skipped past
+ *  by a later read-cursor ack (see the #70 discussion on cursor semantics). */
+export type SweepDecision =
+  | { kind: 'advance'; agentId: string; conversationId: string }
+  | { kind: 'exhaust'; conversationId: string; room: string[] }
 
-export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSince?: (agentId: string, since: Date, companyId: string | null) => Promise<boolean> } = {}): Promise<SweepWake[]> {
+export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSince?: (agentId: string, since: Date, companyId: string | null) => Promise<boolean> } = {}): Promise<SweepDecision[]> {
   const leaseMs = opts.leaseMs ?? ELECTION_LEASE_MS
   const hasRunSince = opts.hasRunSince ?? defaultHasRunSince
-  const wakes: SweepWake[] = []
+  const decisions: SweepDecision[] = []
 
   const due = await pool.query<TakenRow>(
     `UPDATE agent_routing_claims
@@ -153,7 +161,8 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
     const nextCursor = row.cursor + 1
     if (nextCursor >= row.candidates.length) {
       await pool.query(`UPDATE agent_routing_claims SET status = 'exhausted', updated_at = NOW() WHERE message_id = $1`, [row.messageId])
-      console.warn(`[routing] election for message ${row.messageId}: every candidate went quiet — leaving the message to the room's next natural wake`)
+      console.warn(`[routing] election for message ${row.messageId}: every candidate went quiet — falling back to the full-room fan-out`)
+      decisions.push({ kind: 'exhaust', conversationId: row.conversationId, room: [...row.candidates] })
       continue
     }
     await pool.query(
@@ -163,7 +172,7 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
       [row.messageId, nextCursor, leaseMs, row.cursor],
     )
     console.warn(`[routing] elected primary ${primary} for message ${row.messageId} produced no turn within its lease — advancing to ${row.candidates[nextCursor]}`)
-    wakes.push({ agentId: row.candidates[nextCursor], conversationId: row.conversationId })
+    decisions.push({ kind: 'advance', agentId: row.candidates[nextCursor], conversationId: row.conversationId })
   }
 
   // Reap terminal rows so the table stays operator-sized.
@@ -173,7 +182,7 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
         AND updated_at < NOW() - ($1::int * INTERVAL '1 millisecond')`,
     [TERMINAL_ROW_TTL_MS],
   )
-  return wakes
+  return decisions
 }
 
 interface TakenRow extends RoutingClaimRow { createdAt: Date }
@@ -197,13 +206,20 @@ async function defaultHasRunSince(agentId: string, since: Date, companyId: strin
 function startRoutingClaimSweeper(intervalMs: number = SWEEP_INTERVAL_MS): NodeJS.Timeout {
   const tick = (): void => {
     sweepRoutingClaimsOnce()
-      .then((wakes) => {
-        for (const w of wakes) {
+      .then((decisions) => {
+        for (const d of decisions) {
           void (async () => {
-            const { wakeAgent } = await import('./scheduler.js')
-            await wakeAgent(w.agentId, 'message.new', w.conversationId)
+            const scheduler = await import('./scheduler.js')
+            if (d.kind === 'advance') {
+              await scheduler.wakeAgent(d.agentId, 'message.new', d.conversationId)
+            } else {
+              // The election came up empty — hand the room back to the
+              // pre-election behaviour: one fan-out of the original lineup,
+              // then the row is terminal and the sweep never touches it again.
+              await scheduler.fanOutWake(d.room, d.conversationId, null)
+            }
           })().catch((err) => {
-            console.error(`[routing] lease-advance wake for ${w.agentId} failed:`, err instanceof Error ? err.message : err)
+            console.error(`[routing] lease-advance wake failed (${d.kind}):`, err instanceof Error ? err.message : err)
           })
         }
       })

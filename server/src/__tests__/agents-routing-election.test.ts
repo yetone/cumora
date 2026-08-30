@@ -185,15 +185,19 @@ test('the sweep advances to the next candidate when the primary went quiet', asy
     if (sql.startsWith(REAP)) return { rows: [] }
     throw new Error('unexpected: ' + sql.slice(0, 60))
   })
-  const wakes = await sweepRoutingClaimsOnce()
+  const decisions = await sweepRoutingClaimsOnce()
   assert.equal(advanced, true)
-  assert.deepEqual(wakes, [{ agentId: 'atlas', conversationId: 'conv1' }])
+  assert.deepEqual(decisions, [{ kind: 'advance', agentId: 'atlas', conversationId: 'conv1' }])
 })
 
-test('an exhausted lineup is marked, not woken', async () => {
+test('an exhausted lineup is marked and falls back to the full-room fan-out', async () => {
+  // Exhaust means every candidate held the wake and started no turn. Leaving
+  // the message to each member's next natural wake would let a later
+  // read-cursor ack skip it permanently (the #70 cursor semantics), so the
+  // sweep hands the room back to the pre-election behaviour: one full fan-out.
   const statuses: string[] = []
   mockPool((sql) => {
-    if (sql.startsWith(TAKE)) return { rows: [{ messageId: 'm1', companyId: 'c1', conversationId: 'conv1', candidates: ['iris'], cursor: 0, status: 'pending', createdAt: new Date(NOW - 120_000) }] }
+    if (sql.startsWith(TAKE)) return { rows: [{ messageId: 'm1', companyId: 'c1', conversationId: 'conv1', candidates: ['iris', 'atlas'], cursor: 1, status: 'pending', createdAt: new Date(NOW - 300_000) }] }
     if (sql.startsWith('SELECT id FROM agent_runs')) return { rows: [] }
     if (sql.startsWith(SERVE_OR_EXHAUST)) {
       statuses.push(/'exhausted'/.test(sql) ? 'exhausted' : 'other')
@@ -202,9 +206,9 @@ test('an exhausted lineup is marked, not woken', async () => {
     if (sql.startsWith(REAP)) return { rows: [] }
     throw new Error('unexpected: ' + sql.slice(0, 60))
   })
-  const wakes = await sweepRoutingClaimsOnce()
-  assert.deepEqual(wakes, [])
+  const decisions = await sweepRoutingClaimsOnce()
   assert.deepEqual(statuses, ['exhausted'])
+  assert.deepEqual(decisions, [{ kind: 'exhaust', conversationId: 'conv1', room: ['iris', 'atlas'] }])
 })
 
 test('the sweep leaves healthy claims alone and reaps terminal rows', async () => {
