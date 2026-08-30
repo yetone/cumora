@@ -82,6 +82,7 @@ function WebHandoff() {
         </div>
         <div className="w-full flex flex-col gap-2.5">
           <button
+            type="button"
             onClick={openApp}
             className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-white transition"
             style={{
@@ -91,6 +92,7 @@ function WebHandoff() {
           >{t('web.openDesktop')}</button>
           <GetDesktopAppLink variant="button-secondary" />
           <button
+            type="button"
             onClick={() => void signOut()}
             className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
           >{t('web.signOut')}</button>

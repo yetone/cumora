@@ -65,7 +65,7 @@ export function WaitlistConfirmedScreen({ email }: { email: string | null }) {
         <div style={{ marginBottom: 24, fontSize: 12.5, color: 'var(--ink-400)', fontStyle: 'italic' }}>
           {footerParts[0]}<GetDesktopAppLink variant="text" />{footerParts.slice(1).join('\u0000')}
         </div>
-        <button className="btn-ghost" onClick={() => setDismissed(true)}>
+        <button type="button" className="btn-ghost" onClick={() => setDismissed(true)}>
           {t('waitlist.confirmedDone')}
         </button>
       </div>

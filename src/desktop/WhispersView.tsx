@@ -78,6 +78,7 @@ export function WhispersView() {
                 : t('whispers.andNMore', { a: ms[0].name, b: ms[1].name, n: ms.length - 2 })
             return (
               <button
+                type="button"
                 key={w.id}
                 onClick={() => setSelectedId(w.id)}
                 className={cn(

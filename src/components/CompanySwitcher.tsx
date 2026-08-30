@@ -70,6 +70,7 @@ export function CompanySwitcher() {
   return (
     <div className="relative" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
       <button
+        type="button"
         onClick={() => setOpen((v) => !v)}
         className="flex items-center gap-1.5 px-2 py-1 rounded-md text-[12px] font-medium text-ink-700 hover:bg-cloud transition"
         style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
@@ -99,6 +100,7 @@ export function CompanySwitcher() {
           </div>
           {companies.map((c) => (
             <button
+              type="button"
               key={c.id}
               onClick={() => switchCompany(c.id)}
               className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition"
@@ -121,6 +123,7 @@ export function CompanySwitcher() {
 
           {active && (active.role === 'owner' || active.role === 'admin') && (
             <button
+              type="button"
               onClick={() => { setInviteOpen(true); setOpen(false) }}
               className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
             >
@@ -146,12 +149,14 @@ export function CompanySwitcher() {
               {err && <div className="text-[11px] text-coral-deep">{err}</div>}
               <div className="flex gap-1.5">
                 <button
+                  type="button"
                   onClick={() => void submitNew()}
                   disabled={!newName.trim() || busy}
                   className="flex-1 py-1.5 rounded text-[12px] font-semibold text-white disabled:opacity-50"
                   style={{ background: 'var(--skype)' }}
                 >{busy ? '…' : t('company.createBtn')}</button>
                 <button
+                  type="button"
                   onClick={() => { setCreating(false); setNewName(''); setErr(null) }}
                   className="px-3 py-1.5 rounded text-[12px] text-ink-500 hover:bg-cloud"
                 >{t('common.cancel')}</button>
@@ -159,6 +164,7 @@ export function CompanySwitcher() {
             </div>
           ) : (
             <button
+              type="button"
               onClick={() => setCreating(true)}
               className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
             >

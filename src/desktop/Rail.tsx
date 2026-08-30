@@ -80,6 +80,7 @@ export function Rail() {
       style={{ background: 'var(--chrome-rail)' }}
     >
       <button
+        type="button"
         className="mb-3.5 relative"
         onClick={() => setView('me')}
         title={daemonOutdated ? t('common.daemonOutdatedTip') : (authUser?.name ?? t('common.you'))}
@@ -98,6 +99,7 @@ export function Rail() {
         const badge = key === 'conversations' && totalUnread > 0 ? totalUnread : undefined
         return (
           <button
+            type="button"
             key={key}
             onClick={() => setView(key)}
             title={t(label)}
@@ -123,6 +125,7 @@ export function Rail() {
 
       <div className="flex-1" />
       <button
+        type="button"
         onClick={async () => {
           // Revoke session server-side before clearing local state, so a
           // leaked token isn't valid anywhere after sign out. Best-effort —

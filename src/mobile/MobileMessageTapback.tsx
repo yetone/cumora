@@ -161,6 +161,7 @@ export function MobileMessageTapback({
             <div role="menu">
               {actions.map((a, i) => (
                 <button
+                  type="button"
                   key={i}
                   role="menuitem"
                   onClick={() => {

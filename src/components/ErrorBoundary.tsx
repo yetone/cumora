@@ -39,6 +39,7 @@ export class ErrorBoundary extends Component<Props, State> {
             </pre>
             <div className="flex gap-2 justify-center">
               <button
+                type="button"
                 onClick={() => this.setState({ error: null, resetKey: this.state.resetKey + 1 })}
                 className="py-2 px-4 rounded-[10px] text-[13px] font-semibold text-white"
                 style={{
@@ -47,6 +48,7 @@ export class ErrorBoundary extends Component<Props, State> {
                 }}
               >{t('errorBoundary.resetView')}</button>
               <button
+                type="button"
                 onClick={() => window.location.reload()}
                 className="py-2 px-4 rounded-[10px] text-[13px] font-semibold text-ink-700 bg-cloud"
                 style={{ border: '1px solid var(--ink-100)' }}

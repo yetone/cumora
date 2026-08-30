@@ -92,6 +92,7 @@ export function SwipeableRow({ actions, children, className }: SwipeableRowProps
           }
           return (
             <button
+              type="button"
               key={i}
               tabIndex={revealed ? 0 : -1}
               onClick={() => {

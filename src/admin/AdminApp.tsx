@@ -97,7 +97,7 @@ export function AdminApp() {
         <div style={{ fontSize: 14, opacity: 0.7, marginBottom: 16 }}>
           {t('admin.signedInAs', { email: user?.email ?? '(unknown)' })}
         </div>
-        <button className="btn" onClick={() => { clear() }}>
+        <button type="button" className="btn" onClick={() => { clear() }}>
           {t('admin.signOutSwitch')}
         </button>
       </FullScreenNote>
@@ -107,7 +107,7 @@ export function AdminApp() {
   return (
     <div className={`admin-shell${navOpen ? ' nav-open' : ''}`}>
       <header className="admin-topbar">
-        <button className="admin-topbar-burger" onClick={() => setNavOpen((v) => !v)} aria-label={t('admin.toggleNav')}>
+        <button type="button" className="admin-topbar-burger" onClick={() => setNavOpen((v) => !v)} aria-label={t('admin.toggleNav')}>
           <span /><span /><span />
         </button>
         <div className="admin-topbar-brand">
@@ -132,7 +132,7 @@ export function AdminApp() {
           <NavLink current={route} target="settings"      label={t('admin.settings')} />
         </nav>
         <div className="admin-sidebar-foot">
-          <button className="btn-ghost" onClick={() => { clear() }}>{t('admin.signOut')}</button>
+          <button type="button" className="btn-ghost" onClick={() => { clear() }}>{t('admin.signOut')}</button>
         </div>
       </aside>
       <main className="admin-main">

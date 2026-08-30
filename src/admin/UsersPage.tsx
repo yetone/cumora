@@ -211,6 +211,7 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
         </div>
         <div onClick={(e) => e.stopPropagation()} data-label={t('users.colAdmin')}>
           <button
+            type="button"
             className={`admin-toggle ${u.isAdmin ? 'is-on' : ''}`}
             onClick={onAdminToggle}
             disabled={isMe && u.isAdmin}
@@ -249,6 +250,7 @@ function UserRow({ u, expanded, onToggleExpand, onTierChange, onAdminToggle, onS
               )}
               <div className="admin-detail-actions">
                 <button
+                  type="button"
                   className={`btn-ghost ${detail.suspended ? '' : 'admin-btn-danger'}`}
                   onClick={handleSuspendClick}
                   disabled={isMe && !detail.suspended}

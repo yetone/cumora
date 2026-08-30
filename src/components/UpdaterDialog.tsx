@@ -172,6 +172,7 @@ export function UpdateBanner({ forceOpen, onOpen }: BannerProps) {
         )}
       </div>
       <button
+        type="button"
         onClick={onOpen}
         className="px-3 py-1.5 rounded-[8px] text-[12px] font-semibold text-white transition shrink-0"
         style={{ background: 'var(--skype)' }}
@@ -180,6 +181,7 @@ export function UpdateBanner({ forceOpen, onOpen }: BannerProps) {
       </button>
       {!isDownloading && (
         <button
+          type="button"
           onClick={() => setDismissed(true)}
           className="w-6 h-6 rounded-[6px] grid place-items-center text-ink-400 hover:text-ink-700 hover:bg-cloud transition text-[14px] shrink-0"
           aria-label={t('updater.bannerDismiss')}
@@ -325,6 +327,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
 
         <div className="px-6 py-4 flex items-center gap-2 border-t border-ink-100 bg-cloud">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 hover:bg-paper transition"
             style={{ border: '1px solid var(--ink-100)' }}
@@ -335,6 +338,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
 
           {(kind === 'idle' || kind === 'update-not-available' || kind === 'error') && !isUnsupported && (
             <button
+              type="button"
               onClick={() => void check()}
               className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition"
               style={{ background: 'var(--skype)' }}
@@ -342,6 +346,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           )}
           {kind === 'checking' && (
             <button
+              type="button"
               disabled
               className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-white opacity-60"
               style={{ background: 'var(--skype)' }}
@@ -349,6 +354,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           )}
           {kind === 'update-available' && (
             <button
+              type="button"
               onClick={() => void download()}
               className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition"
               style={{
@@ -359,6 +365,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           )}
           {kind === 'downloading' && (
             <button
+              type="button"
               disabled
               className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white opacity-60"
               style={{ background: 'var(--skype)' }}
@@ -366,6 +373,7 @@ export function UpdaterDialog({ open, onClose }: DialogProps) {
           )}
           {kind === 'update-downloaded' && (
             <button
+              type="button"
               onClick={() => void install()}
               className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition"
               style={{

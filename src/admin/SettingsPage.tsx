@@ -73,6 +73,7 @@ function SettingRow({ title, desc, on, busy, disabled, onToggle }: {
         <div className="admin-setting-desc">{desc}</div>
       </div>
       <button
+        type="button"
         className={`admin-switch${on ? ' is-on' : ''}`}
         onClick={onToggle}
         disabled={disabled || busy}

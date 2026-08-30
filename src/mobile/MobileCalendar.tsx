@@ -216,6 +216,7 @@ export function MobileCalendar() {
         className="sticky top-0 z-10 bg-paper/95 backdrop-blur-md px-3 pt-2 pb-1 flex items-center gap-2"
       >
         <button
+          type="button"
           onClick={() => goMonth(-1)}
           className="w-9 h-9 grid place-items-center rounded-full text-ink-700 active:bg-sky2-50 transition text-[20px] leading-none"
           aria-label={t('mcal.prevMonth')}
@@ -224,11 +225,13 @@ export function MobileCalendar() {
           {monthLabel}
         </div>
         <button
+          type="button"
           onClick={() => goMonth(1)}
           className="w-9 h-9 grid place-items-center rounded-full text-ink-700 active:bg-sky2-50 transition text-[20px] leading-none"
           aria-label={t('mcal.nextMonth')}
         >›</button>
         <button
+          type="button"
           onClick={goToday}
           className="py-1.5 px-3 text-[11.5px] font-semibold rounded-full bg-sky2-50 border border-sky2-100 active:bg-sky2-100 transition"
           style={{ color: 'var(--skype)' }}
@@ -255,6 +258,7 @@ export function MobileCalendar() {
             const isSelected = selectedDay !== null && sameDay(d, selectedDay)
             return (
               <button
+                type="button"
                 key={k}
                 onClick={() => {
                   setSelectedDay(new Date(d))
@@ -346,6 +350,7 @@ function DayDetail({ day, items, onEdit, onNew, byId }: {
         </div>
         <span className="text-[11px] text-ink-400">· {items.length === 1 ? t('mcal.eventCount', { n: items.length, s: '' }) : t('mcal.eventCount', { n: items.length, s: 's' })}</span>
         <button
+          type="button"
           onClick={onNew}
           className="ml-auto py-1 px-2 text-[11px] font-semibold rounded-full text-skype-deep bg-sky2-50 border border-sky2-100 active:bg-sky2-100 transition"
         >{t('mcal.newEvent')}</button>
@@ -360,6 +365,7 @@ function DayDetail({ day, items, onEdit, onNew, byId }: {
           </div>
           <div className="text-[12.5px] text-ink-500 font-display italic leading-relaxed">{t('mcal.emptyDay')}</div>
           <button
+            type="button"
             onClick={onNew}
             className="mt-3 py-1.5 px-3 text-[12px] font-semibold rounded-full bg-cloud border border-ink-100 text-ink-700 active:bg-sky2-50 transition"
           >{t('mcal.addEvent')}</button>
@@ -374,6 +380,7 @@ function DayDetail({ day, items, onEdit, onNew, byId }: {
             const assignee = ev.assigneeId ? byId[ev.assigneeId] : null
             return (
               <button
+                type="button"
                 key={`${ev.id}-${it.occurrence.getTime()}`}
                 onClick={() => onEdit(ev)}
                 className="w-full text-left rounded-[12px] p-3 border active:scale-[0.99] transition"

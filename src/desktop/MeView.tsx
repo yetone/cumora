@@ -343,7 +343,7 @@ function UsageTab() {
             style={{ border: '1px solid var(--ink-100)' }}>
             <div className="font-display text-[14px] text-ink-700 mb-1">{t('me.quotaFetchFailed')}</div>
             <div className="font-display italic text-[12px] text-coral-deep mb-3">{state.message}</div>
-            <button onClick={load}
+            <button type="button" onClick={load}
               className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white"
               style={{ background: 'var(--skype)' }}>
               {t('common.tryAgain')}
@@ -384,7 +384,7 @@ function UsageTab() {
             <div className="font-display italic text-[12px] text-ink-500 mt-1 max-w-xl">
               {error ? t('me.quotaGatewayUnreachHint') : t('me.subNotProvisioned')}
             </div>
-            <button onClick={load}
+            <button type="button" onClick={load}
               className="mt-3 px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
               style={{ border: '1px dashed var(--sky2-300)' }}>
               {t('me.refresh')}
@@ -414,7 +414,7 @@ function UsageTab() {
           ))}
         </div>
         <div className="mt-4 flex items-center gap-3">
-          <button onClick={load}
+          <button type="button" onClick={load}
             className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}>
             {t('me.refresh')}
@@ -569,6 +569,7 @@ function ProjectsTab() {
                   </div>
                 </div>
                 <button
+                  type="button"
                   onClick={() => archive(p.id, p.status !== 'archived')}
                   className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-ink-700 bg-paper hover:bg-sky2-50 transition"
                   style={{ border: '1px solid var(--ink-100)' }}
@@ -601,12 +602,14 @@ function ProjectsTab() {
             {err && <div className="text-[11.5px] text-coral-deep">{err}</div>}
             <div className="flex gap-2">
               <button
+                type="button"
                 onClick={create}
                 disabled={!name.trim() || busy}
                 className="px-4 py-1.5 rounded-[8px] text-[12px] font-semibold text-white disabled:opacity-50"
                 style={{ background: 'var(--skype)' }}
               >{busy ? t('me.createProjectBusy') : t('me.createProject')}</button>
               <button
+                type="button"
                 onClick={() => { setCreating(false); setName(''); setDescription(''); setErr(null) }}
                 className="px-3 py-1.5 rounded-[8px] text-[12px] text-ink-500 hover:bg-cloud"
               >{t('common.cancel')}</button>
@@ -615,12 +618,14 @@ function ProjectsTab() {
         ) : (
           <div className="mt-4 flex items-center gap-3">
             <button
+              type="button"
               onClick={() => setCreating(true)}
               className="px-4 py-2 rounded-[10px] text-[12.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition"
               style={{ border: '1px dashed var(--sky2-300)' }}
             >{t('me.newProject')}</button>
             {archivedCount > 0 && (
               <button
+                type="button"
                 onClick={() => setShowArchived((v) => !v)}
                 className="text-[11.5px] text-ink-500 hover:text-skype-deep transition italic font-display"
               >
@@ -1003,7 +1008,7 @@ function ComputersTab() {
                         className="text-[12px] font-semibold text-skype-deep px-2 py-1">
                         {expanded ? t('me.hideAction') : t('me.reconnect')}
                       </button>
-                      <button onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
+                      <button type="button" onClick={(e) => { e.stopPropagation(); void remove(c.id, c.name) }}
                         className="text-[12px] font-semibold text-coral-deep hover:underline px-2 py-1">
                         {t('me.remove')}
                       </button>
@@ -1110,7 +1115,7 @@ function ComputersTab() {
                     ) : (
                       <>
                         <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{repairCmd}</pre>
-                        <button onClick={(e) => { e.stopPropagation(); void navigator.clipboard?.writeText(repairCmd); setRepairCopied(true) }}
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void navigator.clipboard?.writeText(repairCmd); setRepairCopied(true) }}
                           className="mt-2 inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                           style={{ background: repairCopied ? '#3BB273' : 'var(--skype)' }}>
                           {repairCopied ? t('me.copied') : t('me.copyCommand')}
@@ -1154,7 +1159,7 @@ function ComputersTab() {
             </label>
             <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{pairCommand}</pre>
             <div className="flex gap-2 mt-3">
-              <button onClick={copyCommand} aria-live="polite"
+              <button type="button" onClick={copyCommand} aria-live="polite"
                 className="inline-flex items-center justify-center gap-1.5 min-w-[128px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                 style={{ background: copied ? '#3BB273' : 'var(--skype)' }}>
                 {copied ? (
@@ -1168,7 +1173,7 @@ function ComputersTab() {
                   </>
                 ) : t('me.copyCommand')}
               </button>
-              <button onClick={() => setCode(null)}
+              <button type="button" onClick={() => setCode(null)}
                 className="text-[12px] font-semibold px-3 py-1.5 rounded-[9px] border border-ink-100 text-ink-600">{t('me.done')}</button>
             </div>
             <style>{`
@@ -1177,7 +1182,7 @@ function ComputersTab() {
             `}</style>
           </div>
         ) : (
-          <button onClick={addComputer} disabled={busy}
+          <button type="button" onClick={addComputer} disabled={busy}
             className="mt-4 px-4 py-2 rounded-[10px] bg-skype text-white text-[13px] font-semibold disabled:opacity-50">
             {busy ? t('me.computersGenerating') : t('me.addComputer')}
           </button>
@@ -1257,13 +1262,13 @@ function DaemonUpgradeBanner({ onJump }: { onJump: () => void }) {
           </div>
           <div className="mt-2.5 flex items-stretch gap-2 max-w-[580px]">
             <code className="flex-1 bg-ink-900 text-cloud rounded-[10px] px-3 py-2 text-[12px] font-mono overflow-x-auto whitespace-nowrap select-all flex items-center">{cmd}</code>
-            <button onClick={copy}
+            <button type="button" onClick={copy}
               className="shrink-0 inline-flex items-center justify-center min-w-[82px] text-[12px] font-semibold px-3 rounded-[10px] text-white transition-colors duration-200"
               style={{ background: copied ? 'var(--avail)' : 'var(--gold-deep)' }}>
               {copied ? t('me.copiedShort') : t('me.copy')}
             </button>
           </div>
-          <button onClick={onJump} className="mt-2 text-[11.5px] font-semibold text-gold-deep hover:underline" style={{ color: 'var(--gold-deep)' }}>
+          <button type="button" onClick={onJump} className="mt-2 text-[11.5px] font-semibold text-gold-deep hover:underline" style={{ color: 'var(--gold-deep)' }}>
             {t('me.manageComputers')}
           </button>
         </div>
@@ -1296,6 +1301,7 @@ export function MeView() {
         <div className="flex gap-1 mb-7 border-b border-ink-100">
           {tabs.map((tabDef, i) => (
             <button
+              type="button"
               key={tabDef.key}
               onClick={() => setTab(tabDef.key)}
               className={cn(

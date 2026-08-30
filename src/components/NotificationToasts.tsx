@@ -364,6 +364,7 @@ function ToastCard({ toast, onClick, onDismiss }: { toast: Toast; onClick: () =>
 
   return (
     <button
+      type="button"
       onClick={onClick}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}

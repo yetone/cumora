@@ -41,11 +41,12 @@ export function Pager({ total, pageSize, offset, loading, onPage }: {
     <div className="admin-pager">
       <span>{t('adminPager.range', { from: offset + 1, to: Math.min(offset + pageSize, total), total })}</span>
       <div className="admin-pager-btns">
-        <button className="btn-ghost" disabled={current === 0 || loading} onClick={() => go(current - 1)}>{t('adminPager.prev')}</button>
+        <button type="button" className="btn-ghost" disabled={current === 0 || loading} onClick={() => go(current - 1)}>{t('adminPager.prev')}</button>
         {cells.map((c, i) => c === 'gap'
           ? <span key={`gap-${i}`} className="admin-pager-ellipsis">…</span>
           : (
             <button
+              type="button"
               key={c}
               className={`admin-pager-num${c === current ? ' is-active' : ''}`}
               disabled={loading}
@@ -55,7 +56,7 @@ export function Pager({ total, pageSize, offset, loading, onPage }: {
               {c + 1}
             </button>
           ))}
-        <button className="btn-ghost" disabled={current >= pages - 1 || loading} onClick={() => go(current + 1)}>{t('adminPager.next')}</button>
+        <button type="button" className="btn-ghost" disabled={current >= pages - 1 || loading} onClick={() => go(current + 1)}>{t('adminPager.next')}</button>
       </div>
     </div>
   )

@@ -236,6 +236,7 @@ function ChatHeader({
             <>
               <span className="w-1 h-1 rounded-full bg-ink-300 shrink-0" />
               <button
+                type="button"
                 onClick={startEditTopic}
                 className="text-ink-300 italic font-display hover:text-skype-deep transition shrink-0"
                 title={t('chat.setTopic')}
@@ -263,6 +264,7 @@ function ChatHeader({
           />
         ) : c.topic ? (
           <button
+            type="button"
             onClick={startEditTopic}
             // Italic glyphs lean past their box — without right padding,
             // `truncate`'s overflow:hidden chops the slanted edge of the
@@ -279,6 +281,7 @@ function ChatHeader({
           already lists the names below it, so this is a redundant visual
           worth dropping when space is tight. */}
       <button
+        type="button"
         ref={memberStackRef}
         onClick={onClickStack}
         aria-haspopup="dialog"
@@ -304,6 +307,7 @@ function ChatHeader({
           action in this header. */}
       <div className="flex gap-1 text-ink-500 shrink-0">
         <button
+          type="button"
           onClick={onToggleSearch}
           title={t('chat.search')}
           aria-label={t('chat.search')}
@@ -315,6 +319,7 @@ function ChatHeader({
           <ISearch className="w-[19px] h-[19px]" />
         </button>
         <button
+          type="button"
           onClick={async () => {
             // Optimistic flip so the icon updates instantly; reload to sync
             // pinned-order in the sidebar. Mirrors the conversations-pane flow.
@@ -341,6 +346,7 @@ function ChatHeader({
         </button>
         <div className="relative">
           <button
+            type="button"
             onClick={() => setShowConveneSoon((v) => !v)}
             title={t('chat.convene')}
             className="px-3.5 inline-flex items-center gap-1.5 font-semibold text-[12.5px] rounded-full text-white"
@@ -414,6 +420,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
       <div className="flex gap-1 mb-2 px-0.5">
         {(['std', 'skype'] as const).map((k) => (
           <button
+            type="button"
             key={k}
             onClick={() => setTab(k)}
             className={cn(
@@ -427,6 +434,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
         <div className="grid grid-cols-6 gap-1">
           {COMPOSER_EMOJIS.map((e) => (
             <button
+              type="button"
               key={e}
               onClick={() => onPick(e)}
               className="h-8 w-8 rounded grid place-items-center hover:bg-sky2-50 transition"
@@ -440,6 +448,7 @@ function EmojiPopover({ onPick, onClose }: { onPick: (e: string) => void; onClos
         >
           {SKYPE_EMOJIS.map((e) => (
             <button
+              type="button"
               key={e.key}
               onClick={() => {
                 onPick(e.shortcodes[0])
@@ -1036,6 +1045,7 @@ export function Composer({
               <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
             </div>
             <button
+              type="button"
               onClick={() => setAttachment(null)}
               className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
               aria-label={t('chat.removeAttachment')}
@@ -1073,6 +1083,7 @@ export function Composer({
               </div>
             </div>
             <button
+              type="button"
               onClick={() => setReplyingTo(convoId, null)}
               className="w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0 self-center"
               aria-label={t('chat.cancelReply')}
@@ -1221,11 +1232,13 @@ export function Composer({
             onChange={onPickFile}
           />
           <button
+            type="button"
             onClick={() => fileRef.current?.click()}
             className="w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition"
             title={t('chat.attachFile')}
           ><IClip className="w-[17px] h-[17px]" /></button>
           <button
+            type="button"
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => insertAtCursor('@')}
             className="w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition"
@@ -1233,6 +1246,7 @@ export function Composer({
           ><IAt className="w-[17px] h-[17px]" /></button>
           <div className="relative">
             <button
+              type="button"
               onClick={() => setEmojiOpen((v) => !v)}
               className={cn(
                 'w-7 h-7 rounded-[7px] grid place-items-center hover:bg-sky2-50 hover:text-skype-deep transition',
@@ -1248,6 +1262,7 @@ export function Composer({
             )}
           </div>
           <button
+            type="button"
             onClick={send}
             disabled={!canSend}
             className="ml-auto h-[30px] px-3.5 rounded-full font-semibold text-[12px] text-white inline-flex items-center gap-1.5 transition disabled:cursor-not-allowed"
@@ -1348,6 +1363,7 @@ function ThreadError({ message, onRetry }: { message: string; onRetry: () => voi
           {message}
         </div>
         <button
+          type="button"
           onClick={handleRetry}
           disabled={retrying}
           className="mt-1 h-[30px] px-3.5 rounded-full font-semibold text-[12px] text-white inline-flex items-center gap-1.5 transition disabled:cursor-not-allowed"

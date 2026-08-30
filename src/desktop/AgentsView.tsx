@@ -77,6 +77,7 @@ function AgentCard({ p, onEdit, onDelete }: {
       {/* Hover actions: edit / delete */}
       <div className="absolute top-3 right-3 flex gap-1 opacity-0 group-hover/card:opacity-100 transition-opacity">
         <button
+          type="button"
           onClick={() => onEdit(p)}
           className="w-7 h-7 rounded-full grid place-items-center bg-cloud hover:bg-sky2-50 text-ink-500 hover:text-skype-deep transition"
           style={{ border: '1px solid var(--ink-100)' }}
@@ -86,6 +87,7 @@ function AgentCard({ p, onEdit, onDelete }: {
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         </button>
         <button
+          type="button"
           onClick={() => onDelete(p)}
           className="w-7 h-7 rounded-full grid place-items-center bg-cloud hover:bg-coral-soft text-ink-500 hover:text-coral-deep transition"
           style={{ border: '1px solid var(--ink-100)' }}
@@ -146,13 +148,14 @@ function AgentCard({ p, onEdit, onDelete }: {
 
       <div className="flex gap-2 mt-auto">
         <button
+          type="button"
           onClick={openChat}
           disabled={openingChat}
           className="flex-1 py-2 px-3 bg-skype text-white rounded-[9px] text-[12px] font-semibold transition disabled:opacity-60"
           style={{ boxShadow: '0 4px 12px -3px rgba(0, 168, 240, 0.4)' }}>
           {openingChat ? t('agents.openingChat') : t('agents.cardChat')}
         </button>
-        <button className="flex-1 py-2 px-3 bg-cloud text-ink-700 rounded-[9px] text-[12px] font-semibold hover:border-whisper-200 hover:text-whisper-deep transition"
+        <button type="button" className="flex-1 py-2 px-3 bg-cloud text-ink-700 rounded-[9px] text-[12px] font-semibold hover:border-whisper-200 hover:text-whisper-deep transition"
           style={{ border: '1px solid var(--ink-100)' }}>
           {t('agents.cardWhisper')}
         </button>
@@ -190,6 +193,7 @@ function HireCard({ onClick }: { onClick: () => void }) {
   const t = useT()
   return (
     <button
+      type="button"
       onClick={onClick}
       className="rounded-[16px] p-5 grid place-items-center text-center min-h-[280px] cursor-pointer transition hover:bg-sky2-50 active:scale-[0.99]"
       style={{
@@ -252,12 +256,14 @@ function ConfirmOffboard({ p, onCancel, onConfirmed }: {
         )}
         <div className="flex gap-2">
           <button
+            type="button"
             onClick={onCancel}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >{t('common.cancel')}</button>
           <button
+            type="button"
             onClick={submit}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
@@ -285,6 +291,7 @@ function FormerAgentCard({ p, onRehire }: { p: Participant; onRehire: (p: Partic
         <div className="text-[11px] text-ink-500 italic font-display">{p.role} · {departed}</div>
       </div>
       <button
+        type="button"
         onClick={() => onRehire(p)}
         className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-50 transition inline-flex items-center gap-1"
         style={{ border: '1px solid var(--sky2-200)' }}
@@ -348,6 +355,7 @@ export function AgentsView() {
             </div>
           </div>
           <button
+            type="button"
             onClick={openCreate}
             className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-[10px] text-[12.5px] font-semibold text-white transition"
             style={{

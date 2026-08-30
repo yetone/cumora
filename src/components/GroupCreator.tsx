@@ -227,6 +227,7 @@ export function GroupCreator({ onClose, initialPicked }: Props) {
 
         <div className="px-6 py-4 border-t border-ink-100 flex items-center gap-2 bg-paper shrink-0">
           <button
+            type="button"
             onClick={onClose}
             disabled={busy}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
@@ -234,6 +235,7 @@ export function GroupCreator({ onClose, initialPicked }: Props) {
           >{t('group.cancelBtn')}</button>
           <div className="flex-1" />
           <button
+            type="button"
             onClick={submit}
             disabled={!canSubmit}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"

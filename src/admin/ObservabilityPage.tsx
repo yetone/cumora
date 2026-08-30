@@ -356,6 +356,7 @@ export function ObservabilityPage() {
           <div className="obs-pills" role="tablist" aria-label={t('adminobs.rangeAria')}>
             {RANGES.map((r) => (
               <button
+                type="button"
                 key={r.days}
                 role="tab"
                 aria-selected={sinceDays === r.days}
@@ -367,6 +368,7 @@ export function ObservabilityPage() {
           <div className="obs-pills" role="tablist" aria-label={t('adminobs.sourceAria')}>
             {SOURCE_FILTERS.map((s) => (
               <button
+                type="button"
                 key={s.key}
                 role="tab"
                 aria-selected={sourceFilter === s.key}
@@ -380,6 +382,7 @@ export function ObservabilityPage() {
           <div className="obs-pills" role="tablist" aria-label={t('adminobs.unitAria')}>
             {UNITS.map((u) => (
               <button
+                type="button"
                 key={u.key}
                 role="tab"
                 aria-selected={unit === u.key}

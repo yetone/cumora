@@ -82,6 +82,7 @@ export function MobileLibrary() {
             const active = tab === key
             return (
               <button
+                type="button"
                 key={key}
                 onClick={() => setTab(key)}
                 className={cn(
@@ -110,6 +111,7 @@ export function MobileLibrary() {
           or board list. Color/label switch per-tab to keep the affordance
           honest about what + means. */}
       <button
+        type="button"
         onClick={onPlus}
         disabled={creating}
         aria-label={tab === 'documents' ? 'New document' : tab === 'boards' ? 'New board' : 'New event'}
@@ -173,6 +175,7 @@ function DocumentsList() {
           const authorName = author?.name ?? (d.createdBy === me?.id ? 'You' : d.createdBy)
           return (
             <button
+              type="button"
               key={d.id}
               onClick={() => openDocumentPeek(d.id)}
               className="w-full text-left grid grid-cols-[36px_1fr_auto] gap-3 py-3 px-4 active:bg-sky2-50 transition"
@@ -223,6 +226,7 @@ function BoardsList() {
           const authorName = author?.name ?? (b.createdBy === me?.id ? 'You' : b.createdBy)
           return (
             <button
+              type="button"
               key={b.id}
               onClick={() => openBoardPeek(b.id, null)}
               className="w-full text-left grid grid-cols-[36px_1fr_auto] gap-3 py-3 px-4 active:bg-sky2-50 transition"

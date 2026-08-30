@@ -90,6 +90,7 @@ export function ConveneView() {
             {t('convene.ctaSub', { title: c.title })}
           </div>
           <button
+            type="button"
             onClick={startConvene}
             className="py-3 px-5 rounded-full text-white text-[13.5px] font-semibold inline-flex items-center gap-2"
             style={{ background: 'linear-gradient(135deg, var(--skype), var(--skype-deep))', boxShadow: '0 6px 16px -4px rgba(0, 168, 240, 0.5)' }}>

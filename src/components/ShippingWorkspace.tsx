@@ -95,7 +95,7 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
                 <h1 className="text-[18px] font-semibold text-ink-900">{t('nav.ship')}</h1>
                 <p className="mt-0.5 text-[11px] text-ink-400">{t('ship.subtitle')}</p>
               </div>
-              <button onClick={() => setCreating(true)} className="grid h-9 w-9 place-items-center rounded-xl bg-skype text-white shadow-soft" aria-label={t('ship.newFeature')} title={t('ship.newFeatureTitle')}><IPlus className="h-4 w-4" /></button>
+              <button type="button" onClick={() => setCreating(true)} className="grid h-9 w-9 place-items-center rounded-xl bg-skype text-white shadow-soft" aria-label={t('ship.newFeature')} title={t('ship.newFeatureTitle')}><IPlus className="h-4 w-4" /></button>
             </div>
           </div>
           {creating && <CreateFeature onClose={() => setCreating(false)} />}
@@ -109,7 +109,7 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
             {overview.features.map((feature) => {
               const progress = featureProgress(feature)
               return (
-                <button key={feature.id} onClick={() => void select(feature.id)} className={cn('mb-1 w-full rounded-xl px-3 py-3 text-left transition', selectedId === feature.id ? 'bg-sky2-50 ring-1 ring-sky2-200' : 'hover:bg-ink-50')}>
+                <button type="button" key={feature.id} onClick={() => void select(feature.id)} className={cn('mb-1 w-full rounded-xl px-3 py-3 text-left transition', selectedId === feature.id ? 'bg-sky2-50 ring-1 ring-sky2-200' : 'hover:bg-ink-50')}>
                   <div className="flex items-start justify-between gap-2">
                     <span className="min-w-0 truncate text-[13px] font-semibold text-ink-900">{feature.title}</span>
                     <Pill tone={feature.failedSquares ? 'bad' : feature.status === 'learned' ? 'good' : 'blue'}>{t(STATUS_LABEL_KEY[feature.status])}</Pill>
@@ -127,7 +127,7 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
       )}
       {showDetail && (
         <main className={cn('h-full min-w-0 overflow-y-auto bg-[var(--ship-canvas)]', compact && 'absolute inset-0')}>
-          {compact && <button onClick={() => void select(null)} className="sticky top-0 z-20 flex h-11 w-full items-center gap-1 border-b border-ink-100 bg-cloud/95 px-3 text-[12px] font-semibold text-skype-deep backdrop-blur"><IBack className="h-4 w-4" /> {t('ship.allFeatures')}</button>}
+          {compact && <button type="button" onClick={() => void select(null)} className="sticky top-0 z-20 flex h-11 w-full items-center gap-1 border-b border-ink-100 bg-cloud/95 px-3 text-[12px] font-semibold text-skype-deep backdrop-blur"><IBack className="h-4 w-4" /> {t('ship.allFeatures')}</button>}
           {loadingFeatureId === selectedId && !detail ? <Centered title={t('ship.openingContract')} /> : detail ? <FeatureDetail feature={detail} /> : <Centered title={t('ship.pickOne')} />}
         </main>
       )}

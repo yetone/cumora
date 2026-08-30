@@ -74,7 +74,7 @@ export function Onboarding() {
                 {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
                 <div className="text-[13px] text-ink-600 mb-4" dangerouslySetInnerHTML={{ __html: t('onboard.cmdIntro') }} />
                 {err && <div className="text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2 mb-3">{err}</div>}
-                <button onClick={getCode} disabled={busy}
+                <button type="button" onClick={getCode} disabled={busy}
                   className="px-5 py-2.5 rounded-[11px] bg-skype text-white text-[14px] font-semibold disabled:opacity-50">
                   {busy ? t('onboard.generating') : t('onboard.addComputer')}
                 </button>
@@ -108,7 +108,7 @@ export function Onboarding() {
                 </label>
                 <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{cmd}</pre>
                 <div className="flex items-center gap-3 mt-3">
-                  <button onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
+                  <button type="button" onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
                     className="inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                     style={{ background: copied ? '#3BB273' : 'var(--skype)' }}>
                     {copied ? t('onboard.copied') : t('onboard.copy')}

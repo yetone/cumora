@@ -101,6 +101,7 @@ export function ContextMenu({ x, y, items, onClose, _isChild }: Props) {
           const hasSubmenu = !!it.submenu && it.submenu.length > 0
           return (
             <button
+              type="button"
               key={i}
               role="menuitem"
               disabled={it.disabled}

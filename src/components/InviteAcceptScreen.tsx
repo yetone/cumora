@@ -271,6 +271,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
               })}
             </p>
             <button
+              type="button"
               onClick={() => { useAuth.getState().clear() }}
               className="px-4 py-2 rounded-[10px] text-[13px] font-semibold transition"
               style={{ background: 'var(--ink-700)', color: 'white' }}
@@ -311,6 +312,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
             ) : (
               <>
                 <button
+                  type="button"
                   onClick={() => void accept()}
                   disabled={busy}
                   className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-white transition disabled:opacity-60"
@@ -320,6 +322,7 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
                   }}
                 >{busy ? t('inviteAccept.joinBusy') : t('inviteAccept.joinAs', { company: companyName, role: inv.role })}</button>
                 <button
+                  type="button"
                   onClick={() => { clearPendingInvite(); onDone() }}
                   className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic"
                 >{t('inviteAccept.notNow')}</button>
@@ -375,6 +378,7 @@ function JoinedSuccessBlock({ companyName, onContinueInBrowser }: {
       </div>
       <div className="w-full flex flex-col gap-2.5">
         <button
+          type="button"
           onClick={tryOpenDesktopApp}
           className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-white transition"
           style={{
@@ -385,6 +389,7 @@ function JoinedSuccessBlock({ companyName, onContinueInBrowser }: {
         <GetDesktopAppLink variant="button-secondary" />
         {!isWebAppHost && (
           <button
+            type="button"
             onClick={onContinueInBrowser}
             className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
           >{t('inviteAccept.continueInBrowser')}</button>
@@ -413,6 +418,7 @@ function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
       </p>
       <div className="w-full flex flex-col gap-2.5">
         <button
+          type="button"
           onClick={tryOpenDesktopApp}
           className="w-full py-3 rounded-[12px] text-[14px] font-semibold text-white transition"
           style={{
@@ -423,6 +429,7 @@ function AlreadyMemberBlock({ companyName, onSwitchInBrowser }: {
         <GetDesktopAppLink variant="button-secondary" />
         {!isWebAppHost && (
           <button
+            type="button"
             onClick={onSwitchInBrowser}
             className="text-[12px] text-ink-400 hover:text-ink-700 transition font-display italic mt-1"
           >{t('inviteAccept.continueInBrowser')}</button>
@@ -441,6 +448,7 @@ function ErrorBlock({ title, body, onDismiss }: { title: string; body: string; o
       <p className="text-[13px] text-ink-500 font-display italic leading-relaxed">{body}</p>
       {tokenStr && onDismiss && (
         <button
+          type="button"
           onClick={onDismiss}
           className="px-4 py-2 rounded-[10px] text-[12.5px] font-semibold text-ink-700 transition"
           style={{ background: 'var(--cloud)', border: '1px solid var(--ink-100)' }}

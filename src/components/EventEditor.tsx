@@ -549,6 +549,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
         <div className="px-6 py-4 border-t border-ink-100 flex items-center gap-2 bg-paper shrink-0">
           {canDelete && (
             <button
+              type="button"
               onClick={onDelete}
               disabled={busy}
               className="px-3 py-2 rounded-[9px] text-[12.5px] font-semibold text-coral-deep bg-cloud hover:bg-coral-soft transition"
@@ -557,6 +558,7 @@ export function EventEditor({ event, prefill, onClose }: Props) {
           )}
           {isEdit && event!.kind === 'agent_task' && event!.status === 'active' && (
             <button
+              type="button"
               onClick={onRunNow}
               disabled={busy}
               className="px-3 py-2 rounded-[9px] text-[12.5px] font-semibold text-skype-deep bg-cloud hover:bg-sky2-100 transition"
@@ -566,12 +568,14 @@ export function EventEditor({ event, prefill, onClose }: Props) {
           )}
           <div className="flex-1" />
           <button
+            type="button"
             onClick={onClose}
             disabled={busy}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >{tLabel('common.cancel', "Cancel")}</button>
           <button
+            type="button"
             onClick={submit}
             disabled={busy}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"

@@ -38,7 +38,8 @@
     "rules": {
       "preset": "recommended",
       "a11y": {
-        "preset": "none"
+        "preset": "none",
+        "useButtonType": "error"
       },
       "style": {
         "noNonNullAssertion": "off",

@@ -86,6 +86,7 @@ function BoardsSidebar({ onResizeStart }: { onResizeStart: (e: React.MouseEvent)
       <div className="px-4 py-4 flex items-center justify-between">
         <h2 className="text-lg font-semibold text-ink-900">{t('boards.title')}</h2>
         <button
+          type="button"
           onClick={() => setCreating(true)}
           className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-50 hover:text-skype-deep"
           title={t('boards.newBoard')}
@@ -116,6 +117,7 @@ function BoardsSidebar({ onResizeStart }: { onResizeStart: (e: React.MouseEvent)
           return (
             <li key={b.id}>
               <button
+                type="button"
                 onClick={() => selectBoard(b.id)}
                 className={cn(
                   'w-full text-left px-4 py-2.5 flex items-center gap-2.5 transition-colors',
@@ -229,6 +231,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
             />
           ) : (
             <button
+              type="button"
               onClick={() => { setTitleDraft(snap.title); setEditingTitle(true) }}
               className="text-2xl font-semibold text-ink-900 hover:text-skype-deep text-left truncate"
             >
@@ -242,6 +245,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
           )}
         </div>
         <button
+          type="button"
           onClick={async () => {
             if (!confirm(t('boards.deleteBoardConfirm', { title: snap.title }))) return
             try { await deleteBoard(boardId) } catch (e) { console.warn('[boards] delete failed', e) }
@@ -282,6 +286,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
             </div>
           ) : (
             <button
+              type="button"
               onClick={() => setAddingCol(true)}
               className="w-72 flex-shrink-0 px-3 py-2.5 rounded-lg text-sm text-ink-500 border border-dashed border-ink-200 hover:bg-cloud/40 hover:text-ink-700 transition-colors text-left"
             >
@@ -371,6 +376,7 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
           />
         ) : (
           <button
+            type="button"
             onClick={() => { setTitleDraft(column.title); setEditingTitle(true) }}
             className="text-sm font-medium text-ink-700 hover:text-skype-deep flex-1 text-left truncate"
           >
@@ -379,6 +385,7 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
         )}
         <span className="text-xs text-ink-400">{cards.length}</span>
         <button
+          type="button"
           onClick={async () => {
             if (cards.length > 0 && !confirm(t('boards.deleteColumnConfirm', { title: column.title, count: cards.length }))) return
             try { await deleteColumn(boardId, column.id) } catch (e) { console.warn('[boards] delete col failed', e) }
@@ -410,6 +417,7 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
           />
         ) : (
           <button
+            type="button"
             onClick={() => setAdding(true)}
             className="w-full text-left text-xs text-ink-400 px-2.5 py-1.5 rounded-md hover:bg-cloud hover:text-ink-600 transition-colors"
           >
@@ -914,6 +922,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
             )}
             <div className="mt-1 flex justify-end">
               <button
+                type="button"
                 onClick={() => void saveDescription()}
                 className="text-xs text-ink-500 hover:text-skype-deep px-2 py-1"
               >{t('boards.saveDescription')}</button>
@@ -957,6 +966,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
               />
               <div className="mt-1 flex justify-end gap-2">
                 <button
+                  type="button"
                   onClick={() => void postComment()}
                   disabled={!draftComment.trim() || posting}
                   className="px-3 py-1.5 text-sm rounded-md bg-skype text-white hover:bg-skype-deep disabled:opacity-40 disabled:hover:bg-skype"
@@ -971,6 +981,7 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
             {t('boards.createdByAt', { time: formatTime(card.createdAt), author: byId[card.createdBy]?.name ?? card.createdBy })}
           </div>
           <button
+            type="button"
             onClick={async () => {
               if (!confirm(t('boards.deleteCardConfirm'))) return
               try { await deleteCard(boardId, card.id); onClose() } catch (e) { console.warn(e) }

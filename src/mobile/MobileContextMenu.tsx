@@ -134,6 +134,7 @@ export function MobileContextMenu({ open, anchor, items, caption, onClose }: Mob
             <div role="menu">
               {items.map((it, i) => (
                 <button
+                  type="button"
                   key={i}
                   role="menuitem"
                   disabled={it.disabled}

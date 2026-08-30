@@ -128,6 +128,7 @@ export function ThreadDrawer() {
           </div>
         </div>
         <button
+          type="button"
           onClick={close}
           aria-label={t('thread.close')}
           className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition"

@@ -87,7 +87,7 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
 
       <div className="admin-tabs">
         {(['pending', 'approved', 'rejected'] as Tab[]).map((tabKey) => (
-          <button key={tabKey}
+          <button type="button" key={tabKey}
             className={`admin-tab${tab === tabKey ? ' is-active' : ''}`}
             onClick={() => setTab(tabKey)}
           >
@@ -134,13 +134,13 @@ export function WaitlistPage({ onChanged }: { onChanged: () => void }) {
             <div className="admin-row-actions">
               {tab === 'pending' ? (
                 <>
-                  <button className="btn-primary"
+                  <button type="button" className="btn-primary"
                     disabled={busyId === entry.id}
                     onClick={() => approve(entry)}
                   >
                     {busyId === entry.id ? t('waitlist.approveBusy') : t('waitlist.approve')}
                   </button>
-                  <button className="btn-ghost"
+                  <button type="button" className="btn-ghost"
                     disabled={busyId === entry.id}
                     onClick={() => reject(entry)}
                   >

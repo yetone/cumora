@@ -1397,6 +1397,7 @@ function ReactionPill({ msgId, r }: { msgId: string; r: import('@/types').Reacti
   return (
     <>
       <button
+        type="button"
         ref={btnRef}
         onMouseEnter={onEnter}
         onMouseLeave={onLeave}
@@ -1443,6 +1444,7 @@ function QuickReactionButton({ msgId, emoji }: { msgId: string; emoji: string })
   const [burst, setBurst] = useState(0)
   return (
     <button
+      type="button"
       onClick={() => {
         setBurst((n) => n + 1)
         void toggleReaction(msgId, emoji)
@@ -1620,6 +1622,7 @@ export function SystemRow({ msg, delay = 0, animate = true }: { msg: { body: str
 function SystemActor({ p, onClick }: { p: Participant; onClick: () => void }) {
   return (
     <button
+      type="button"
       onClick={onClick}
       disabled={p.kind !== 'agent'}
       className="inline-flex items-center gap-1.5 not-italic font-semibold text-ink-500 hover:text-skype-deep transition disabled:cursor-default disabled:hover:text-ink-500"
@@ -1648,6 +1651,7 @@ function QuoteCard({ msg }: { msg: Message }) {
   if (!summary) {
     return (
       <button
+        type="button"
         onClick={jump}
         className="mb-1 max-w-[min(100%,580px)] flex items-stretch gap-2 text-left rounded-md bg-cloud/60 border border-ink-100 hover:border-ink-200 px-2 py-1.5 transition-colors"
       >
@@ -1662,6 +1666,7 @@ function QuoteCard({ msg }: { msg: Message }) {
     : summary.body.slice(0, 140).replace(/\n/g, ' ')
   return (
     <button
+      type="button"
       onClick={jump}
       className="mb-1 max-w-[min(100%,580px)] flex items-stretch gap-2 text-left rounded-md bg-cloud/60 border border-ink-100 hover:border-ink-200 hover:bg-cloud px-2 py-1.5 transition-colors"
       title={t('msgview.jumpToOriginal')}
@@ -1683,6 +1688,7 @@ function ReplyIconButton({ msg }: { msg: Message }) {
   const setReplyingTo = useApp((s) => s.setReplyingTo)
   return (
     <button
+      type="button"
       onClick={() => setReplyingTo(msg.conversationId, msg.id)}
       className="w-6 h-6 rounded-full hover:bg-sky2-50 grid place-items-center text-ink-400 hover:text-skype-deep"
       title={t('chat.reply')}
@@ -1796,6 +1802,7 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
       style={animate ? { animationDelay: `${delay}ms` } : undefined}
     >
       <button
+        type="button"
         onClick={onAvatarClick}
         disabled={isMine}
         className={cn('rounded-full transition shrink-0', !isMine && 'hover:opacity-80 active:scale-95 cursor-pointer')}
@@ -1843,6 +1850,7 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
 
         {(msg.replyCount ?? 0) > 0 && (
           <button
+            type="button"
             onClick={() => openThreadView(msg.conversationId, msg.id)}
             className="mt-1 text-[11.5px] text-skype-deep hover:underline flex items-center gap-1"
           >

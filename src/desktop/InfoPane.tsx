@@ -68,6 +68,7 @@ export function InfoPane() {
       style={{ background: 'var(--chrome-pane)' }}
     >
       <button
+        type="button"
         onClick={close}
         aria-label={t('info.close')}
         className="absolute top-3 right-3 z-10 w-7 h-7 rounded-full grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition border border-ink-100 bg-cloud/70 backdrop-blur-sm"
@@ -91,6 +92,7 @@ export function InfoPane() {
 
       <div className="flex gap-2 py-3.5 px-[22px] border-b border-ink-100">
         <button
+          type="button"
           onClick={startDM}
           disabled={opening}
           className="flex-1 py-2.5 px-3 text-white rounded-[9px] text-[12px] font-semibold inline-flex items-center justify-center gap-1.5 transition disabled:opacity-50"
@@ -105,10 +107,10 @@ export function InfoPane() {
         {/* Whisper / Convene are agent-team rituals; humans use plain DM. */}
         {isAgent && (
           <>
-            <button className="flex-1 py-2.5 px-3 bg-skype-ink text-white rounded-[9px] text-[12px] font-semibold inline-flex items-center justify-center gap-1.5">
+            <button type="button" className="flex-1 py-2.5 px-3 bg-skype-ink text-white rounded-[9px] text-[12px] font-semibold inline-flex items-center justify-center gap-1.5">
               {t('info.whisper')}
             </button>
-            <button className="flex-1 py-2.5 px-3 bg-cloud border border-ink-100 rounded-[9px] text-[12px] font-semibold inline-flex items-center justify-center gap-1.5 hover:border-sky2-200 hover:text-skype-deep">
+            <button type="button" className="flex-1 py-2.5 px-3 bg-cloud border border-ink-100 rounded-[9px] text-[12px] font-semibold inline-flex items-center justify-center gap-1.5 hover:border-sky2-200 hover:text-skype-deep">
               {t('info.convene')}
             </button>
           </>

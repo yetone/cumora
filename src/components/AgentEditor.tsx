@@ -237,6 +237,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             </div>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="w-8 h-8 rounded-full grid place-items-center text-ink-500 hover:bg-sky2-50 hover:text-ink-900 transition"
             aria-label={t('common.close')}
@@ -542,12 +543,14 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
 
         <div className="px-6 py-4 border-t border-ink-100 flex items-center gap-2 bg-paper shrink-0">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >{t('agent.cancelBtn')}</button>
           <div className="flex-1" />
           <button
+            type="button"
             onClick={submit}
             disabled={busy || !name.trim() || !systemPrompt.trim()}
             className="px-5 py-2 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"

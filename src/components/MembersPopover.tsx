@@ -92,6 +92,7 @@ export function MembersPopover({ members, anchor, triggerRef, onClose }: Props) 
           const isYou = p.id === meId
           return (
             <button
+              type="button"
               key={p.id}
               onClick={() => {
                 if (!isYou) openInfo(p.id)

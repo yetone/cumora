@@ -547,12 +547,14 @@ export function MobileChat() {
                   }}
                 >
                   <button
+                    type="button"
                     onClick={() => { pushStack('info'); setMenuOpen(false) }}
                     className="w-full text-left py-2.5 px-3.5 text-[13px] text-ink-700 active:bg-sky2-50"
                   >
                     {t('mobchat.viewDetails')}
                   </button>
                   <button
+                    type="button"
                     onClick={toggleMute}
                     className="w-full text-left py-2.5 px-3.5 text-[13px] text-ink-700 active:bg-sky2-50"
                   >
@@ -560,6 +562,7 @@ export function MobileChat() {
                   </button>
                   <div className="h-px bg-ink-100 mx-1.5 my-1" />
                   <button
+                    type="button"
                     onClick={leaveConvo}
                     className="w-full text-left py-2.5 px-3.5 text-[13px] text-coral-deep active:bg-coral-soft/60"
                   >
@@ -667,6 +670,7 @@ export function MobileChat() {
               <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
             </div>
             <button
+              type="button"
               onClick={() => setAttachment(null)}
               className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0"
               aria-label={t('mobchat.removeAttachment')}
@@ -693,6 +697,7 @@ export function MobileChat() {
               </div>
             </div>
             <button
+              type="button"
               onClick={() => setReplyingTo(convoId, null)}
               className="w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0 self-center"
               aria-label={t('mobchat.cancelReply')}
@@ -878,6 +883,7 @@ export function MobileChat() {
             <div className="flex gap-1 px-2 pt-2">
               {(['std', 'skype'] as const).map((k) => (
                 <button
+                  type="button"
                   key={k}
                   onClick={() => setEmojiTab(k)}
                   className={cn(
@@ -892,6 +898,7 @@ export function MobileChat() {
                 <div className="grid grid-cols-8 gap-0.5">
                   {COMPOSER_EMOJIS.map((e) => (
                     <button
+                      type="button"
                       key={e}
                       onClick={() => insertAtCursor(e)}
                       className="h-9 grid place-items-center rounded active:bg-sky2-50 transition"
@@ -903,6 +910,7 @@ export function MobileChat() {
                 <div className="grid grid-cols-7 gap-0.5">
                   {SKYPE_EMOJIS.map((e) => (
                     <button
+                      type="button"
                       key={e.key}
                       onClick={() => insertAtCursor(e.shortcodes[0])}
                       className="h-10 grid place-items-center rounded active:bg-sky2-50 transition"
@@ -1184,6 +1192,7 @@ export function MobileChatInfo() {
       >
         <div className="px-2 py-2.5 flex items-center gap-2">
           <button
+            type="button"
             onClick={() => pushStack('chat')}
             className="w-10 h-10 grid place-items-center text-ink-700 active:bg-sky2-50 rounded-full transition"
             aria-label={t('mpinfo.back')}
@@ -1280,6 +1289,7 @@ export function MobileChatInfo() {
 
       <div className="grid grid-cols-2 gap-2 px-4 py-4 border-b border-ink-100">
         <button
+          type="button"
           onClick={startConvene}
           disabled={busy}
           className="py-3 px-4 rounded-xl text-white font-semibold text-[13px] active:opacity-80 transition disabled:opacity-50"
@@ -1288,6 +1298,7 @@ export function MobileChatInfo() {
           {busy ? t('mobchat.starting') : t('mobchat.convene')}
         </button>
         <button
+          type="button"
           onClick={onToggleMute}
           className="py-3 px-4 rounded-xl bg-cloud border border-ink-100 text-ink-700 font-semibold text-[13px] active:bg-sky2-50 transition"
         >
@@ -1392,6 +1403,7 @@ export function MobileChatInfo() {
 
       <div className="py-4 px-5">
         <button
+          type="button"
           onClick={onLeave}
           className="w-full py-3 px-4 rounded-[12px] text-[13px] font-semibold text-coral-deep transition text-left active:opacity-70"
           style={{ border: '1px solid rgba(255, 122, 107, 0.3)' }}

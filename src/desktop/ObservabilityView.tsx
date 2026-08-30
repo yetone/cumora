@@ -366,6 +366,7 @@ function RunRow({ run, active, onClick }: { run: ApiAgentRun; active: boolean; o
   const t = useT()
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
         'w-full rounded-[12px] border p-3 text-left transition',
@@ -503,6 +504,7 @@ function FolderRow({ node, depth, expanded, onToggle }: {
 }) {
   return (
     <button
+      type="button"
       onClick={onToggle}
       className="flex w-full items-center gap-1.5 rounded-[7px] px-1.5 py-1 text-left transition hover:bg-cloud/80"
       style={{ paddingLeft: 6 + depth * 14 }}
@@ -552,6 +554,7 @@ function FileRow({ node, depth, active, onClick }: {
   const tint = FILE_TYPE_TINT[ext] ?? { bg: 'var(--ink-100)', fg: 'var(--ink-500)' }
   return (
     <button
+      type="button"
       onClick={onClick}
       className={cn(
         'flex w-full items-center gap-2 rounded-[7px] py-1 pr-1.5 text-left transition',
@@ -761,6 +764,7 @@ function WakeEconomicsPanel(props: {
           <div className="grid grid-cols-4 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
             {DEV_PANELS.map((item) => (
               <button
+                type="button"
                 key={item}
                 onClick={() => props.setPanel(item)}
                 className={cn(
@@ -912,6 +916,7 @@ function TriageEconomicsPanel(props: {
           <div className="grid grid-cols-4 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
             {DEV_PANELS.map((item) => (
               <button
+                type="button"
                 key={item}
                 onClick={() => props.setPanel(item)}
                 className={cn(
@@ -1341,6 +1346,7 @@ export function ObservabilityView() {
           <div className="mt-4 grid grid-cols-4 gap-1 rounded-[11px] border border-ink-100 bg-cloud p-1">
             {DEV_PANELS.map((item) => (
               <button
+                type="button"
                 key={item}
                 onClick={() => setPanel(item)}
                 className={cn(

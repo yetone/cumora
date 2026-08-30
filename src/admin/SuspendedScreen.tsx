@@ -70,7 +70,7 @@ export function SuspendedScreen({ email, reason }: { email: string | null; reaso
         <div className="cumora-waitlist-sub" style={{ marginTop: 16, marginBottom: 24 }}>
           {t('waitlist.suspendedFooter')}
         </div>
-        <button className="btn-ghost" onClick={() => setDismissed(true)}>
+        <button type="button" className="btn-ghost" onClick={() => setDismissed(true)}>
           {t('waitlist.suspendedDone')}
         </button>
       </div>

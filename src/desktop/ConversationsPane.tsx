@@ -464,6 +464,7 @@ function SearchResultsPane({
           const sel = idx === selectedIdx
           return (
             <button
+              type="button"
               key={`p-${p.id}`}
               data-search-idx={idx}
               onMouseEnter={() => onHover(idx)}
@@ -548,6 +549,7 @@ function SearchResultsPane({
           })
           return (
             <button
+              type="button"
               key={`m-${m.id}`}
               data-search-idx={idx}
               onMouseEnter={() => onHover(idx)}
@@ -598,6 +600,7 @@ function SearchConvoButton({ id, kind, title, members, byId, query, index, isSel
   })()
   return (
     <button
+      type="button"
       key={id}
       data-search-idx={index}
       onMouseEnter={() => onHover(index)}
@@ -950,6 +953,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           const isActive = filter === f
           return (
             <button
+              type="button"
               key={f}
               onClick={() => setFilter(f)}
               className={cn(
@@ -984,6 +988,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           const isActive = filter === filterKey
           return (
             <button
+              type="button"
               key={p.id}
               onClick={() => setFilter(filterKey)}
               className={cn(
@@ -1164,6 +1169,7 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
             <div className="flex flex-col gap-1.5">
               {groups.map((g) => (
                 <button
+                  type="button"
                   key={g.id}
                   onClick={() => pick(g)}
                   disabled={busy}
@@ -1187,6 +1193,7 @@ function AddToGroupPicker({ participantId, participantName, groups, onClose }: {
         </div>
         <div className="px-6 py-4 border-t border-ink-100 flex items-center justify-end shrink-0 bg-paper">
           <button
+            type="button"
             onClick={onClose}
             className="px-4 py-2 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
@@ -1221,12 +1228,14 @@ function ConfirmLeave({ c, onCancel, onLeft }: {
         </p>
         <div className="flex gap-2">
           <button
+            type="button"
             onClick={onCancel}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}
           >{t('common.cancel')}</button>
           <button
+            type="button"
             onClick={async () => { setBusy(true); await onLeft() }}
             disabled={busy}
             className="flex-1 py-2 px-3 rounded-[9px] text-[12.5px] font-semibold text-white transition disabled:opacity-50"
@@ -1315,6 +1324,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
             const busy = busyId === p.id
             return (
               <button
+                type="button"
                 key={p.id}
                 disabled={busy}
                 onClick={() => void pick(p)}
@@ -1353,6 +1363,7 @@ function AddMembersPicker({ group, candidates, onClose }: {
         )}
         <div className="px-5 py-3 border-t border-ink-100 flex shrink-0">
           <button
+            type="button"
             onClick={onClose}
             className="ml-auto py-2 px-4 rounded-[9px] text-[12.5px] font-semibold text-ink-700 bg-cloud hover:bg-sky2-50 transition"
             style={{ border: '1px solid var(--ink-100)' }}

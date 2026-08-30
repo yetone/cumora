@@ -383,6 +383,7 @@ export function EmailComposer() {
     <div className="fixed inset-0 z-[55] grid place-items-end pointer-events-none" aria-modal="true">
       {/* Click-outside backdrop. Click anywhere outside the panel to close. */}
       <button
+        type="button"
         aria-label={t('email.closeComposerBackdropAria')}
         onClick={close}
         className="absolute inset-0 pointer-events-auto animate-fade-in"
