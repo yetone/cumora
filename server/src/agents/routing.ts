@@ -72,11 +72,14 @@ export function buildRouteRequest(args: {
 }
 
 /** Parse the router's answer. Anything unexpected — malformed JSON, a mode we
- *  don't know, an empty completion — reads as `each`, i.e. change nothing. */
+ *  don't know, an empty completion — reads as `each`, i.e. change nothing.
+ *  `one-of-us` is recognized but only ever produced for an UNADDRESSED group
+ *  message (see buildUnaddressedRouteRequest); the addressed router is still
+ *  told to answer `me`|`each` only. */
 export function parseRoute(raw: string): ResponseMode {
   const match = raw.match(/"responseMode"\s*:\s*"(me|each|one-of-us)"/i)
   const mode = match?.[1]?.toLowerCase()
-  return mode === 'me' ? 'me' : 'each'
+  return mode === 'me' ? 'me' : mode === 'one-of-us' ? 'one-of-us' : 'each'
 }
 
 /** The recipients to actually wake. Separated from the model call so the
@@ -122,5 +125,93 @@ export async function routeMessage(args: {
   } catch (err) {
     console.warn(`[routing] router unavailable; waking everyone: ${err instanceof Error ? err.message : String(err)}`)
     return 'each'
+  }
+}
+
+/** The unaddressed half of #70: a human group message that names NOBODY. Today
+ *  that always fans out to every agent, and production measures ~26% of those
+ *  wakes producing nothing — an open question makes everyone reason over the
+ *  same room. The router decides between:
+ *
+ *    - `each`      — the room engages (discussion, opinions, votes, small talk);
+ *    - `one-of-us` — one agent should take the turn (a task, a question with a
+ *                    deliverable), and it may propose WHICH agent by role fit.
+ *
+ *  The proposal is only a hint: `pickPrimary` (routing-election.ts) validates it
+ *  against real candidates and falls back to a deterministic order, so two
+ *  replicas agree without coordinating. */
+export interface UnaddressedRoute {
+  mode: 'each' | 'one-of-us'
+  /** Router's role-fit proposal, when mode is `one-of-us`. Unvalidated. */
+  primary: string | null
+}
+
+export function buildUnaddressedRouteRequest(args: {
+  body: string
+  conversationKind: string
+  /** Wake candidates with their roster role, for the fit signal. */
+  candidates: ReadonlyArray<{ id: string; role: string | null }>
+}): RouteRequest {
+  // A broadcast is for everyone, by definition.
+  if (ALL_MENTION_RE.test(args.body)) return { mode: 'each' }
+  // DMs are handled before the router ever runs (one recipient, human-DM
+  // triage note). Anything odd about the room reads as `each`.
+  if (args.conversationKind === 'direct') return { mode: 'each' }
+  // A room of one agent has nothing to elect among.
+  if (args.candidates.length < 2) return { mode: 'each' }
+
+  return {
+    instructions: [
+      'You route ONE message in a team chat where some teammates are AI agents.',
+      'The message does not name anyone. Decide whether the whole room should engage, or whether ONE agent should take it.',
+      'Answer "one-of-us" when the message is a task, an assignment, or a question with a concrete answer one person can own — and set "primary" to the candidate id whose role fits best.',
+      'Answer "each" when the room is expected to engage together — discussion, opinions, votes, roll calls, small talk, or anything where several independent replies are wanted.',
+      'When unsure, answer "each". Waking an extra agent costs tokens; waking no one loses the message.',
+      'Respond ONLY with a single JSON object: {"responseMode": "each"|"one-of-us", "primary": "<candidate id or null>"}.',
+    ].join('\n'),
+    input: [
+      `Agents in the room: ${args.candidates.map((c) => (c.role ? `${c.id} (${c.role})` : c.id)).join(', ')}`,
+      '',
+      'Message:',
+      args.body.slice(0, 2000),
+    ].join('\n'),
+  }
+}
+
+/** Parse the unaddressed router's answer. Everything unexpected reads as
+ *  `each` — narrowing is the one mistake that is silent, so the bar for it is
+ *  an explicit, well-formed `one-of-us`. */
+export function parseUnaddressedRoute(raw: string): UnaddressedRoute {
+  if (!/"responseMode"\s*:\s*"one-of-us"/i.test(raw)) return { mode: 'each', primary: null }
+  const primary = raw.match(/"primary"\s*:\s*"([^"]*)"/i)?.[1]?.trim() || null
+  return { mode: 'one-of-us', primary }
+}
+
+/** Run the unaddressed router on the cloud SMALL model. Fails OPEN to `each`
+ *  — today's full fan-out — on any error, exactly like routeMessage. Tracked
+ *  under the same `message-routing` purpose so its cost lands next to the
+ *  turns it is meant to save. */
+export async function routeUnaddressedMessage(args: {
+  companyId: string | null
+  body: string
+  conversationKind: string
+  candidates: ReadonlyArray<{ id: string; role: string | null }>
+}): Promise<UnaddressedRoute> {
+  const req = buildUnaddressedRouteRequest(args)
+  if (req.mode) return { mode: req.mode as 'each' | 'one-of-us', primary: null }
+  try {
+    const { getTrackedLlmClient } = await import('./llm-ledger.js')
+    const { supportModel } = await import('./model-policy.js')
+    const client = await getTrackedLlmClient({ purpose: 'message-routing', companyId: args.companyId })
+    const r = await client.responses.create({
+      model: supportModel(),
+      instructions: req.instructions,
+      input: req.input ?? '',
+      max_output_tokens: 200,
+    })
+    return parseUnaddressedRoute(r.output_text ?? '')
+  } catch (err) {
+    console.warn(`[routing] router unavailable; waking everyone: ${err instanceof Error ? err.message : String(err)}`)
+    return { mode: 'each', primary: null }
   }
 }

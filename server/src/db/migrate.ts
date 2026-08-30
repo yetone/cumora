@@ -291,6 +291,29 @@ CREATE TABLE IF NOT EXISTS agent_triages (
 CREATE INDEX IF NOT EXISTS idx_agent_triages_company_created ON agent_triages(company_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_triages_agent_created ON agent_triages(agent_id, created_at DESC);
 
+-- One row per one-of-us ROUTING ELECTION (#70). When a human group message
+-- names nobody and the small-model router elects ONE agent to take the turn
+-- instead of waking the room, this row records who was elected (candidates[0]
+-- is the primary; the rest is the deterministic fallback order) and holds the
+-- lease the sweeper uses to advance to the next candidate when the primary
+-- produces no turn. It is operator-facing history too: cursor counts how many
+-- candidates were burnt before one turned. Wake delivery itself is already
+-- single-owner per message (the scheduler's Redis wake-claim) — this row is
+-- the durable, observable lease behind that wake, not a mutual-exclusion
+-- primitive.
+CREATE TABLE IF NOT EXISTS agent_routing_claims (
+  message_id        TEXT PRIMARY KEY,              -- one election per message
+  company_id        TEXT,
+  conversation_id   TEXT NOT NULL,
+  candidates        TEXT[] NOT NULL,               -- election lineup: primary first, fallback order after
+  cursor            INTEGER NOT NULL DEFAULT 0,    -- index of the candidate currently holding the wake
+  status            TEXT NOT NULL DEFAULT 'pending', -- pending | served | exhausted
+  lease_expires_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  created_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  updated_at        TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_agent_routing_claims_sweep ON agent_routing_claims(status, lease_expires_at);
+
 -- One row per OUTBOUND cloud-LLM call (sub2api). The universal ledger so every
 -- sub2api token can be attributed back to the business purpose that spent it:
 -- inbox triage, synthetic-wake gate, agenda classifier, auto-compaction,

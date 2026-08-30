@@ -34,7 +34,10 @@ import { deliver as deliverWake, deliverSteer, type PollWakeBrief } from './runt
 import { inprocClient, isAgentBusy } from './runtime/inproc-client.js'
 import { classifyInboxTriage, type InboxTriageVerdict } from './inbox-triage.js'
 import type { AgentTurnOptions } from './turn.js'
-import { recipientsForRoute, routeMessage } from './routing.js'
+import { recipientsForRoute, routeMessage, routeUnaddressedMessage } from './routing.js'
+import { electLineup, type ElectionCandidate } from './routing-election.js'
+import { claimPrimary, loadElectionCandidates, startRoutingClaimSweeperIfEnabled } from './routing-claims.js'
+import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { Semaphore } from '../concurrency.js'
 
 /** Bounds how many recipients the wake fan-out triages + wakes at once
@@ -780,6 +783,15 @@ async function wake(payload: MessageNewEvent): Promise<void> {
   // human-authored group message with a real named subset, and every uncertainty
   // (@all, no targets, a model error, an unparseable answer) keeps today's full
   // fan-out. See routing.ts.
+  //
+  // The UNADDRESSED case (names nobody) gets the same treatment when
+  // env.ROUTING_ONE_OF_US is on: the router may elect ONE agent to take the
+  // turn instead of waking the room. The election is bounded by a lease row
+  // (routing-claims.ts) — a primary that never starts a turn is replaced by
+  // the next candidate — and every uncertainty fails open to the fan-out
+  // below. It deliberately does NOT resurrect the daemon-side `claimReply`
+  // that was removed for breaking chains: this happens once per message,
+  // before waking, and the woken agent still runs its own glance/yield.
   if (!authorIsAgent && (conversation?.kind ?? 'group') !== 'direct' && recipients.length > 1) {
     const targets = [
       ...mentionedAgentIds(messageBody, recipients),
@@ -799,6 +811,38 @@ async function wake(payload: MessageNewEvent): Promise<void> {
         console.log(`[scheduler] routed ${conversationId} to ${routed.join(', ')} (mode=${mode}, ${recipients.length - routed.length} wake(s) avoided)`)
       }
       recipients = routed
+    } else if (env.ROUTING_ONE_OF_US) {
+      const roster = await loadElectionCandidates(recipients).catch(() => [] as ElectionCandidate[])
+      const route = await routeUnaddressedMessage({
+        companyId: payload.companyId ?? null,
+        body: messageBody,
+        conversationKind: conversation?.kind ?? 'group',
+        candidates: roster.map((c) => ({ id: c.id, role: c.role })),
+      })
+      if (route.mode === 'one-of-us') {
+        const election = electLineup(route.primary, roster, { leaseMs: BUSY_STATUS_LEASE_MS })
+        if (election) {
+          // Fail open: if the lease row cannot be written, the no-show sweep
+          // has nothing to advance, so narrowing would be silent-room with no
+          // safety net — keep the full fan-out instead.
+          // An existing row means the message re-delivered after the wake
+          // claim TTL lapsed: honor the recorded primary instead of
+          // re-electing, and skip entirely when the lease already resolved.
+          const claim = await claimPrimary({
+            messageId: payload.message.id,
+            companyId: payload.companyId ?? null,
+            conversationId,
+            orderedCandidates: election.lineup,
+          }).catch(() => null)
+          if (claim?.status === 'pending') {
+            const primary = claim.candidates[claim.cursor]
+            if (primary && recipients.includes(primary)) {
+              console.log(`[scheduler] routed ${conversationId} to ${primary} (mode=one-of-us, ${recipients.length - 1} wake(s) avoided)`)
+              recipients = [primary]
+            }
+          }
+        }
+      }
     }
   }
 
@@ -1005,6 +1049,7 @@ export function startScheduler(): void {
     }
   })
   startWakeRetryWorker()
+  startRoutingClaimSweeperIfEnabled()
   console.log(`[scheduler] mailbox scheduler listening on ${CH_MESSAGE_NEW}, ${CH_POLLS} · runtime=pod-only`)
 }
 

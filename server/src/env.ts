@@ -97,6 +97,15 @@ export const env = {
    */
   STEER_ENABLED: !/^(false|0|no|off)$/i.test(process.env.STEER_ENABLED ?? ''),
   /**
+   * The `one-of-us` half of agent routing (#70): when a human group message
+   * names NO agent, the small-model router may elect ONE candidate to take the
+   * turn instead of waking the whole room. Election + lease + fallback live in
+   * agents/routing-election.ts / agents/routing-claims.ts. Kill-switch for an
+   * incident without a redeploy — `false` restores the pre-election full
+   * fan-out everywhere (no elections are written, so the sweeper idles too).
+   */
+  ROUTING_ONE_OF_US: !/^(false|0|no|off)$/i.test(process.env.ROUTING_ONE_OF_US ?? ''),
+  /**
    * Minimum interval (ms) between alerts that share the same
    * (label, error-fingerprint). Defaults to 60s — protects the webhook
    * from a tight loop of identical crashes hammering it.
