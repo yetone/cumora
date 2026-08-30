@@ -317,10 +317,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -4343,6 +4343,191 @@ class GeminiAdapter implements EngineAdapter {
   // a fresh one, which is what the one-shot path already does.
 }
 
+// ── Qwen Code ────────────────────────────────────────────────────────────────
+//
+// Qwen Code is a Gemini CLI fork, and shares its flags (`-o stream-json`,
+// `-p`, `-r`, `-m`) — but NOT its output. It emits Claude Code's envelope
+// instead: `{type:'assistant',session_id,message:{model,content,usage}}` and a
+// terminating `{type:'result',subtype,is_error,usage}`. That is the shape
+// `spawnEngine` already sniffs, so the wake path needs no parser of its own;
+// only triage does, because it needs the reply TEXT back.
+//
+// The two forks having the same flags and different envelopes is exactly why
+// neither adapter is derived from the other.
+
+interface QwenBlock { type?: string; text?: unknown }
+interface QwenEvent {
+  type?: string
+  session_id?: string
+  is_error?: boolean
+  error?: { message?: unknown }
+  usage?: EngineUsage
+  message?: { model?: unknown; usage?: EngineUsage; content?: unknown }
+}
+
+/** Pull the assistant's reply out of a captured stream-json run.
+ *
+ *  Exported for tests: it is pure, and it is the only part of this adapter
+ *  that a fake binary cannot exercise through `spawnEngine`.
+ *
+ *  Both `-o json` and `-o stream-json` are event streams here — `json` is
+ *  simply the same events wrapped in a JSON array, NOT Claude's
+ *  `{result,usage}` object — so there is no envelope to unwrap and the text
+ *  has to be assembled from the assistant messages. */
+export function qwenReplyFromStream(stdout: string): {
+  text: string
+  usage?: EngineUsage
+  model?: string | null
+  error?: string
+} {
+  let text = ''
+  let usage: EngineUsage | undefined
+  let model: string | null = null
+  let error: string | undefined
+  for (const raw of stdout.split('\n')) {
+    const line = raw.trim()
+    if (!line.startsWith('{')) continue
+    let ev: QwenEvent
+    try { ev = JSON.parse(line) as QwenEvent } catch { continue }
+    if (typeof ev.message?.model === 'string' && ev.message.model) model = ev.message.model
+    if (ev.type === 'assistant' && Array.isArray(ev.message?.content)) {
+      for (const block of ev.message.content as QwenBlock[]) {
+        if (block?.type === 'text' && typeof block.text === 'string') text += block.text
+      }
+      continue
+    }
+    if (ev.type !== 'result') continue
+    if (ev.usage && typeof ev.usage === 'object') usage = ev.usage
+    if (ev.is_error) {
+      const detail = ev.error?.message
+      error = typeof detail === 'string' && detail ? detail : 'qwen reported a failed turn with no detail'
+    }
+  }
+  return { text: text.trim(), usage, model, error }
+}
+
+class QwenAdapter implements EngineAdapter {
+  readonly id = 'qwen' as const
+  readonly bin = 'qwen'
+
+  /** stream-json on both paths. `-o json` returns the same events as a JSON
+   *  array, so it buys nothing here and only adds a second shape to parse. */
+  private static readonly STREAM = ['--output-format', 'stream-json']
+
+  private async ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineClassifyResult> {
+    const { command, shell } = resolveSpawn(this.bin)
+    // No --model at all when the caller has none: the big-brain probe must
+    // exercise whatever the operator made default, and forcing the cheap
+    // triage id there would report on a model their wakes never use.
+    const model = args.model ? ['--model', args.model] : []
+    const res = await spawnCapture(
+      command,
+      // `--safe-mode` is qwen's own switch for "ignore every customization":
+      // context files, hooks, extensions, skills and MCP servers all stay
+      // unloaded, which is the same thing --strict-mcp-config buys the Claude
+      // triage path and keeps a cold triage spawn cheap. It deliberately does
+      // NOT disable auth, and `-y` (an argv flag) still wins over it, so
+      // nothing can stall waiting for an approval nobody is there to give.
+      [...QwenAdapter.STREAM, '--safe-mode', '--yolo', ...model],
+      {
+        cwd: args.cwd,
+        env: args.env,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        stdinText: prompt,
+      },
+    )
+    const parsed = qwenReplyFromStream(res.text)
+    return {
+      text: parsed.text,
+      // A process failure explains more than a stream that merely reported one,
+      // so keep the same precedence the other stream adapters use.
+      error: res.error ?? (parsed.error ? `engine turn error: ${parsed.error.slice(0, MAX_FAILURE_CHARS)}` : undefined),
+      usage: parsed.usage,
+      model: parsed.model ?? args.model ?? null,
+    }
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // Whole user-owned override: the output becomes opaque, but the prompt
+      // still travels on stdin so a long prompt and a Windows shim survive.
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnCapture(command, flags, {
+        cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell, stdinText: args.prompt,
+      })
+    }
+    return this.ask(args.prompt, {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog,
+      model: args.model || triageModel('qwen3-coder-flash'),
+    })
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // Qwen Code is multi-provider (its own OAuth, DashScope, or any OpenAI-
+    // compatible base URL), so there is no cheap model id that is right for
+    // every operator. The small tier honours CUMORA_TRIAGE_MODEL — the same
+    // knob triage reads, so doctor cannot report a red small brain for an
+    // operator whose triage is configured correctly — and the big tier uses
+    // whatever the operator made default.
+    const model = args.tier === 'small' ? triageModel('qwen3-coder-flash') : null
+    return this.ask(DOCTOR_PROMPT, { cwd: args.cwd, env: args.env, signal: args.signal, model })
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The wake is the same one-shot process probe() already exercises.
+    // --resume re-opens a conversation inside it, it is not a second protocol.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.qwen', 'skills'), { recursive: true })
+    await writeFile(
+      join(home, 'QWEN.md'),
+      PERSONA_HEADER(persona, { personaFile: 'QWEN.md', skillsDir: '.qwen/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_QWEN_ARGS')
+    const { command, shell } = resolveSpawn(this.bin)
+    // `--resume <id>` resumes by session id (`-c` resumes the newest, which is
+    // wrong here: one machine runs many agents out of many homes).
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    if (flags.length) {
+      return spawnEngine(command, [...flags, ...resume], args, { shell, stdinText: args.prompt })
+    }
+    const model = args.model ? ['--model', args.model] : []
+    // No tracker: the envelope is Claude's, so spawnEngine already lifts the
+    // session id, the terminating usage, the model, and one hop per assistant
+    // message into the ledger.
+    return spawnEngine(
+      command,
+      [...QwenAdapter.STREAM, '--yolo', ...resume, ...model],
+      args,
+      // Prompt on stdin on every platform: `qwen` reads it there when no -p is
+      // given, which avoids argv limits and the Windows .cmd shim's inability
+      // to carry a multi-line argument.
+      { shell, stdinText: args.prompt },
+    )
+  }
+
+  // No startSession: qwen has no stream-json INPUT mode, so there is no way to
+  // feed turn N+1 into a live process. --resume re-opens the conversation in a
+  // fresh one, which is what the one-shot path already does.
+}
+
+
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
   codex: new CodexAdapter(),
@@ -4351,6 +4536,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   opencode: new OpenCodeAdapter(),
   pi: new PiAdapter(),
   gemini: new GeminiAdapter(),
+  qwen: new QwenAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {

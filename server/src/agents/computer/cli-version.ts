@@ -70,7 +70,9 @@ export interface EngineVersionSpec {
   latestVia?: 'cursor-about' | 'grok-check'
 }
 
-/** Keep in sync with electron/main.cjs LOCAL_CLIS and src/lib/engines.ts. */
+/** Keep in sync with src/lib/engines.ts (ENGINE_LABEL / ENGINE_BIN /
+ *  RUNNABLE_ENGINE_IDS) and, for engines Cumora can actually wake, ENGINE_IDS
+ *  in agents/computer/engine.ts. */
 export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
   claude: {
     versionArgs: ['--version'],

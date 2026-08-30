@@ -220,7 +220,7 @@ CREATE TABLE IF NOT EXISTS agent_triages (
   id                    TEXT PRIMARY KEY,
   agent_id              TEXT NOT NULL,
   company_id            TEXT,
-  source                TEXT NOT NULL,                 -- cloud | byoa-claude | byoa-codex | byoa-grok | byoa-cursor | byoa-opencode | byoa-pi | byoa-gemini
+  source                TEXT NOT NULL,                 -- cloud | byoa-claude | byoa-codex | byoa-grok | byoa-cursor | byoa-opencode | byoa-pi | byoa-gemini | byoa-qwen
   model                 TEXT,
   actionable            BOOLEAN NOT NULL DEFAULT FALSE, -- verdict: woke the big brain?
   reason                TEXT,
@@ -1504,7 +1504,7 @@ CREATE TABLE IF NOT EXISTS computers (
   owner_user_id     TEXT,                                  -- NULL for the managed Cumora Cloud row
   name              TEXT NOT NULL,                         -- "Cumora Cloud", "MacBook Pro", "prod-vps-01"
   kind              TEXT NOT NULL,                         -- 'cloud' | 'local' | 'vps'
-  available_engines JSONB NOT NULL DEFAULT '[]'::jsonb,    -- ['claude','codex','grok','cursor','opencode','pi','gemini']; ['managed'] for cloud
+  available_engines JSONB NOT NULL DEFAULT '[]'::jsonb,    -- ['claude','codex','grok','cursor','opencode','pi','gemini','qwen']; ['managed'] for cloud
   status            TEXT NOT NULL DEFAULT 'offline',       -- 'online' | 'offline' | 'busy'
   last_seen_at      TIMESTAMP WITH TIME ZONE,
   credential_hash   TEXT,                                  -- SHA256 of the device token; NULL for cloud
@@ -1526,7 +1526,7 @@ ALTER TABLE computers ADD COLUMN IF NOT EXISTS daemon_supervised BOOLEAN;
 -- a 'cloud' computer, means managed (current pod behavior). A 'local' /
 -- 'vps' computer means BYOA: wakes go to the paired daemon, no pod.
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS computer_id TEXT;
-ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine      TEXT;  -- 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini'
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine      TEXT;  -- 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
 -- Per-agent model overrides. "model" (added earlier) is the big-brain / main
 -- reasoning model; "fast_model" is the small-brain model for cheap auxiliary
 -- work. For BYOA agents these pass through to the engine as --model (big) and,

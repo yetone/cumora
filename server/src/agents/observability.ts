@@ -4,7 +4,7 @@ import { pool } from '../db/pool.js'
 import { EMPTY_USAGE, effectiveCostUsd, modelPriceTable, priceFor, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
-export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini'
+export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen'
 export type AgentEventLevel = 'debug' | 'info' | 'warn' | 'error'
 
 type Queryable = Pick<PoolClient, 'query'>

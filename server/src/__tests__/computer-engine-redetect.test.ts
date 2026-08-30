@@ -69,7 +69,12 @@ test('an unchanged empty list writes nothing', () => {
 test('a detection of only unknown ids is treated as empty', () => {
   // A newer daemon reporting an engine this server has no adapter for must not
   // clear the list either.
-  assert.equal(mergeDetectedEngines(['claude'], ['qwen', 'hermes']), null)
+  //
+  // The fixture has to be ids with NO adapter, so it goes stale every time one
+  // gains one — 'qwen' used to sit here and now drives real wakes. Replace the
+  // ids when that happens rather than deleting the case: what it protects is
+  // the compatibility path, not these particular names.
+  assert.equal(mergeDetectedEngines(['claude'], ['hermes', 'not-an-engine']), null)
 })
 
 test('unknown ids are filtered out but known ones still apply', () => {

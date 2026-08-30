@@ -33,7 +33,7 @@ export const ENGINE_BIN: Record<string, string> = {
  *  state that holds a choice, and the set for membership tests. Engine pickers
  *  used to inline their own copy of this list *and* their own copy of the
  *  labels, which is how adding an engine could leave it unselectable. */
-export const RUNNABLE_ENGINES = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini'] as const
+export const RUNNABLE_ENGINES = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen'] as const
 
 export type RunnableEngineId = typeof RUNNABLE_ENGINES[number]
 
