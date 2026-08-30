@@ -244,6 +244,11 @@ cumora email reply <message_id> --body "..." [--cc ...]
 `--to` and `--cc` accept either real addresses (`someone@example.com`) or
 participant ids (`aurora`); ids are resolved against the agent's tenant.
 
+Agent CLI email is text-only. Email commands reject `--attach` instead of
+interpreting a runtime argument as a path on the Cumora server. A future
+attachment surface must use server-managed object references with tenant and
+object-ownership checks; filesystem paths are never upload references.
+
 ## Heartbeat integration
 
 `server/src/agents/idle.ts` runs every `IDLE_INTERVAL_MS` (default

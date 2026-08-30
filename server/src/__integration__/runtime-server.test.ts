@@ -17,15 +17,17 @@
  *  - Payload validation: 400s for missing required fields, without ever
  *    touching the DB.
  *
- * The full /cli endpoint (which actually spawns runCli) is intentionally
- * not exercised here — booting the CLI requires the whole agent stack.
- * Its security-critical bit (argv strip + JWT-sub injection) lives in
- * agents-runtime-cli-argv.test.ts as a unit test.
+ * The full /cli endpoint is covered for security-critical boundaries that
+ * require the real HTTP/JWT/runCli chain. Lower-level argv normalization
+ * remains exhaustively covered in agents-runtime-cli-argv.test.ts.
  */
 import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer, type Server } from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
 import { mintAgentRuntimeToken } from '../agents/computer/registry.js'
 import { signAgentToken, verifyAgentToken } from '../agents/runtime/jwt.js'
@@ -301,6 +303,95 @@ test('[integration] runtime: /inbox-triage/payload rejects a stale token before 
 
   assert.equal(r.status, 403)
   assert.match(String(r.body?.error ?? ''), /token tenant/i)
+})
+
+test('[integration] runtime: /cli rejects email server-path attachments before storage or mail side effects', async () => {
+  const { token } = await seedAgent()
+  const root = await mkdtemp(join(tmpdir(), 'cumora-email-attachment-'))
+  const secretPath = join(root, 'server-secret.txt')
+  const nested = join(root, 'nested')
+  const symlinkPath = join(root, 'server-secret-link.txt')
+  await writeFile(secretPath, 'must never leave the server')
+  await mkdir(nested)
+  await symlink(secretPath, symlinkPath)
+
+  const candidates = [
+    secretPath,
+    `${nested}/../server-secret.txt`,
+    symlinkPath,
+    '/proc/self/environ',
+    '/var/run/secrets/kubernetes.io/serviceaccount/token',
+  ]
+
+  try {
+    const { storage } = await import('../storage.js')
+    const beforeKeys = (await storage.listObjectsByPrefix('email-attachments/'))
+      .map((item) => item.key)
+      .sort()
+
+    for (const candidate of candidates) {
+      for (const argv of [
+        ['email', 'send', '--to', 'external@example.com', '--subject', 'status', '--body', 'body', '--attach', candidate],
+        ['email', 'reply', 'missing-message', '--body', 'body', '--attach', candidate],
+      ]) {
+        const r = await call('/runtime/cli', { token, body: { argv } })
+        assert.equal(r.status, 200)
+        assert.equal(r.body?.ok, false)
+        assert.equal(r.body?.exitCode, 1)
+        assert.match(String(r.body?.text ?? ''), /never accepts server filesystem paths/i)
+      }
+    }
+
+    const afterKeys = (await storage.listObjectsByPrefix('email-attachments/'))
+      .map((item) => item.key)
+      .sort()
+    assert.deepEqual(afterKeys, beforeKeys, 'rejected paths must not upload storage objects')
+
+    const { rows } = await pool.query<{
+      conversations: number; messages: number; emailMessages: number; emailAttachments: number;
+    }>(
+      `SELECT
+         (SELECT COUNT(*)::int FROM conversations) AS conversations,
+         (SELECT COUNT(*)::int FROM messages) AS messages,
+         (SELECT COUNT(*)::int FROM email_messages) AS "emailMessages",
+         (SELECT COUNT(*)::int FROM email_attachments) AS "emailAttachments"`,
+    )
+    assert.deepEqual(rows[0], {
+      conversations: 0,
+      messages: 0,
+      emailMessages: 0,
+      emailAttachments: 0,
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('[integration] runtime: /cli still sends text-only agent email in mock mode', async () => {
+  const { token } = await seedAgent()
+  const r = await call('/runtime/cli', {
+    token,
+    body: {
+      argv: [
+        'email', 'send',
+        '--to', 'external@example.com',
+        '--subject', 'text-only status',
+        '--body', 'safe body',
+      ],
+    },
+  })
+
+  assert.equal(r.status, 200)
+  assert.equal(r.body?.ok, true, String(r.body?.text ?? ''))
+  assert.equal(r.body?.sideEffects?.[0]?.event, 'email.sent')
+  assert.equal(r.body?.sideEffects?.[0]?.attachmentCount, 0)
+
+  const { rows } = await pool.query<{ messages: number; attachments: number }>(
+    `SELECT
+       (SELECT COUNT(*)::int FROM email_messages) AS messages,
+       (SELECT COUNT(*)::int FROM email_attachments) AS attachments`,
+  )
+  assert.deepEqual(rows[0], { messages: 1, attachments: 0 })
 })
 
 test('[integration] runtime: /faces requires a tenant-pinned token', async () => {
