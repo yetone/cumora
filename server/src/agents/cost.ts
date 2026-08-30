@@ -50,17 +50,40 @@ export const EMPTY_USAGE: TokenUsage = {
 // only `verified` (non-estimated) when the OPERATOR supplies the real contracted
 // rate via CUMORA_MODEL_PRICES_JSON. Everything else surfaces as an estimate.
 const SEED_PRICES: Record<string, ModelPrice> = {
-  'gpt-5.5':      { inPer1M: 2.5, cachedInPer1M: 0.25, cacheWritePer1M: 2.5, outPer1M: 10, verified: false },
-  'gpt-5.4-mini': { inPer1M: 0.25, cachedInPer1M: 0.025, cacheWritePer1M: 0.25, outPer1M: 2, verified: false },
+  // OpenAI cloud aliases & models
+  'gpt-5.5':        { inPer1M: 2.5,  cachedInPer1M: 0.25,  cacheWritePer1M: 2.5,  outPer1M: 10,   verified: false },
+  'gpt-5.4-mini':   { inPer1M: 0.25, cachedInPer1M: 0.025, cacheWritePer1M: 0.25, outPer1M: 2,    verified: false },
+  'gpt-4o-mini':    { inPer1M: 0.15, cachedInPer1M: 0.075, cacheWritePer1M: 0.15, outPer1M: 0.6,  verified: false },
+  'gpt-4o':         { inPer1M: 2.5,  cachedInPer1M: 1.25,  cacheWritePer1M: 2.5,  outPer1M: 10,   verified: false },
+  'o3-mini':        { inPer1M: 1.1,  cachedInPer1M: 0.55,  cacheWritePer1M: 1.1,  outPer1M: 4.4,  verified: false },
+  'o1-mini':        { inPer1M: 1.1,  cachedInPer1M: 0.55,  cacheWritePer1M: 1.1,  outPer1M: 4.4,  verified: false },
+  'o1':             { inPer1M: 15,   cachedInPer1M: 7.5,   cacheWritePer1M: 15,   outPer1M: 60,   verified: false },
   // Claude — Anthropic published list prices (input / cache-read = "cache hits &
   // refreshes" / 5m cache-write / output, per 1M). Matched by substring so version
   // suffixes resolve. Legacy Opus 4.0/4.1 ($15/$75) are listed BEFORE the general
   // `claude-opus` so the specific version wins; current Opus (4.5–4.8) is cheaper
   // ($5/$25). Haiku here = Haiku 4.5 ($1/$5); Sonnet 4.x = $3/$15.
-  'claude-opus-4-1': { inPer1M: 15, cachedInPer1M: 1.5, cacheWritePer1M: 18.75, outPer1M: 75, verified: false },
-  'claude-opus':   { inPer1M: 5, cachedInPer1M: 0.5, cacheWritePer1M: 6.25, outPer1M: 25, verified: false },
-  'claude-sonnet': { inPer1M: 3, cachedInPer1M: 0.3, cacheWritePer1M: 3.75, outPer1M: 15, verified: false },
-  'claude-haiku':  { inPer1M: 1, cachedInPer1M: 0.1, cacheWritePer1M: 1.25, outPer1M: 5, verified: false },
+  'claude-opus-4-1': { inPer1M: 15,  cachedInPer1M: 1.5,   cacheWritePer1M: 18.75, outPer1M: 75,  verified: false },
+  'claude-opus':     { inPer1M: 5,   cachedInPer1M: 0.5,   cacheWritePer1M: 6.25,  outPer1M: 25,  verified: false },
+  'claude-sonnet':   { inPer1M: 3,   cachedInPer1M: 0.3,   cacheWritePer1M: 3.75,  outPer1M: 15,  verified: false },
+  'claude-haiku':    { inPer1M: 1,   cachedInPer1M: 0.1,   cacheWritePer1M: 1.25,  outPer1M: 5,   verified: false },
+  // Google Gemini — published list rates
+  'gemini-2.5-flash-lite': { inPer1M: 0.075, cachedInPer1M: 0.01875, cacheWritePer1M: 0.075, outPer1M: 0.3, verified: false },
+  'gemini-2.5-flash':      { inPer1M: 0.15,  cachedInPer1M: 0.0375,  cacheWritePer1M: 0.15,  outPer1M: 0.6, verified: false },
+  'gemini-2.5-pro':        { inPer1M: 1.25,  cachedInPer1M: 0.3125,  cacheWritePer1M: 1.25,  outPer1M: 5,   verified: false },
+  'gemini-1.5-flash':      { inPer1M: 0.075, cachedInPer1M: 0.01875, cacheWritePer1M: 0.075, outPer1M: 0.3, verified: false },
+  'gemini-1.5-pro':        { inPer1M: 1.25,  cachedInPer1M: 0.3125,  cacheWritePer1M: 1.25,  outPer1M: 5,   verified: false },
+  'gemini-flash':          { inPer1M: 0.15,  cachedInPer1M: 0.0375,  cacheWritePer1M: 0.15,  outPer1M: 0.6, verified: false },
+  'gemini-pro':            { inPer1M: 1.25,  cachedInPer1M: 0.3125,  cacheWritePer1M: 1.25,  outPer1M: 5,   verified: false },
+  // xAI Grok
+  'grok-3':                { inPer1M: 3.0,   cachedInPer1M: 0.75,    cacheWritePer1M: 3.0,   outPer1M: 15.0, verified: false },
+  'grok-2':                { inPer1M: 2.0,   cachedInPer1M: 0.5,     cacheWritePer1M: 2.0,   outPer1M: 10.0, verified: false },
+  // DeepSeek & Qwen
+  'deepseek-reasoner':     { inPer1M: 0.55,  cachedInPer1M: 0.14,    cacheWritePer1M: 0.55,  outPer1M: 2.19, verified: false },
+  'deepseek-chat':         { inPer1M: 0.27,  cachedInPer1M: 0.07,    cacheWritePer1M: 0.27,  outPer1M: 1.1,  verified: false },
+  'qwen-plus':             { inPer1M: 0.4,   cachedInPer1M: 0.1,     cacheWritePer1M: 0.4,   outPer1M: 1.2,  verified: false },
+  'qwen-turbo':            { inPer1M: 0.05,  cachedInPer1M: 0.0125,  cacheWritePer1M: 0.05,  outPer1M: 0.2,  verified: false },
+  'qwen-max':              { inPer1M: 1.6,   cachedInPer1M: 0.4,     cacheWritePer1M: 1.6,   outPer1M: 4.8,  verified: false },
 }
 
 // Last-resort rate for an unrecognized model: mid-tier, ALWAYS flagged estimated.

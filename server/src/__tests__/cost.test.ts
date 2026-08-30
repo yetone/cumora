@@ -65,3 +65,22 @@ test('the user scenario: a cold triage can cost MORE than a cache-warm turn it s
   assert.ok(triageCost > 0 && turnCost > 0)
   assert.ok(priceFor('haiku').cachedInPer1M < priceFor('haiku').inPer1M)
 })
+
+test('seeded rates resolve for Gemini, Grok, OpenAI, and DeepSeek models without hitting fallback', () => {
+  assert.equal(priceFor('gemini-2.5-flash-lite').inPer1M, 0.075)
+  assert.equal(priceFor('gemini-2.5-flash-lite').outPer1M, 0.3)
+  assert.equal(priceFor('gemini-2.5-flash').inPer1M, 0.15)
+  assert.equal(priceFor('gemini-2.5-pro').inPer1M, 1.25)
+  assert.equal(priceFor('gpt-4o-mini').inPer1M, 0.15)
+  assert.equal(priceFor('gpt-4o').inPer1M, 2.5)
+  assert.equal(priceFor('o3-mini').inPer1M, 1.1)
+  assert.equal(priceFor('grok-3').inPer1M, 3.0)
+  assert.equal(priceFor('grok-2').inPer1M, 2.0)
+  assert.equal(priceFor('deepseek-chat').inPer1M, 0.27)
+  assert.equal(priceFor('deepseek-reasoner').inPer1M, 0.55)
+  assert.equal(priceFor('qwen-plus').inPer1M, 0.4)
+
+  // Provider prefix routing (e.g. novita/deepseek/deepseek-chat)
+  assert.equal(priceFor('novita/deepseek/deepseek-chat').inPer1M, 0.27)
+  assert.equal(priceFor('openrouter/anthropic/claude-3.7-sonnet').inPer1M, 3)
+})

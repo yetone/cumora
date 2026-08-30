@@ -470,7 +470,7 @@ function writeStdin(child: ChildProcess, text: string, opts: { end?: boolean } =
     stdin.on('error', () => { /* reported by the child's own close/error path */ })
   }
   try {
-    stdin.write(text)
+    stdin.write(stripLoneSurrogates(text))
     if (opts.end) stdin.end()
     return true
   } catch {
@@ -485,7 +485,7 @@ function spawnEngine(
   spawnOpts: { shell?: boolean; stdinText?: string; onStdoutLine?: (line: string) => void } = {},
 ): Promise<EngineRunResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(bin, args, {
+    const child = spawn(bin, args.map(stripLoneSurrogates), {
       cwd: home, env,
       stdio: [spawnOpts.stdinText != null ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: spawnOpts.shell ?? false,
