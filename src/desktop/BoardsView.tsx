@@ -435,7 +435,7 @@ function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
   const byId = useParticipants((s) => s.byId)
   const assignee = card.assigneeId ? byId[card.assigneeId] : null
   return (
-    <article
+    <div
       role="button"
       tabIndex={0}
       draggable
@@ -469,7 +469,7 @@ function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
           )}
         </div>
       )}
-    </article>
+    </div>
   )
 }
 

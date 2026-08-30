@@ -128,6 +128,7 @@ export function Select<T extends string = string>({
       <button
         id={selectId}
         type="button"
+        role="combobox"
         disabled={disabled}
         aria-label={ariaLabel}
         aria-haspopup="listbox"

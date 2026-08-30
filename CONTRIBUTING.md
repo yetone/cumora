@@ -50,8 +50,9 @@ npm run guard:llm-tracked  # architecture guard, see below
 Biome is configured (`biome.json`) as a **linter only** — it is not a
 formatter here, so it won't reflow existing code. The rule set is a
 pragmatic subset of Biome's recommended rules: correctness and real-bug
-rules are on; noisy or intentional-pattern style rules (and the a11y
-group, tracked as separate follow-up work) are off.
+rules are on; noisy or intentional-pattern style rules are off, while the a11y
+rules are enforced incrementally (useButtonType, ARIA roles/props, and core
+accessibility rules are active).
 
 Both TypeScript projects are `strict`. There are no frontend unit tests yet;
 server and worker logic is covered by `server/src/__tests__` and

@@ -3570,7 +3570,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     const limit = Math.min(100, Math.max(1, Number(parsed.flags.limit ?? 20)))
     // Fetch extra rows so in-memory project filtering can still fill `limit`.
     // `--all` is the only path that skips isolation.
-    const fetchLimit = Boolean(parsed.flags.all) ? limit : Math.min(500, Math.max(limit * 10, 100))
+    const fetchLimit = parsed.flags.all ? limit : Math.min(500, Math.max(limit * 10, 100))
     params.push(fetchLimit)
     const limitParam = `$${params.length}`
     const { rows } = await pool.query<{

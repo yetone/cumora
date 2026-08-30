@@ -951,9 +951,7 @@ function ComputersTab() {
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 <div
                   className={cn('p-4 flex items-center gap-4 rounded-[14px]', repairable && 'cursor-pointer hover:bg-sky2-50')}
-                  onClick={repairable ? () => toggleEngines(c.id) : undefined}
-                  role={repairable ? 'button' : undefined}
-                  aria-expanded={repairable ? enginesShown : undefined}>
+                  onClick={repairable ? () => toggleEngines(c.id) : undefined}>
                   <div className="text-[22px] w-8 text-center">{KIND_ICON[c.kind] ?? '🖥'}</div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">

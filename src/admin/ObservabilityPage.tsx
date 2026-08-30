@@ -984,6 +984,10 @@ function CachePurposeBar({ purpose, hitRate, savableUsd, costUsd, uncachedIn, ca
         <div
           className={`obs-cache-bar-fill ${cacheToneClass(hitRate)}`}
           style={{ width: `${ratePct}%` }}
+          role="progressbar"
+          aria-valuenow={Math.round(ratePct)}
+          aria-valuemin={0}
+          aria-valuemax={100}
           aria-label={`${ratePct.toFixed(0)}%`}
         />
         <span className="obs-cache-bar-rate">{hitRate != null ? fmtPct(hitRate, 0) : '—'}</span>

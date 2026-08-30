@@ -44,6 +44,7 @@ export function TwEmoji({ emoji, size = 16, className }: Props) {
     // Native fallback — keep the inline-baseline alignment so layout stays put.
     return (
       <span
+        role="img"
         className={className}
         style={{ fontSize: size, lineHeight: 1, display: 'inline-block', verticalAlign: 'text-bottom' }}
         aria-label={emoji}

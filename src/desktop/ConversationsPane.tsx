@@ -247,6 +247,7 @@ function MutedGlyph({ title }: { title: string }) {
   // Slack-style bell-off — small, ink-300, matches the row's secondary tone.
   return (
     <span
+      role="img"
       className="inline-flex items-center justify-center w-3 h-3 shrink-0 text-ink-300"
       title={title}
       aria-label={title}

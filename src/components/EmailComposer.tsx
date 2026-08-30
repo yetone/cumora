@@ -380,7 +380,7 @@ export function EmailComposer() {
   }
 
   return (
-    <div className="fixed inset-0 z-[55] grid place-items-end pointer-events-none" aria-modal="true">
+    <div className="fixed inset-0 z-[55] grid place-items-end pointer-events-none" role="dialog" aria-modal="true">
       {/* Click-outside backdrop. Click anywhere outside the panel to close. */}
       <button
         type="button"
