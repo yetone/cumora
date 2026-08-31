@@ -50,7 +50,7 @@ function* walk(dir) {
   const abs = join(ROOT, dir)
   for (const entry of readdirSync(abs)) {
     const p = join(abs, entry)
-    const rel = p.slice(ROOT_LEN)
+    const rel = p.slice(ROOT_LEN).replaceAll('\\', '/')
     if (SKIP.test(rel)) continue
     const st = statSync(p)
     if (st.isDirectory()) yield* walk(rel)
