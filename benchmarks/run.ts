@@ -25,8 +25,8 @@ import { kanbanScenario } from './games/kanban.ts'
 const REGISTRY: Record<string, Scenario> = {
   chain: chainScenario,
   counting: countingScenario,
-  werewolf: werewolfScenario,  // stub
-  kanban: kanbanScenario,      // stub
+  werewolf: werewolfScenario,
+  kanban: kanbanScenario,
 }
 
 function usage(): never {
