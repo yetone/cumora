@@ -317,10 +317,10 @@ export function resolveSpawn(bin: string): { command: string; shell: boolean; wa
   return { command: bin, shell: true, wantsStdinPrompt: true }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'reasonix'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'reasonix']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -4406,6 +4406,37 @@ export function qwenReplyFromStream(stdout: string): {
   return { text: text.trim(), usage, model, error }
 }
 
+/** reasonix `run --output-format json` emits ONE terminal JSON document
+ *  (verified against reasonix v1.31.1):
+ *    {"type":"result","subtype":"success","is_error":false,"result":"…",
+ *     "session_id":"20260831-…","model":"deepseek-v4-flash",
+ *     "usage":{"input_tokens":…,"output_tokens":…,"cache_read_input_tokens":…,"cache_creation_input_tokens":…}}
+ *  The usage field names already match EngineUsage, and spawnEngine sniffs
+ *  session_id/usage/model straight out of the same document on the run path. */
+export function reasonixReplyFromJson(stdout: string): {
+  text: string
+  usage?: EngineUsage
+  model?: string | null
+  error?: string
+} {
+  const cleaned = stdout.replace(ANSI_RE, '').trim()
+  if (!cleaned) return { text: '', usage: undefined, model: null, error: 'reasonix produced no output' }
+  let obj: { type?: unknown; is_error?: boolean; result?: unknown; error?: unknown; model?: string; usage?: EngineUsage }
+  try {
+    obj = JSON.parse(cleaned) as typeof obj
+  } catch {
+    return { text: cleaned, error: `reasonix did not return a JSON result: ${cleaned.slice(0, MAX_FAILURE_CHARS)}`, usage: undefined, model: null }
+  }
+  if (obj === null || typeof obj !== 'object' || obj.type !== 'result') {
+    return { text: cleaned, error: `unexpected reasonix output: ${cleaned.slice(0, MAX_FAILURE_CHARS)}`, usage: undefined, model: null }
+  }
+  const text = typeof obj.result === 'string' ? obj.result : cleaned
+  const error = obj.is_error
+    ? (typeof obj.error === 'string' && obj.error ? obj.error : 'reasonix reported a failed turn with no detail')
+    : undefined
+  return { text, usage: obj.usage, model: obj.model ?? null, error }
+}
+
 class QwenAdapter implements EngineAdapter {
   readonly id = 'qwen' as const
   readonly bin = 'qwen'
@@ -4527,6 +4558,140 @@ class QwenAdapter implements EngineAdapter {
   // fresh one, which is what the one-shot path already does.
 }
 
+/**
+ * Reasonix — DeepSeek-native coding agent CLI (npm: reasonix).
+ *
+ * Headless contract (verified against reasonix v1.31.1):
+ *   reasonix run [--permission-mode auto] [--output-format json]
+ *                [--resume <session-id>] [--model <provider>]   ← prompt on stdin
+ * - One terminal JSON result document; usage field names already match
+ *   EngineUsage, and the session_id is returned for --resume on the next wake.
+ * - Project memory/persona lives in `AGENTS.md` (or `REASONIX.md`) in cwd;
+ *   skills in `<root>/.reasonix/skills/`.
+ * - File-write sandbox: `[sandbox] workspace_root` (default = cwd, which is the
+ *   agent home) is enforced for writers, so model-spawned file tools cannot
+ *   escape the agent home even under --permission-mode auto.
+ *
+ * NOT in SANDBOXED_ENGINE_IDS: Cumora's fail-closed OS boundary for claude /
+ * codex is stricter (restricted-mode / permission-profile process isolation);
+ * reasonix enforces workspace-root writes + permission gates, not that OS
+ * boundary, so it runs only when CUMORA_BYOA_ALLOW_UNSANDBOXED=1, like the
+ * other compatibility engines.
+ *
+ * Model knob: Cumora pins Anthropic/OpenAI model ids that reasonix providers
+ * don't know, so run() intentionally ignores args.model — the operator's own
+ * reasonix default provider (e.g. deepseek-flash) is the brain. Set
+ * CUMORA_REASONIX_MODEL to a provider name from the reasonix config to force
+ * one. Triage (classify/probe small tier) honours CUMORA_TRIAGE_MODEL with a
+ * deepseek-flash fallback.
+ */
+class ReasonixAdapter implements EngineAdapter {
+  readonly id = 'reasonix' as const
+  readonly bin = 'reasonix'
+
+  private async ask(prompt: string, args: {
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    onLog?: (line: string) => void
+    model?: string | null
+  }): Promise<EngineClassifyResult> {
+    const { command, shell } = resolveSpawn(this.bin)
+    // No --model at all when the caller has none: the probe must exercise
+    // whatever the operator made default, and forcing a triage id there would
+    // report on a model their wakes never use.
+    const model = args.model ? ['--model', args.model] : []
+    const res = await spawnCapture(
+      command,
+      ['run', '--permission-mode', 'auto', '--output-format', 'json', ...model],
+      {
+        cwd: args.cwd,
+        env: args.env,
+        signal: args.signal,
+        onLog: args.onLog,
+        shell,
+        stdinText: prompt,
+      },
+    )
+    const parsed = reasonixReplyFromJson(res.text)
+    return {
+      text: parsed.text,
+      error: res.error ?? (parsed.error ? `engine turn error: ${parsed.error.slice(0, MAX_FAILURE_CHARS)}` : undefined),
+      usage: parsed.usage,
+      model: parsed.model ?? args.model ?? null,
+    }
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const flags = extraArgs('CUMORA_TRIAGE_ARGS')
+    if (flags.length) {
+      // Whole user-owned override: the output becomes opaque, but the prompt
+      // still travels on stdin so a long prompt and a Windows shim survive.
+      const { command, shell } = resolveSpawn(this.bin)
+      return spawnCapture(command, flags, {
+        cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog, shell, stdinText: args.prompt,
+      })
+    }
+    return this.ask(args.prompt, {
+      cwd: args.cwd, env: args.env, signal: args.signal, onLog: args.onLog,
+      model: args.model || triageModel('deepseek-flash'),
+    })
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // Small tier = the same provider triage reads (so doctor cannot report a
+    // red small brain for a correctly configured triage); big tier = whatever
+    // the operator made default.
+    const model = args.tier === 'small' ? triageModel('deepseek-flash') : null
+    return this.ask(DOCTOR_PROMPT, { cwd: args.cwd, env: args.env, signal: args.signal, model })
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The wake is the same one-shot process probe() already exercises.
+    // --resume re-opens a conversation inside it, it is not a second protocol.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.reasonix', 'skills'), { recursive: true })
+    // reasonix loads project memory from AGENTS.md (or REASONIX.md) in cwd.
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.reasonix/skills/' }),
+      'utf8',
+    )
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    const flags = extraArgs('CUMORA_REASONIX_ARGS')
+    const { command, shell } = resolveSpawn(this.bin)
+    // --resume <id> resumes by session id (`-c` resumes the newest, which is
+    // wrong here: one machine runs many agents out of many homes).
+    const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
+    if (flags.length) {
+      return spawnEngine(command, ['run', ...flags, ...resume], args, { shell, stdinText: args.prompt })
+    }
+    // Deliberately NO --model from args.model: Cumora pins Anthropic/OpenAI
+    // ids that reasonix providers don't know; the operator's configured
+    // default provider is the right brain. CUMORA_REASONIX_MODEL (a provider
+    // name from the reasonix config) is the escape hatch.
+    const model = process.env.CUMORA_REASONIX_MODEL ? ['--model', process.env.CUMORA_REASONIX_MODEL] : []
+    return spawnEngine(
+      command,
+      ['run', '--permission-mode', 'auto', '--output-format', 'json', ...resume, ...model],
+      args,
+      // Prompt on stdin on every platform: long wake deltas exceed argv
+      // limits; reasonix reads stdin when no positional task is given.
+      { shell, stdinText: args.prompt },
+    )
+  }
+
+  // No startSession: reasonix run is one-shot per wake; --resume re-opens the
+  // conversation in a fresh process, which is what the one-shot path already
+  // does. (reasonix acp offers a persistent ACP session — future work.)
+}
+
 
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
@@ -4537,6 +4702,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   pi: new PiAdapter(),
   gemini: new GeminiAdapter(),
   qwen: new QwenAdapter(),
+  reasonix: new ReasonixAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {

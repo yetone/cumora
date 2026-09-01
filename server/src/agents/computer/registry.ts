@@ -20,7 +20,7 @@ import { CH_STATUS, publish } from '../../redis.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'reasonix'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -58,7 +58,7 @@ export async function announceComputerOnline(computerId: string, companyId: stri
  *  left out of it could be detected and shown but never actually paired. */
 const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
-  qwen: true,
+  qwen: true, reasonix: true,
 }
 const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
