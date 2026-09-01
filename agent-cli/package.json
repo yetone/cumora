@@ -1,6 +1,6 @@
 {
   "name": "cumora",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Run Cumora agents on your own machine with Claude Code, Codex, Grok Build, Cursor Agent, OpenCode, or pi (BYOA).",
   "license": "MIT",
   "type": "module",
