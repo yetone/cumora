@@ -20,6 +20,10 @@ import { pool } from './db/pool.js'
 import { CH_MESSAGE_NEW, CH_CALENDAR_REMINDER, publish } from './redis.js'
 import { env } from './env.js'
 import { formatAddress, sendViaProvider, mintMessageId } from './email.js'
+// The pure half lives apart so it can be tested without a database, Redis or an
+// email transport. Re-exported here so every existing importer is unaffected.
+export { nextOccurrenceOnOrAfter, type RecurrenceRule } from './recurrence.js'
+import { nextOccurrenceOnOrAfter, type RecurrenceRule } from './recurrence.js'
 
 const TICK_INTERVAL_MS = 60_000
 const CALENDAR_SYSTEM_AUTHOR_ID = 'calendar'
@@ -29,19 +33,6 @@ const CALENDAR_SYSTEM_AUTHOR_ID = 'calendar'
  *  next slot fell more than this many minutes ago get fast-forwarded to
  *  the next future slot without firing. */
 const MAX_CATCHUP_MS = 60 * 60_000
-
-export interface RecurrenceRule {
-  freq: 'daily' | 'weekly' | 'monthly' | 'yearly'
-  interval: number
-  /** 0=Sun … 6=Sat. Only honored when freq='weekly'. Empty/undefined = use
-   *  the weekday of the seed start_at. */
-  byweekday?: number[]
-  /** Inclusive end of the series — no occurrences after this ISO timestamp. */
-  until?: string | null
-  /** Hard cap on total firings (including the seed). Once reached, the
-   *  series is marked 'done'. */
-  count?: number | null
-}
 
 export interface CalendarEventRow {
   id: string
@@ -64,94 +55,6 @@ export interface CalendarEventRow {
   is_private: boolean
   created_at: Date
   updated_at: Date
-}
-
-/* ─────────────────────────── recurrence math ─────────────────────────── */
-
-/** Add N days to a Date without mutating the input. */
-function addDays(d: Date, n: number): Date {
-  const out = new Date(d.getTime())
-  out.setUTCDate(out.getUTCDate() + n)
-  return out
-}
-
-function addMonths(d: Date, n: number): Date {
-  const out = new Date(d.getTime())
-  out.setUTCMonth(out.getUTCMonth() + n)
-  return out
-}
-
-function addYears(d: Date, n: number): Date {
-  const out = new Date(d.getTime())
-  out.setUTCFullYear(out.getUTCFullYear() + n)
-  return out
-}
-
-/** Step one rrule "interval" forward from `from`. For weekly with
- *  byweekday this scans day-by-day (cheap — bounded at 7 iterations). */
-function stepOnce(from: Date, rule: RecurrenceRule): Date {
-  const interval = Math.max(1, Math.floor(rule.interval || 1))
-  switch (rule.freq) {
-    case 'daily':
-      return addDays(from, interval)
-    case 'weekly': {
-      // No explicit byweekday → just hop intervals*7 days at a time.
-      const days = rule.byweekday && rule.byweekday.length > 0 ? rule.byweekday : null
-      if (!days) return addDays(from, interval * 7)
-      // Walk forward one day at a time until we hit a permitted weekday.
-      // Skip the first interval-1 full weeks first, then resume scanning.
-      // For interval=1 this is "next allowed day after `from`".
-      let candidate = addDays(from, 1)
-      const sorted = [...days].sort((a, b) => a - b)
-      // For interval>1 we need: same DOW family, just N weeks later. The
-      // simplest correct behavior — scan forward N*7 days, then pick the
-      // next allowed weekday within the week of that target.
-      if (interval > 1) {
-        candidate = addDays(from, (interval - 1) * 7 + 1)
-      }
-      for (let i = 0; i < 14; i++) {
-        if (sorted.includes(candidate.getUTCDay())) return candidate
-        candidate = addDays(candidate, 1)
-      }
-      return candidate
-    }
-    case 'monthly':
-      return addMonths(from, interval)
-    case 'yearly':
-      return addYears(from, interval)
-  }
-}
-
-/**
- * Compute the next firing time strictly >= `after`, walking forward from
- * the event's seed `start_at`. Returns null if:
- *   - the series has no recurrence and start_at < after (already fired)
- *   - rule.until is earlier than the next computed slot
- *   - rule.count is exhausted
- */
-export function nextOccurrenceOnOrAfter(
-  startAt: Date,
-  recurrence: RecurrenceRule | null,
-  after: Date,
-): Date | null {
-  // One-shot: the only possible slot is start_at itself.
-  if (!recurrence) {
-    return startAt.getTime() >= after.getTime() ? startAt : null
-  }
-  const untilTs = recurrence.until ? new Date(recurrence.until).getTime() : Infinity
-  const maxCount = recurrence.count ?? Infinity
-  let current = startAt
-  let fired = 1            // start_at counts as occurrence #1
-  // Cap iterations defensively so a misconfigured rule (e.g. byweekday=[])
-  // can't tie up the tick loop forever.
-  for (let i = 0; i < 5000; i++) {
-    if (current.getTime() > untilTs) return null
-    if (fired > maxCount) return null
-    if (current.getTime() >= after.getTime()) return current
-    current = stepOnce(current, recurrence)
-    fired += 1
-  }
-  return null
 }
 
 /* ─────────────────────────── dispatcher ─────────────────────────── */
