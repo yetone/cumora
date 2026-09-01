@@ -45,6 +45,7 @@ import {
 } from '../runtime/wake-options.js'
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
+import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, snapshotDetectedEngines } from './engine.js'
 
 export { conversationHeader }
@@ -2125,6 +2126,11 @@ class AgentRunner {
    *  agenda turns; the per-turn deltas (chatDelta / agendaDelta) carry only the
    *  dynamic bits. No game-specific rules — the engine coordinates in-turn via the
    *  shared glance-yield protocol, exactly like the cloud pod-agent. */
+  /** Which calling convention this agent's turns actually have. */
+  private promptSurface(): ActionSurface {
+    return actionSurfaceFor(allowUnsandboxedByoa())
+  }
+
   private standingPrompt(): string {
     // RESTORED to the 5/28T22:17Z baseline SHAPE: one minimal prompt of essential
     // mechanics, with GLANCE_YIELD_RULES and a few core sections — NOT a wall of
@@ -2135,7 +2141,7 @@ class AgentRunner {
     // surface via `cumora <cmd> --help` when it needs it.
     return (
       `You are a Cumora teammate — a first-class member of this team with your own voice. ` +
-      `You act on Cumora through the \`cumora\` CLI on your PATH.\n\n` +
+      actionSurfaceText(this.promptSurface()) +
       `Read the relevant thread and respond appropriately, in your own voice — like a real teammate. ` +
       `If a human addressed the whole team, you and every peer likely woke at the same instant, so ` +
       `coordinate via the protocol below — in short: post the real next item from what's ACTUALLY been posted, ` +
@@ -2143,10 +2149,8 @@ class AgentRunner {
       // The shared glance-and-yield protocol — verbatim via the const so BYOA
       // coordinates identically to the cloud pod-agent.
       GLANCE_YIELD_RULES + `\n\n` +
-      `Posting a message: For ANY message with backticks, code, $, quotes, or multiple lines, ` +
-      `write it to a file (e.g. \`notes/reply.md\`) and post with \`cumora reply <conversationId> --file notes/reply.md\` — ` +
-      `the shell mangles inline \`backtick\` / \`$(...)\` content. For short plain text, ` +
-      `\`cumora reply <conversationId> 'text'\` (SINGLE quotes) is fine. When you're answering a ` +
+      postingMechanicsText(this.promptSurface()) +
+      `When you're answering a ` +
       `SPECIFIC message, add \`--quote <message_id>\` so your reply threads to its context. ` +
       `To address a teammate, @<their-id> (the short id in \`cumora messages\` / \`cumora participants\`), ` +
       `NOT their display name.\n\n` +
@@ -2163,7 +2167,7 @@ class AgentRunner {
       `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
       `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
       `"still need X?") and schedule your own check-back: ` +
-      `\`cumora calendar create '<chase>' --at <iso> --assignee ${this.agent.id} --prompt '<what future-you does>'\`. ` +
+      calendarExampleText(this.promptSurface(), this.agent.id) +
       `Stop only when the work is truly done or it's someone else's move.\n\n` +
       `Privacy: stay inside your home directory. Never read or expose files outside it — this machine ` +
       `holds the operator's private files.`
