@@ -24,6 +24,19 @@ import {
 } from './memory-scope.js'
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
 import { wakeKanbanAgents } from './kanban-wake.js'
+import {
+  enqueueBroadcast,
+  nudgeRealtimeOutbox,
+  withOutboxTransaction,
+} from '../realtime-outbox.js'
+import {
+  CH_BOARDS,
+  CH_CALENDAR_EVENTS,
+  CH_CONVO_UPDATED,
+  CH_DOCS,
+  CH_MESSAGE_NEW,
+  CH_STATUS,
+} from '../redis.js'
 
 // Every CLI result flows through ok()/err(), so scrubbing lone UTF-16 surrogates
 // here means CLI output (read by agents as tool results) can never carry a split
@@ -2237,7 +2250,34 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
        ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
       [me, convoId],
     )
+    await enqueueBroadcast(txClient, CH_MESSAGE_NEW, {
+      type: 'message.new',
+      conversationId: convoId,
+      companyId,
+      message: {
+        id: messageId,
+        conversationId: convoId,
+        authorId: me,
+        kind: 'text',
+        body: finalBody,
+        sequence,
+        at: new Date().toISOString(),
+        attachment: attachment ?? undefined,
+        quotedMessageId: resolvedQuotedId ?? undefined,
+        quoted: quotedSummary
+          ? {
+              id: quotedSummary.id,
+              authorId: quotedSummary.authorId,
+              authorName: quotedSummary.authorName,
+              kind: 'text',
+              body: quotedSummary.body,
+              sequence: quotedSummary.sequence,
+            }
+          : undefined,
+      },
+    })
     await txClient.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (e) {
     await txClient.query('ROLLBACK').catch(() => { /* already failed */ })
     throw e
@@ -2264,29 +2304,6 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // worst case is the counter TTLs naturally in 45min.
   void (await import('./agenda.js')).resetStallNudgeDeclines(convoId)
 
-  // Broadcast — frontend, scheduler, etc. all listen on CH_MESSAGE_NEW
-  const { CH_MESSAGE_NEW, publish } = await import('../redis.js')
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: convoId,
-    companyId,
-    message: {
-      id: messageId, conversationId: convoId, authorId: me,
-      kind: 'text', body: finalBody, sequence, at: new Date().toISOString(),
-      attachment: attachment ?? undefined,
-      quotedMessageId: resolvedQuotedId ?? undefined,
-      quoted: quotedSummary ? {
-        id: quotedSummary.id,
-        authorId: quotedSummary.authorId,
-        authorName: quotedSummary.authorName,
-        kind: 'text',
-        body: quotedSummary.body,
-        sequence: quotedSummary.sequence,
-      } : undefined,
-    },
-  }).catch((error) => {
-    console.warn(`[reply] durable message ${messageId} committed but publish failed`, error)
-  })
   const attachmentNote = attachment
     ? ` · attached ${attachment.kind} "${attachment.name}"`
     : ''
@@ -3657,19 +3674,20 @@ async function setAgentAvatarFromUrl(args: {
   const key = `avatars/avatar-${args.agentId}-${randomUUID().slice(0, 8)}.${ext}`
   const url = await storage.put(key, buf, mime)
 
-  await pool.query(
-    `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
-    [args.agentId, url, args.tenant],
-  )
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
+      [args.agentId, url, args.tenant],
+    )
+    await enqueueBroadcast(client, CH_STATUS, {
+      type: 'participants.avatar',
+      participantId: args.agentId,
+      avatarUrl: url,
+      companyId: args.tenant,
+    })
+  })
   const { invalidatePersonaCache } = await import('./personas.js')
   invalidatePersonaCache(args.agentId)
-  const { CH_STATUS, publish } = await import('../redis.js')
-  await publish(CH_STATUS, {
-    type: 'participants.avatar',
-    participantId: args.agentId,
-    avatarUrl: url,
-    companyId: args.tenant,
-  })
   return { url }
 }
 
@@ -3750,22 +3768,26 @@ async function cmdTopicSet(parsed: ParsedArgs): Promise<CliResult> {
     participantId: me,
     companyId: preflight[0].company_id,
     conversationId: convoId,
-    run: async (client) => client.query<{ company_id: string }>(
-      `UPDATE conversations SET topic = $2, updated_at = NOW()
-        WHERE id = $1 AND company_id = $3
-        RETURNING company_id`,
-      [convoId, topic, preflight[0].company_id],
-    ),
+    run: async (client) => {
+      const result = await client.query<{ company_id: string }>(
+        `UPDATE conversations SET topic = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3
+          RETURNING company_id`,
+        [convoId, topic, preflight[0].company_id],
+      )
+      if (result.rows[0]) {
+        await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+          type: 'conversation.updated',
+          conversationId: convoId,
+          companyId: result.rows[0].company_id,
+          patch: { topic },
+        })
+      }
+      return result
+    },
   })
   const companyId = updated?.rows[0]?.company_id
   if (!companyId) return err(`conversation ${convoId} not found or no longer authorized`)
-  const { CH_CONVO_UPDATED, publish } = await import('../redis.js')
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: convoId,
-    companyId,
-    patch: { topic },
-  })
   return ok(topic ? `topic set: "${topic}"` : '(topic cleared)', [{
     event: 'conversation.topic_updated',
     command: 'topic-set',
@@ -3830,22 +3852,26 @@ async function cmdRename(parsed: ParsedArgs): Promise<CliResult> {
     participantId: me,
     companyId: rows[0].company_id,
     conversationId: convoId,
-    run: async (client) => client.query(
-      `UPDATE conversations
-          SET title = $2, updated_at = NOW()
-        WHERE id = $1 AND company_id = $3
-          AND kind = 'group' AND title = $4`,
-      [convoId, title, rows[0].company_id, currentTitle],
-    ),
+    run: async (client) => {
+      const result = await client.query(
+        `UPDATE conversations
+            SET title = $2, updated_at = NOW()
+          WHERE id = $1 AND company_id = $3
+            AND kind = 'group' AND title = $4`,
+        [convoId, title, rows[0].company_id, currentTitle],
+      )
+      if (result.rowCount) {
+        await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+          type: 'conversation.updated',
+          conversationId: convoId,
+          companyId: rows[0].company_id,
+          patch: { title },
+        })
+      }
+      return result
+    },
   })
   if (!updated?.rowCount) return err(`conversation ${convoId} changed or is no longer authorized; rename cancelled`)
-  const { CH_CONVO_UPDATED, publish } = await import('../redis.js')
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: convoId,
-    companyId: rows[0].company_id,
-    patch: { title },
-  })
   return ok(`renamed to "${title}" (${convoId})`, [{
     event: 'conversation.renamed',
     command: 'rename',
@@ -4371,10 +4397,6 @@ async function cmdTasks(parsed: ParsedArgs): Promise<CliResult> {
  * tasks/email above.
  */
 
-/** Best-effort WS broadcast for a calendar row change initiated by the
- *  agent CLI. Mirrors the REST `publishCalendarChange` helper in
- *  router.ts so the desktop client patches its Calendar view in real
- *  time whether the change came from a human (HTTP) or an agent (CLI). */
 /** Visibility predicate for the agent CLI. Mirrors the REST helper but
  *  with one simplification: agents can't be company owners, so the
  *  owner-override branch never applies — the predicate collapses to the
@@ -4384,14 +4406,14 @@ function cliCalendarVisibilityClause(meIdx: number): string {
   return `(is_private = false OR created_by = $${meIdx} OR assignee_id = $${meIdx})`
 }
 
-async function publishCalendarCli(args: {
+/** Queue the calendar invalidation alongside the CLI mutation. */
+async function enqueueCalendarCli(db: PoolClient, args: {
   companyId: string
   kind: 'event.created' | 'event.updated' | 'event.deleted' | 'event.dispatched'
   eventId: string
   actorId: string
 }): Promise<void> {
-  const { CH_CALENDAR_EVENTS, publish } = await import('../redis.js')
-  await publish(CH_CALENDAR_EVENTS, {
+  await enqueueBroadcast(db, CH_CALENDAR_EVENTS, {
     type: 'calendar.changed',
     companyId: args.companyId,
     kind: args.kind,
@@ -4545,17 +4567,19 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
         }
       }
       const id = `ce-${randomUUID()}`
-      await pool.query(
-        `INSERT INTO calendar_events
-           (id, company_id, created_by, kind, title, assignee_id,
-            target_conversation_id, agent_prompt, start_at, recurrence,
-            reminder_minutes_before, reminder_channel, status, is_private)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,'active',$13)`,
-        [id, companyId, me, kind, title, assigneeId, targetConvo, agentPrompt, start,
-         recurrence ? JSON.stringify(recurrence) : null,
-         reminderMinutes, reminderChannel, isPrivate],
-      )
-      await publishCalendarCli({ companyId, kind: 'event.created', eventId: id, actorId: me })
+      await withOutboxTransaction(async (client) => {
+        await client.query(
+          `INSERT INTO calendar_events
+             (id, company_id, created_by, kind, title, assignee_id,
+              target_conversation_id, agent_prompt, start_at, recurrence,
+              reminder_minutes_before, reminder_channel, status, is_private)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12,'active',$13)`,
+          [id, companyId, me, kind, title, assigneeId, targetConvo, agentPrompt, start,
+           recurrence ? JSON.stringify(recurrence) : null,
+           reminderMinutes, reminderChannel, isPrivate],
+        )
+        await enqueueCalendarCli(client, { companyId, kind: 'event.created', eventId: id, actorId: me })
+      })
       return ok(`scheduled ${id}: "${title}" at ${start.toISOString()}${recurrence ? ` · every ${recurrence.interval} ${recurrence.freq}` : ''}${assigneeId ? ` → @${assigneeId}` : ''}${reminderMinutes != null ? ` · remind ${reminderMinutes}m before (${reminderChannel})` : ''}${isPrivate ? ' · 🔒 private' : ''}`, [{
         event: 'calendar.event_created',
         command: 'calendar create',
@@ -4684,18 +4708,23 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     if (sets.length === 0) return err('nothing to update — pass at least one calendar field flag')
     sets.push('updated_at = NOW()')
     params.push(id, companyId)
-    const { rows } = await pool.query<{
-      id: string; title: string; kind: string; status: string;
-      assignee_id: string | null; target_conversation_id: string | null; start_at: Date
-    }>(
-      `UPDATE calendar_events SET ${sets.join(', ')}
-        WHERE id = $${params.length - 1} AND company_id = $${params.length}
-        RETURNING id, title, kind, status, assignee_id, target_conversation_id, start_at`,
-      params,
-    )
+    const rows = await withOutboxTransaction(async (client) => {
+      const updated = await client.query<{
+        id: string; title: string; kind: string; status: string;
+        assignee_id: string | null; target_conversation_id: string | null; start_at: Date
+      }>(
+        `UPDATE calendar_events SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND company_id = $${params.length}
+          RETURNING id, title, kind, status, assignee_id, target_conversation_id, start_at`,
+        params,
+      )
+      if (updated.rows[0]) {
+        await enqueueCalendarCli(client, { companyId, kind: 'event.updated', eventId: id, actorId: me })
+      }
+      return updated.rows
+    })
     const row = rows[0]
     if (!row) return err(`no event ${id}`)
-    await publishCalendarCli({ companyId, kind: 'event.updated', eventId: id, actorId: me })
     return ok(`updated ${id}: "${row.title}" at ${row.start_at.toISOString()} (${row.status})`, [{
       event: 'calendar.event_updated',
       command: `calendar ${op}`,
@@ -4730,7 +4759,10 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     if (!rows[0]) return err(`no event ${id}`)
     const { dispatchEvent } = await import('../calendar.js')
     const result = await dispatchEvent(rows[0] as import('../calendar.js').CalendarEventRow, new Date())
-    await publishCalendarCli({ companyId, kind: 'event.dispatched', eventId: id, actorId: me })
+    await withOutboxTransaction((client) => enqueueCalendarCli(
+      client,
+      { companyId, kind: 'event.dispatched', eventId: id, actorId: me },
+    ))
     return ok(`dispatched ${id}: ${JSON.stringify(result)}`, [{
       event: 'calendar.event_dispatched',
       command: 'calendar run-now',
@@ -4775,24 +4807,29 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
     // to "no event found" regardless of whether the row is missing or
     // privacy-filtered, so we don't leak existence to non-authorized
     // callers.
-    const r = await pool.query(
-      op === 'delete'
-        ? `DELETE FROM calendar_events
-            WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`
-        : `UPDATE calendar_events SET status = 'cancelled', updated_at = NOW()
-            WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`,
-      [id, companyId, me],
-    )
+    const r = await withOutboxTransaction(async (client) => {
+      const changed = await client.query(
+        op === 'delete'
+          ? `DELETE FROM calendar_events
+              WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`
+          : `UPDATE calendar_events SET status = 'cancelled', updated_at = NOW()
+              WHERE id = $1 AND company_id = $2 AND ${cliCalendarVisibilityClause(3)}`,
+        [id, companyId, me],
+      )
+      if ((changed.rowCount ?? 0) > 0) {
+        await enqueueCalendarCli(client, {
+          companyId,
+          kind: op === 'delete' ? 'event.deleted' : 'event.updated',
+          eventId: id,
+          actorId: me,
+        })
+      }
+      return changed
+    })
     if ((r.rowCount ?? 0) === 0) return err(`no event ${id}`)
     // `cancel` flips status → updated; `delete` drops the row → deleted.
     // Clients listening on calendar.changed will refetch (or drop the row
     // from local state) accordingly.
-    await publishCalendarCli({
-      companyId,
-      kind: op === 'delete' ? 'event.deleted' : 'event.updated',
-      eventId: id,
-      actorId: me,
-    })
     return ok(`${op === 'delete' ? 'deleted' : 'cancelled'} ${id}`, [{
       event: op === 'delete' ? 'calendar.event_deleted' : 'calendar.event_cancelled',
       command: `calendar ${op}`,
@@ -4810,7 +4847,7 @@ async function cmdCalendar(parsed: ParsedArgs): Promise<CliResult> {
  *
  * Same shape as the rest of this file: the agent operates as `me` (the
  * --as participant) inside that participant's tenant. All inserts /
- * updates publish on the `boards` channel so the desktop client + every
+ * updates enqueue on the `boards` channel so the desktop client + every
  * other connected member sees the change in real time. */
 
 type KanbanMentionTarget = { id: string; name: string }
@@ -4869,7 +4906,7 @@ async function cliParseMentions(companyId: string, text: string): Promise<string
   return cliParseMentionTargets(text, rows)
 }
 
-async function publishBoardCli(args: {
+async function enqueueBoardCli(db: PoolClient, args: {
   companyId: string
   kind:
     | 'board.created' | 'board.updated' | 'board.deleted'
@@ -4883,8 +4920,7 @@ async function publishBoardCli(args: {
   mentions?: string[]
   actorId: string
 }): Promise<void> {
-  const { CH_BOARDS, publish } = await import('../redis.js')
-  await publish(CH_BOARDS, {
+  await enqueueBroadcast(db, CH_BOARDS, {
     type: 'board.changed',
     companyId: args.companyId,
     kind: args.kind,
@@ -4974,9 +5010,7 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     const description = typeof parsed.flags.description === 'string'
       ? unescapeChat(parsed.flags.description).slice(0, 4000) : null
     const id = `board-${randomUUID().slice(0, 12)}`
-    const client = await pool.connect()
-    try {
-      await client.query('BEGIN')
+    await withOutboxTransaction(async (client) => {
       await client.query(
         `INSERT INTO boards (id, company_id, title, description, created_by) VALUES ($1, $2, $3, $4, $5)`,
         [id, companyId, title.slice(0, 200), description, me],
@@ -4990,14 +5024,8 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
           [`col-${randomUUID().slice(0, 12)}`, id, seeds[i][0], (i + 1) * 1000, seeds[i][1]],
         )
       }
-      await client.query('COMMIT')
-    } catch (e) {
-      await client.query('ROLLBACK').catch(() => { /* swallow */ })
-      throw e
-    } finally {
-      client.release()
-    }
-    await publishBoardCli({ companyId, kind: 'board.created', boardId: id, actorId: me })
+      await enqueueBoardCli(client, { companyId, kind: 'board.created', boardId: id, actorId: me })
+    })
     return ok(`created board ${id}: ${title}`, [{
       event: 'kanban.board_created',
       command: 'kanban create',
@@ -5034,14 +5062,19 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }
     if (sets.length === 0) return err('nothing to update — pass --title or --description')
     params.push(boardId, companyId)
-    const { rows } = await pool.query<{ title: string; description: string | null }>(
-      `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW()
-        WHERE id = $${params.length - 1} AND company_id = $${params.length}
-        RETURNING title, description`,
-      params,
-    )
+    const rows = await withOutboxTransaction(async (client) => {
+      const updated = await client.query<{ title: string; description: string | null }>(
+        `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW()
+          WHERE id = $${params.length - 1} AND company_id = $${params.length}
+          RETURNING title, description`,
+        params,
+      )
+      if (updated.rows[0]) {
+        await enqueueBoardCli(client, { companyId, kind: 'board.updated', boardId, actorId: me })
+      }
+      return updated.rows
+    })
     if (rows.length === 0) return err(`board ${boardId} not found`)
-    await publishBoardCli({ companyId, kind: 'board.updated', boardId, actorId: me })
     return ok(`updated board ${boardId}: ${rows[0].title}`, [{
       event: 'kanban.board_updated',
       command: `kanban ${op}`,
@@ -5082,11 +5115,13 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     )
     const position = (Number(posRows[0]?.max ?? 0)) + 1000
     const id = `col-${randomUUID().slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-      [id, boardId, title.slice(0, 100), position],
-    )
-    await publishBoardCli({ companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
+        [id, boardId, title.slice(0, 100), position],
+      )
+      await enqueueBoardCli(client, { companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+    })
     return ok(`added column ${id}: ${title}`, [{
       event: 'kanban.column_created',
       command: 'kanban add-column',
@@ -5126,14 +5161,19 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }
     if (sets.length === 0) return err('nothing to update — pass --title or --position')
     params.push(columnId, boardId)
-    const { rows } = await pool.query<{ title: string; position: number }>(
-      `UPDATE board_columns SET ${sets.join(', ')}
-        WHERE id = $${params.length - 1} AND board_id = $${params.length}
-        RETURNING title, position`,
-      params,
-    )
+    const rows = await withOutboxTransaction(async (client) => {
+      const updated = await client.query<{ title: string; position: number }>(
+        `UPDATE board_columns SET ${sets.join(', ')}
+          WHERE id = $${params.length - 1} AND board_id = $${params.length}
+          RETURNING title, position`,
+        params,
+      )
+      if (updated.rows[0]) {
+        await enqueueBoardCli(client, { companyId, kind: 'column.updated', boardId, columnId, actorId: me })
+      }
+      return updated.rows
+    })
     if (rows.length === 0) return err(`column ${columnId} not in board ${boardId}`)
-    await publishBoardCli({ companyId, kind: 'column.updated', boardId, columnId, actorId: me })
     return ok(`updated column ${columnId}: ${rows[0].title}`, [{
       event: 'kanban.column_updated',
       command: `kanban ${op}`,
@@ -5156,12 +5196,17 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
       [boardId],
     )
     if (b.rows.length === 0 || b.rows[0].company_id !== companyId) return err(`board ${boardId} not found`)
-    const r = await pool.query(
-      `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
-      [columnId, boardId],
-    )
+    const r = await withOutboxTransaction(async (client) => {
+      const deleted = await client.query(
+        `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
+        [columnId, boardId],
+      )
+      if ((deleted.rowCount ?? 0) > 0) {
+        await enqueueBoardCli(client, { companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
+      }
+      return deleted
+    })
     if ((r.rowCount ?? 0) === 0) return err(`column ${columnId} not in board ${boardId}`)
-    await publishBoardCli({ companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
     return ok(`deleted column ${columnId}`, [{
       event: 'kanban.column_deleted',
       command: `kanban ${op}`,
@@ -5176,12 +5221,17 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
   if (op === 'delete' || op === 'rm') {
     const boardId = parsed.positional[1]
     if (!boardId) return err('usage: kanban delete <board_id>')
-    const r = await pool.query(
-      `DELETE FROM boards WHERE id = $1 AND company_id = $2`,
-      [boardId, companyId],
-    )
+    const r = await withOutboxTransaction(async (client) => {
+      const deleted = await client.query(
+        `DELETE FROM boards WHERE id = $1 AND company_id = $2`,
+        [boardId, companyId],
+      )
+      if ((deleted.rowCount ?? 0) > 0) {
+        await enqueueBoardCli(client, { companyId, kind: 'board.deleted', boardId, actorId: me })
+      }
+      return deleted
+    })
     if ((r.rowCount ?? 0) === 0) return err(`board ${boardId} not found`)
-    await publishBoardCli({ companyId, kind: 'board.deleted', boardId, actorId: me })
     return ok(`deleted board ${boardId}`, [{
       event: 'kanban.board_deleted',
       command: 'kanban delete',
@@ -5425,15 +5475,17 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const position = (Number(posRows[0]?.max ?? 0)) + 1000
     const mentions = await cliParseMentions(companyId, `${title}\n${description ?? ''}`)
     const id = `card-${randomUUID().slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO board_cards
-         (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
-      [id, boardId, columnId, title.slice(0, 200), description, position, assignee, JSON.stringify(mentions), me],
-    )
-    await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-    await publishBoardCli({
-      companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO board_cards
+           (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
+        [id, boardId, columnId, title.slice(0, 200), description, position, assignee, JSON.stringify(mentions), me],
+      )
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+      })
     })
     void wakeKanbanAgents({
       companyId, mentions, actorId: me,
@@ -5481,13 +5533,15 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       `SELECT MAX(position) AS max FROM board_cards WHERE column_id = $1`, [toCol],
     )
     const position = (Number(posRows[0]?.max ?? 0)) + 1000
-    await pool.query(
-      `UPDATE board_cards SET column_id = $1, position = $2, updated_at = NOW() WHERE id = $3`,
-      [toCol, position, cardId],
-    )
-    await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
-    await publishBoardCli({
-      companyId, kind: 'card.moved', boardId: home.boardId, cardId, columnId: toCol, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET column_id = $1, position = $2, updated_at = NOW() WHERE id = $3`,
+        [toCol, position, cardId],
+      )
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.moved', boardId: home.boardId, cardId, columnId: toCol, actorId: me,
+      })
     })
     return ok(`moved card ${cardId} → ${toCol}`, [{
       event: 'kanban.card_moved',
@@ -5509,12 +5563,14 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
     const assignee = (!who || who.toLowerCase() === 'null' || who === '-') ? null : who.trim()
-    await pool.query(
-      `UPDATE board_cards SET assignee_id = $1, updated_at = NOW() WHERE id = $2`,
-      [assignee, cardId],
-    )
-    await publishBoardCli({
-      companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET assignee_id = $1, updated_at = NOW() WHERE id = $2`,
+        [assignee, cardId],
+      )
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me,
+      })
     })
     if (assignee && assignee !== me) {
       void wakeKanbanAgents({
@@ -5548,15 +5604,36 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId) return err('usage: card claim <card_id>')
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
-    const claimed = await pool.query<{ id: string }>(
-      `UPDATE board_cards SET assignee_id = $1, updated_at = NOW()
-         WHERE id = $2
-           AND (assignee_id IS NULL OR assignee_id = $1
-                OR updated_at < NOW() - INTERVAL '20 minutes')
-       RETURNING id`,
-      [me, cardId],
-    )
-    if ((claimed.rowCount ?? 0) === 0) {
+    const claim = await withOutboxTransaction(async (client) => {
+      const claimed = await client.query<{ id: string }>(
+        `UPDATE board_cards SET assignee_id = $1, updated_at = NOW()
+           WHERE id = $2
+             AND (assignee_id IS NULL OR assignee_id = $1
+                  OR updated_at < NOW() - INTERVAL '20 minutes')
+         RETURNING id`,
+        [me, cardId],
+      )
+      if ((claimed.rowCount ?? 0) === 0) return { claimed: false, advanceTo: null as string | null }
+      const cols = await client.query<{ id: string; position: number; kind: string | null }>(
+        `SELECT id, position, kind FROM board_columns WHERE board_id = $1`, [home.boardId],
+      )
+      const advanceTo = claimTargetColumn({ columns: cols.rows, currentColumnId: home.columnId })
+      if (advanceTo) {
+        await client.query(
+          `UPDATE board_cards SET column_id = $1, updated_at = NOW() WHERE id = $2`,
+          [advanceTo, cardId],
+        )
+      }
+      await enqueueBoardCli(client, {
+        companyId,
+        kind: advanceTo ? 'card.moved' : 'card.updated',
+        boardId: home.boardId,
+        cardId,
+        actorId: me,
+      })
+      return { claimed: true, advanceTo }
+    })
+    if (!claim.claimed) {
       const cur = await pool.query<{ assignee_id: string | null }>(
         `SELECT assignee_id FROM board_cards WHERE id = $1 LIMIT 1`, [cardId],
       )
@@ -5568,17 +5645,7 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     // board could read Todo 2 / Doing 1 / Done 0 while the work was finished and
     // delivered in chat (#69). Only ever forward, and only on a board whose
     // columns declare what they mean; see claimTargetColumn.
-    const cols = await pool.query<{ id: string; position: number; kind: string | null }>(
-      `SELECT id, position, kind FROM board_columns WHERE board_id = $1`, [home.boardId],
-    )
-    const advanceTo = claimTargetColumn({ columns: cols.rows, currentColumnId: home.columnId })
-    if (advanceTo) {
-      await pool.query(
-        `UPDATE board_cards SET column_id = $1, updated_at = NOW() WHERE id = $2`,
-        [advanceTo, cardId],
-      )
-    }
-    await publishBoardCli({ companyId, kind: advanceTo ? 'card.moved' : 'card.updated', boardId: home.boardId, cardId, actorId: me })
+    const advanceTo = claim.advanceTo
     return ok(`claimed card ${cardId} — it's yours${advanceTo ? ' and moved to Doing' : ''}. Do the work, post progress with \`card comment\`, move it with \`card move\`, and release with \`card assign ${cardId} null\` (or move to a done column) when finished.`, [{
       event: 'kanban.card_claimed',
       command: 'card claim',
@@ -5615,12 +5682,14 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const mentions = await cliParseMentions(companyId, `${nextTitle}\n${nextDesc ?? ''}`)
     params.push(JSON.stringify(mentions)); sets.push(`mentions = $${params.length}::jsonb`)
     params.push(cardId)
-    await pool.query(
-      `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
-      params,
-    )
-    await publishBoardCli({
-      companyId, kind: 'card.updated', boardId: home.boardId, cardId, mentions, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
+        params,
+      )
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.updated', boardId: home.boardId, cardId, mentions, actorId: me,
+      })
     })
     void wakeKanbanAgents({
       companyId, mentions, actorId: me,
@@ -5651,15 +5720,17 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!home) return err(`card ${cardId} not found`)
     const mentions = await cliParseMentions(companyId, body)
     const id = `cmt-${randomUUID().slice(0, 12)}`
-    await pool.query(
-      `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
-       VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [id, cardId, me, body.slice(0, 8000), JSON.stringify(mentions)],
-    )
-    await pool.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
-    await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
-    await publishBoardCli({
-      companyId, kind: 'comment.created', boardId: home.boardId, cardId, commentId: id, mentions, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
+         VALUES ($1, $2, $3, $4, $5::jsonb)`,
+        [id, cardId, me, body.slice(0, 8000), JSON.stringify(mentions)],
+      )
+      await client.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'comment.created', boardId: home.boardId, cardId, commentId: id, mentions, actorId: me,
+      })
     })
     void wakeKanbanAgents({
       companyId, mentions, actorId: me,
@@ -5687,15 +5758,20 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId || !commentId) return err(`usage: card ${op} <card_id> <comment_id>`)
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
-    const r = await pool.query(
-      `DELETE FROM board_card_comments
-        WHERE id = $1 AND card_id = $2 AND author_id = $3`,
-      [commentId, cardId, me],
-    )
-    if ((r.rowCount ?? 0) === 0) return err(`comment ${commentId} not found or not authored by ${me}`)
-    await publishBoardCli({
-      companyId, kind: 'comment.deleted', boardId: home.boardId, cardId, commentId, actorId: me,
+    const r = await withOutboxTransaction(async (client) => {
+      const deleted = await client.query(
+        `DELETE FROM board_card_comments
+          WHERE id = $1 AND card_id = $2 AND author_id = $3`,
+        [commentId, cardId, me],
+      )
+      if ((deleted.rowCount ?? 0) > 0) {
+        await enqueueBoardCli(client, {
+          companyId, kind: 'comment.deleted', boardId: home.boardId, cardId, commentId, actorId: me,
+        })
+      }
+      return deleted
     })
+    if ((r.rowCount ?? 0) === 0) return err(`comment ${commentId} not found or not authored by ${me}`)
     return ok(`deleted comment ${commentId}`, [{
       event: 'kanban.comment_deleted',
       command: `card ${op}`,
@@ -5713,9 +5789,11 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId) return err('usage: card delete <card_id>')
     const home = await resolveCardBoard(cardId)
     if (!home) return err(`card ${cardId} not found`)
-    await pool.query(`DELETE FROM board_cards WHERE id = $1`, [cardId])
-    await publishBoardCli({
-      companyId, kind: 'card.deleted', boardId: home.boardId, cardId, actorId: me,
+    await withOutboxTransaction(async (client) => {
+      await client.query(`DELETE FROM board_cards WHERE id = $1`, [cardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.deleted', boardId: home.boardId, cardId, actorId: me,
+      })
     })
     return ok(`deleted card ${cardId}`, [{
       event: 'kanban.card_deleted',
@@ -5783,21 +5861,19 @@ function buildToolArgs(toolName: string, parsed: ParsedArgs): { argsJson: string
  * happens automatically — the human's editor sees the agent's cursor
  * + insertion live, as if a remote teammate just typed it.
  */
-async function publishDocChanged(
+async function enqueueDocChanged(
+  db: PoolClient,
   companyId: string,
   documentId: string,
   kind: 'document.created' | 'document.updated' | 'document.deleted',
   actorId: string,
 ): Promise<void> {
-  const { CH_DOCS, publish } = await import('../redis.js')
-  await publish(CH_DOCS, {
+  await enqueueBroadcast(db, CH_DOCS, {
     type: 'doc.changed',
     kind,
     companyId,
     documentId,
     actorId,
-  }).catch((error) => {
-    console.warn(`[doc] durable ${kind} for ${documentId} committed but publish failed`, error)
   })
 }
 
@@ -5806,10 +5882,6 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
   const me = resolveAs(parsed)
   const companyId = await agentCompany(me)
   if (!companyId) return err(`unknown agent ${me} (no company)`)
-  const pendingChanges: Array<{
-    kind: 'document.created' | 'document.updated' | 'document.deleted'
-    documentId: string
-  }> = []
   const finalizers: Array<() => Promise<void>> = []
   let locked: CliResult | null
   try {
@@ -5823,7 +5895,7 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
         me,
         companyId,
         client,
-        (kind, documentId) => pendingChanges.push({ kind, documentId }),
+        (kind, documentId) => enqueueDocChanged(client, companyId, documentId, kind, me),
         (finalizer) => finalizers.push(finalizer),
       ),
     })
@@ -5835,12 +5907,6 @@ async function cmdDoc(parsed: ParsedArgs): Promise<CliResult> {
     }
   }
   if (!locked) return err(`agent ${me} is no longer active in ${companyId}`)
-  // `withActiveParticipantLock` commits before returning. Publish only now so
-  // subscribers that immediately reload never observe pre-commit state, and a
-  // failed transaction cannot emit a ghost document event.
-  for (const change of pendingChanges) {
-    await publishDocChanged(companyId, change.documentId, change.kind, me)
-  }
   return locked
 }
 
@@ -5853,10 +5919,9 @@ async function cmdDocAsActiveAgent(
   onChanged: (
     kind: 'document.created' | 'document.updated' | 'document.deleted',
     documentId: string,
-  ) => void,
+  ) => Promise<void>,
   onFinally: (finalizer: () => Promise<void>) => void,
 ): Promise<CliResult> {
-
   if (op === 'ls' || op === 'list') {
     const { rows } = await dbClient.query<{
       id: string; title: string; created_by: string; updated_at: Date
@@ -5938,7 +6003,7 @@ async function cmdDocAsActiveAgent(
         const { applyAgentEdit } = await import('../documents/rooms.js')
         await applyAgentEdit(id, companyId, me, [{ kind: 'append', text: body }], dbClient)
       }
-      onChanged('document.created', id)
+      await onChanged('document.created', id)
       return ok(`created document ${id}: ${title}`, [{
         event: 'document.created',
         command: 'doc create',
@@ -5980,7 +6045,7 @@ async function cmdDocAsActiveAgent(
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
     await applyAgentEdit(docId, companyId, me, [{ kind: 'append', text }], dbClient)
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
     return ok(`appended ${text.length} chars to ${docId}`, [{
       event: 'document.updated',
       command: 'doc append',
@@ -6004,7 +6069,7 @@ async function cmdDocAsActiveAgent(
     if (rows.length === 0 || rows[0].company_id !== companyId) return err(`document ${docId} not found`)
     const { applyAgentEdit } = await import('../documents/rooms.js')
     await applyAgentEdit(docId, companyId, me, [{ kind: 'insertParagraph', at: 'start', text }], dbClient)
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
     return ok(`prepended ${text.length} chars to ${docId}`, [{
       event: 'document.updated',
       command: 'doc prepend',
@@ -6077,7 +6142,7 @@ async function cmdDocAsActiveAgent(
       const snippet = placement.anchorText.slice(0, 60)
       return err(`anchor not found in ${docId}: "${snippet}". Re-read the doc and pick a snippet that uniquely identifies the target block — no image was inserted.`)
     }
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
 
     let where: string
     if (isAnchoredImagePlacement(placement)) {
@@ -6125,7 +6190,7 @@ async function cmdDocAsActiveAgent(
     if (result.imagesDeleted === 0) {
       return err(`no images in ${docId} matched the criterion`)
     }
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
     return ok(`deleted ${result.imagesDeleted} image${result.imagesDeleted === 1 ? '' : 's'} from ${docId}`, [{
       event: 'document.updated',
       command: 'doc image-delete',
@@ -6150,7 +6215,7 @@ async function cmdDocAsActiveAgent(
     const { applyAgentEdit } = await import('../documents/rooms.js')
     const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replace', find, replace }], dbClient)
     if (r.replaced === 0) return err(`text not found in ${docId}: ${JSON.stringify(find).slice(0, 80)}`)
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
     return ok(`replaced ${r.replaced} occurrence in ${docId}`, [{
       event: 'document.updated',
       command: 'doc replace',
@@ -6176,7 +6241,7 @@ async function cmdDocAsActiveAgent(
     const { applyAgentEdit } = await import('../documents/rooms.js')
     const r = await applyAgentEdit(docId, companyId, me, [{ kind: 'replaceBlock', anchorText: anchor, text }], dbClient)
     if (r.blocksReplaced === 0) return err(`no block containing ${JSON.stringify(anchor).slice(0, 80)} in ${docId}`)
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
     return ok(`replaced 1 block in ${docId}`, [{
       event: 'document.updated',
       command: 'doc replace-block',
@@ -6199,7 +6264,7 @@ async function cmdDocAsActiveAgent(
       [title.slice(0, 200), docId, companyId],
     )
     if (!r.rowCount) return err(`document ${docId} not found`)
-    onChanged('document.updated', docId)
+    await onChanged('document.updated', docId)
     return ok(`renamed ${docId} to "${title}"`, [{
       event: 'document.updated',
       command: 'doc rename',
@@ -6222,7 +6287,7 @@ async function cmdDocAsActiveAgent(
     if (rows.length === 0) return err(`document ${docId} not found`)
     if (rows[0].created_by !== me) return err(`only the creator can delete document ${docId}`)
     await dbClient.query(`DELETE FROM documents WHERE id = $1`, [docId])
-    onChanged('document.deleted', docId)
+    await onChanged('document.deleted', docId)
     return ok(`deleted document ${docId}`, [{
       event: 'document.deleted',
       command: 'doc delete',

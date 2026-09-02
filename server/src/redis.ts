@@ -69,7 +69,11 @@ export const CH_CALENDAR_EVENTS = 'cumora:calendar.events'
  * memberships. Events without `companyId` are treated as conservatively
  * routable (skipped) — keep the field populated at every publish site.
  */
-interface TenantTagged { companyId?: string }
+interface TenantTagged {
+  companyId?: string
+  /** Stable transactional-outbox delivery id. Redis delivery is at-least-once. */
+  deliveryId?: string
+}
 
 export interface MessageNewEvent extends TenantTagged {
   type: 'message.new'

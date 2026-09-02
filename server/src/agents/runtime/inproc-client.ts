@@ -18,6 +18,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../../db/pool.js'
 import { CH_MESSAGE_NEW, CH_TYPING, publish, redis } from '../../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../../realtime-outbox.js'
 import { notifyAlert } from '../../alerting.js'
 import { freshenAttachmentUrl, type StoredAttachment } from '../../storage.js'
 
@@ -720,7 +721,22 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
         [messageId, args.conversationId, args.agentId, body, sequence, companyId, clientId],
       )
       await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [args.conversationId])
+      await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+        type: 'message.new',
+        conversationId: args.conversationId,
+        companyId,
+        message: {
+          id: messageId,
+          conversationId: args.conversationId,
+          authorId: args.agentId,
+          kind: 'system',
+          body,
+          sequence,
+          at: new Date().toISOString(),
+        },
+      })
       await client.query('COMMIT')
+      nudgeRealtimeOutbox()
       posted = true
     } catch (error) {
       await client.query('ROLLBACK').catch(() => {})
@@ -729,18 +745,6 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
       client.release()
     }
 
-    await publish(CH_MESSAGE_NEW, {
-      type: 'message.new',
-      conversationId: args.conversationId,
-      companyId,
-      message: {
-        id: messageId, conversationId: args.conversationId, authorId: args.agentId,
-        kind: 'system', body, sequence,
-        at: new Date().toISOString(),
-      },
-    }).catch((error) => {
-      console.warn(`[runtime] durable notice ${messageId} committed but publish failed`, error)
-    })
     return { posted, authorized: true }
   }
 

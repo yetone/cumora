@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { api, ws, type CalendarEventInput } from '@/api/client'
 import type { CalendarEvent, CalendarEventStatus } from '@/types'
+import { pendingCreateRequestId } from '@/lib/create-idempotency'
 
 interface CalendarState {
   events: CalendarEvent[]
@@ -90,7 +91,9 @@ export const useCalendar = create<CalendarState>((set, get) => ({
   },
 
   async create(input) {
-    const { event } = await api.createCalendarEvent(input)
+    const retry = pendingCreateRequestId('calendar-event', input)
+    const { event } = await api.createCalendarEvent({ ...input, requestId: retry.requestId })
+    retry.complete()
     set((s) => ({ events: replaceOrInsert(s.events, event) }))
     return event
   },

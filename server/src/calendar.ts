@@ -17,7 +17,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
-import { CH_MESSAGE_NEW, CH_CALENDAR_REMINDER, publish } from './redis.js'
+import { CH_MESSAGE_NEW, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, publish } from './redis.js'
+import { enqueueBroadcast, withOutboxTransaction } from './realtime-outbox.js'
 import { env } from './env.js'
 import { formatAddress, sendViaProvider, mintMessageId } from './email.js'
 // The pure half lives apart so it can be tested without a database, Redis or an
@@ -121,39 +122,41 @@ async function postDispatchMessage(args: {
   body: string
 }): Promise<string> {
   const { event, conversationId, body } = args
-  const seqResult = await pool.query<{ seq: number }>(
-    `INSERT INTO conversation_counters (conversation_id, next_sequence)
-     VALUES ($1, 2)
-     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-     RETURNING next_sequence - 1 AS seq`,
-    [conversationId],
-  )
-  const sequence = seqResult.rows[0]?.seq ?? 1
-  const messageId = `m-${randomUUID()}`
-  // Author: Calendar itself. The creator is preserved in the payload, but the
-  // agent should read this as a scheduled Calendar event, not as the creator
-  // manually sending a generic system row.
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-     VALUES ($1,$2,$3,'system',$4,$5,$6)`,
-    [messageId, conversationId, CALENDAR_SYSTEM_AUTHOR_ID, body, sequence, event.company_id],
-  )
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId,
-    companyId: event.company_id,
-    message: {
-      id: messageId,
+  return withOutboxTransaction(async (client) => {
+    const seqResult = await client.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+       RETURNING next_sequence - 1 AS seq`,
+      [conversationId],
+    )
+    const sequence = seqResult.rows[0]?.seq ?? 1
+    const messageId = `m-${randomUUID()}`
+    // Author: Calendar itself. The creator is preserved in the payload, but the
+    // agent should read this as a scheduled Calendar event, not as the creator
+    // manually sending a generic system row.
+    await client.query(
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+       VALUES ($1,$2,$3,'system',$4,$5,$6)`,
+      [messageId, conversationId, CALENDAR_SYSTEM_AUTHOR_ID, body, sequence, event.company_id],
+    )
+    await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
+    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+      type: 'message.new',
       conversationId,
-      authorId: CALENDAR_SYSTEM_AUTHOR_ID,
-      kind: 'system',
-      body,
-      sequence,
-      at: new Date().toISOString(),
-    },
+      companyId: event.company_id,
+      message: {
+        id: messageId,
+        conversationId,
+        authorId: CALENDAR_SYSTEM_AUTHOR_ID,
+        kind: 'system',
+        body,
+        sequence,
+        at: new Date().toISOString(),
+      },
+    })
+    return messageId
   })
-  return messageId
 }
 
 /** Dispatch a single event's occurrence. Inserts the dispatch row first
@@ -418,8 +421,10 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
       : row.start_at
     const slot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, after)
     if (!slot) {
-      await pool.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
-      void publishCalendarChanged(row.company_id, 'event.updated', row.id)
+      await withOutboxTransaction(async (client) => {
+        await client.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
+        await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+      })
       continue
     }
 
@@ -438,52 +443,52 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
     if (slot.getTime() > now.getTime()) continue           // not yet
     const lag = now.getTime() - slot.getTime()
     if (lag > MAX_CATCHUP_MS) {
-      await pool.query(
-        `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
-        [row.id, slot],
-      )
+      await withOutboxTransaction(async (client) => {
+        await client.query(
+          `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
+          [row.id, slot],
+        )
+        await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+      })
       continue
     }
     const result = await dispatchEvent(row, slot)
     if (result.status === 'dispatched' || result.status === 'skipped' || result.status === 'failed') {
-      await pool.query(
-        `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
-        [row.id, slot],
-      )
+      await withOutboxTransaction(async (client) => {
+        await client.query(
+          `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
+          [row.id, slot],
+        )
+        if (!row.recurrence) {
+          await client.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
+        }
+        await enqueueCalendarChanged(
+          client,
+          row.company_id,
+          result.status === 'dispatched' ? 'event.dispatched' : 'event.updated',
+          row.id,
+        )
+      })
       if (result.status === 'dispatched') fired += 1
-      if (!row.recurrence) {
-        await pool.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
-      }
-      void publishCalendarChanged(
-        row.company_id,
-        result.status === 'dispatched' ? 'event.dispatched' : 'event.updated',
-        row.id,
-      )
     }
   }
   return { scanned: rows.length, fired, reminded }
 }
 
-/** Tick-driven WS broadcast for a calendar row. Best-effort — never let a
- *  publish failure abort the scheduler loop. Mirrors `publishCalendarChange`
- *  on the REST side and `publishCalendarCli` on the CLI side. */
-async function publishCalendarChanged(
+/** Queue the tick-driven invalidation in the calendar mutation transaction. */
+async function enqueueCalendarChanged(
+  client: import('pg').PoolClient,
   companyId: string,
   kind: 'event.updated' | 'event.dispatched',
   eventId: string,
 ): Promise<void> {
-  try {
-    const { CH_CALENDAR_EVENTS, publish } = await import('./redis.js')
-    await publish(CH_CALENDAR_EVENTS, {
-      type: 'calendar.changed',
-      companyId,
-      kind,
-      eventId,
-      actorId: null,
-    })
-  } catch (e) {
-    console.warn('[calendar] publish failed', e instanceof Error ? e.message : e)
-  }
+  await enqueueBroadcast(client, CH_CALENDAR_EVENTS, {
+    type: 'calendar.changed',
+    companyId,
+    kind,
+    eventId,
+    actorId: null,
+  })
 }
 
 let started = false

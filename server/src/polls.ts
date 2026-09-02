@@ -17,7 +17,12 @@
  */
 import { randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
-import { CH_MESSAGE_NEW, CH_POLLS, publish, type PollUpdatedEvent } from './redis.js'
+import { CH_MESSAGE_NEW, CH_POLLS, type PollUpdatedEvent } from './redis.js'
+import {
+  enqueueBroadcast,
+  nudgeRealtimeOutbox,
+  type Queryable,
+} from './realtime-outbox.js'
 import type { PollPayload, PollOption } from './db/schema.js'
 
 const MAX_OPTIONS = 10
@@ -140,42 +145,30 @@ export async function createPoll(input: CreatePollInput): Promise<CreatedPoll> {
       `UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND company_id = $2`,
       [input.conversationId, input.companyId],
     )
+    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+      type: 'message.new',
+      conversationId: input.conversationId,
+      companyId: input.companyId,
+      message: {
+        id: messageId,
+        conversationId: input.conversationId,
+        authorId: input.authorId,
+        kind: 'poll',
+        body,
+        sequence,
+        at: new Date().toISOString(),
+        poll: payload,
+        pollTallies: [],
+      },
+    })
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
   } finally {
     client.release()
   }
-
-  // Drop the poll into the message bus exactly like a text message — the
-  // mailbox scheduler wakes member agents, each gets to decide for itself
-  // whether to vote / react / stay silent.
-  //
-  // We MUST carry the structured payload on the broadcast. Without it the
-  // renderer receives a kind='poll' row whose `poll` field is undefined,
-  // the PollBubble bails out, and the new poll renders as a blank slot
-  // until the user switches conversations and re-fetches via GET. Empty
-  // pollTallies pre-seeds the array so the bubble doesn't NaN-divide on
-  // total = 0 either.
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: input.conversationId,
-    companyId: input.companyId,
-    message: {
-      id: messageId,
-      conversationId: input.conversationId,
-      authorId: input.authorId,
-      kind: 'poll',
-      body,
-      sequence,
-      at: new Date().toISOString(),
-      poll: payload,
-      pollTallies: [],
-    },
-  }).catch((error) => {
-    console.warn(`[poll] durable message ${messageId} committed but publish failed`, error)
-  })
 
   return { messageId, sequence, poll: payload }
 }
@@ -242,10 +235,10 @@ export async function castVote(input: CastVoteInput): Promise<PollUpdatedEvent> 
         [input.messageId, input.voterParticipantId, input.voterKind, optId, input.companyId],
       )
     }
+    const event = await buildPollUpdatedEvent(input.messageId, input.voterParticipantId, client)
+    await enqueueBroadcast(client, CH_POLLS, event)
     await client.query('COMMIT')
-
-    const event = await buildPollUpdatedEvent(input.messageId, input.voterParticipantId)
-    await publish(CH_POLLS, event)
+    nudgeRealtimeOutbox()
     return event
   } catch (e) {
     await client.query('ROLLBACK').catch(() => { /* swallow */ })
@@ -318,10 +311,10 @@ export async function closePoll(input: CloseInput): Promise<PollUpdatedEvent | n
       `UPDATE messages SET poll = $2::jsonb WHERE id = $1`,
       [input.messageId, JSON.stringify(closedPoll)],
     )
+    const event = await buildPollUpdatedEvent(input.messageId, input.actorId, client)
+    await enqueueBroadcast(client, CH_POLLS, event)
     await client.query('COMMIT')
-
-    const event = await buildPollUpdatedEvent(input.messageId, input.actorId)
-    await publish(CH_POLLS, event)
+    nudgeRealtimeOutbox()
     return event
   } catch (e) {
     await client.query('ROLLBACK').catch(() => { /* swallow */ })
@@ -333,8 +326,12 @@ export async function closePoll(input: CloseInput): Promise<PollUpdatedEvent | n
 
 /** Build the fan-out payload — full poll snapshot + per-option tally with
  *  voter ids. Renderers patch in place from this event without refetching. */
-async function buildPollUpdatedEvent(messageId: string, actorId: string | null): Promise<PollUpdatedEvent> {
-  const { rows } = await pool.query<{
+async function buildPollUpdatedEvent(
+  messageId: string,
+  actorId: string | null,
+  db: Queryable = pool,
+): Promise<PollUpdatedEvent> {
+  const { rows } = await db.query<{
     conversation_id: string
     company_id: string
     poll: PollPayload | null
@@ -345,7 +342,7 @@ async function buildPollUpdatedEvent(messageId: string, actorId: string | null):
   const row = rows[0]
   if (!row || !row.poll) throw new PollError('poll vanished mid-update', 500)
 
-  const { rows: tallyRows } = await pool.query<{
+  const { rows: tallyRows } = await db.query<{
     option_id: string
     cnt: number
     voter_ids: string[]

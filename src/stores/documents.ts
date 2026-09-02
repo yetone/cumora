@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { api, ws, type ApiDocument } from '@/api/client'
+import { pendingCreateRequestId } from '@/lib/create-idempotency'
 
 interface DocumentsState {
   list: ApiDocument[]
@@ -37,7 +38,13 @@ export const useDocuments = create<DocumentsState>((set, get) => ({
   },
   reset: () => set({ list: [], loaded: false, selectedId: null }),
   create: async (input) => {
-    const doc = await api.createDocument(input ?? {})
+    const normalized = input ?? {}
+    const retry = pendingCreateRequestId('document', {
+      title: normalized.title ?? 'Untitled',
+      conversationId: normalized.conversationId ?? null,
+    })
+    const doc = await api.createDocument({ ...normalized, requestId: retry.requestId })
+    retry.complete()
     set((s) => ({ list: [doc, ...s.list.filter((d) => d.id !== doc.id)], selectedId: doc.id }))
     return doc
   },

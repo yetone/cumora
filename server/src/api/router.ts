@@ -5,7 +5,8 @@ import {
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
 } from '../storage.js'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, publish } from '../redis.js'
+import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, publish } from '../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox, withOutboxTransaction } from '../realtime-outbox.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
@@ -42,6 +43,10 @@ import {
 import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
+import {
+  findIdempotentCreate, IdempotencyConflictError,
+  parseRequestId, requestHash,
+} from '../idempotent-create.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -130,6 +135,28 @@ api.use((req, res, next) => {
 
 class HttpError extends Error {
   constructor(public status: number, message: string) { super(message) }
+}
+
+function createRequestId(value: unknown): string | null {
+  try {
+    return parseRequestId(value)
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : 'invalid requestId')
+  }
+}
+
+async function createReplay(
+  client: PoolClient,
+  args: Parameters<typeof findIdempotentCreate>[1],
+): Promise<{ id: string } | null> {
+  try {
+    return await findIdempotentCreate(client, args)
+  } catch (error) {
+    if (error instanceof IdempotencyConflictError) {
+      throw new HttpError(error.status, error.message)
+    }
+    throw error
+  }
 }
 
 /** Throw 401 if the request has no valid session. Returns the user_id. */
@@ -2765,21 +2792,20 @@ export async function generateAndPersistAvatar(args: {
 
   const key = `avatars/avatar-${id}-${randomUUID().slice(0, 8)}.png`
   const url = await storage.put(key, imageBuf, 'image/png')
-  await pool.query(
-    `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
-    [id, url, tenant],
-  )
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
+      [id, url, tenant],
+    )
+    await enqueueBroadcast(client, CH_STATUS, {
+      type: 'participants.avatar',
+      participantId: id,
+      avatarUrl: url,
+      companyId: tenant,
+    })
+  })
   const { invalidatePersonaCache } = await import('../agents/personas.js')
   invalidatePersonaCache(id)
-  // Notify connected clients that this agent's avatar changed so they
-  // can pick it up without waiting for the 60s periodic refresh.
-  const { CH_STATUS, publish } = await import('../redis.js')
-  await publish(CH_STATUS, {
-    type: 'participants.avatar',
-    participantId: id,
-    avatarUrl: url,
-    companyId: tenant,
-  })
   return { url }
 }
 
@@ -2977,13 +3003,13 @@ api.post('/conversations/:id/topic', async (req, res) => {
           WHERE id = $1 AND company_id = $3`,
         [id, topic, tenant],
       )
+      await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+        type: 'conversation.updated',
+        conversationId: id,
+        companyId: tenant,
+        patch: { topic },
+      })
     },
-  })
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: id,
-    companyId: tenant,
-    patch: { topic },
   })
   res.json({ ok: true, topic })
 })
@@ -3006,13 +3032,13 @@ api.post('/conversations/:id/title', async (req, res) => {
           WHERE id = $1 AND company_id = $3`,
         [id, title, tenant],
       )
+      await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+        type: 'conversation.updated',
+        conversationId: id,
+        companyId: tenant,
+        patch: { title },
+      })
     },
-  })
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: id,
-    companyId: tenant,
-    patch: { title },
   })
   res.json({ ok: true, title })
 })
@@ -3688,8 +3714,22 @@ api.post('/conversations/:id/messages', async (req, res) => {
         `UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND company_id = $2`,
         [id, tenant],
       )
+      await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+        type: 'message.new',
+        conversationId: id,
+        companyId: tenant,
+        message: {
+          id: persisted.id, conversationId: id, authorId: me,
+          kind: 'text', body, sequence: persisted.sequence, at: new Date().toISOString(),
+          attachment: attachment ?? undefined,
+          quotedMessageId: resolvedQuotedId ?? undefined,
+          quoted: quotedSummary ?? undefined,
+          clientId: clientId ?? undefined,
+        },
+      })
     }
     await client.query('COMMIT')
+    if (insertedNew) nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -3719,24 +3759,10 @@ api.post('/conversations/:id/messages', async (req, res) => {
     return
   }
 
-  // Drop the message into the bus. The mailbox scheduler (subscribed to
-  // CH_MESSAGE_NEW) wakes every agent member and lets each decide for itself
-  // whether to reply, react, dm, or stay silent. The companyId tag lets
-  // the WS bridge filter who sees it.
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: id,
-    companyId: tenant,
-    message: {
-      id: messageId, conversationId: id, authorId: me,
-      kind: 'text', body, sequence: persistedSequence, at: new Date().toISOString(),
-      attachment: attachment ?? undefined,
-      quotedMessageId: resolvedQuotedId ?? undefined,
-      quoted: quotedSummary ?? undefined,
-      clientId: clientId ?? undefined,
-    },
-  })
-  logDelivery('ws.published')
+  // Redis delivery is handled by the transactional outbox worker. The mailbox
+  // scheduler and WS bridge receive the same payload without participating in
+  // HTTP command completion.
+  logDelivery('ws.enqueued')
 
   // Fan out APNs to recipients who aren't currently looking at the app
   // (NotificationToasts handles those). Fire-and-forget — push delivery
@@ -4436,6 +4462,13 @@ api.post('/messages/:id/reactions', async (req, res) => {
            GROUP BY emoji ORDER BY count DESC, emoji ASC`,
         [id],
       )
+      await enqueueBroadcast(client, CH_REACTIONS, {
+        type: 'message.reactions',
+        conversationId,
+        companyId: tenant,
+        messageId: id,
+        reactions,
+      })
       return { wasRemoval, messageAuthorId: message[0].author_id, reactions }
     },
   })
@@ -4451,20 +4484,6 @@ api.post('/messages/:id/reactions', async (req, res) => {
       note: `received ${emoji} from ${me}`,
     })
   }
-
-  // Aggregate. No server-side `mine` flag: the same row is broadcast over
-  // WS to every client in the tenant, and "is this mine" is per-recipient.
-  // Renderer derives mine = users.includes(meId) — see fromApi /
-  // applyEvent in src/stores/messages.ts.
-  await publish(CH_REACTIONS, {
-    type: 'message.reactions',
-    conversationId,
-    companyId: tenant,
-    messageId: id,
-    reactions: mutation.reactions,
-  }).catch((error) => {
-    console.warn(`[reactions] durable reaction on ${id} committed but publish failed`, error)
-  })
 
   res.json({ reactions: mutation.reactions })
 })
@@ -5167,7 +5186,7 @@ async function requireBoardAccess(req: Request & AuthedRequest, boardId: string)
   return { userId, companyId }
 }
 
-async function publishBoardEvent(args: {
+async function enqueueBoardEvent(db: PoolClient, args: {
   companyId: string
   kind: import('../redis.js').BoardEvent['kind']
   boardId: string
@@ -5177,8 +5196,7 @@ async function publishBoardEvent(args: {
   mentions?: string[]
   actorId?: string
 }): Promise<void> {
-  const { CH_BOARDS, publish } = await import('../redis.js')
-  await publish(CH_BOARDS, {
+  await enqueueBroadcast(db, CH_BOARDS, {
     type: 'board.changed',
     companyId: args.companyId,
     kind: args.kind,
@@ -5297,13 +5315,19 @@ api.post('/boards', async (req, res) => {
   const title = String(req.body?.title ?? '').trim().slice(0, 200)
   const description = String(req.body?.description ?? '').trim().slice(0, 4000) || null
   if (!title) throw new HttpError(400, 'title required')
-  const id = `board-${randomUUID().slice(0, 12)}`
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
+  const requestId = createRequestId(req.body?.requestId)
+  const hash = requestHash({ title, description })
+  const created = await withOutboxTransaction(async (client) => {
+    const replay = await createReplay(client, {
+      domain: 'board', companyId, actorId: me, requestId, requestHash: hash,
+    })
+    if (replay) return { id: replay.id, replayed: true }
+    const id = `board-${randomUUID().slice(0, 12)}`
     await client.query(
-      `INSERT INTO boards (id, company_id, title, description, created_by) VALUES ($1, $2, $3, $4, $5)`,
-      [id, companyId, title, description, me],
+      `INSERT INTO boards
+         (id, company_id, title, description, created_by, creation_request_id, creation_request_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, companyId, title, description, me, requestId, requestId ? hash : null],
     )
     // Seed the MEANING alongside the title — see board-columns.ts. Without it an
     // agent asked to advance a card has to infer which column is "Doing" from
@@ -5315,15 +5339,10 @@ api.post('/boards', async (req, res) => {
         [`col-${randomUUID().slice(0, 12)}`, id, seeds[i][0], (i + 1) * 1000, seeds[i][1]],
       )
     }
-    await client.query('COMMIT')
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => { /* swallow */ })
-    throw e
-  } finally {
-    client.release()
-  }
-  await publishBoardEvent({ companyId, kind: 'board.created', boardId: id, actorId: me })
-  res.json({ id })
+    await enqueueBoardEvent(client, { companyId, kind: 'board.created', boardId: id, actorId: me })
+    return { id, replayed: false }
+  })
+  res.status(created.replayed ? 200 : 201).json(created)
 })
 
 /** GET /boards/:id — full snapshot: board + columns (ordered) + cards
@@ -5407,11 +5426,13 @@ api.patch('/boards/:id', async (req, res) => {
     params.push(v); sets.push(`${k} = $${params.length}`)
   }
   params.push(boardId)
-  await pool.query(
-    `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
-    params,
-  )
-  await publishBoardEvent({ companyId, kind: 'board.updated', boardId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
+      params,
+    )
+    await enqueueBoardEvent(client, { companyId, kind: 'board.updated', boardId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5419,8 +5440,10 @@ api.patch('/boards/:id', async (req, res) => {
 api.delete('/boards/:id', async (req, res) => {
   const boardId = req.params.id
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  await pool.query(`DELETE FROM boards WHERE id = $1`, [boardId])
-  await publishBoardEvent({ companyId, kind: 'board.deleted', boardId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    await client.query(`DELETE FROM boards WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, { companyId, kind: 'board.deleted', boardId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5435,11 +5458,13 @@ api.post('/boards/:id/columns', async (req, res) => {
   )
   const position = (Number(posRows[0]?.max ?? 0)) + 1000
   const id = `col-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-    [id, boardId, title, position],
-  )
-  await publishBoardEvent({ companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
+      [id, boardId, title, position],
+    )
+    await enqueueBoardEvent(client, { companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+  })
   res.json({ id, position })
 })
 
@@ -5458,12 +5483,14 @@ api.patch('/boards/:bid/columns/:cid', async (req, res) => {
   }
   if (sets.length === 0) { res.json({ ok: true }); return }
   params.push(columnId); params.push(boardId)
-  const r = await pool.query(
-    `UPDATE board_columns SET ${sets.join(', ')} WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
-    params,
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({ companyId, kind: 'column.updated', boardId, columnId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `UPDATE board_columns SET ${sets.join(', ')} WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
+      params,
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, { companyId, kind: 'column.updated', boardId, columnId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5472,12 +5499,14 @@ api.delete('/boards/:bid/columns/:cid', async (req, res) => {
   const boardId = req.params.bid
   const columnId = req.params.cid
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  const r = await pool.query(
-    `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
-    [columnId, boardId],
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({ companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
+      [columnId, boardId],
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, { companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5505,15 +5534,17 @@ api.post('/boards/:id/cards', async (req, res) => {
   const position = (Number(posRows[0]?.max ?? 0)) + 1000
   const mentions = await parseMentions(companyId, `${title}\n${description ?? ''}`)
   const id = `card-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO board_cards
-       (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
-    [id, boardId, columnId, title, description, position, assigneeId, JSON.stringify(mentions), me],
-  )
-  await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-  await publishBoardEvent({
-    companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO board_cards
+         (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
+      [id, boardId, columnId, title, description, position, assigneeId, JSON.stringify(mentions), me],
+    )
+    await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, {
+      companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+    })
   })
   void wakeKanbanAgents({
     companyId, mentions, actorId: me,
@@ -5590,16 +5621,18 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
   }
   if (sets.length === 0) { res.json({ ok: true }); return }
   params.push(cardId); params.push(boardId)
-  await pool.query(
-    `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW()
-      WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
-    params,
-  )
-  await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-  await publishBoardEvent({
-    companyId,
-    kind: columnChanged ? 'card.moved' : 'card.updated',
-    boardId, cardId, mentions, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW()
+        WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
+      params,
+    )
+    await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, {
+      companyId,
+      kind: columnChanged ? 'card.moved' : 'card.updated',
+      boardId, cardId, mentions, actorId: me,
+    })
   })
   void wakeKanbanAgents({
     companyId, mentions, actorId: me,
@@ -5629,12 +5662,14 @@ api.delete('/boards/:bid/cards/:cid', async (req, res) => {
   const boardId = req.params.bid
   const cardId = req.params.cid
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  const r = await pool.query(
-    `DELETE FROM board_cards WHERE id = $1 AND board_id = $2`,
-    [cardId, boardId],
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({ companyId, kind: 'card.deleted', boardId, cardId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM board_cards WHERE id = $1 AND board_id = $2`,
+      [cardId, boardId],
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, { companyId, kind: 'card.deleted', boardId, cardId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5679,15 +5714,17 @@ api.post('/boards/:bid/cards/:cid/comments', async (req, res) => {
   if (card.rows.length === 0) throw new HttpError(404, 'not found')
   const mentions = await parseMentions(companyId, body)
   const id = `cmt-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
-     VALUES ($1, $2, $3, $4, $5::jsonb)`,
-    [id, cardId, me, body, JSON.stringify(mentions)],
-  )
-  await pool.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
-  await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-  await publishBoardEvent({
-    companyId, kind: 'comment.created', boardId, cardId, commentId: id, mentions, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [id, cardId, me, body, JSON.stringify(mentions)],
+    )
+    await client.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
+    await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, {
+      companyId, kind: 'comment.created', boardId, cardId, commentId: id, mentions, actorId: me,
+    })
   })
   void wakeKanbanAgents({
     companyId, mentions, actorId: me,
@@ -5706,14 +5743,16 @@ api.delete('/boards/:bid/cards/:cid/comments/:mid', async (req, res) => {
   const cardId = req.params.cid
   const mid = req.params.mid
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  const r = await pool.query(
-    `DELETE FROM board_card_comments
-       WHERE id = $1 AND card_id = $2 AND author_id = $3`,
-    [mid, cardId, me],
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({
-    companyId, kind: 'comment.deleted', boardId, cardId, commentId: mid, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM board_card_comments
+         WHERE id = $1 AND card_id = $2 AND author_id = $3`,
+      [mid, cardId, me],
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, {
+      companyId, kind: 'comment.deleted', boardId, cardId, commentId: mid, actorId: me,
+    })
   })
   res.json({ ok: true })
 })
@@ -5882,23 +5921,19 @@ function calendarVisibilityClause(meIdx: number, companyIdx: number): string {
   )`
 }
 
-/** Fire-and-forget WS broadcast for a calendar row change. Thin payload —
- *  the client refetches the affected row (or the whole list on delete)
- *  rather than receiving inline diffs. Mirrors the doc.changed shape. */
-function publishCalendarChange(args: {
+/** Queue a thin calendar invalidation in the mutation transaction. */
+async function enqueueCalendarChange(db: PoolClient, args: {
   kind: 'event.created' | 'event.updated' | 'event.deleted' | 'event.dispatched'
   eventId: string
   companyId: string
   actorId: string | null
-}): void {
-  void publish(CH_CALENDAR_EVENTS, {
+}): Promise<void> {
+  await enqueueBroadcast(db, CH_CALENDAR_EVENTS, {
     type: 'calendar.changed',
     kind: args.kind,
     eventId: args.eventId,
     companyId: args.companyId,
     actorId: args.actorId,
-  }).catch((e) => {
-    console.warn('[calendar] publish failed', e instanceof Error ? e.message : e)
   })
 }
 
@@ -6002,25 +6037,47 @@ api.post('/calendar/events', async (req, res) => {
     if (!c[0]) throw new HttpError(400, 'targetConversationId not found in this workspace')
   }
 
-  const id = `ce-${randomUUID()}`
-  const { rows } = await pool.query(
-    `INSERT INTO calendar_events
-       (id, company_id, created_by, kind, title, description, assignee_id,
-        target_conversation_id, agent_prompt, start_at, end_at, all_day,
-        recurrence, status, reminder_minutes_before, reminder_channel,
-        is_private)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17)
-     RETURNING ${CALENDAR_SELECT}`,
-    [
-      id, companyId, me, kind, title, description, assigneeId,
-      targetConversationId, agentPrompt, startAt, endAt, allDay,
-      recurrence ? JSON.stringify(recurrence) : null, status,
-      reminderMinutesBefore, reminderChannel,
-      isPrivate,
-    ],
-  )
-  publishCalendarChange({ kind: 'event.created', eventId: id, companyId, actorId: me })
-  res.status(201).json({ event: rowToCalendarEvent(rows[0]) })
+  const requestId = createRequestId(body.requestId)
+  const hash = requestHash({
+    title, kind, description, assigneeId, targetConversationId, agentPrompt,
+    startAt: startAt.toISOString(), endAt: endAt?.toISOString() ?? null,
+    allDay, recurrence, status, reminderMinutesBefore, reminderChannel, isPrivate,
+  })
+  const created = await withOutboxTransaction(async (client) => {
+    const replay = await createReplay(client, {
+      domain: 'calendar-event', companyId, actorId: me, requestId, requestHash: hash,
+    })
+    if (replay) {
+      const existing = await client.query(
+        `SELECT ${CALENDAR_SELECT} FROM calendar_events WHERE id = $1`,
+        [replay.id],
+      )
+      return { rows: existing.rows, replayed: true }
+    }
+    const id = `ce-${randomUUID()}`
+    const inserted = await client.query(
+      `INSERT INTO calendar_events
+         (id, company_id, created_by, kind, title, description, assignee_id,
+          target_conversation_id, agent_prompt, start_at, end_at, all_day,
+          recurrence, status, reminder_minutes_before, reminder_channel,
+          is_private, creation_request_id, creation_request_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17,$18,$19)
+       RETURNING ${CALENDAR_SELECT}`,
+      [
+        id, companyId, me, kind, title, description, assigneeId,
+        targetConversationId, agentPrompt, startAt, endAt, allDay,
+        recurrence ? JSON.stringify(recurrence) : null, status,
+        reminderMinutesBefore, reminderChannel,
+        isPrivate, requestId, requestId ? hash : null,
+      ],
+    )
+    await enqueueCalendarChange(client, { kind: 'event.created', eventId: id, companyId, actorId: me })
+    return { rows: inserted.rows, replayed: false }
+  })
+  res.status(created.replayed ? 200 : 201).json({
+    event: rowToCalendarEvent(created.rows[0]),
+    replayed: created.replayed,
+  })
 })
 
 api.get('/calendar/events/:id', async (req, res) => {
@@ -6138,9 +6195,12 @@ api.patch('/calendar/events/:id', async (req, res) => {
   const sql = `UPDATE calendar_events SET ${sets.join(', ')}
                 WHERE id = $${params.length - 1} AND company_id = $${params.length}
             RETURNING ${CALENDAR_SELECT}`
-  const { rows } = await pool.query(sql, params)
-  if (!rows[0]) throw new HttpError(404, 'event not found')
-  publishCalendarChange({ kind: 'event.updated', eventId: id, companyId, actorId: me })
+  const rows = await withOutboxTransaction(async (client) => {
+    const updated = await client.query(sql, params)
+    if (!updated.rows[0]) throw new HttpError(404, 'event not found')
+    await enqueueCalendarChange(client, { kind: 'event.updated', eventId: id, companyId, actorId: me })
+    return updated.rows
+  })
   res.json({ event: rowToCalendarEvent(rows[0]) })
 })
 
@@ -6150,13 +6210,15 @@ api.delete('/calendar/events/:id', async (req, res) => {
   // The visibility clause is folded into the DELETE so the same caller
   // who can't read the row can't delete it either. rowCount === 0 covers
   // both "no such id" and "privacy filtered" — same 404 on the wire.
-  const r = await pool.query(
-    `DELETE FROM calendar_events
-      WHERE id = $1 AND company_id = $2 AND ${calendarVisibilityClause(3, 2)}`,
-    [id, companyId, me],
-  )
-  if (r.rowCount === 0) throw new HttpError(404, 'event not found')
-  publishCalendarChange({ kind: 'event.deleted', eventId: id, companyId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM calendar_events
+        WHERE id = $1 AND company_id = $2 AND ${calendarVisibilityClause(3, 2)}`,
+      [id, companyId, me],
+    )
+    if (r.rowCount === 0) throw new HttpError(404, 'event not found')
+    await enqueueCalendarChange(client, { kind: 'event.deleted', eventId: id, companyId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -6174,7 +6236,13 @@ api.post('/calendar/events/:id/run-now', async (req, res) => {
   // wide enough to absorb concurrent button-mashing within the same minute.
   const result = await dispatchEvent(rows[0] as import('../calendar.js').CalendarEventRow, new Date())
   // last_fired_at moved + dispatch happened → renderers want to refetch.
-  publishCalendarChange({ kind: 'event.dispatched', eventId: id, companyId, actorId: me })
+  // dispatchEvent owns the durable dispatch transaction. This thin UI
+  // invalidation is queued independently only after dispatch succeeds; the
+  // dispatcher itself also reconciles from PostgreSQL on every tick.
+  await withOutboxTransaction((client) => enqueueCalendarChange(
+    client,
+    { kind: 'event.dispatched', eventId: id, companyId, actorId: me },
+  ))
   res.json(result)
 })
 
@@ -6251,13 +6319,14 @@ function toDocPayload(row: DocumentRow): DocumentPayload {
   }
 }
 
-async function publishDocumentChanged(
+async function enqueueDocumentChanged(
+  db: PoolClient,
   companyId: string,
   documentId: string,
   kind: 'document.created' | 'document.updated' | 'document.deleted',
   actorId: string,
 ): Promise<void> {
-  await publish(CH_DOCS, {
+  await enqueueBroadcast(db, CH_DOCS, {
     type: 'doc.changed',
     kind,
     companyId,
@@ -6281,7 +6350,11 @@ api.get('/documents', safe(async (req, res) => {
 
 api.post('/documents', safe(async (req, res) => {
   const { userId, companyId } = await requireCompany(req)
-  const body = (req.body ?? {}) as { title?: unknown; conversationId?: unknown }
+  const body = (req.body ?? {}) as {
+    title?: unknown
+    conversationId?: unknown
+    requestId?: unknown
+  }
   const title = typeof body.title === 'string' && body.title.trim()
     ? body.title.trim().slice(0, 200)
     : 'Untitled'
@@ -6295,19 +6368,30 @@ api.post('/documents', safe(async (req, res) => {
     if (convRows.length === 0) throw new HttpError(404, 'conversation not found')
     conversationId = body.conversationId
   }
-  const id = `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`
-  await pool.query(
-    `INSERT INTO documents (id, company_id, title, created_by, conversation_id)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [id, companyId, title, userId, conversationId],
-  )
-  const { rows } = await pool.query<DocumentRow>(
-    `SELECT id, company_id, title, created_by, conversation_id, created_at, updated_at
-       FROM documents WHERE id = $1`, [id],
-  )
-  const doc = toDocPayload(rows[0])
-  await publishDocumentChanged(companyId, id, 'document.created', userId)
-  res.status(201).json(doc)
+  const requestId = createRequestId(body.requestId)
+  const hash = requestHash({ title, conversationId })
+  const created = await withOutboxTransaction(async (client) => {
+    const replay = await createReplay(client, {
+      domain: 'document', companyId, actorId: userId, requestId, requestHash: hash,
+    })
+    const id = replay?.id ?? `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+    if (!replay) {
+      await client.query(
+        `INSERT INTO documents
+           (id, company_id, title, created_by, conversation_id, creation_request_id, creation_request_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, companyId, title, userId, conversationId, requestId, requestId ? hash : null],
+      )
+    }
+    const selected = await client.query<DocumentRow>(
+      `SELECT id, company_id, title, created_by, conversation_id, created_at, updated_at
+         FROM documents WHERE id = $1`, [id],
+    )
+    if (!replay) await enqueueDocumentChanged(client, companyId, id, 'document.created', userId)
+    return { rows: selected.rows, replayed: Boolean(replay) }
+  })
+  const doc = toDocPayload(created.rows[0])
+  res.status(created.replayed ? 200 : 201).json({ ...doc, replayed: created.replayed })
 }))
 
 api.get('/documents/:id', safe(async (req, res) => {
@@ -6330,13 +6414,15 @@ api.put('/documents/:id', safe(async (req, res) => {
     throw new HttpError(400, 'title required')
   }
   const title = body.title.trim().slice(0, 200)
-  const { rowCount } = await pool.query(
-    `UPDATE documents SET title = $1, updated_at = NOW()
-      WHERE id = $2 AND company_id = $3`,
-    [title, id, companyId],
-  )
-  if (!rowCount) throw new HttpError(404, 'not found')
-  await publishDocumentChanged(companyId, id, 'document.updated', userId)
+  await withOutboxTransaction(async (client) => {
+    const { rowCount } = await client.query(
+      `UPDATE documents SET title = $1, updated_at = NOW()
+        WHERE id = $2 AND company_id = $3`,
+      [title, id, companyId],
+    )
+    if (!rowCount) throw new HttpError(404, 'not found')
+    await enqueueDocumentChanged(client, companyId, id, 'document.updated', userId)
+  })
   res.json({ ok: true, title })
 }))
 
@@ -6358,8 +6444,10 @@ api.delete('/documents/:id', safe(async (req, res) => {
     const role = roleRows[0]?.role ?? 'member'
     if (!PRIVILEGED_ROLES.has(role)) throw new HttpError(403, 'only the creator or an owner can delete')
   }
-  await pool.query(`DELETE FROM documents WHERE id = $1`, [id])
-  await publishDocumentChanged(companyId, id, 'document.deleted', userId)
+  await withOutboxTransaction(async (client) => {
+    await client.query(`DELETE FROM documents WHERE id = $1`, [id])
+    await enqueueDocumentChanged(client, companyId, id, 'document.deleted', userId)
+  })
   res.json({ ok: true })
 }))
 

@@ -12,7 +12,8 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, publish } from '../redis.js'
+import { CH_MESSAGE_NEW } from '../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
 
 /** Find an existing direct conversation between two participants, or
  *  create one and return its id. Order-independent on members. */
@@ -203,28 +204,28 @@ export async function startPrivateChat(args: {
        ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
       [instigatorId, conversationId],
     )
+    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+      type: 'message.new',
+      conversationId,
+      companyId,
+      message: {
+        id: messageId,
+        conversationId,
+        authorId: instigatorId,
+        kind: 'text',
+        body: opening,
+        sequence,
+        at: new Date().toISOString(),
+      },
+    })
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
   } finally {
     client.release()
   }
-
-  // Same channel as every other message. Agent recipients wake through the
-  // mailbox scheduler; human recipients see the direct conversation normally.
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId,
-    companyId,
-    message: {
-      id: messageId, conversationId, authorId: instigatorId,
-      kind: 'text', body: opening, sequence,
-      at: new Date().toISOString(),
-    },
-  }).catch((error) => {
-    console.warn(`[private_chat] durable message ${messageId} committed but publish failed`, error)
-  })
 
   return { conversationId, messageId }
 }

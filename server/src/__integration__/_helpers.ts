@@ -31,6 +31,7 @@ export function ensureSchemaOnce(): Promise<void> {
  *  constraints; CASCADE on the parents handles it but listing explicitly
  *  keeps the intent visible + lets us spot-check leakage. */
 const TABLES_TO_WIPE: readonly string[] = [
+  'realtime_outbox',
   'shipping_events',
   'shipping_regressions',
   'shipping_friction_reports',
@@ -197,6 +198,10 @@ export async function teardownAll(server?: import('node:http').Server): Promise<
   if (server && server.listening) {
     await new Promise<void>((resolve) => server.close(() => resolve()))
   }
+  try {
+    const { stopRealtimeOutboxWorker } = await import('../realtime-outbox.js')
+    stopRealtimeOutboxWorker()
+  } catch { /* ignore */ }
   // Pool + redis are module-level singletons; ending them is fine because
   // the process is about to exit anyway. Catch swallows reentrant-end
   // errors when multiple test files share the singleton.

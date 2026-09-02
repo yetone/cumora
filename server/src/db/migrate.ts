@@ -39,6 +39,30 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(conversation_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_messages_convo_created ON messages(conversation_id, created_at);
 
+-- Transactional realtime outbox. Durable mutations write their invalidation
+-- here in the SAME PostgreSQL transaction; a bounded worker publishes to Redis
+-- after commit. Redis is therefore never part of command completion.
+CREATE TABLE IF NOT EXISTS realtime_outbox (
+  id            TEXT PRIMARY KEY,
+  channel       TEXT NOT NULL,
+  payload       JSONB NOT NULL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  available_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  locked_by     TEXT,
+  locked_until  TIMESTAMP WITH TIME ZONE,
+  published_at  TIMESTAMP WITH TIME ZONE,
+  discarded_at  TIMESTAMP WITH TIME ZONE,
+  last_error    TEXT,
+  created_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  CONSTRAINT realtime_outbox_payload_object CHECK (jsonb_typeof(payload) = 'object')
+);
+CREATE INDEX IF NOT EXISTS idx_realtime_outbox_pending
+  ON realtime_outbox(available_at, created_at)
+  WHERE published_at IS NULL AND discarded_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_realtime_outbox_published
+  ON realtime_outbox(published_at)
+  WHERE published_at IS NOT NULL;
+
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_recipient_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_messages_delivery_recipient
@@ -1217,6 +1241,11 @@ CREATE INDEX IF NOT EXISTS idx_calendar_events_status
 CREATE INDEX IF NOT EXISTS idx_calendar_events_assignee
   ON calendar_events(assignee_id, start_at)
   WHERE assignee_id IS NOT NULL;
+ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_calendar_event_creation_request
+  ON calendar_events(company_id, created_by, creation_request_id)
+  WHERE creation_request_id IS NOT NULL;
 
 -- One row per actual firing of a calendar event. Lets the scheduler dedup
 -- on (event_id, scheduled_for) so a tick that runs twice (replica race or
@@ -1298,6 +1327,11 @@ CREATE TABLE IF NOT EXISTS boards (
   updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_boards_company ON boards(company_id, updated_at DESC);
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_board_creation_request
+  ON boards(company_id, created_by, creation_request_id)
+  WHERE creation_request_id IS NOT NULL;
 
 -- Columns within a board. position is a DOUBLE so reorders can insert
 -- between two cards without renumbering every sibling.
@@ -1399,6 +1433,11 @@ CREATE INDEX IF NOT EXISTS idx_documents_company_updated
   ON documents(company_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_documents_conversation
   ON documents(conversation_id) WHERE conversation_id IS NOT NULL;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_document_creation_request
+  ON documents(company_id, created_by, creation_request_id)
+  WHERE creation_request_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS document_updates (
   id            BIGSERIAL PRIMARY KEY,
@@ -2249,6 +2288,10 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
       'participants_agent_id_unique',
       'uniq_participants_agent_creation_request',
       'uniq_messages_client_id',
+      'uniq_board_creation_request',
+      'uniq_document_creation_request',
+      'uniq_calendar_event_creation_request',
+      'idx_realtime_outbox_pending',
     ]
     const { rows } = await client.query<{
       missing_tables: string[]; missing_columns: string[]; missing_indexes: string[]

@@ -1335,8 +1335,8 @@ export const api = {
   listBoards: () => http<BoardSummary[]>('/boards'),
   getBoard: (id: string) => http<BoardSnapshot>(`/boards/${encodeURIComponent(id)}`),
   getBoardCard: (id: string) => http<BoardCardLookup>(`/cards/${encodeURIComponent(id)}`),
-  createBoard: (input: { title: string; description?: string }) =>
-    http<{ id: string }>('/boards', { method: 'POST', body: JSON.stringify(input) }),
+  createBoard: (input: { title: string; description?: string; requestId?: string }) =>
+    http<{ id: string; replayed: boolean }>('/boards', { method: 'POST', body: JSON.stringify(input) }),
   updateBoard: (id: string, input: { title?: string; description?: string }) =>
     http<{ ok: boolean }>(`/boards/${encodeURIComponent(id)}`, {
       method: 'PATCH', body: JSON.stringify(input),
@@ -1408,7 +1408,7 @@ export const api = {
   getCalendarEvent: (id: string) =>
     http<{ event: CalendarEvent }>(`/calendar/events/${encodeURIComponent(id)}`),
   createCalendarEvent: (input: CalendarEventInput) =>
-    http<{ event: CalendarEvent }>('/calendar/events', {
+    http<{ event: CalendarEvent; replayed: boolean }>('/calendar/events', {
       method: 'POST',
       body: JSON.stringify(input),
     }),
@@ -1431,7 +1431,7 @@ export const api = {
   /* ============== Collaborative documents (CRDT) ============== */
   listDocuments: () =>
     http<{ documents: ApiDocument[] }>('/documents'),
-  createDocument: (input: { title?: string; conversationId?: string | null } = {}) =>
+  createDocument: (input: { title?: string; conversationId?: string | null; requestId?: string } = {}) =>
     http<ApiDocument>('/documents', { method: 'POST', body: JSON.stringify(input) }),
   getDocument: (id: string) =>
     http<ApiDocument>(`/documents/${encodeURIComponent(id)}`),
@@ -1472,6 +1472,8 @@ export interface CalendarEventInput {
    *  (and the workspace owner, if the row involves an agent). Default
    *  false = same shared-workspace behavior as before. */
   isPrivate?: boolean
+  /** Stable across retries after an ambiguous network failure. */
+  requestId?: string
 }
 
 /* ============== WebSocket bridge ============== */

@@ -34,6 +34,7 @@ import { startTrialSweepWorker } from './trial-sweep.js'
 import { seedAdmins } from './admin.js'
 import { notifyAlert } from './alerting.js'
 import { startShippingMaintenance } from './shipping-maintenance.js'
+import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from './realtime-outbox.js'
 
 async function main() {
   await ensureSchemaWithBootRetry()
@@ -311,6 +312,10 @@ async function main() {
   // failures into deduplicated improvement signals.
   startShippingMaintenance()
 
+  // PostgreSQL owns command completion; Redis delivery is retried here after
+  // commit. Start after the schema ensure so the outbox table is guaranteed.
+  startRealtimeOutboxWorker()
+
   // Agent-pod garbage collection — sweep Succeeded/Failed/Unknown
   // agent pods older than 5min. Plain Pods don't have TTL-after-
   // finished, so without this leftover idle-exit pods accumulate
@@ -369,6 +374,7 @@ async function main() {
   const shutdown = async (sig: string) => {
     console.log(`[shutdown] ${sig}`)
     server.close()
+    stopRealtimeOutboxWorker()
     try { await pool.end() } catch { /* ignore */ }
     try { redis.disconnect() } catch { /* ignore */ }
     process.exit(0)

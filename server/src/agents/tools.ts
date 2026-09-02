@@ -21,6 +21,8 @@ import { randomUUID } from 'node:crypto'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { pool } from '../db/pool.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
+import { CH_REACTIONS } from '../redis.js'
 import { tReadFile, tWriteFile, tEditFile } from './runtime/native-tools.js'
 import type { FsNamespace } from './runtime/fs-namespace.js'
 import {
@@ -259,7 +261,15 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
       [messageId],
     )
     agg = aggregate.rows
+    await enqueueBroadcast(client, CH_REACTIONS, {
+      type: 'message.reactions',
+      conversationId,
+      companyId,
+      messageId,
+      reactions: agg,
+    })
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -271,17 +281,6 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
   // acknowledgement for long work, and marking the request read before the
   // turn completes can erase unfinished tasks from the agent's inbox. The turn
   // runtime advances reads only after semantic completion is accepted.
-  const { CH_REACTIONS, publish } = await import('../redis.js')
-  await publish(CH_REACTIONS, {
-    type: 'message.reactions',
-    conversationId,
-    companyId,
-    messageId,
-    reactions: agg,
-  }).catch((error) => {
-    console.warn(`[react] durable reaction on ${messageId} committed but publish failed`, error)
-  })
-
   return {
     ok: true,
     output: { messageId, emoji, action, reactions: agg },

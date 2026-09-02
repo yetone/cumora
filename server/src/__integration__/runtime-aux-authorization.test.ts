@@ -24,6 +24,7 @@ import { pool } from '../db/pool.js'
 import { readDocumentText, subscribe } from '../documents/rooms.js'
 import { env } from '../env.js'
 import { CH_DOCS, redis } from '../redis.js'
+import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from '../realtime-outbox.js'
 import {
   ensureSchemaOnce, resetAllTables, seedCompanyWithAgent, teardownAll,
 } from './_helpers.js'
@@ -411,6 +412,7 @@ test('[integration] CLI document change events are published only after commit',
   const subscriber = redis.duplicate({ enableOfflineQueue: true, maxRetriesPerRequest: null })
   await observer.connect()
   await subscriber.subscribe(CH_DOCS)
+  startRealtimeOutboxWorker()
 
   type ChangedEvent = {
     type: 'doc.changed'
@@ -479,6 +481,7 @@ test('[integration] CLI document change events are published only after commit',
     assert.equal(deleted.ok, true, deleted.text)
     await deleteObserved
   } finally {
+    stopRealtimeOutboxWorker()
     await subscriber.unsubscribe(CH_DOCS).catch(() => {})
     await subscriber.quit().catch(() => {})
     await observer.end().catch(() => {})
