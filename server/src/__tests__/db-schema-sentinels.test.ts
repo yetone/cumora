@@ -49,3 +49,18 @@ test('commented-out DDL does not become a phantom expectation', () => {
     assert.match(c.column, /^[a-z_][a-z0-9_]*$/)
   }
 })
+
+test('a table the DDL creates and later drops is not an expectation', () => {
+  const { tables, columns } = ddlExpectations()
+  // The DDL still carries `CREATE TABLE IF NOT EXISTS email_verification_tokens`
+  // followed by the migration that dropped it when password auth was removed.
+  // Deriving expectations from the CREATEs alone made it a phantom: production
+  // could never be "current", the 40P01 shortcut never fired, and the v0.13.1
+  // rollout on 2026-09-02 crash-looped its migrate init container under load.
+  for (const t of ['email_verification_tokens', 'password_reset_tokens', 'notion_pages', 'github_branches']) {
+    assert.ok(!tables.includes(t), `${t} is dropped by the DDL and must not be expected`)
+    assert.ok(!columns.some((c) => c.table === t), `no column of dropped table ${t} may be expected`)
+  }
+  // The live tables next to them are still promised.
+  for (const t of ['users', 'sessions', 'user_identities']) assert.ok(tables.includes(t), `${t} must be expected`)
+})

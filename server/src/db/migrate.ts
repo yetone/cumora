@@ -2203,10 +2203,30 @@ export async function releaseMigrationClient(client: MigrationClient): Promise<v
  *  cannot become a phantom expectation. */
 export function ddlExpectations(): { tables: string[]; columns: Array<{ table: string; column: string }> } {
   const sql = DDL.replace(/--[^\n]*/g, '')
+  // A table the DDL creates and LATER drops (the retired auth-token tables) is
+  // not a promise — it is history. Left in, it is a phantom expectation that can
+  // never be satisfied: `schemaAlreadyCurrent` answers "not current" on every
+  // boot, the lock-contention shortcut below never fires, and a deploy under
+  // sustained traffic crash-loops on 40P01 with nothing to actually apply.
+  // That is exactly how the v0.13.1 rollout wedged on 2026-09-02.
+  // "Later" is by position in the DDL: a DROP that precedes a CREATE of the same
+  // name is a reset, and the re-created table is still promised.
+  const lastDropAt = new Map<string, number>()
+  for (const m of sql.matchAll(/DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?([a-z_][a-z0-9_]*)/gi)) {
+    lastDropAt.set((m[1] as string).toLowerCase(), m.index ?? 0)
+  }
+  for (const m of sql.matchAll(/ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+DROP\s+COLUMN\s+(?:IF\s+EXISTS\s+)?([a-z_][a-z0-9_]*)/gi)) {
+    lastDropAt.set(`${(m[1] as string).toLowerCase()}.${(m[2] as string).toLowerCase()}`, m.index ?? 0)
+  }
+  const droppedAfter = (key: string, at: number) => (lastDropAt.get(key) ?? -1) > at
   const tables = [...sql.matchAll(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
-    .map((m) => m[1] as string)
+    .map((m) => ({ name: (m[1] as string).toLowerCase(), at: m.index ?? 0 }))
+    .filter((t) => !droppedAfter(t.name, t.at))
+    .map((t) => t.name)
   const columns = [...sql.matchAll(/ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
-    .map((m) => ({ table: m[1] as string, column: m[2] as string }))
+    .map((m) => ({ table: (m[1] as string).toLowerCase(), column: (m[2] as string).toLowerCase(), at: m.index ?? 0 }))
+    .filter((c) => !droppedAfter(c.table, c.at) && !droppedAfter(`${c.table}.${c.column}`, c.at))
+    .map((c) => ({ table: c.table, column: c.column }))
   return { tables: [...new Set(tables)], columns }
 }
 
