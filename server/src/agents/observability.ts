@@ -877,9 +877,13 @@ export async function getTurnsPerMessage(args: {
           AND a.departed_at IS NULL
           AND EXISTS (
             SELECT 1
-              FROM jsonb_array_elements_text(c.members) AS j(mid)
-              JOIN participants ap ON ap.id = j.mid AND ap.company_id = c.company_id
-             WHERE ap.kind = 'agent' AND ap.departed_at IS NULL
+              FROM conversation_members cm
+              JOIN participants ap
+                ON ap.id = cm.participant_id
+               AND ap.company_id = cm.company_id
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND ap.kind = 'agent' AND ap.departed_at IS NULL
           )
      ),
      turns AS (

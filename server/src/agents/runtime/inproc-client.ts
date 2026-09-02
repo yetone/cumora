@@ -136,24 +136,10 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
   }
 
   async loadInbox(agentId: string): Promise<InboxRow[]> {
-    // Resolve the agent's conversations via the members GIN, then pull each one's
-    // unread tail with a LATERAL over idx_messages_convo_created — instead of the
-    // old form that joined ALL messages of every member conversation with a PER-ROW
-    // cursor subquery (an 8s query that, with loadContext, starved the pool).
-    //
-    // Force the members GIN: the planner mis-costs `members @>` and SEQ-SCANS all
-    // conversations (~2s), which starves the pool under load. enable_seqscan=off
-    // makes it use the GIN (~100ms). It is set at SESSION level on a dedicated
-    // client with NO transaction — a single autocommit SELECT only takes ACCESS
-    // SHARE, so (unlike the earlier BEGIN…COMMIT version) it can't deadlock with
-    // DML or a rolling-deploy ALTER TABLE. RESET on the success path; on any error
-    // the connection is DESTROYED (release(true)) so a stray GUC never leaks back
-    // into the pool. Every access in the query is index-backed.
-    const client = await pool.connect()
-    let rows: InboxRow[] = []
-    try {
-      await client.query('SET enable_seqscan = off')
-      const res = await client.query<InboxRow>(
+    // Resolve membership through the normalized participant-led index, then
+    // pull each conversation's unread tail with the message index. This avoids
+    // both the old JSONB seq-scan and its dedicated enable_seqscan=off session.
+    const { rows } = await pool.query<InboxRow>(
       `WITH requesting_agent AS MATERIALIZED (
          SELECT company_id
            FROM participants
@@ -165,7 +151,7 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                 c.project_id, pr.name AS project_name,
                 COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz) AS lr_at,
                 COALESCE(cr.last_read_message_id, '') AS lr_id,
-                c.members @> to_jsonb(ARRAY[$1::text]) AS current_member,
+                (current_membership.participant_id IS NOT NULL) AS current_member,
                 EXISTS (
                   SELECT 1 FROM conversation_mutes mu
                    WHERE mu.user_id = $1 AND mu.conversation_id = c.id
@@ -173,9 +159,13 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
                 ) AS muted
            FROM requesting_agent ra
            JOIN conversations c ON c.company_id = ra.company_id
+           LEFT JOIN conversation_members current_membership
+             ON current_membership.conversation_id = c.id
+            AND current_membership.company_id = c.company_id
+            AND current_membership.participant_id = $1
            LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
            LEFT JOIN projects pr ON pr.id = c.project_id
-          WHERE c.members @> to_jsonb(ARRAY[$1::text])
+          WHERE current_membership.participant_id IS NOT NULL
              OR EXISTS (
                SELECT 1
                  FROM messages delivered
@@ -233,15 +223,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
          LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = co.company_id
         ORDER BY m.created_at ASC, m.id ASC
         LIMIT 200`,
-        [agentId],
-      )
-      await client.query('RESET enable_seqscan')
-      rows = res.rows
-    } catch (err) {
-      client.release(true) // destroy — never return a connection in unknown GUC state
-      throw err
-    }
-    client.release()
+      [agentId],
+    )
     await refreshAttachmentUrls(rows)
     // NOTE: This used to call recordSeen() here to advance the freshness-
     // preflight boundary, but that fired for EVERY caller of loadInbox —
@@ -429,7 +412,12 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
            LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
           WHERE c.id = ANY($3::text[])
             AND c.company_id = $2
-            AND c.members @> to_jsonb(ARRAY[$1::text])
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $1
+            )
        )
        SELECT id, conversation_id, company_id, conversation_title, conversation_kind, conversation_topic,
               project_name,
@@ -668,10 +656,15 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
         return { posted: false, authorized: false }
       }
       const conversation = await client.query(
-        `SELECT id FROM conversations
-          WHERE id = $1 AND company_id = $2
-            AND members @> to_jsonb(ARRAY[$3::text])
-          FOR UPDATE`,
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            )
+          FOR UPDATE OF c`,
         [args.conversationId, companyId, args.agentId],
       )
       if (!conversation.rowCount) {
@@ -1076,7 +1069,12 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
             WHERE m.id = $1 AND m.conversation_id = $3
               AND ($4::text IS NULL OR c.company_id = $4)
               AND (
-                c.members @> to_jsonb(ARRAY[$2::text])
+                EXISTS (
+                  SELECT 1 FROM conversation_members cm
+                   WHERE cm.conversation_id = c.id
+                     AND cm.company_id = c.company_id
+                     AND cm.participant_id = $2
+                )
                 OR (m.kind = 'system' AND m.delivery_recipient_id = $2)
               )
          )

@@ -314,13 +314,11 @@ export async function computeMessageRecipients(args: {
   authorId: string
 }): Promise<string[]> {
   const { rows } = await pool.query<{ user_id: string }>(
-    `WITH convo AS (
-       SELECT members FROM conversations WHERE id = $1
-     )
-     SELECT u.id AS user_id
-       FROM users u
-       JOIN convo c ON u.id = ANY(SELECT jsonb_array_elements_text(c.members))
-      WHERE u.id <> $2
+    `SELECT u.id AS user_id
+       FROM conversation_members cm
+       JOIN users u ON u.id = cm.participant_id
+      WHERE cm.conversation_id = $1
+        AND u.id <> $2
         AND NOT EXISTS (
           SELECT 1 FROM conversation_mutes m
            WHERE m.conversation_id = $1

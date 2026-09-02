@@ -108,11 +108,27 @@ test('[integration] returns 403 when the requester is not a thread member', asyn
   // members list so the membership check fails even though the auth
   // header is valid.
   const { messageId, companyId } = await seedEmailWithHtml('<p>secret</p>')
-  await pool.query(
-    `UPDATE conversations SET members = to_jsonb(ARRAY[$2]::text[])
-      WHERE id = (SELECT conversation_id FROM email_messages WHERE message_id = $1)`,
-    [messageId, 'someone-else'],
-  )
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query<{ conversation_id: string }>(
+      `DELETE FROM conversation_members
+        WHERE participant_id = $2
+          AND conversation_id = (
+            SELECT conversation_id FROM email_messages WHERE message_id = $1
+          )
+        RETURNING conversation_id`,
+      [messageId, ME_USER_ID],
+    )
+    assert.ok(rows[0])
+    await client.query(`SELECT refresh_conversation_members_projection($1)`, [rows[0].conversation_id])
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
   const res = await fetchHtml(messageId, companyId)
   assert.equal(res.status, 403)
 })

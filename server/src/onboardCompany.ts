@@ -15,6 +15,8 @@ import { invalidatePersonaCache } from './agents/personas.js'
 import { randomUUID } from 'node:crypto'
 import { gravatarUrlForEmail } from './auth.js'
 import { ensureDirectConversation } from './agents/private_chat.js'
+import { CH_MESSAGE_NEW } from './redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from './realtime-outbox.js'
 
 interface StarterAgent {
   /** Preferred id; we'll suffix on collision. */
@@ -168,10 +170,21 @@ export async function onboardStarterAgents(
         // Skip if a DM already exists for this pair — saves needless rows on
         // partial reruns.
         const { rows: ex } = await pool.query(
-          `SELECT 1 FROM conversations
-            WHERE company_id = $1 AND kind = 'direct'
-              AND members @> to_jsonb(ARRAY[$2::text, $3::text])
-              AND jsonb_array_length(members) = 2 LIMIT 1`,
+          `SELECT 1 FROM conversations c
+            WHERE c.company_id = $1 AND c.kind = 'direct'
+              AND EXISTS (
+                SELECT 1 FROM conversation_members cm
+                 WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                   AND cm.participant_id = $2
+              )
+              AND EXISTS (
+                SELECT 1 FROM conversation_members cm
+                 WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                   AND cm.participant_id = $3
+              )
+              AND (SELECT COUNT(*) FROM conversation_members cm
+                    WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+            LIMIT 1`,
           [companyId, ownerId, a.id],
         )
         if (ex[0]) continue
@@ -251,8 +264,8 @@ export async function onboardStarterAgents(
  * group and broadcast a "X joined" system message. Called from POST /agents,
  * /auth/signup, and POST /companies after a new participant is persisted.
  *
- * Idempotent — if the participant is already in the members array, only the
- * system message is skipped too. If the company has no all-hands group yet
+ * Idempotent — if the participant already has a normalized membership row,
+ * the system message is skipped too. If the company has no all-hands group yet
  * (legacy or seeding race), this is a no-op rather than an error.
  */
 export async function joinAllHands(args: {
@@ -294,26 +307,37 @@ export async function joinAllHands(args: {
       return
     }
 
-    const { rows: updated } = await client.query<{ added: boolean }>(
-      `UPDATE conversations c
-          SET members = members || to_jsonb(ARRAY[$2::text]),
-              updated_at = NOW()
-        WHERE c.id = $1
-          AND c.company_id = $3
-          AND NOT (c.members @> to_jsonb(ARRAY[$2::text]))
-          AND EXISTS (
-            SELECT 1 FROM participants target
-             WHERE target.id = $2 AND target.company_id = c.company_id
-               AND target.kind IN ('agent', 'human')
-               AND target.departed_at IS NULL
-          )
-        RETURNING TRUE AS added`,
-      [convId, participantId, companyId],
+    const lockedConversation = await client.query(
+      `SELECT id FROM conversations
+        WHERE id = $1 AND company_id = $2
+        FOR UPDATE`,
+      [convId, companyId],
     )
-    if (updated.length === 0) {
+    if (!lockedConversation.rowCount) {
       await client.query('COMMIT')
       return
     }
+    const inserted = await client.query(
+      `INSERT INTO conversation_members (
+         conversation_id, company_id, participant_id, ordinal
+       )
+       SELECT c.id, c.company_id, $2,
+              COALESCE(MAX(existing.ordinal) + 1, 0)::integer
+         FROM conversations c
+         LEFT JOIN conversation_members existing
+           ON existing.conversation_id = c.id
+          AND existing.company_id = c.company_id
+        WHERE c.id = $1 AND c.company_id = $3
+        GROUP BY c.id, c.company_id
+       ON CONFLICT (conversation_id, participant_id) DO NOTHING
+       RETURNING participant_id`,
+      [convId, participantId, companyId],
+    )
+    if (!inserted.rowCount) {
+      await client.query('COMMIT')
+      return
+    }
+    await client.query(`SELECT refresh_conversation_members_projection($1)`, [convId])
 
     const seqResult = await client.query<{ seq: number }>(
       `INSERT INTO conversation_counters (conversation_id, next_sequence)
@@ -328,7 +352,17 @@ export async function joinAllHands(args: {
        VALUES ($1, $2, $3, 'system', $4, $5, $6)`,
       [messageId, convId, participantId, body, sequence, companyId],
     )
+    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+      type: 'message.new',
+      conversationId: convId,
+      companyId,
+      message: {
+        id: messageId, conversationId: convId, authorId: participantId,
+        kind: 'system', body, sequence, at: new Date().toISOString(),
+      },
+    })
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -336,20 +370,6 @@ export async function joinAllHands(args: {
     client.release()
   }
   if (!convId || sequence === 0) return
-
-  // Broadcast so already-open clients see the join in real time.
-  const { CH_MESSAGE_NEW, CH_STATUS, publish } = await import('./redis.js')
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: convId,
-    companyId,
-    message: {
-      id: messageId, conversationId: convId, authorId: participantId,
-      kind: 'system', body, sequence, at: new Date().toISOString(),
-    },
-  }).catch((error) => {
-    console.warn('[onboard] all-hands message publish failed; row remains durable', error instanceof Error ? error.message : error)
-  })
 
   // Fire-and-forget: also publish the full participant payload so existing
   // members upsert it into their local byId store. Without this, the system
@@ -359,6 +379,7 @@ export async function joinAllHands(args: {
   // update — broadcast misses are tolerable (the 60s refresher backfills),
   // a DB hiccup here should not roll back the actual membership change.
   try {
+    const { CH_STATUS, publish } = await import('./redis.js')
     const { rows: pRow } = await pool.query<{
       id: string; kind: string; name: string; role: string | null;
       initial: string; avatar_bg: string; avatar_url: string | null;

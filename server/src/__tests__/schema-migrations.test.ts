@@ -13,6 +13,7 @@ process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
 const { computedBaselineMigrationChecksum } = await import('../db/migrate.js')
+const { normalizedConversationMembersChecksum } = await import('../db/migrations/0002-normalized-conversation-members.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -20,6 +21,10 @@ const current = (): AppliedMigration[] => SCHEMA_MIGRATIONS.map((migration) => (
 
 test('the frozen baseline SQL matches its immutable manifest checksum', () => {
   assert.equal(computedBaselineMigrationChecksum(), SCHEMA_MIGRATIONS[0].checksum)
+})
+
+test('the normalized membership migration matches its immutable manifest checksum', () => {
+  assert.equal(normalizedConversationMembersChecksum(), SCHEMA_MIGRATIONS[1].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

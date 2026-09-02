@@ -197,7 +197,7 @@ test('[integration] runtime notices: a queued kick wins before notice authorizat
     // Queue the real membership mutation first. It holds both participant rows
     // while waiting for our conversation lock.
     kickPromise = runCli(['--as', actor.agentId, 'kick', conversationId, target.agentId])
-    await waitForBlockedQuery('%UPDATE conversations c%SET members = members -%')
+    await waitForBlockedQuery('%SELECT c.id%FROM conversations c%FOR UPDATE OF c%')
 
     // The notice request passes JWT validation, then blocks on the target's
     // participant row behind the already-queued kick transaction.

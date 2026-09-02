@@ -231,31 +231,25 @@ async function loadDueEvents(agentId: string, companyId: string, now: Date): Pro
 }
 
 /** Conversations the agent is a member of whose LATEST text message sits in the
- *  stall window [STALL_MIN_MS, STALL_MAX_MS] of silence. Cheap: members GIN +
- *  idx_messages_convo_created via a LATERAL "latest message" per conversation.
- *
- *  enable_seqscan=off (session-level, NO transaction — a single autocommit SELECT
- *  only takes ACCESS SHARE, can't deadlock) forces the members GIN; the planner
- *  otherwise seq-scans all conversations (~2s). Same approach as loadInbox. On
- *  error the connection is destroyed so the GUC never leaks back into the pool. */
+ *  stall window [STALL_MIN_MS, STALL_MAX_MS] of silence. The participant-led
+ *  normalized membership index narrows the conversations first, then
+ *  idx_messages_convo_created serves the LATERAL latest-message lookup. */
 async function loadStalledConversations(agentId: string, companyId: string): Promise<StalledConvo[]> {
-  const client = await pool.connect()
-  let rows: Array<{
+  const { rows } = await pool.query<{
     conversation_id: string; kind: string; title: string | null
     last_message_id: string; last_author_id: string; last_author_name: string
     last_author_is_self: boolean; last_body: string; minutes_silent: string; recent_tail: string | null
-  }>
-  try {
-    await client.query('SET enable_seqscan = off')
-    const res = await client.query<{
-      conversation_id: string; kind: string; title: string | null
-      last_message_id: string; last_author_id: string; last_author_name: string
-      last_author_is_self: boolean; last_body: string; minutes_silent: string; recent_tail: string | null
-    }>(
-      `WITH convos AS (
+  }>(
+    `WITH convos AS (
          SELECT c.id, c.kind, c.title
            FROM conversations c
-          WHERE c.company_id = $2 AND c.members @> to_jsonb(ARRAY[$1::text])
+          WHERE c.company_id = $2
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $1
+            )
        )
        SELECT co.id AS conversation_id, co.kind, co.title,
               m.id AS last_message_id, m.author_id AS last_author_id,
@@ -286,15 +280,8 @@ async function loadStalledConversations(agentId: string, companyId: string): Pro
           AND m.created_at >= NOW() - ($4::double precision * INTERVAL '1 millisecond')
         ORDER BY m.created_at DESC
         LIMIT 10`,
-      [agentId, companyId, STALL_MIN_MS, STALL_MAX_MS],
-    )
-    await client.query('RESET enable_seqscan')
-    rows = res.rows
-  } catch (err) {
-    client.release(true) // destroy — never return a connection in unknown GUC state
-    throw err
-  }
-  client.release()
+    [agentId, companyId, STALL_MIN_MS, STALL_MAX_MS],
+  )
   return rows.map((r) => ({
     conversationId: r.conversation_id,
     kind: r.kind,

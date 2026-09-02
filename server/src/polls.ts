@@ -120,10 +120,15 @@ export async function createPoll(input: CreatePollInput): Promise<CreatedPoll> {
     )
     if (!actor.rowCount) throw new PollError('author is not an active tenant participant', 403)
     const authorized = await client.query(
-      `SELECT id FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR UPDATE`,
+      `SELECT c.id FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND cm.participant_id = $3
+          )
+        FOR UPDATE OF c`,
       [input.conversationId, input.companyId, input.authorId],
     )
     if (!authorized.rowCount) throw new PollError('conversation not found or not authorized', 403)
@@ -203,10 +208,15 @@ export async function castVote(input: CastVoteInput): Promise<PollUpdatedEvent> 
       company_id: string
     }>(
       `SELECT m.poll, m.conversation_id, m.company_id
-         FROM conversations c
+        FROM conversations c
          JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
         WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
-          AND c.members @> to_jsonb(ARRAY[$3::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND cm.participant_id = $3
+          )
         FOR SHARE OF c
         FOR UPDATE OF m`,
       [input.messageId, input.companyId, input.voterParticipantId],
@@ -281,7 +291,12 @@ export async function closePoll(input: CloseInput): Promise<PollUpdatedEvent | n
              FROM conversations c
              JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
             WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
-              AND c.members @> to_jsonb(ARRAY[$3::text])
+              AND EXISTS (
+                SELECT 1 FROM conversation_members cm
+                 WHERE cm.conversation_id = c.id
+                   AND cm.company_id = c.company_id
+                   AND cm.participant_id = $3
+              )
             FOR SHARE OF c
             FOR UPDATE OF m`
         : `SELECT poll, author_id FROM messages

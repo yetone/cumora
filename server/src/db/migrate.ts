@@ -13,6 +13,10 @@ import {
   SCHEMA_MIGRATIONS,
   validateMigrationHistory,
 } from './migrations/manifest.js'
+import {
+  NORMALIZED_CONVERSATION_MEMBERS_SQL,
+  normalizedConversationMembersChecksum,
+} from './migrations/0002-normalized-conversation-members.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2083,7 +2087,11 @@ async function applyLegacyBaseline(client: import('pg').PoolClient): Promise<voi
   `)
   await ensureMessageClientIdIndex(client)
   await buildConcurrentIndexes(client)
-  await verifyRequiredIndexes(client)
+  await verifyRequiredIndexes(client, BASELINE_REQUIRED_SCHEMA_INDEXES)
+}
+
+async function applyNormalizedConversationMembers(client: import('pg').PoolClient): Promise<void> {
+  await client.query(NORMALIZED_CONVERSATION_MEMBERS_SQL)
 }
 
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
@@ -2091,6 +2099,11 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     ...SCHEMA_MIGRATIONS[0],
     sourceChecksum: computedBaselineMigrationChecksum(),
     up: applyLegacyBaseline,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[1],
+    sourceChecksum: normalizedConversationMembersChecksum(),
+    up: applyNormalizedConversationMembers,
   },
 ]
 
@@ -2299,7 +2312,7 @@ async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<
   }
 }
 
-export const REQUIRED_SCHEMA_INDEXES = [
+const BASELINE_REQUIRED_SCHEMA_INDEXES = [
   'participants_agent_id_unique',
   'uniq_participants_agent_creation_request',
   'uniq_messages_client_id',
@@ -2312,9 +2325,18 @@ export const REQUIRED_SCHEMA_INDEXES = [
   'idx_llm_calls_created_brin',
 ] as const
 
+export const REQUIRED_SCHEMA_INDEXES = [
+  ...BASELINE_REQUIRED_SCHEMA_INDEXES,
+  'conversation_members_conversation_ordinal_key',
+  'idx_conversation_members_participant',
+] as const
+
 /** Promotion gate: every required index must exist and be valid, ready, and
  * live. An interrupted CREATE INDEX CONCURRENTLY must never look healthy. */
-async function verifyRequiredIndexes(client: import('pg').PoolClient): Promise<void> {
+async function verifyRequiredIndexes(
+  client: import('pg').PoolClient,
+  requiredIndexes: readonly string[] = REQUIRED_SCHEMA_INDEXES,
+): Promise<void> {
   const { rows } = await client.query<{
     name: string
     indisvalid: boolean
@@ -2327,10 +2349,10 @@ async function verifyRequiredIndexes(client: import('pg').PoolClient): Promise<v
        JOIN pg_namespace n ON n.oid = c.relnamespace
       WHERE n.nspname = current_schema()
         AND c.relname = ANY($1::text[])`,
-    [[...REQUIRED_SCHEMA_INDEXES]],
+    [[...requiredIndexes]],
   )
   const byName = new Map(rows.map((row) => [row.name, row]))
-  const invalid = REQUIRED_SCHEMA_INDEXES.filter((name) => {
+  const invalid = requiredIndexes.filter((name) => {
     const row = byName.get(name)
     return !row || !row.indisvalid || !row.indisready || !row.indislive
   })

@@ -368,8 +368,8 @@ async function requireCompanyRole(
  * Tenant + conversation membership gate in one round-trip.
  *
  * Verifies (a) the caller belongs to the active tenant and (b) the
- * conversation lives in that tenant AND (c) the caller is in the
- * conversation's `members` array. This is the missing check that used to
+ * conversation lives in that tenant AND (c) the caller has a normalized
+ * conversation-membership row. This is the missing check that used to
  * allow any tenant member to read or react in conversations they weren't
  * part of (private DMs etc.).
  *
@@ -386,15 +386,19 @@ async function requireConversationMember(
 ): Promise<{ userId: string; companyId: string; members: string[]; kind: string }> {
   const { userId, companyId } = await requireCompany(req)
   const { rows } = await pool.query<{ members: string[]; kind: string }>(
-    `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2 LIMIT 1`,
-    [conversationId, companyId],
+    `SELECT c.members, c.kind
+       FROM conversations c
+       JOIN conversation_members cm
+         ON cm.conversation_id = c.id
+        AND cm.company_id = c.company_id
+        AND cm.participant_id = $3
+      WHERE c.id = $1 AND c.company_id = $2
+      LIMIT 1`,
+    [conversationId, companyId, userId],
   )
+  // Stay opaque: same 404 a non-existent / cross-tenant convo returns,
+  // so a probing client can't tell "doesn't exist" from "I'm not in it".
   if (!rows[0]) throw new HttpError(404, 'not found')
-  if (!rows[0].members.includes(userId)) {
-    // Stay opaque: same 404 a non-existent / cross-tenant convo returns,
-    // so a probing client can't tell "doesn't exist" from "I'm not in it".
-    throw new HttpError(404, 'not found')
-  }
   return { userId, companyId, members: rows[0].members, kind: rows[0].kind }
 }
 
@@ -423,13 +427,20 @@ async function withLockedConversationMember<T>(args: {
     )
     if (!actor.rowCount) throw new HttpError(404, 'not found')
     const { rows } = await client.query<{ members: string[]; kind: string; pinned: boolean }>(
-      `SELECT members, kind, pinned FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR UPDATE`,
-      [args.conversationId, args.companyId, args.userId],
+      `SELECT c.members, c.kind, c.pinned FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        FOR UPDATE OF c`,
+      [args.conversationId, args.companyId],
     )
     if (!rows[0]) throw new HttpError(404, 'not found')
+    const membership = await client.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1
+          AND company_id = $2
+          AND participant_id = $3`,
+      [args.conversationId, args.companyId, args.userId],
+    )
+    if (!membership.rowCount) throw new HttpError(404, 'not found')
     const result = await args.work(client, rows[0])
     await client.query('COMMIT')
     return result
@@ -2908,12 +2919,14 @@ api.get('/conversations', async (req, res) => {
       LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id AND mu.user_id = $1
       LEFT JOIN LATERAL (
         SELECT p_other.name
-          FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+          FROM conversation_members member
           JOIN participants p_other
-            ON p_other.id = member.id
-           AND p_other.company_id = c.company_id
-         WHERE member.id <> $1
-         ORDER BY member.ord
+            ON p_other.id = member.participant_id
+           AND p_other.company_id = member.company_id
+         WHERE member.conversation_id = c.id
+           AND member.company_id = c.company_id
+           AND member.participant_id <> $1
+         ORDER BY member.ordinal
          LIMIT 1
       ) other_participant ON c.kind = 'direct'
       WHERE c.company_id = $2
@@ -2922,7 +2935,12 @@ api.get('/conversations', async (req, res) => {
         -- into the user's list even though they're not a participant
         -- — those are private to the agents and surfaced only via the
         -- "Whispers" peek tab.
-        AND c.members @> to_jsonb(ARRAY[$1::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id
+             AND cm.company_id = c.company_id
+             AND cm.participant_id = $1
+        )
       ORDER BY c.pinned DESC, c.updated_at DESC`,
     [me, tenant],
   )
@@ -3072,12 +3090,22 @@ api.post('/conversations/direct', async (req, res) => {
       [tenant, pairKey],
     )
     const { rows: existing } = await client.query<{ id: string }>(
-      `SELECT id FROM conversations
-        WHERE kind = 'direct' AND company_id = $3
-          AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$2::text])
-          AND jsonb_array_length(members) = 2
-        ORDER BY updated_at DESC LIMIT 1
-        FOR UPDATE`,
+      `SELECT c.id FROM conversations c
+        WHERE c.kind = 'direct' AND c.company_id = $3
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $1
+          )
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $2
+          )
+          AND (SELECT COUNT(*) FROM conversation_members cm
+                WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+        ORDER BY c.updated_at DESC LIMIT 1
+        FOR UPDATE OF c`,
       [me, otherId, tenant],
     )
     if (existing[0]) {
@@ -3204,14 +3232,29 @@ api.post('/conversations/:id/members', async (req, res) => {
   const { id } = req.params
   const newMember = String(req.body?.id ?? '').trim()
   if (!newMember) { res.status(400).json({ error: 'id required' }); return }
-  const { rows } = await pool.query<{ kind: string; members: string[] }>(
-    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
+  const { rows } = await pool.query<{
+    kind: string; members: string[]; actor_is_member: boolean; target_is_member: boolean
+  }>(
+    `SELECT c.kind, c.members,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            ) AS actor_is_member,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $4
+            ) AS target_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [id, tenant, me, newMember],
   )
   const c = rows[0]
   if (!c) { res.status(404).json({ error: 'not found' }); return }
   if (c.kind !== 'group') { res.status(400).json({ error: `cannot add to a ${c.kind} conversation` }); return }
-  if (!c.members.includes(me)) { res.status(403).json({ error: 'only members can add others' }); return }
-  if (c.members.includes(newMember)) { res.json({ ok: true, members: c.members, alreadyIn: true }); return }
+  if (!c.actor_is_member) { res.status(403).json({ error: 'only members can add others' }); return }
+  if (c.target_is_member) { res.json({ ok: true, members: c.members, alreadyIn: true }); return }
   // Validate participant exists in this tenant.
   const { rows: existing } = await pool.query<{ id: string }>(
     `SELECT id FROM participants WHERE id = $1 AND company_id = $2`, [newMember, tenant],
@@ -3235,15 +3278,23 @@ api.post('/conversations/:id/members', async (req, res) => {
 api.post('/conversations/:id/leave', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
-  const { rows } = await pool.query<{ kind: string; members: string[] }>(
-    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
+  const { rows } = await pool.query<{ kind: string; members: string[]; actor_is_member: boolean }>(
+    `SELECT c.kind, c.members,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            ) AS actor_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [id, tenant, me],
   )
   const c = rows[0]
   if (!c) { res.status(404).json({ error: 'not found' }); return }
   if (c.kind === 'direct') {
     res.status(400).json({ error: 'cannot leave a direct conversation' }); return
   }
-  if (!c.members.includes(me)) { res.status(409).json({ error: 'not a member' }); return }
+  if (!c.actor_is_member) { res.status(409).json({ error: 'not a member' }); return }
   const { removeConversationMember } = await import('../agents/membership.js')
   const mutation = await removeConversationMember({
     conversationId: id, memberId: me, actorId: me, companyId: tenant,
@@ -3572,16 +3623,23 @@ api.post('/conversations/:id/messages', async (req, res) => {
     }
   })
 
-  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string }>(
-    `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
+  const { rows: convoRows } = await pool.query<{ kind: string; actor_is_member: boolean }>(
+    `SELECT c.kind,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            ) AS actor_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [id, tenant, me],
   )
   const convo = convoRows[0]
   if (!convo) {
     res.status(404).json({ error: 'conversation not found' })
     return
   }
-  if (!convo.members.includes(me)) {
+  if (!convo.actor_is_member) {
     res.status(403).json({ error: 'not a member of this conversation' })
     return
   }
@@ -3641,13 +3699,18 @@ api.post('/conversations/:id/messages', async (req, res) => {
     )
     if (!actor.rowCount) throw new HttpError(403, 'participant is no longer active in this workspace')
     const currentConversation = await client.query<{ kind: string }>(
-      `SELECT kind FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR UPDATE`,
-      [id, tenant, me],
+      `SELECT c.kind FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        FOR UPDATE OF c`,
+      [id, tenant],
     )
     if (!currentConversation.rowCount) throw new HttpError(403, 'not a member of this conversation')
+    const currentMembership = await client.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1 AND company_id = $2 AND participant_id = $3`,
+      [id, tenant, me],
+    )
+    if (!currentMembership.rowCount) throw new HttpError(403, 'not a member of this conversation')
     if (currentConversation.rows[0].kind === 'email') {
       throw new HttpError(409, 'conversation changed; retry the email reply')
     }
@@ -4131,10 +4194,12 @@ api.get('/email/:messageId/html', async (req, res) => {
     const row = rows[0]
     if (!row) { res.status(404).json({ error: 'unknown email message' }); return }
     if (!row.html) { res.status(204).end(); return }
-    const { rows: cv } = await pool.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1`, [row.conversation_id],
+    const { rows: cv } = await pool.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1 AND company_id = $2 AND participant_id = $3`,
+      [row.conversation_id, tenant, me],
     )
-    if (!cv[0] || !cv[0].members.includes(me)) {
+    if (!cv[0]) {
       res.status(403).json({ error: 'not a member of this thread' }); return
     }
     const { sanitizeEmailHtml } = await import('../email.js')
@@ -4181,10 +4246,12 @@ api.post('/email/reply/:messageId', async (req, res) => {
     )
     const o = orig[0]
     if (!o) { res.status(404).json({ error: 'unknown email message' }); return }
-    const { rows: cv } = await pool.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1`, [o.conversation_id],
+    const { rows: cv } = await pool.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1 AND company_id = $2 AND participant_id = $3`,
+      [o.conversation_id, tenant, me],
     )
-    if (!cv[0] || !cv[0].members.includes(me)) {
+    if (!cv[0]) {
       res.status(403).json({ error: 'not a member of this thread' }); return
     }
 
@@ -4515,7 +4582,7 @@ api.post('/messages/:id/reactions', async (req, res) => {
  * if you don't see what you want.
  *
  * Scoping: requireCompany() pins to the active company. Conversation/message
- * results additionally filter on `members @> [userId]` so we never leak
+ * results additionally join the normalized membership truth so we never leak
  * rooms the caller isn't actually in (same guard `/conversations` uses).
  */
 api.get('/search', async (req, res) => {
@@ -4577,17 +4644,23 @@ api.get('/search', async (req, res) => {
          LEFT JOIN projects p ON p.id = c.project_id
          LEFT JOIN LATERAL (
            SELECT p_other.name
-             FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+             FROM conversation_members member
              JOIN participants p_other
-               ON p_other.id = member.id
-              AND p_other.company_id = c.company_id
-            WHERE member.id <> $2
-            ORDER BY member.ord
+               ON p_other.id = member.participant_id
+              AND p_other.company_id = member.company_id
+            WHERE member.conversation_id = c.id
+              AND member.company_id = c.company_id
+              AND member.participant_id <> $2
+            ORDER BY member.ordinal
             LIMIT 1
          ) other_participant ON c.kind = 'direct'
         WHERE c.company_id = $1
           AND c.kind IN ('direct', 'whisper')
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $2
+          )
      )
      SELECT r.id, r.kind, r.title, r.members, r."projectName"
        FROM my_rooms r
@@ -4597,7 +4670,12 @@ api.get('/search', async (req, res) => {
                WHERE p.company_id = $1
                  AND p.name ILIKE $3 ESCAPE '\\'
                  AND p.id <> $2
-                 AND r.members @> to_jsonb(ARRAY[p.id::text])
+                 AND EXISTS (
+                   SELECT 1 FROM conversation_members cm
+                    WHERE cm.conversation_id = r.id
+                      AND cm.company_id = $1
+                      AND cm.participant_id = p.id
+                 )
             )
       ORDER BY
         CASE WHEN lower(r.title) = lower($4) THEN 0
@@ -4614,7 +4692,11 @@ api.get('/search', async (req, res) => {
        LEFT JOIN projects p ON p.id = c.project_id
       WHERE c.company_id = $1
         AND c.kind = 'group'
-        AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+             AND cm.participant_id = $2
+        )
         AND (c.title ILIKE $3 ESCAPE '\\' OR (c.topic IS NOT NULL AND c.topic ILIKE $3 ESCAPE '\\'))
       ORDER BY
         CASE WHEN lower(c.title) = lower($4) THEN 0
@@ -4645,16 +4727,22 @@ api.get('/search', async (req, res) => {
          ON p.id = m.author_id AND p.company_id = c.company_id
        LEFT JOIN LATERAL (
          SELECT p_other.name
-           FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+           FROM conversation_members member
            JOIN participants p_other
-             ON p_other.id = member.id
-            AND p_other.company_id = c.company_id
-          WHERE member.id <> $2
-          ORDER BY member.ord
+             ON p_other.id = member.participant_id
+            AND p_other.company_id = member.company_id
+          WHERE member.conversation_id = c.id
+            AND member.company_id = c.company_id
+            AND member.participant_id <> $2
+          ORDER BY member.ordinal
           LIMIT 1
        ) other_participant ON c.kind = 'direct'
       WHERE c.company_id = $1
-        AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+             AND cm.participant_id = $2
+        )
         AND m.kind = 'text'
         AND m.body ILIKE $3 ESCAPE '\\'
       ORDER BY m.created_at DESC
@@ -4701,19 +4789,32 @@ api.get('/peek/agent-chats', async (req, res) => {
             c.kind,
             c.title,
             c.members,
-            (c.members->>0) AS "agentA",
-            (c.members->>1) AS "agentB",
+            (SELECT member.participant_id
+               FROM conversation_members member
+              WHERE member.conversation_id = c.id
+              ORDER BY member.ordinal
+              LIMIT 1) AS "agentA",
+            (SELECT member.participant_id
+               FROM conversation_members member
+              WHERE member.conversation_id = c.id
+              ORDER BY member.ordinal
+              OFFSET 1 LIMIT 1) AS "agentB",
             c.topic AS about,
             c.created_at AS "createdAt",
             c.updated_at AS "updatedAt",
             (SELECT COUNT(*)::int FROM messages WHERE conversation_id = c.id) AS "msgCount"
        FROM conversations c
        WHERE c.company_id = $1
-         AND jsonb_array_length(c.members) >= 2
+         AND (SELECT COUNT(*) FROM conversation_members member
+               WHERE member.conversation_id = c.id) >= 2
          AND NOT EXISTS (
-           SELECT 1 FROM jsonb_array_elements_text(c.members) m
-             LEFT JOIN participants p ON p.id = m AND p.company_id = c.company_id
-            WHERE p.kind IS DISTINCT FROM 'agent'
+           SELECT 1
+             FROM conversation_members member
+             LEFT JOIN participants p
+               ON p.id = member.participant_id
+              AND p.company_id = member.company_id
+            WHERE member.conversation_id = c.id
+              AND p.kind IS DISTINCT FROM 'agent'
          )
        ORDER BY c.updated_at DESC
        LIMIT 50`,
@@ -4734,11 +4835,16 @@ api.get('/peek/agent-chats/:id/messages', async (req, res) => {
   // of kind='agent' in this company.
   const { rows: w } = await pool.query<{ ok: boolean }>(
     `SELECT (
-        jsonb_array_length(c.members) >= 1
+        (SELECT COUNT(*) FROM conversation_members member
+          WHERE member.conversation_id = c.id) >= 1
         AND NOT EXISTS (
-          SELECT 1 FROM jsonb_array_elements_text(c.members) m
-            LEFT JOIN participants p ON p.id = m AND p.company_id = c.company_id
-           WHERE p.kind IS DISTINCT FROM 'agent'
+          SELECT 1
+            FROM conversation_members member
+            LEFT JOIN participants p
+              ON p.id = member.participant_id
+             AND p.company_id = member.company_id
+           WHERE member.conversation_id = c.id
+             AND p.kind IS DISTINCT FROM 'agent'
         )
      ) AS ok
        FROM conversations c

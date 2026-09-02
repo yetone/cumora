@@ -205,21 +205,23 @@ export async function resolveWsEventRecipientUserIds(
     : null
   const { rows } = await pool.query<{ user_id: string }>(
     `WITH scoped_conversation AS (
-       SELECT id, company_id, members
+       SELECT id, company_id
          FROM conversations
         WHERE id = $1 AND company_id = $2
      ), current_members AS (
-       SELECT cm.user_id
+       SELECT company_member.user_id
          FROM scoped_conversation c
-         CROSS JOIN LATERAL jsonb_array_elements_text(c.members) member(id)
+         JOIN conversation_members room_member
+           ON room_member.conversation_id = c.id
+          AND room_member.company_id = c.company_id
          JOIN participants p
-           ON p.id = member.id
+           ON p.id = room_member.participant_id
           AND p.company_id = c.company_id
           AND p.kind = 'human'
           AND p.departed_at IS NULL
-         JOIN company_members cm
-           ON cm.user_id = p.id
-          AND cm.company_id = c.company_id
+         JOIN company_members company_member
+           ON company_member.user_id = p.id
+          AND company_member.company_id = c.company_id
      ), durable_recipient AS (
        SELECT cm.user_id
          FROM scoped_conversation c
@@ -701,24 +703,41 @@ async function postDocMentionWake(args: {
     // participants still belong to it. 2) Otherwise reuse/create one DM.
     if (document[0].conversation_id) {
       const { rows } = await client.query<{ id: string }>(
-        `SELECT id FROM conversations
-          WHERE id = $1 AND company_id = $2
-            AND members @> to_jsonb(ARRAY[$3::text])
-            AND members @> to_jsonb(ARRAY[$4::text])
-          FOR UPDATE`,
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            )
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $4
+            )
+          FOR UPDATE OF c`,
         [document[0].conversation_id, companyId, mentionerId, agentId],
       )
       conversationId = rows[0]?.id ?? ''
     }
     if (!conversationId) {
       const { rows } = await client.query<{ id: string }>(
-        `SELECT id FROM conversations
-          WHERE kind = 'direct' AND company_id = $3
-            AND members @> to_jsonb(ARRAY[$1::text])
-            AND members @> to_jsonb(ARRAY[$2::text])
-            AND jsonb_array_length(members) = 2
-          ORDER BY updated_at DESC LIMIT 1
-          FOR UPDATE`,
+        `SELECT c.id FROM conversations c
+          WHERE c.kind = 'direct' AND c.company_id = $3
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $1
+            )
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $2
+            )
+            AND (SELECT COUNT(*) FROM conversation_members cm
+                  WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+          ORDER BY c.updated_at DESC LIMIT 1
+          FOR UPDATE OF c`,
         [mentionerId, agentId, companyId],
       )
       conversationId = rows[0]?.id ?? ''

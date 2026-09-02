@@ -33,12 +33,16 @@ test('[integration] a human participant can open a CLI DM with an agent', async 
 
   assert.equal(result.ok, true, `human-authored DM should succeed: ${result.text}`)
   const { rows: conversations } = await pool.query<{ id: string; members: string[] }>(
-    `SELECT id, members FROM conversations
-      WHERE kind = 'direct'
-        AND members @> $1::jsonb
-        AND members @> $2::jsonb
-        AND jsonb_array_length(members) = 2`,
-    [JSON.stringify([humanId]), JSON.stringify([agentId])],
+    `SELECT c.id,
+            ARRAY_AGG(member.participant_id ORDER BY member.ordinal) AS members
+       FROM conversations c
+       JOIN conversation_members member ON member.conversation_id = c.id
+      WHERE c.kind = 'direct'
+      GROUP BY c.id
+     HAVING COUNT(*) = 2
+        AND BOOL_OR(member.participant_id = $1)
+        AND BOOL_OR(member.participant_id = $2)`,
+    [humanId, agentId],
   )
   assert.equal(conversations.length, 1)
   assert.deepEqual(new Set(conversations[0].members), new Set([humanId, agentId]))

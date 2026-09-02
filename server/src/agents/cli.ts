@@ -122,19 +122,26 @@ async function withConversationActorLock<T>(args: {
     companyId: args.companyId,
     kind: args.kind,
     run: async (client) => {
-      const params: unknown[] = [args.conversationId, args.companyId, args.participantId]
+      const params: unknown[] = [args.conversationId, args.companyId]
       let kindPredicate = ''
       if (args.conversationKind) {
         params.push(args.conversationKind)
-        kindPredicate = `AND kind = $4`
+        kindPredicate = `AND c.kind = $3`
       }
-      const authorized = await client.query(
-        `SELECT id FROM conversations
-          WHERE id = $1 AND company_id = $2
-            AND members @> to_jsonb(ARRAY[$3::text])
+      const locked = await client.query(
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
             ${kindPredicate}
           FOR UPDATE`,
         params,
+      )
+      if (!locked.rowCount) return null
+      const authorized = await client.query(
+        `SELECT 1 FROM conversation_members
+          WHERE conversation_id = $1
+            AND company_id = $2
+            AND participant_id = $3`,
+        [args.conversationId, args.companyId, args.participantId],
       )
       if (!authorized.rowCount) return null
       return args.run(client)
@@ -517,7 +524,11 @@ async function cmdWhoami(parsed: ParsedArgs): Promise<CliResult> {
   const { rows: convos } = await pool.query<{ id: string; title: string; kind: string }>(
     `SELECT id, title, kind FROM conversations
       WHERE company_id = $2
-        AND members @> to_jsonb(ARRAY[$1::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = conversations.id
+             AND member.participant_id = $1
+        )
         AND EXISTS (
           SELECT 1 FROM participants requester
            WHERE requester.id = $1
@@ -597,7 +608,11 @@ async function cmdConversations(parsed: ParsedArgs, kindFilter?: 'group' | 'dire
         AND requester.kind = 'agent'
         AND requester.departed_at IS NULL
       WHERE c.company_id = $2
-        AND c.members @> to_jsonb(ARRAY[$1::text]) ${kindWhere}
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $1
+        ) ${kindWhere}
       ORDER BY c.updated_at DESC`,
     params,
   )
@@ -625,8 +640,9 @@ async function cmdMembers(parsed: ParsedArgs): Promise<CliResult> {
   const id = parsed.positional[0]
   if (!id) return err('usage: members <conversation_id>')
   const { rows } = await pool.query<{ members: string[] }>(
-    `SELECT c.members
+    `SELECT ARRAY_AGG(member.participant_id ORDER BY member.ordinal) AS members
        FROM conversations c
+       JOIN conversation_members member ON member.conversation_id = c.id
        JOIN participants requester
          ON requester.id = $2
         AND requester.company_id = c.company_id
@@ -634,7 +650,12 @@ async function cmdMembers(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE c.id = $1
         AND c.company_id = $3
-        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members actor
+           WHERE actor.conversation_id = c.id
+             AND actor.participant_id = $2
+        )
+      GROUP BY c.id`,
     [id, me, companyId],
   )
   if (!rows[0]) return err(`unknown conversation: ${id}`)
@@ -697,7 +718,11 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
           AND requester.departed_at IS NULL
         WHERE c.id = $1
           AND c.company_id = $3
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = c.id
+               AND member.participant_id = $2
+          )
      )
      SELECT
         m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at, m.attachment, m.poll,
@@ -800,7 +825,11 @@ async function cmdConvening(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE ci.conversation_id = $1
         AND c.company_id = $3
-        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
     [id, me, companyId],
   )
   const c = rows[0]
@@ -854,7 +883,11 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.kind = 'agent'
         AND requester.departed_at IS NULL
       WHERE c.company_id = $2
-        AND c.members @> to_jsonb(ARRAY[$1::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $1
+        )
         AND m.body ILIKE $3 ${whereExtra}
       ORDER BY m.created_at DESC LIMIT ${limitParam}`,
     params,
@@ -1031,7 +1064,11 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
         AND requesting_agent.kind = 'agent'
         AND requesting_agent.departed_at IS NULL
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
-      WHERE (c.members @> to_jsonb(ARRAY[$1::text]) OR m.delivery_recipient_id = $1)
+      WHERE (EXISTS (
+               SELECT 1 FROM conversation_members member
+                WHERE member.conversation_id = c.id
+                  AND member.participant_id = $1
+             ) OR m.delivery_recipient_id = $1)
         AND (m.author_id <> $1 OR m.delivery_recipient_id = $1)
         AND m.created_at > COALESCE(
           (SELECT last_read_at FROM conversation_reads
@@ -1153,7 +1190,11 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
        LEFT JOIN participants p ON p.id = m.author_id AND p.company_id = c.company_id
       WHERE m.conversation_id = $1
         AND c.company_id = $3
-        AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )
       ORDER BY m.created_at DESC
       LIMIT 12`,
     [convoId, me, companyId],
@@ -1236,7 +1277,11 @@ async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE c.id = $2
         AND ($3::text IS NULL OR c.company_id = $3)
-        AND c.members @> to_jsonb(ARRAY[$1::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $1
+        )
      ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
     [me, convoId, activeAgentCompanyId],
   )
@@ -1287,13 +1332,20 @@ async function cmdMute(parsed: ParsedArgs): Promise<CliResult> {
   if (!conversationId) return err('usage: mute <conversation_id> [--for 30m|2h|1d|1w] [--until <iso>]  OR  mute list')
   let until: Date | null
   try { until = parseMuteUntil(parsed) } catch (error) { return err(error instanceof Error ? error.message : String(error)) }
-  const { rows } = await pool.query<{ kind: string; title: string; members: string[] }>(
-    `SELECT kind, title, members FROM conversations WHERE id = $1 AND company_id = $2`,
-    [conversationId, companyId],
+  const { rows } = await pool.query<{ kind: string; title: string; actor_is_member: boolean }>(
+    `SELECT c.kind, c.title,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $3
+            ) AS actor_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [conversationId, companyId, me],
   )
   const conversation = rows[0]
   if (!conversation) return err(`conversation not found: ${conversationId}`)
-  if (!conversation.members.includes(me)) return err(`you are not a member of ${conversationId}`)
+  if (!conversation.actor_is_member) return err(`you are not a member of ${conversationId}`)
   if (conversation.kind === 'direct') return err('direct conversations always deliver; mute a group instead')
   const muted = await withConversationActorLock({
     participantId: me,
@@ -1548,10 +1600,16 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   if (!convoId) return err('usage: leave <conversation_id>')
 
   const { rows } = await pool.query<{
-    kind: string; title: string; members: string[]; company_id: string | null
+    kind: string; title: string; company_id: string | null; actor_is_member: boolean
   }>(
-    `SELECT kind, title, members, company_id FROM conversations WHERE id = $1`,
-    [convoId],
+    `SELECT c.kind, c.title, c.company_id,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $2
+            ) AS actor_is_member
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me],
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
@@ -1559,7 +1617,7 @@ async function cmdLeave(parsed: ParsedArgs): Promise<CliResult> {
   if (c.kind === 'direct') {
     return err('cannot leave a direct conversation — use `cumora ack` to mute it from your inbox instead')
   }
-  if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId}`)
+  if (!c.actor_is_member) return err(`${me} is not a member of ${convoId}`)
 
   // Bind authorization to the write itself. If another member revoked us
   // after the SELECT above, this must fail closed and must not emit a false
@@ -1597,10 +1655,22 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
   if (target === me) return err(`${me} is already the one inviting`)
 
   const { rows } = await pool.query<{
-    kind: string; title: string; members: string[]; company_id: string | null
+    kind: string; title: string; company_id: string | null;
+    actor_is_member: boolean; target_is_member: boolean
   }>(
-    `SELECT kind, title, members, company_id FROM conversations WHERE id = $1`,
-    [convoId],
+    `SELECT c.kind, c.title, c.company_id,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $2
+            ) AS actor_is_member,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $3
+            ) AS target_is_member
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me, target],
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
@@ -1608,8 +1678,8 @@ async function cmdInvite(parsed: ParsedArgs): Promise<CliResult> {
   if (c.kind === 'direct') {
     return err('cannot invite into a direct conversation — use `cumora pull-group` to start a fresh thread')
   }
-  if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId} — can't invite into a group you're not in`)
-  if (c.members.includes(target)) return ok(`${target} is already a member of ${convoId}`)
+  if (!c.actor_is_member) return err(`${me} is not a member of ${convoId} — can't invite into a group you're not in`)
+  if (c.target_is_member) return ok(`${target} is already a member of ${convoId}`)
 
   // Verify the invitee exists in this tenant.
   const tenant = c.company_id
@@ -1652,25 +1722,39 @@ async function cmdKick(parsed: ParsedArgs): Promise<CliResult> {
   if (target === me) return err('use `cumora leave <convo_id>` to leave a group yourself')
 
   const { rows } = await pool.query<{
-    kind: string; title: string; members: string[]; company_id: string | null
+    kind: string; title: string; company_id: string | null; member_count: number;
+    actor_is_member: boolean; target_is_member: boolean
   }>(
-    `SELECT kind, title, members, company_id FROM conversations WHERE id = $1`,
-    [convoId],
+    `SELECT c.kind, c.title, c.company_id,
+            (SELECT COUNT(*)::int FROM conversation_members member
+              WHERE member.conversation_id = c.id) AS member_count,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $2
+            ) AS actor_is_member,
+            EXISTS (
+              SELECT 1 FROM conversation_members member
+               WHERE member.conversation_id = c.id
+                 AND member.participant_id = $3
+            ) AS target_is_member
+       FROM conversations c WHERE c.id = $1`,
+    [convoId, me, target],
   )
   const c = rows[0]
   if (!c) return err(`unknown conversation ${convoId}`)
   if (!c.company_id) return err(`conversation ${convoId} is not attached to a workspace`)
   if (c.kind === 'direct') return err('cannot kick from a direct conversation')
-  if (!c.members.includes(me)) return err(`${me} is not a member of ${convoId} — can't kick from a group you're not in`)
-  if (!c.members.includes(target)) return err(`${target} is not a member of ${convoId}`)
+  if (!c.actor_is_member) return err(`${me} is not a member of ${convoId} — can't kick from a group you're not in`)
+  if (!c.target_is_member) return err(`${target} is not a member of ${convoId}`)
 
-  const next = c.members.filter((m) => m !== target)
+  const nextCount = c.member_count - 1
   // Refuse to leave a group with just one member as a side-effect of kick —
   // if there'd only be the actor left, that's "everyone else gone", which
   // is fine, but require explicit confirmation via --confirm-empty for the
   // case where the kick removes the LAST other member. Cheap guard against
   // accidental group-clearing.
-  if (next.length === 1 && !parsed.flags['confirm-empty']) {
+  if (nextCount === 1 && !parsed.flags['confirm-empty']) {
     return err(`kicking ${target} would leave only ${me} in this group; pass --confirm-empty if that's intended`)
   }
 
@@ -1740,9 +1824,11 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // conversation row, so a concurrent kick, offboarding, or tenant move
   // cannot leave this snapshot authorized at the write boundary.
   const { rows: cv } = await pool.query<{
-    members: string[]; company_id: string; kind: string; actor_is_agent: boolean
+    member_count: number; company_id: string; kind: string; actor_is_agent: boolean
   }>(
-    `SELECT c.members, c.company_id, c.kind,
+    `SELECT (SELECT COUNT(*)::int FROM conversation_members member
+              WHERE member.conversation_id = c.id) AS member_count,
+            c.company_id, c.kind,
             (requester.kind = 'agent') AS actor_is_agent
        FROM conversations c
        JOIN participants requester
@@ -1752,7 +1838,11 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE c.id = $1
         AND ($3::text IS NULL OR c.company_id = $3)
-        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
     [convoId, me, activeAgentCompanyId],
   )
   if (!cv[0]) return err(`conversation ${convoId} not found or no longer authorized`)
@@ -1781,7 +1871,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // forces the agent to commit deliberately rather than absent-
   // mindedly continuing to monologue.
   const monologueBypass = Boolean(parsed.flags.continue || parsed.flags.also)
-  if (!monologueBypass && cv[0].actor_is_agent && cv[0].members.length > 2) {
+  if (!monologueBypass && cv[0].actor_is_agent && cv[0].member_count > 2) {
     const { rows: lastMsg } = await pool.query<{ author_id: string; created_at: string }>(
       `SELECT author_id, created_at FROM messages
          WHERE conversation_id = $1
@@ -1885,7 +1975,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // the agent a HELD envelope for this conversation.
   const sendAnywayFlag = Boolean(parsed.flags['send-anyway'])
   const replyHoldScope = `reply:${convoId}`
-  const preflightApplies = !monologueBypass && cv[0].members.length > 2
+  const preflightApplies = !monologueBypass && cv[0].member_count > 2
   const heldAck = sendAnywayFlag
     ? await consumeHold(me, replyHoldScope)
     : { armed: false, heldUpToSeq: null }
@@ -2167,20 +2257,30 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   const txClient = await pool.connect()
   try {
     await txClient.query('BEGIN')
-    const { rows: authorizedRows } = await txClient.query<{ member_count: number }>(
-      `SELECT jsonb_array_length(c.members)::int AS member_count
-         FROM participants requester
-         JOIN conversations c
-           ON c.company_id = requester.company_id
-          AND c.id = $2
-          AND c.members @> to_jsonb(ARRAY[$1::text])
-        WHERE requester.id = $1
-          AND requester.company_id = $3
-          AND requester.kind IN ('agent', 'human')
-          AND requester.departed_at IS NULL
-        FOR SHARE OF requester, c`,
-      [me, convoId, companyId],
+    const activeActor = await txClient.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind IN ('agent', 'human') AND departed_at IS NULL
+        FOR SHARE`,
+      [me, companyId],
     )
+    const lockedConversation = activeActor.rowCount
+      ? await txClient.query(
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+          FOR SHARE OF c`,
+        [convoId, companyId],
+      )
+      : null
+    const { rows: authorizedRows } = lockedConversation?.rowCount
+      ? await txClient.query<{ member_count: number }>(
+        `SELECT COUNT(*)::int AS member_count
+           FROM conversation_members
+          WHERE conversation_id = $1 AND company_id = $2
+         HAVING BOOL_OR(participant_id = $3)`,
+        [convoId, companyId, me],
+      )
+      : { rows: [] as Array<{ member_count: number }> }
     if (!authorizedRows[0]) {
       await txClient.query('ROLLBACK')
       return err(`conversation ${convoId} no longer authorized; reply cancelled`)
@@ -2877,7 +2977,11 @@ async function listAgentEmailThreads(args: {
          FROM conversations c
         WHERE c.kind = 'email'
           AND c.company_id = $1
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = c.id
+               AND member.participant_id = $2
+          )
      ),
      last_msg AS (
        SELECT DISTINCT ON (em.conversation_id)
@@ -3042,7 +3146,11 @@ async function cmdPollShow(parsed: ParsedArgs, me: string, companyId: string): P
        FROM participants requester
        JOIN conversations c
          ON c.company_id = requester.company_id
-        AND c.members @> to_jsonb(ARRAY[$3::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $3
+        )
        JOIN messages m ON m.conversation_id = c.id AND m.company_id = c.company_id
       WHERE m.id = $1 AND m.company_id = $2 AND m.kind = 'poll'
         AND requester.id = $3
@@ -3733,7 +3841,11 @@ async function cmdTopicRead(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE c.id = $1
         AND ($3::text IS NULL OR c.company_id = $3)
-        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
     [convoId, me, activeAgentCompanyId],
   )
   if (!rows[0]) return err(`conversation ${convoId} not found or no longer authorized`)
@@ -3760,7 +3872,11 @@ async function cmdTopicSet(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE c.id = $1
         AND ($3::text IS NULL OR c.company_id = $3)
-        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
     [convoId, me, activeAgentCompanyId],
   )
   if (!preflight[0]) return err(`conversation ${convoId} not found or no longer authorized`)
@@ -3819,7 +3935,11 @@ async function cmdRename(parsed: ParsedArgs): Promise<CliResult> {
         AND requester.departed_at IS NULL
       WHERE c.id = $1
         AND ($3::text IS NULL OR c.company_id = $3)
-        AND c.members @> to_jsonb(ARRAY[$2::text])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members member
+           WHERE member.conversation_id = c.id
+             AND member.participant_id = $2
+        )`,
     [convoId, me, activeAgentCompanyId],
   )
   if (!rows[0]) return err(`conversation ${convoId} not found or no longer authorized`)

@@ -58,7 +58,12 @@ async function agentHasUnreadInbox(agentId: string): Promise<boolean> {
        SELECT 1
          FROM messages m
          JOIN conversations c ON c.id = m.conversation_id
-        WHERE c.members @> to_jsonb(ARRAY[$1::text])
+        WHERE EXISTS (
+                SELECT 1 FROM conversation_members cm
+                 WHERE cm.conversation_id = c.id
+                   AND cm.company_id = c.company_id
+                   AND cm.participant_id = $1
+              )
           AND m.author_id <> $1
           AND ROW(m.created_at, m.id) > (
             SELECT

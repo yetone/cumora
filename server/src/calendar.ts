@@ -91,15 +91,23 @@ function renderDispatchBody(event: CalendarEventRow, scheduledFor: Date): string
  *  missing, target conversation deleted, etc.). */
 async function resolveTargetConversation(event: CalendarEventRow): Promise<string | null> {
   if (event.target_conversation_id) {
-    const { rows } = await pool.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1 AND company_id = $2 LIMIT 1`,
-      [event.target_conversation_id, event.company_id],
+    const { rows } = await pool.query<{ assignee_is_member: boolean }>(
+      `SELECT ($3::text IS NULL OR EXISTS (
+                SELECT 1 FROM conversation_members member
+                 WHERE member.conversation_id = c.id
+                   AND member.company_id = c.company_id
+                   AND member.participant_id = $3
+              )) AS assignee_is_member
+         FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        LIMIT 1`,
+      [event.target_conversation_id, event.company_id, event.assignee_id],
     )
     if (!rows[0]) return null
     // Best-effort: skip dispatch if the assignee isn't a member of the
     // target conversation. Avoids the @mention dangling in a room the
     // agent can't see.
-    if (event.assignee_id && !rows[0].members.includes(event.assignee_id)) return null
+    if (!rows[0].assignee_is_member) return null
     return event.target_conversation_id
   }
   if (!event.assignee_id) return null
@@ -107,11 +115,22 @@ async function resolveTargetConversation(event: CalendarEventRow): Promise<strin
   // creator and the assignee. We don't auto-create one — if it doesn't
   // exist the dispatch records 'skipped'.
   const { rows } = await pool.query<{ id: string }>(
-    `SELECT id FROM conversations
-      WHERE company_id = $1 AND kind = 'direct'
-        AND members @> $2::jsonb AND members @> $3::jsonb
+    `SELECT c.id FROM conversations c
+      WHERE c.company_id = $1 AND c.kind = 'direct'
+        AND EXISTS (
+          SELECT 1 FROM conversation_members creator
+           WHERE creator.conversation_id = c.id
+             AND creator.participant_id = $2
+        )
+        AND EXISTS (
+          SELECT 1 FROM conversation_members assignee
+           WHERE assignee.conversation_id = c.id
+             AND assignee.participant_id = $3
+        )
+        AND (SELECT COUNT(*) FROM conversation_members member
+              WHERE member.conversation_id = c.id) = 2
       LIMIT 1`,
-    [event.company_id, JSON.stringify([event.created_by]), JSON.stringify([event.assignee_id])],
+    [event.company_id, event.created_by, event.assignee_id],
   )
   return rows[0]?.id ?? null
 }
@@ -123,6 +142,21 @@ async function postDispatchMessage(args: {
 }): Promise<string> {
   const { event, conversationId, body } = args
   return withOutboxTransaction(async (client) => {
+    const target = await client.query(
+      `SELECT c.id FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        FOR UPDATE OF c`,
+      [conversationId, event.company_id],
+    )
+    if (!target.rowCount) throw new Error('calendar target conversation disappeared')
+    const membership = await client.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1
+          AND company_id = $2
+          AND participant_id = $3`,
+      [conversationId, event.company_id, event.assignee_id],
+    )
+    if (!membership.rowCount) throw new Error('calendar assignee is no longer a target member')
     const seqResult = await client.query<{ seq: number }>(
       `INSERT INTO conversation_counters (conversation_id, next_sequence)
        VALUES ($1, 2)

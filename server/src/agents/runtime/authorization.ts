@@ -97,10 +97,15 @@ export async function withRuntimeConversationAuthorization<T>(args: {
     }
     if (conversationIds.length > 0) {
       const conversations = await client.query<{ id: string }>(
-        `SELECT id FROM conversations
-          WHERE company_id = $1 AND id = ANY($2::text[])
-            AND members @> to_jsonb(ARRAY[$3::text])
-          ORDER BY id FOR SHARE`,
+        `SELECT c.id FROM conversations c
+          WHERE c.company_id = $1 AND c.id = ANY($2::text[])
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            )
+          ORDER BY c.id FOR SHARE OF c`,
         [args.companyId, conversationIds, args.agentId],
       )
       if (conversations.rows.length !== conversationIds.length) {
@@ -150,7 +155,12 @@ export async function withRuntimeMessageReadAuthorization<T>(args: {
            ON m.id = $4 AND m.conversation_id = c.id AND m.company_id = c.company_id
         WHERE c.id = $1 AND c.company_id = $2
           AND (
-            c.members @> to_jsonb(ARRAY[$3::text])
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            )
             OR (m.kind = 'system' AND m.delivery_recipient_id = $3)
           )
         FOR SHARE OF c, m`,

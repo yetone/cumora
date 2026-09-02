@@ -204,7 +204,12 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
          FROM participants requester
          JOIN conversations c
            ON c.company_id = requester.company_id
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND cm.participant_id = $2
+          )
          JOIN messages m
            ON m.conversation_id = c.id
           AND m.company_id = c.company_id

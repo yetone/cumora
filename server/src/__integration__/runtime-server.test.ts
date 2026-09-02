@@ -385,8 +385,10 @@ test('[integration] runtime: /context enforces tenant and conversation membershi
   const otherTenant = await seedAgent()
   const crossTenantId = await seedContextConversation({
     companyId: otherTenant.companyId,
-    // Even a forged members array cannot override the JWT tenant boundary.
-    members: [agentId, otherTenant.agentId],
+    // The composite membership FK now prevents forging agentId into this
+    // tenant at fixture time; the runtime tenant boundary must still exclude
+    // a valid foreign conversation id supplied by the caller.
+    members: [otherTenant.agentId],
     authorId: otherTenant.agentId,
     body: 'cross-tenant-private',
   })
@@ -535,11 +537,29 @@ test('[integration] runtime: a current token cannot use a stale member id to rea
     ],
   )
 
-  const moved = await pool.query(
-    `UPDATE participants SET company_id = $1 WHERE id = $2 AND company_id = $3`,
-    [currentTenant.companyId, originalTenant.agentId, originalTenant.companyId],
-  )
-  assert.equal(moved.rowCount, 1)
+  const mover = await pool.connect()
+  try {
+    await mover.query('BEGIN')
+    await mover.query(
+      `DELETE FROM conversation_members
+        WHERE conversation_id = $1
+          AND participant_id = $2
+          AND company_id = $3`,
+      [oldConversationId, originalTenant.agentId, originalTenant.companyId],
+    )
+    await mover.query(`SELECT refresh_conversation_members_projection($1)`, [oldConversationId])
+    const moved = await mover.query(
+      `UPDATE participants SET company_id = $1 WHERE id = $2 AND company_id = $3`,
+      [currentTenant.companyId, originalTenant.agentId, originalTenant.companyId],
+    )
+    assert.equal(moved.rowCount, 1)
+    await mover.query('COMMIT')
+  } catch (error) {
+    await mover.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    mover.release()
+  }
   const currentToken = signAgentToken({
     agentId: originalTenant.agentId,
     companyId: currentTenant.companyId,
@@ -605,8 +625,16 @@ test('[integration] runtime: a current token cannot use a stale member id to rea
           pulled_by ->> 'agentId' = $2
           OR (
             kind = 'direct'
-            AND members @> to_jsonb(ARRAY[$2::text])
-            AND members @> to_jsonb(ARRAY[$3::text])
+            AND EXISTS (
+              SELECT 1 FROM conversation_members first_member
+               WHERE first_member.conversation_id = conversations.id
+                 AND first_member.participant_id = $2
+            )
+            AND EXISTS (
+              SELECT 1 FROM conversation_members second_member
+               WHERE second_member.conversation_id = conversations.id
+                 AND second_member.participant_id = $3
+            )
           )
         )`,
     [currentTenant.companyId, originalTenant.agentId, oldPeerId],

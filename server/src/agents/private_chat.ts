@@ -27,15 +27,24 @@ async function findOrCreateDirect(
   bName: string,
 ): Promise<string> {
   const { rows } = await client.query<{ id: string }>(
-    `SELECT id FROM conversations
-       WHERE kind = 'direct'
-         AND members @> $1::jsonb
-         AND members @> $2::jsonb
-         AND jsonb_array_length(members) = 2
-         AND company_id = $3
-       ORDER BY created_at DESC LIMIT 1
-       FOR UPDATE`,
-    [JSON.stringify([aId]), JSON.stringify([bId]), companyId],
+    `SELECT c.id FROM conversations c
+       WHERE c.kind = 'direct'
+         AND c.company_id = $3
+         AND EXISTS (
+           SELECT 1 FROM conversation_members cm
+            WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+              AND cm.participant_id = $1
+         )
+         AND EXISTS (
+           SELECT 1 FROM conversation_members cm
+            WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+              AND cm.participant_id = $2
+         )
+         AND (SELECT COUNT(*) FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+       ORDER BY c.created_at DESC LIMIT 1
+       FOR UPDATE OF c`,
+    [aId, bId, companyId],
   )
   if (rows[0]) {
     if (topic) {

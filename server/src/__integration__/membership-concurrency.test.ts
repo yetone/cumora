@@ -1,19 +1,18 @@
 /**
  * Concurrent membership changes must not lose each other.
  *
- * `conversations.members` is a jsonb array, and every mutation of it read the
- * array, edited it in JavaScript, and wrote the whole thing back. Two of those
- * overlapping means the second write is computed from a snapshot taken before
- * the first, so the first change is silently erased.
+ * Membership is normalized into tenant-constrained rows. Every mutation locks
+ * the active participant rows and conversation in one order, changes one
+ * membership row, rebuilds the JSON compatibility projection, and commits its
+ * system message plus realtime outbox row in the same transaction.
  *
  * This is a hot path here rather than a theoretical one: the scheduler wakes
  * several agents for the same message, and `cumora invite` / `leave` / `kick`
  * are things those agents do in response. Concurrency is the normal case.
  *
- * The dropped invite is worse than it first looks. The `joined` system row is
- * posted regardless, so the transcript records a join that did not happen —
- * and because the mailbox query filters on `members @> [agentId]`, the agent
- * who "joined" is never woken for that conversation again. Nothing errors.
+ * These tests keep two real PostgreSQL clients on opposing lock queues. They
+ * therefore cover lost updates, stale authorization, duplicate invites, and
+ * the transcript/routing divergence that the old JSONB source allowed.
  *
  * Only a real Postgres can show this: it is about what two overlapping
  * statements do to one row.
@@ -23,6 +22,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import { setTimeout as delay } from 'node:timers/promises'
+import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
 import { runCli } from '../agents/cli.js'
 import { inprocClient } from '../agents/runtime/inproc-client.js'
@@ -78,9 +78,65 @@ async function seedGroup(companyId: string, members: string[]): Promise<string> 
 
 async function membersOf(convoId: string): Promise<string[]> {
   const { rows } = await pool.query<{ members: string[] }>(
-    `SELECT members FROM conversations WHERE id = $1`, [convoId],
+    `SELECT COALESCE(
+              ARRAY_AGG(participant_id ORDER BY ordinal),
+              ARRAY[]::text[]
+            ) AS members
+       FROM conversation_members
+      WHERE conversation_id = $1`,
+    [convoId],
   )
   return rows[0]?.members ?? []
+}
+
+async function removeMemberWithClient(
+  client: PoolClient,
+  conversationId: string,
+  participantId: string,
+  companyId?: string,
+): Promise<void> {
+  await client.query(
+    `DELETE FROM conversation_members
+      WHERE conversation_id = $1
+        AND participant_id = $2
+        AND ($3::text IS NULL OR company_id = $3)`,
+    [conversationId, participantId, companyId ?? null],
+  )
+  await client.query(`SELECT refresh_conversation_members_projection($1)`, [conversationId])
+}
+
+async function removeMember(
+  conversationId: string,
+  participantId: string,
+  companyId?: string,
+): Promise<void> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    await removeMemberWithClient(client, conversationId, participantId, companyId)
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+async function detachParticipantWithClient(
+  client: PoolClient,
+  participantId: string,
+  companyId: string,
+): Promise<void> {
+  const { rows } = await client.query<{ conversation_id: string }>(
+    `DELETE FROM conversation_members
+      WHERE participant_id = $1 AND company_id = $2
+      RETURNING conversation_id`,
+    [participantId, companyId],
+  )
+  for (const conversationId of new Set(rows.map((row) => row.conversation_id))) {
+    await client.query(`SELECT refresh_conversation_members_projection($1)`, [conversationId])
+  }
 }
 
 async function noticesOf(convoId: string): Promise<Array<{ kind?: string; participantId?: string }>> {
@@ -107,8 +163,8 @@ async function waitForBlockedQuery(pattern: string, minimum: number = 1): Promis
   throw new Error(`query never reached the expected row lock: ${pattern}`)
 }
 
-async function waitForBlockedMembershipUpdate(fragment: 'members ||' | 'members -'): Promise<void> {
-  await waitForBlockedQuery(`%UPDATE conversations c%SET members = ${fragment}%`)
+async function waitForBlockedMembershipUpdate(_fragment: 'members ||' | 'members -'): Promise<void> {
+  await waitForBlockedQuery('%SELECT c.id%FROM conversations c%FOR UPDATE OF c%')
 }
 
 async function waitForBlockedMembershipGuards(minimum: number): Promise<void> {
@@ -120,7 +176,7 @@ async function waitForBlockedMembershipGuards(minimum: number): Promise<void> {
           AND pid <> pg_backend_pid()
           AND wait_event_type = 'Lock'
           AND (
-            query ILIKE '%UPDATE conversations c%SET members =%'
+            query ILIKE '%SELECT c.id%FROM conversations c%FOR UPDATE OF c%'
             OR query ILIKE '%FROM participants%FOR UPDATE%'
           )`,
     )
@@ -151,7 +207,7 @@ test('[integration] simultaneous invites do not lose an invitee', async () => {
 
   // Every invite reported success, so every invitee must actually be a member.
   // Before the fix several were missing while their `joined` rows still stood,
-  // and their mailbox query (members @> [id]) never matched again.
+  // and their normalized mailbox membership never matched again.
   const members = await membersOf(convo)
   const missing = invitees.filter((who) => !members.includes(who))
   assert.deepEqual(missing, [], `dropped despite reporting success: ${JSON.stringify(missing)}`)
@@ -270,10 +326,7 @@ test('[integration] a revoked HTTP actor cannot finish a stale invite or emit a 
   let pending: Promise<Response> | undefined
   try {
     await revoker.query('BEGIN')
-    await revoker.query(
-      `UPDATE conversations SET members = members - $2::text WHERE id = $1`,
-      [convo, HTTP_A],
-    )
+    await removeMemberWithClient(revoker, convo, HTTP_A)
     pending = fetch(`${httpBaseUrls[0]}/api/conversations/${convo}/members`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-company-id': companyId },
@@ -311,16 +364,13 @@ test('[integration] a revoked HTTP actor cannot finish a stale text message writ
   let pending: Promise<Response> | undefined
   try {
     await revoker.query('BEGIN')
-    await revoker.query(
-      `UPDATE conversations SET members = members - $2::text WHERE id = $1`,
-      [convo, HTTP_A],
-    )
+    await removeMemberWithClient(revoker, convo, HTTP_A)
     pending = fetch(`${httpBaseUrls[0]}/api/conversations/${convo}/messages`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-company-id': companyId },
       body: JSON.stringify({ body: 'must-not-land-after-kick' }),
     })
-    await waitForBlockedQuery('%SELECT kind FROM conversations%FOR UPDATE%')
+    await waitForBlockedQuery('%SELECT c.kind FROM conversations c%FOR UPDATE OF c%')
     await revoker.query('COMMIT')
     committed = true
   } finally {
@@ -388,10 +438,7 @@ test('[integration] a revoked HTTP email reply is rejected before the provider c
   let response: Response | undefined
   try {
     await revoker.query('BEGIN')
-    await revoker.query(
-      `UPDATE conversations SET members = members - $2::text WHERE id = $1`,
-      [convo, HTTP_A],
-    )
+    await removeMemberWithClient(revoker, convo, HTTP_A)
     pending = fetch(`${httpBaseUrls[0]}/api/email/reply/${inboundId}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-company-id': companyId },
@@ -464,8 +511,16 @@ test('[integration] HTTP group and direct creation reject targets moved while pa
   })
   assert.equal(directResponse.status, 404, await directResponse.text())
   const created = await pool.query(
-    `SELECT 1 FROM conversations
-      WHERE company_id = $1 AND (title = 'must-not-create-stale-group' OR members @> to_jsonb(ARRAY[$2::text]))`,
+    `SELECT 1 FROM conversations c
+      WHERE c.company_id = $1
+        AND (
+          c.title = 'must-not-create-stale-group'
+          OR EXISTS (
+            SELECT 1 FROM conversation_members member
+             WHERE member.conversation_id = c.id
+               AND member.participant_id = $2
+          )
+        )`,
     [companyA, directTarget],
   )
   assert.equal(created.rowCount, 0)
@@ -483,10 +538,7 @@ test('[integration] a revoked CLI actor cannot finish a stale kick or emit a kic
   let pending: ReturnType<typeof runCli> | undefined
   try {
     await revoker.query('BEGIN')
-    await revoker.query(
-      `UPDATE conversations SET members = members - $2::text WHERE id = $1`,
-      [convo, actor],
-    )
+    await removeMemberWithClient(revoker, convo, actor)
     pending = runCli(['--as', actor, 'kick', convo, target])
     await waitForBlockedMembershipUpdate('members -')
     await revoker.query('COMMIT')
@@ -517,6 +569,7 @@ test('[integration] an actor tenant move that wins the participant lock cancels 
   let pending: ReturnType<typeof runCli> | undefined
   try {
     await mover.query('BEGIN')
+    await detachParticipantWithClient(mover, actor, companyA)
     await mover.query(
       `UPDATE participants SET company_id = $2 WHERE id = $1 AND company_id = $3`,
       [actor, companyB, companyA],
@@ -534,7 +587,7 @@ test('[integration] an actor tenant move that wins the participant lock cancels 
 
   const result = await pending!
   assert.equal(result.ok, false, result.text)
-  assert.deepEqual(await membersOf(convo), [actor])
+  assert.deepEqual(await membersOf(convo), [])
   assert.equal((await noticesOf(convo)).length, 0)
 })
 
@@ -643,10 +696,21 @@ test('[integration] a moved agent cannot read a stale old-tenant membership', as
      VALUES ($1,$2,$3,'text','old tenant secret',1,$4)`,
     [`m-${randomUUID()}`, convo, actor, companyA],
   )
-  await pool.query(
-    `UPDATE participants SET company_id = $2 WHERE id = $1 AND company_id = $3`,
-    [moved, companyB, companyA],
-  )
+  const mover = await pool.connect()
+  try {
+    await mover.query('BEGIN')
+    await detachParticipantWithClient(mover, moved, companyA)
+    await mover.query(
+      `UPDATE participants SET company_id = $2 WHERE id = $1 AND company_id = $3`,
+      [moved, companyB, companyA],
+    )
+    await mover.query('COMMIT')
+  } catch (error) {
+    await mover.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    mover.release()
+  }
 
   const inbox = await inprocClient.loadInbox(moved)
   assert.deepEqual(inbox, [])
@@ -671,10 +735,7 @@ test('[integration] a kicked poll author is not woken with later room tally deta
      VALUES ($1,$2,$3,'poll',$4,1,$5::jsonb,$6)`,
     [messageId, convo, author, poll.question, JSON.stringify(poll), companyId],
   )
-  await pool.query(
-    `UPDATE conversations SET members = members - $2::text WHERE id = $1 AND company_id = $3`,
-    [convo, author, companyId],
-  )
+  await removeMember(convo, author, companyId)
 
   const woke = await handlePollUpdated({
     type: 'poll.updated',
@@ -713,10 +774,7 @@ test('[integration] WebSocket routing uses current room membership with one dura
   assert.deepEqual([...before].sort(), [HTTP_A, HTTP_B].sort())
   assert.ok(!before.has(outsider), 'same-tenant non-member received a private conversation frame')
 
-  await pool.query(
-    `UPDATE conversations SET members = members - $2::text WHERE id = $1`,
-    [convo, HTTP_A],
-  )
+  await removeMember(convo, HTTP_A)
   const afterKick = await resolveWsEventRecipientUserIds({
     type: 'message.new', companyId, conversationId: convo, message: { id: ordinaryId },
   })

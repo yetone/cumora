@@ -657,11 +657,20 @@ export async function persistEmailMessage(args: {
     const conversation = await client.query(
       `SELECT id FROM conversations
         WHERE id = $1 AND company_id = $2
-          AND ($3::boolean = FALSE OR members @> to_jsonb(ARRAY[$4::text]))
         FOR UPDATE`,
-      [args.conversationId, args.companyId, args.direction === 'out', args.authorId],
+      [args.conversationId, args.companyId],
     )
     if (!conversation.rowCount) throw new Error('email conversation not found or no longer authorized')
+    if (args.direction === 'out') {
+      const membership = await client.query(
+        `SELECT 1 FROM conversation_members
+          WHERE conversation_id = $1
+            AND company_id = $2
+            AND participant_id = $3`,
+        [args.conversationId, args.companyId, args.authorId],
+      )
+      if (!membership.rowCount) throw new Error('email conversation not found or no longer authorized')
+    }
 
     const seqResult = await client.query<{ seq: number }>(
       `INSERT INTO conversation_counters (conversation_id, next_sequence)
@@ -811,9 +820,10 @@ export async function persistEmailMessage(args: {
  *       direct/group conversations use. Title = the subject line
  *       (collapses Re:/Fwd: prefixes for display sanity).
  *
- *  members is what powers the inbox / RLS / wake fan-out. Including
- *  the sender means their own outbox messages show up in their inbox
- *  view (matches Gmail's behavior). */
+ *  Normalized participant memberships power inbox authorization and wake
+ *  fan-out. Synthetic `external:<addr>` author markers are deliberately not
+ *  memberships; including the internal sender still makes their own outbox
+ *  messages appear in their inbox (matching Gmail's behavior). */
 export async function findOrCreateEmailConversation(args: {
   companyId: string
   inReplyTo: string | null
@@ -823,8 +833,9 @@ export async function findOrCreateEmailConversation(args: {
    *  sender. Order is preserved for the title fallback ("A ↔ B"). */
   memberIds: string[]
 }): Promise<{ conversationId: string; created: boolean }> {
-  const uniqueMembers = Array.from(new Set(args.memberIds))
-  const concreteMembers = uniqueMembers.filter((id) => !id.startsWith('external:')).sort()
+  const concreteMembers = Array.from(new Set(args.memberIds))
+    .filter((id) => !id.startsWith('external:'))
+    .sort()
   const client = await pool.connect()
   try {
     await client.query('BEGIN')
@@ -846,22 +857,32 @@ export async function findOrCreateEmailConversation(args: {
       .filter((x): x is string => Boolean(x))
     const existing = await findEmailConversationByMessageIds(candidates, args.companyId, client)
     if (existing) {
-      // Membership repair is serialized with participant moves and validates
-      // every concrete member before extending the JSON array.
-      await client.query(
-        `UPDATE conversations
-            SET members = (
-              SELECT to_jsonb(ARRAY(
-                SELECT DISTINCT m FROM (
-                  SELECT jsonb_array_elements_text(members) AS m
-                  UNION
-                  SELECT unnest($2::text[]) AS m
-                ) u
-              ))
-            )
-          WHERE id = $1 AND company_id = $3`,
-        [existing, uniqueMembers, args.companyId],
+      // Serialize thread repair before checking/inserting normalized rows.
+      // The next statement gets a fresh snapshot after any lock wait.
+      const locked = await client.query(
+        `SELECT id FROM conversations
+          WHERE id = $1 AND company_id = $2
+          FOR UPDATE`,
+        [existing, args.companyId],
       )
+      if (!locked.rowCount) throw new Error('email conversation moved or disappeared')
+      await client.query(
+        `INSERT INTO conversation_members (
+           conversation_id, company_id, participant_id, ordinal
+         )
+         SELECT $1, $3, incoming.participant_id,
+                base.next_ordinal + incoming.input_ordinal - 1
+           FROM UNNEST($2::text[]) WITH ORDINALITY
+                  AS incoming(participant_id, input_ordinal)
+           CROSS JOIN LATERAL (
+             SELECT COALESCE(MAX(ordinal) + 1, 0)::integer AS next_ordinal
+               FROM conversation_members
+              WHERE conversation_id = $1 AND company_id = $3
+           ) base
+         ON CONFLICT (conversation_id, participant_id) DO NOTHING`,
+        [existing, concreteMembers, args.companyId],
+      )
+      await client.query(`SELECT refresh_conversation_members_projection($1)`, [existing])
       await client.query('COMMIT')
       return { conversationId: existing, created: false }
     }
@@ -871,7 +892,7 @@ export async function findOrCreateEmailConversation(args: {
     await client.query(
       `INSERT INTO conversations (id, kind, title, members, company_id, topic)
        VALUES ($1, 'email', $2, $3::jsonb, $4, $5)`,
-      [id, cleanSubject.slice(0, 200), JSON.stringify(uniqueMembers), args.companyId, cleanSubject.slice(0, 200)],
+      [id, cleanSubject.slice(0, 200), JSON.stringify(concreteMembers), args.companyId, cleanSubject.slice(0, 200)],
     )
     await client.query('COMMIT')
     return { conversationId: id, created: true }

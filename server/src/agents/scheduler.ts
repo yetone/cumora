@@ -676,13 +676,20 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     company_id: string
     muted_agent_ids: string[]
   }>(
-    `SELECT c.members, c.kind, c.company_id,
-            COALESCE(array_agg(mu.user_id) FILTER (WHERE mu.user_id IS NOT NULL), ARRAY[]::text[]) AS muted_agent_ids
+    `SELECT COALESCE((
+              SELECT array_agg(cm.participant_id ORDER BY cm.ordinal, cm.participant_id)
+                FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+            ), ARRAY[]::text[]) AS members,
+            c.kind, c.company_id,
+            COALESCE((
+              SELECT array_agg(mu.user_id)
+                FROM conversation_mutes mu
+               WHERE mu.conversation_id = c.id
+                 AND (mu.muted_until IS NULL OR mu.muted_until > NOW())
+            ), ARRAY[]::text[]) AS muted_agent_ids
        FROM conversations c
-       LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id
-        AND (mu.muted_until IS NULL OR mu.muted_until > NOW())
-      WHERE c.id = $1
-      GROUP BY c.id`,
+      WHERE c.id = $1`,
     [conversationId],
   )
   const conversation = convoRows[0]
@@ -708,8 +715,8 @@ async function wake(payload: MessageNewEvent): Promise<void> {
   const agentRecipients: string[] = []
   for (const m of members) {
     if (m === authorId) continue
-    // Treat conversations.members as untrusted denormalized data. A malformed
-    // cross-tenant id must never become a wake/steer recipient for this tenant.
+    // The normalized membership FK is tenant-constrained; the active
+    // participant filter additionally excludes offboarded agents.
     if (!currentAgents.has(m)) continue
     if (mutedAgentIds.has(m) && !shouldDeliverToMutedAgent({
       agentId: m,
@@ -1030,7 +1037,12 @@ const POLL_CLOSE_WAKE_CLAIM_SECONDS = 600
 export async function handlePollUpdated(event: PollUpdatedEvent): Promise<boolean> {
   if (!event.companyId) return false
   const { rows } = await pool.query<{ author_id: string; members: string[] }>(
-    `SELECT m.author_id, c.members
+    `SELECT m.author_id,
+            COALESCE((
+              SELECT array_agg(cm.participant_id ORDER BY cm.ordinal, cm.participant_id)
+                FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+            ), ARRAY[]::text[]) AS members
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
        JOIN participants author
@@ -1041,7 +1053,12 @@ export async function handlePollUpdated(event: PollUpdatedEvent): Promise<boolea
       WHERE m.id = $1 AND m.company_id = $2
         AND m.conversation_id = $3
         AND c.company_id = $2
-        AND c.members @> to_jsonb(ARRAY[m.author_id])`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id
+             AND cm.company_id = c.company_id
+             AND cm.participant_id = m.author_id
+        )`,
     [event.messageId, event.companyId, event.conversationId],
   )
   const row = rows[0]
