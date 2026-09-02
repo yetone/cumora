@@ -14,6 +14,7 @@ import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
+import { AgentCreationError, createAgentRecord } from '../agents/create.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { notifyMessage, computeMessageRecipients } from '../push.js'
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
@@ -2026,17 +2027,6 @@ api.get('/participants', async (req, res) => {
 
 /* ============== Agent CRUD ============== */
 
-const AVATAR_PALETTE = [
-  '#FFB088', '#FFD9D2', '#FFB7AF', '#F4B740',
-  '#7C5CFF', '#A593FF', '#4FC2F4', '#41B5DC',
-  '#4FC2A1', '#6EC56A', '#E9A0E9', '#FF7AB6',
-]
-function defaultAvatarBg(id: string): string {
-  let h = 0
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0
-  return AVATAR_PALETTE[h % AVATAR_PALETTE.length]
-}
-
 /* ============== Deterministic visual signature per agent ============== */
 
 // FNV-1a hash — stable across runs, no deps.
@@ -2458,48 +2448,6 @@ function readAgentBody(b: AgentBody): {
   return out as ReturnType<typeof readAgentBody>
 }
 
-/** Slugify a display name into a candidate agent id: lowercase ASCII
- *  letters/digits/hyphens, starts with a letter, capped at 24 chars.
- *  Falls back to `'agent'` when the name has no usable ASCII tail
- *  (e.g. an all-CJK / emoji name). Used by /agents POST to derive
- *  the agent id from the user-supplied name — users no longer enter
- *  an id directly, so we get to enforce shape AND global uniqueness
- *  invisibly. */
-function slugifyAgentName(name: string): string {
-  const lowered = name.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
-  let slug = lowered
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-{2,}/g, '-')
-    .slice(0, 24)
-  if (!/^[a-z]/.test(slug)) slug = `a-${slug}`.slice(0, 24)
-  if (slug.length === 0) slug = 'agent'
-  return slug
-}
-
-/** Pick a globally-unique agent id, preferring the slug of `name` and
- *  falling back to `${slug}-${random4}` if (and as many times as)
- *  needed. The participants table enforces global uniqueness on
- *  `id WHERE kind='agent'` via a partial unique index, so this loop
- *  + the INSERT race together can still 409 if a peer wins; the
- *  caller catches that and retries with a fresh suffix. */
-async function pickUniqueAgentId(baseName: string): Promise<string> {
-  const base = slugifyAgentName(baseName)
-  const tryIds: string[] = [base]
-  for (let i = 0; i < 8; i++) {
-    tryIds.push(`${base}-${Math.random().toString(36).slice(2, 6)}`)
-  }
-  for (const candidate of tryIds) {
-    const { rows } = await pool.query<{ exists: boolean }>(
-      `SELECT EXISTS(SELECT 1 FROM participants WHERE id = $1) AS exists`,
-      [candidate],
-    )
-    if (!rows[0].exists) return candidate
-  }
-  // Wildly unlikely with 8 random suffixes.
-  throw new HttpError(500, 'could not pick a unique agent id — please retry')
-}
-
 api.post('/agents', async (req, res) => {
   // Agents are shared workspace identities — they speak on behalf of the
   // company, hold their own LLM budget, and can email out. Restricting
@@ -2511,33 +2459,43 @@ api.post('/agents', async (req, res) => {
   if (!data.systemPrompt || data.systemPrompt.trim().length < 10) {
     res.status(400).json({ error: 'systemPrompt required (at least 10 chars — describe the agent\'s style)' }); return
   }
-  await assertCompanyAgentLimit(tenant)
-  // The id is now SERVER-generated from the name (slugified) rather
-  // than user-supplied — users can't accidentally cause cross-tenant
-  // id collisions, and the same display name landing in two
-  // workspaces still produces two distinct ids (the second one gets
-  // a random suffix).
-  const agentId = await pickUniqueAgentId(data.name)
-  const initial = data.initial || data.name.charAt(0).toUpperCase()
-  const avatarBg = data.avatarBg || defaultAvatarBg(agentId)
+  if (req.body?.requestId !== undefined && typeof req.body.requestId !== 'string') {
+    res.status(400).json({ error: 'requestId must be a string' }); return
+  }
+  if (req.body?.computerId !== undefined && typeof req.body.computerId !== 'string') {
+    res.status(400).json({ error: 'computerId must be a string' }); return
+  }
+  const tier = await companyPlanTier(tenant)
+  const computerId = typeof req.body?.computerId === 'string' ? req.body.computerId.trim() || null : null
+  const engine = typeof req.body?.engine === 'string' ? req.body.engine : undefined
+  const inherit = req.body?.inherit === true
+  let creation: Awaited<ReturnType<typeof createAgentRecord>>
   try {
-    await pool.query(
-      `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, status, bio, tools, system_prompt, model, fast_model, company_id)
-       VALUES ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb, $8, $9, $10, $11)`,
-      [agentId, data.name, data.role ?? '', initial, avatarBg, data.bio ?? '',
-       JSON.stringify(data.tools ?? ['bash']), data.systemPrompt, data.model ?? null, data.fastModel ?? null, tenant],
-    )
+    creation = await createAgentRecord({
+      companyId: tenant,
+      tier,
+      maxActiveAgents: TIER_LIMITS[tier].agentsPerCompany,
+      requestId: typeof req.body?.requestId === 'string' ? req.body.requestId : null,
+      name: data.name,
+      role: data.role,
+      systemPrompt: data.systemPrompt,
+      bio: data.bio,
+      initial: data.initial,
+      avatarBg: data.avatarBg,
+      model: data.model,
+      fastModel: data.fastModel,
+      tools: data.tools ?? undefined,
+      computerId,
+      engine,
+      inherit,
+    })
   } catch (e) {
+    const status = e instanceof AgentCreationError ? e.status : 500
     const msg = e instanceof Error ? e.message : String(e)
-    if (/duplicate key|participants_agent_id_unique/.test(msg)) {
-      // Race window between pickUniqueAgentId's SELECT and the INSERT
-      // — another POST squatted on this id. Client can retry.
-      res.status(409).json({ error: 'agent id collision — please retry' })
-    } else {
-      res.status(500).json({ error: msg })
-    }
+    res.status(status).json({ error: msg })
     return
   }
+  const agentId = creation.id
   // Re-bind data.id for the rest of the handler so subsequent code
   // (workspace seeding, all-hands join, response payload) sees it.
   data.id = agentId
@@ -2600,12 +2558,18 @@ api.post('/agents', async (req, res) => {
   // with their initial-letter avatar; the real portrait shows up on the
   // next /participants poll once the image is ready. We deliberately
   // don't block the 201 response since image gen can take several seconds.
-  const newAgentId = data.id
-  void generateAndPersistAvatar({ agentId: newAgentId, tenant })
-    .then(() => console.log(`[agents] auto-portrait ready for ${newAgentId}`))
-    .catch((e) => console.warn(`[agents] auto-portrait failed for ${newAgentId}`, e))
+  if (creation.created) {
+    const newAgentId = data.id
+    void generateAndPersistAvatar({ agentId: newAgentId, tenant })
+      .then(() => console.log(`[agents] auto-portrait ready for ${newAgentId}`))
+      .catch((e) => console.warn(`[agents] auto-portrait failed for ${newAgentId}`, e))
+  }
 
-  res.status(201).json({ id: data.id })
+  res.status(creation.created ? 201 : 200).json({
+    id: data.id,
+    replayed: !creation.created,
+    ...(creation.placement ?? {}),
+  })
 })
 
 api.put('/agents/:id', async (req, res) => {

@@ -14,6 +14,12 @@ import { engineLabel } from '@/lib/engines'
 
 const INHERIT_ENGINE = '__inherit__'
 
+function newCreateRequestId(): string {
+  return typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+    ? crypto.randomUUID()
+    : `agent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+}
+
 /** Which engine-dropdown value to show for a saved agent.
  *  Official production has no `engineInherit`: a stored engine that isn't
  *  the computer default means the user pinned it. */
@@ -59,6 +65,9 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [repairCode, setRepairCode] = useState<string | null>(null)
   const [repairErr, setRepairErr] = useState<string | null>(null)
   const [repairCopied, setRepairCopied] = useState(false)
+  // Survives an ambiguous network failure and the user's retry click, but a
+  // newly opened editor gets a fresh key. The server binds it to the payload.
+  const createRequestId = useRef(newCreateRequestId())
 
   // "Runs on" — which Computer hosts this agent. Cloud = managed engine.
   // Free tier is BYOA-only: it has no real Cumora Cloud computer; we show a
@@ -144,6 +153,8 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       const current = agent?.computerId ?? cloud?.id
       const targetComputer = target ? computersById[target] : undefined
       const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
+      const inherit = engineChoice === INHERIT_ENGINE
+      const pinned = inherit ? undefined : (engineChoice as EngineId)
       const payload: AgentInput = {
         name, role, systemPrompt, bio, avatarBg,
         model: model.trim() || null,
@@ -155,21 +166,28 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
         if ((agent!.avatarUrl ?? null) !== avatarUrl) payload.avatarUrl = avatarUrl
         await api.updateAgent(agent!.id, payload)
       } else {
-        // No `id` field on create — server slugifies it from `name`
-        // and guarantees global uniqueness.
-        const created = await api.createAgent(payload)
+        // Creation + initial host/engine assignment is one transaction. The
+        // stable request id makes retry-after-timeout return that same Agent.
+        const created = await api.createAgent({
+          ...payload,
+          requestId: createRequestId.current,
+          computerId: target || null,
+          engine: isByoaTarget ? pinned : undefined,
+          inherit: isByoaTarget ? inherit : false,
+        })
         agentId = created.id
+        if (isByoaTarget && pinned && created.engine !== pinned) {
+          throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
+        }
       }
       // Persist the host assignment when the computer OR the engine changed.
       // (Engine lives in the same assign call; gating only on the computer
       // would silently drop a Claude→Codex switch on the same machine.) Still
       // skipped on a plain style edit to avoid the owner/admin-gated call.
-      const inherit = engineChoice === INHERIT_ENGINE
-      const pinned = inherit ? undefined : (engineChoice as EngineId)
       const savedChoice = initialEngineChoice(agent, targetComputer)
       const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
       const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
-      if (agentId && target && (target !== current || inheritChanged || engineChanged)) {
+      if (editing && agentId && target && (target !== current || inheritChanged || engineChanged)) {
         const out = await api.assignAgentComputer(agentId, target, isByoaTarget ? pinned : undefined, isByoaTarget ? inherit : false)
         if (isByoaTarget && pinned && out.engine !== pinned) {
           throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))

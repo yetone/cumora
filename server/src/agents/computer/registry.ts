@@ -63,6 +63,13 @@ const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
 }
 const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
+type Queryable = {
+  query<T extends object = Record<string, unknown>>(
+    text: string,
+    params?: readonly unknown[],
+  ): Promise<{ rows: T[]; rowCount?: number | null }>
+}
+
 /** Merge a fresh PATH detection into a computer's advertised engine list.
  *
  *  `available_engines[0]` is the computer's DEFAULT — pairComputer's comment
@@ -661,22 +668,25 @@ export function isByoaKind(kind: ComputerKind | null): boolean {
   return kind === 'local' || kind === 'vps'
 }
 
-/** Assign an agent to a computer (move it between Cumora Cloud and a paired
- *  machine). Resolves the engine: 'managed' for cloud, else the requested
- *  engine if the computer advertises it, else the computer's first engine.
- *  Returns the resolved { kind, engine } or null if the computer/agent is
- *  invalid for this company. */
-export async function assignAgentToComputer(args: {
-  agentId: string
+/** Resolve and lock a valid Computer placement without mutating an Agent.
+ *
+ * Creation uses this inside the participant INSERT transaction so a rejected
+ * or revoked Computer can never leave behind an unassigned Agent. Existing
+ * assignment callers retain their historical fallback behavior; creation sets
+ * `strictEngine` so an unavailable explicit pin fails instead of silently
+ * selecting the Computer default. */
+export async function resolveComputerAssignment(args: {
   companyId: string
   computerId: string
   engine?: string
   /** When true (or when no engine is named), follow the computer default. */
   inherit?: boolean
-}): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
-  const { rows } = await pool.query<{ kind: ComputerKind; available_engines: string[] }>(
+  strictEngine?: boolean
+}, db: Queryable = pool): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
+  const { rows } = await db.query<{ kind: ComputerKind; available_engines: string[] }>(
     `SELECT kind, available_engines FROM computers
-      WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL LIMIT 1`,
+      WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL
+      LIMIT 1 FOR SHARE`,
     [args.computerId, args.companyId],
   )
   const computer = rows[0]
@@ -691,6 +701,9 @@ export async function assignAgentToComputer(args: {
     const advertised = computer.available_engines ?? []
     const wantInherit = args.inherit === true || !args.engine
     const requested = args.engine && PAIRABLE_ENGINES.has(args.engine) ? (args.engine as EngineId) : null
+    if (!wantInherit && args.strictEngine && (!requested || !advertised.includes(requested))) {
+      return null
+    }
     const pick = (
       wantInherit
         ? advertised[0]
@@ -701,13 +714,32 @@ export async function assignAgentToComputer(args: {
     inherit = wantInherit
   }
 
+  return { kind: computer.kind, engine, inherit }
+}
+
+/** Assign an agent to a computer (move it between Cumora Cloud and a paired
+ *  machine). Resolves the engine: 'managed' for cloud, else the requested
+ *  engine if the computer advertises it, else the computer's first engine.
+ *  Returns the resolved { kind, engine } or null if the computer/agent is
+ *  invalid for this company. */
+export async function assignAgentToComputer(args: {
+  agentId: string
+  companyId: string
+  computerId: string
+  engine?: string
+  /** When true (or when no engine is named), follow the computer default. */
+  inherit?: boolean
+}): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
+  const placement = await resolveComputerAssignment(args)
+  if (!placement) return null
+
   const { rowCount } = await pool.query(
     `UPDATE participants SET computer_id = $1, engine = $2, engine_inherit = $3
       WHERE id = $4 AND company_id = $5 AND kind = 'agent'`,
-    [args.computerId, engine, inherit, args.agentId, args.companyId],
+    [args.computerId, placement.engine, placement.inherit, args.agentId, args.companyId],
   )
   if (!rowCount) return null
-  return { kind: computer.kind, engine, inherit }
+  return placement
 }
 
 /** Ask the online daemon to re-probe PATH on its next heartbeat. */

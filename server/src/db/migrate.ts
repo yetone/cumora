@@ -1554,6 +1554,11 @@ ALTER TABLE computers ADD COLUMN IF NOT EXISTS engines_detected_at TIMESTAMP WIT
 ALTER TABLE computers ADD COLUMN IF NOT EXISTS detect_requested_at TIMESTAMP WITH TIME ZONE;
 -- true = follow computers.available_engines[0]; false = pin participants.engine.
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine_inherit BOOLEAN NOT NULL DEFAULT TRUE;
+-- Stable browser-generated key for idempotent Agent creation. The hash binds
+-- the key to the sanitized create payload so accidental key reuse cannot
+-- silently return a differently configured Agent.
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
 
 -- ============== Evidence-backed feature shipping =======================
 -- A shipping feature is deliberately distinct from a generic board card.
@@ -2122,6 +2127,11 @@ export async function ensureSchema(): Promise<void> {
         CREATE UNIQUE INDEX IF NOT EXISTS participants_agent_id_unique
           ON participants(id) WHERE kind = 'agent'
       `)
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_participants_agent_creation_request
+          ON participants(company_id, creation_request_id)
+          WHERE kind = 'agent' AND creation_request_id IS NOT NULL
+      `)
       await ensureMessageClientIdIndex(client)
 
         console.log('[db] schema ensured')
@@ -2235,7 +2245,11 @@ async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<bo
     const { tables, columns } = ddlExpectations()
     // Indexes are not derivable the same way (partial/concurrent/renamed), so
     // the few that gate correctness stay explicit.
-    const indexes = ['participants_agent_id_unique', 'uniq_messages_client_id']
+    const indexes = [
+      'participants_agent_id_unique',
+      'uniq_participants_agent_creation_request',
+      'uniq_messages_client_id',
+    ]
     const { rows } = await client.query<{
       missing_tables: string[]; missing_columns: string[]; missing_indexes: string[]
     }>(

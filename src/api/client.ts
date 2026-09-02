@@ -311,6 +311,15 @@ export interface AgentInput {
   tools?: string[]
 }
 
+export interface AgentCreateInput extends AgentInput {
+  /** Stable for the lifetime of one create form so ambiguous retries replay. */
+  requestId: string
+  /** Initial host placement is committed atomically with the Agent row. */
+  computerId?: string | null
+  engine?: EngineId
+  inherit?: boolean
+}
+
 export interface ApiAttachment {
   url: string
   name: string
@@ -960,8 +969,14 @@ export const api = {
     http<{ ok: boolean; kind: ComputerKind; engine: EngineId; inherit?: boolean }>(
       `/agents/${encodeURIComponent(agentId)}/computer`,
       { method: 'POST', body: JSON.stringify({ computerId, engine, inherit }) }),
-  createAgent: (input: AgentInput) =>
-    http<{ id: string }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
+  createAgent: (input: AgentCreateInput) =>
+    http<{
+      id: string
+      replayed: boolean
+      kind?: ComputerKind
+      engine?: EngineId
+      inherit?: boolean
+    }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
   updateAgent: (id: string, input: AgentInput) =>
     http<{ ok: boolean }>(`/agents/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) }),
   /** Soft-delete: marks the agent as off-boarded. Memory + log preserved. */
