@@ -17,6 +17,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
 import { CH_STATUS, publish } from '../../redis.js'
+import { normalizeTier, type Tier } from '../../tier.js'
 import { signAgentToken } from '../runtime/jwt.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
@@ -639,28 +640,182 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
   }))
 }
 
-export interface AgentHost {
-  /** kind of computer the agent runs on, or null if unassigned (treat as cloud). */
+export interface ResolvedAgentHost {
+  status: 'found'
+  /** kind of computer the agent runs on, or null only when truly unassigned. */
   kind: ComputerKind | null
-  /** the agent's company — lets the scheduler check the company's tier. */
-  companyId: string | null
+  /** Exact assigned computer. Null is the explicit unassigned state. */
+  computerId: string | null
+  /** Active agent tenant. A found result never carries an empty tenant. */
+  companyId: string
+  /** Tenant tier read in the same database snapshot as the host assignment. */
+  tier: Tier
+}
+
+export interface MissingAgentHost {
+  status: 'missing'
+}
+
+export interface FailedAgentHostResolution {
+  status: 'error'
+  code: 'lookup_failed' | 'invalid_assignment'
+  reason: string
+  cause?: unknown
+}
+
+/** A database failure is deliberately different from a valid unassigned Agent. */
+export type AgentHostResolution =
+  | ResolvedAgentHost
+  | MissingAgentHost
+  | FailedAgentHostResolution
+
+export type ManagedPodPlacement =
+  | { status: 'allowed'; companyId: string; computerId: string | null }
+  | {
+      status: 'denied'
+      code: 'agent_not_found' | 'placement_lookup_failed' | 'placement_denied'
+      reason: string
+    }
+
+function isComputerKind(value: unknown): value is ComputerKind {
+  return value === 'cloud' || value === 'local' || value === 'vps'
 }
 
 /** Resolve where an agent runs + its company. Not cached: this sits on the
  *  scheduler's cold path (wakeOne only calls it for a resting agent with no
  *  live subscriber), and it's a single indexed lookup — a PK probe on
- *  participants + a PK LEFT JOIN on computers. An in-process cache here would
+ *  participants + PK joins on computers/company ownership. An in-process cache here would
  *  be both pointless (cold path) and unsafe (each replica caches independently,
  *  so reassignments/tier changes go stale per-pod). LEFT JOIN so an unassigned
- *  agent (computer_id NULL) still returns its companyId with a null kind. */
-export async function resolveAgentHost(agentId: string): Promise<AgentHost> {
-  const { rows } = await pool.query<{ kind: ComputerKind | null; company_id: string | null }>(
-    `SELECT c.kind, p.company_id FROM participants p
-       LEFT JOIN computers c ON c.id = p.computer_id
-      WHERE p.id = $1 AND p.kind = 'agent' LIMIT 1`,
-    [agentId],
-  )
-  return { kind: rows[0]?.kind ?? null, companyId: rows[0]?.company_id ?? null }
+ *  agent (computer_id NULL) still returns its companyId with a null kind.
+ *
+ *  Do not throw lookup failures into the same shape as "missing": callers route
+ *  execution from this result, so every state is explicit and exhaustively
+ *  handled. Soft-reference corruption (missing/cross-tenant Computer) is also
+ *  an error, never an implicit cloud assignment. */
+export async function resolveAgentHost(
+  agentId: string,
+  db: Queryable = pool,
+): Promise<AgentHostResolution> {
+  try {
+    const { rows } = await db.query<{
+      company_id: string | null
+      computer_id: string | null
+      resolved_computer_id: string | null
+      computer_company_id: string | null
+      kind: string | null
+      revoked_at: Date | null
+      resolved_company_id: string | null
+      tier: string | null
+    }>(
+      `SELECT p.company_id,
+              p.computer_id,
+              c.id AS resolved_computer_id,
+              c.company_id AS computer_company_id,
+              c.kind,
+              c.revoked_at,
+              company.id AS resolved_company_id,
+              COALESCE(owner_user.tier, owner_member.tier, 'free') AS tier
+         FROM participants p
+         LEFT JOIN computers c ON c.id = p.computer_id
+         LEFT JOIN companies company ON company.id = p.company_id
+         LEFT JOIN users owner_user ON owner_user.id = company.owner_user_id
+         LEFT JOIN LATERAL (
+           SELECT u.tier
+             FROM company_members cm
+             JOIN users u ON u.id = cm.user_id
+            WHERE cm.company_id = company.id AND cm.role = 'owner'
+            ORDER BY cm.joined_at ASC
+            LIMIT 1
+         ) owner_member ON TRUE
+        WHERE p.id = $1
+          AND p.kind = 'agent'
+          AND p.departed_at IS NULL
+        LIMIT 1`,
+      [agentId],
+    )
+    const row = rows[0]
+    if (!row) return { status: 'missing' }
+    if (!row.company_id || !row.resolved_company_id) {
+      return {
+        status: 'error',
+        code: 'invalid_assignment',
+        reason: `agent ${agentId} has no valid company assignment`,
+      }
+    }
+    if (row.computer_id !== null) {
+      if (!row.resolved_computer_id || !isComputerKind(row.kind)) {
+        return {
+          status: 'error',
+          code: 'invalid_assignment',
+          reason: `agent ${agentId} references an unavailable computer`,
+        }
+      }
+      if (row.computer_company_id !== row.company_id) {
+        return {
+          status: 'error',
+          code: 'invalid_assignment',
+          reason: `agent ${agentId} computer assignment crosses company boundaries`,
+        }
+      }
+      if (row.revoked_at !== null) {
+        return {
+          status: 'error',
+          code: 'invalid_assignment',
+          reason: `agent ${agentId} is assigned to a revoked computer`,
+        }
+      }
+    }
+    return {
+      status: 'found',
+      kind: row.computer_id === null ? null : row.kind as ComputerKind,
+      computerId: row.computer_id,
+      companyId: row.company_id,
+      tier: normalizeTier(row.tier),
+    }
+  } catch (cause) {
+    return {
+      status: 'error',
+      code: 'lookup_failed',
+      reason: `host lookup failed for agent ${agentId}`,
+      cause,
+    }
+  }
+}
+
+/** Final managed-runtime policy used at the `ensurePod` boundary. */
+export function managedPodPlacement(
+  resolution: AgentHostResolution,
+): ManagedPodPlacement {
+  if (resolution.status === 'missing') {
+    return { status: 'denied', code: 'agent_not_found', reason: 'no such agent' }
+  }
+  if (resolution.status === 'error') {
+    return {
+      status: 'denied',
+      code: resolution.code === 'lookup_failed' ? 'placement_lookup_failed' : 'placement_denied',
+      reason: resolution.reason,
+    }
+  }
+  if (isByoaKind(resolution.kind)) {
+    return {
+      status: 'denied',
+      code: 'placement_denied',
+      reason: `managed pod denied: agent is assigned to a ${resolution.kind} computer`,
+    }
+  }
+  if (resolution.tier === 'free') {
+    return {
+      status: 'denied',
+      code: 'placement_denied',
+      reason: 'managed pod denied: free tier is BYOA-only',
+    }
+  }
+  return {
+    status: 'allowed',
+    companyId: resolution.companyId,
+    computerId: resolution.computerId,
+  }
 }
 
 /** A BYOA host (user-paired) runs a daemon, not a server-managed pod. */

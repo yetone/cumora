@@ -29,6 +29,11 @@ import { inprocClient } from './inproc-client.js'
 import { signAgentToken } from './jwt.js'
 import { notifyAlert } from '../../alerting.js'
 import { Semaphore } from '../../concurrency.js'
+import {
+  managedPodPlacement,
+  resolveAgentHost,
+  type AgentHostResolution,
+} from '../computer/registry.js'
 
 const KUBECTL = process.env.CUMORA_KUBECTL ?? 'kubectl'
 /** kubectl context to target. In dev we pin to OrbStack so a stray
@@ -621,7 +626,56 @@ export function stuckPendingReason(h: PodHealth): string | null {
 export type EnsurePodResult =
   | { created: true;  ok: true;  reason: string }
   | { created: false; ok: true;  reason: string }
-  | { created: false; ok: false; reason: string }
+  | {
+      created: false
+      ok: false
+      reason: string
+      code:
+        | 'watchdog_timeout'
+        | 'pod_reap_failed'
+        | 'capacity_denied'
+        | 'agent_not_found'
+        | 'placement_lookup_failed'
+        | 'placement_denied'
+        | 'pod_apply_failed'
+    }
+
+export type ManagedPodPlacementVerification =
+  | { ok: true; companyId: string; computerId: string | null }
+  | {
+      ok: false
+      code: 'agent_not_found' | 'placement_lookup_failed' | 'placement_denied'
+      reason: string
+    }
+
+/** Resolve the policy at the managed-runtime boundary. The resolver is
+ * injectable only so fault-path unit tests can prove that lookup exceptions
+ * and invalid assignments fail closed without invoking kubectl. */
+export async function verifyManagedPodPlacement(
+  agentId: string,
+  resolver: (id: string) => Promise<AgentHostResolution> = resolveAgentHost,
+): Promise<ManagedPodPlacementVerification> {
+  let resolution: AgentHostResolution
+  try {
+    resolution = await resolver(agentId)
+  } catch (cause) {
+    resolution = {
+      status: 'error',
+      code: 'lookup_failed',
+      reason: `host lookup failed for agent ${agentId}`,
+      cause,
+    }
+  }
+  const decision = managedPodPlacement(resolution)
+  if (decision.status === 'denied') {
+    return { ok: false, code: decision.code, reason: decision.reason }
+  }
+  return {
+    ok: true,
+    companyId: decision.companyId,
+    computerId: decision.computerId,
+  }
+}
 
 /** In-flight `ensurePod` deduplication. Without this a thundering
  *  herd (e.g. 50 wakes for one resting agent within 1s) calls
@@ -663,6 +717,7 @@ export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
         resolve({
           created: false,
           ok: false,
+          code: 'watchdog_timeout',
           reason: `ensurePod watchdog: implementation did not return within ${ENSURE_POD_WATCHDOG_MS}ms`,
         })
       }, ENSURE_POD_WATCHDOG_MS).unref?.(),
@@ -690,13 +745,39 @@ export async function ensurePod(agentId: string): Promise<EnsurePodResult> {
 
 async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const startedAt = Date.now()
+  // This is the final authorization boundary for managed execution. Scheduler
+  // lookups are advisory only: assignment/tier can change between a wake and
+  // this call, and other callers may invoke ensurePod directly.
+  const initialPlacement = await verifyManagedPodPlacement(agentId)
+  if (!initialPlacement.ok) {
+    return { created: false, ...initialPlacement }
+  }
+  const recheckPlacement = async (): Promise<EnsurePodResult | null> => {
+    const current = await verifyManagedPodPlacement(agentId)
+    if (!current.ok) return { created: false, ...current }
+    if (current.companyId !== initialPlacement.companyId) {
+      return {
+        created: false,
+        ok: false,
+        code: 'placement_denied',
+        reason: 'managed pod denied: agent company changed during placement',
+      }
+    }
+    return null
+  }
   const h = await podHealth(agentId)
   if (h.phase === 'Running') {
+    const denied = await recheckPlacement()
+    if (denied) return denied
     return { created: false, ok: true, reason: 'already running' }
   }
   if (h.phase === 'Pending') {
     const stuck = stuckPendingReason(h)
-    if (!stuck) return { created: false, ok: true, reason: 'already pending' }
+    if (!stuck) {
+      const denied = await recheckPlacement()
+      if (denied) return denied
+      return { created: false, ok: true, reason: 'already pending' }
+    }
     // Fall through to the stuck-Pending reap path below. Don't admission-
     // gate this: reaping is a cleanup that frees a slot, not a fresh
     // demand on cluster capacity.
@@ -718,6 +799,8 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
     // `--timeout=30s` on the kubectl side AND our wrapper timeout —
     // belt-and-braces. A pod with stuck finalizers shouldn't block
     // the orchestrator's main loop indefinitely.
+    const denied = await recheckPlacement()
+    if (denied) return denied
     const reap = await kubectlWithRetry(
       ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
       { timeoutMs: 40_000 },
@@ -728,7 +811,7 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
       // Surface a precise error rather than letting the apply step
       // try and produce a misleading "already exists" message.
       return {
-        created: false, ok: false,
+        created: false, ok: false, code: 'pod_reap_failed',
         reason: `pod reap failed (was stuck=${stuck}): ${(reap.err || reap.out).trim()}`,
       }
     }
@@ -751,6 +834,8 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
     } else if (h.phase === 'Unknown') {
       console.warn(`[orchestrator] ${agentId} previous pod was in Unknown phase (node lost?); reaping`)
     }
+    const denied = await recheckPlacement()
+    if (denied) return denied
     await kubectlWithRetry(
       ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
       { timeoutMs: 40_000 },
@@ -768,13 +853,23 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const fuse = await getClusterFuseUtilization()
   if (fuse.cap > 0 && fuse.ratio >= FUSE_ADMISSION_THRESHOLD) {
     return {
-      created: false, ok: false,
+      created: false, ok: false, code: 'capacity_denied',
       reason: `cluster fuse saturated: ${fuse.used}/${fuse.cap} (${Math.round(fuse.ratio * 100)}% ≥ ${Math.round(FUSE_ADMISSION_THRESHOLD * 100)}% threshold)`,
     }
   }
 
   const persona = await inprocClient.loadPersona(agentId).catch(() => null)
-  if (!persona) return { created: false, ok: false, reason: 'no such agent' }
+  if (!persona) {
+    return { created: false, ok: false, code: 'agent_not_found', reason: 'no such agent' }
+  }
+  if (persona.companyId !== initialPlacement.companyId) {
+    return {
+      created: false,
+      ok: false,
+      code: 'placement_denied',
+      reason: 'managed pod denied: persona tenant does not match host assignment',
+    }
+  }
 
   const token = signAgentToken({
     agentId,
@@ -808,6 +903,13 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
       console.warn(`[orchestrator] sub2api key lookup failed for ${persona.companyId}; legacy fallback`, e instanceof Error ? e.message : e)
     }
   }
+
+  // Re-read immediately before the first Kubernetes mutation. This closes the
+  // scheduler-to-orchestrator and preparation-time race: moving the Agent to a
+  // BYOA Computer or downgrading the tenant while pod health/key resolution is
+  // in flight cannot still result in a managed PVC/Pod apply.
+  const finalPlacementDenied = await recheckPlacement()
+  if (finalPlacementDenied) return finalPlacementDenied
 
   // Apply the per-agent chrome-profile PVC BEFORE the pod. kubectl
   // apply is idempotent — if the PVC already exists this is a no-op.
@@ -853,7 +955,12 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
       error: new Error(`kubectl apply failed for ${agentId}: ${errText}`),
       extras: { agentId, elapsedMs: Date.now() - startedAt, timedOut: podApply.timedOut },
     })
-    return { created: false, ok: false, reason: `pod apply failed: ${errText}` }
+    return {
+      created: false,
+      ok: false,
+      code: 'pod_apply_failed',
+      reason: `pod apply failed: ${errText}`,
+    }
   }
   bumpFuseUtilUsedOnSpawn()
   console.log(`[orchestrator] ${agentId} pod spun up in ${Date.now() - startedAt}ms`)

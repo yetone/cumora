@@ -12,6 +12,7 @@ import {
   _consumeLowPriorityWakeBudget,
   _resetLowPriorityWakeBudgetForTests,
   _shouldRetryEnsurePodFailure,
+  _shouldRetryWakeFailure,
   _wakeRetryDelayMs,
   shouldDeliverToMutedAgent,
 } from '../agents/scheduler.js'
@@ -91,6 +92,23 @@ test('ensurePod retry is only for manual wakes — message.new is durable via DB
   // not by the queue.
   assert.equal(_shouldRetryEnsurePodFailure('idle', 'cluster fuse saturated'), false)
   assert.equal(_shouldRetryEnsurePodFailure('background_scan', 'cluster fuse saturated'), false)
+})
+
+test('host-resolution failure retries before any execution location was selected', () => {
+  assert.equal(
+    _shouldRetryWakeFailure('message.new', 'host lookup failed', 'host_resolution'),
+    true,
+  )
+  assert.equal(
+    _shouldRetryWakeFailure('idle', 'host lookup failed', 'host_resolution'),
+    true,
+  )
+  // The existing duplicate-turn protection remains intact for ordinary pod
+  // failures after placement was successfully resolved.
+  assert.equal(
+    _shouldRetryWakeFailure('message.new', 'pod apply failed', 'ensure_pod'),
+    false,
+  )
 })
 
 test('muted agent delivery only allows direct, exact mention, or quote reply', () => {
