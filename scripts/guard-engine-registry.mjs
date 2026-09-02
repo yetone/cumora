@@ -156,6 +156,34 @@ const CHECKS = [
     needle: (id) => `'byoa-${id}'`,
     fix: "widen ApiTriageSource with 'byoa-<id>'",
   },
+  {
+    file: 'server/src/agents/computer/registry.ts',
+    what: 'ENGINE_BINS',
+    body: (s) => extract(s, /const ENGINE_BINS(?::[^=]*)? = \{([\s\S]*?)\n\}/),
+    needle: (id) => `${id}:`,
+    fix: 'add the binary mapping to ENGINE_BINS',
+  },
+  {
+    file: 'server/src/agents/computer/registry.ts',
+    what: 'listAgentsForComputer default model fallback',
+    body: (s) => extract(s, /export async function listAgentsForComputer[\s\S]*?return rows\.map\(\(r\) => \{([\s\S]*?)\n\s{2}\}\)/),
+    needle: (id) => `r.engine === '${id}'`,
+    fix: "add a default model fallback for '<id>' in listAgentsForComputer",
+  },
+  {
+    file: 'server/src/agents/computer/daemon.ts',
+    what: 'authFailureHint',
+    body: (s) => extract(s, /export function authFailureHint[\s\S]*?\{([\s\S]*?)\n\}/),
+    needle: (id) => `engine === '${id}'`,
+    fix: "add an auth failure hint for '<id>' in authFailureHint",
+  },
+  {
+    file: 'server/src/agents/computer/daemon.ts',
+    what: 'triageModel',
+    body: (s) => extract(s, /private triageModel\(\): string \{([\s\S]*?)\n\s{2}\}/),
+    needle: (id) => `this.adapter.id === '${id}'`,
+    fix: "add triage model resolution for '<id>' in triageModel",
+  },
 ]
 
 /** The spawn guard keys on BINARY names, not engine ids (cursor's binary is

@@ -8,6 +8,8 @@ import assert from 'node:assert/strict'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.CUMORA_DEFAULT_CLAUDE_MODEL = 'claude-opus-4-7'
+process.env.CUMORA_DEFAULT_GEMINI_MODEL = 'gemini-2.5-pro'
+process.env.CUMORA_DEFAULT_QWEN_MODEL = 'qwen3-coder-plus'
 process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL = 'Gemini 3.5 Flash (High)'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
@@ -68,6 +70,8 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
         { id: 'bram', name: 'Bram', role: 'engineer', systemPrompt: null, engine: 'claude', model: 'stale-pin', fastModel: 'haiku' },
         { id: 'saga', name: 'Saga', role: 'writer', systemPrompt: null, engine: 'claude', model: null, fastModel: null },
         { id: 'aster', name: 'Aster', role: 'reviewer', systemPrompt: null, engine: 'antigravity', model: null, fastModel: null },
+        { id: 'atlas', name: 'Atlas', role: 'analyst', systemPrompt: null, engine: 'gemini', model: null, fastModel: null },
+        { id: 'orion', name: 'Orion', role: 'coder', systemPrompt: null, engine: 'qwen', model: null, fastModel: null },
       ] }
     }
     return { rows: [] }
@@ -79,6 +83,10 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
   assert.equal(agents[1]?.engine, 'claude')
   assert.equal(agents[2]?.model, 'Gemini 3.5 Flash (High)')
   assert.equal(agents[2]?.engine, 'antigravity')
+  assert.equal(agents[3]?.model, 'gemini-2.5-pro')
+  assert.equal(agents[3]?.engine, 'gemini')
+  assert.equal(agents[4]?.model, 'qwen3-coder-plus')
+  assert.equal(agents[4]?.engine, 'qwen')
 })
 
 test('reportDetectedEngines keeps the previous default first when it is still installed', async () => {

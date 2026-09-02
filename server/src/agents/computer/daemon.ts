@@ -704,7 +704,7 @@ export function isStaleResumeError(err: string): boolean {
   return STALE_RESUME_RE.test(engineDiagnosticProse(err))
 }
 
-function authFailureHint(engine: EngineId, detail: string): string {
+export function authFailureHint(engine: EngineId, detail: string): string {
   if (CONTEXT_OVERFLOW_RE.test(detail)) {
     return 'The agent filled up its context window. Its session has been reset automatically — just wake the agent again and it will start fresh.'
   }
@@ -716,6 +716,9 @@ function authFailureHint(engine: EngineId, detail: string): string {
   }
   if (engine === 'claude') {
     return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
+  }
+  if (engine === 'codex') {
+    return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
   }
   if (engine === 'grok') {
     return 'Open Grok Build on that computer and run `grok login`, or set XAI_API_KEY, then wake the agent again.'
@@ -729,10 +732,16 @@ function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'pi') {
     return 'Open pi on that computer and run `/login` for its provider (or fix the API key / quota), then wake the agent again.'
   }
+  if (engine === 'gemini') {
+    return 'Open Gemini CLI on that computer and run `gemini` to refresh its login, API key, or quota, then wake the agent again.'
+  }
+  if (engine === 'qwen') {
+    return 'Open Qwen Code on that computer and run `qwen` to refresh its login, API key, or quota, then wake the agent again.'
+  }
   if (engine === 'antigravity') {
     return 'Open Antigravity on that computer and run `agy` to refresh its login, model access, or quota, then wake the agent again.'
   }
-  return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
+  return 'Check the daemon terminal for details, then wake the agent again.'
 }
 
 function missingEngineMessage(): string {
@@ -2093,16 +2102,19 @@ class AgentRunner {
   }
 
   /** Triage model id for pricing, honoring CUMORA_TRIAGE_MODEL. Cursor,
-   *  OpenCode and pi have no universal cheap alias, so a reported/pinned stream
+   *  OpenCode, pi and Antigravity have no universal cheap alias, so a reported/pinned stream
    *  model wins and the agent model is only a fallback. */
   private triageModel(): string {
     if (process.env.CUMORA_TRIAGE_MODEL) return process.env.CUMORA_TRIAGE_MODEL
     if (this.adapter.id === 'claude') return 'haiku'
     if (this.adapter.id === 'grok') return 'grok-4.5'
     if (this.adapter.id === 'codex') return 'gpt-5.4-mini'
+    if (this.adapter.id === 'gemini') return 'gemini-2.5-flash-lite'
+    if (this.adapter.id === 'qwen') return 'qwen3-coder-flash'
     if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
     if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     if (this.adapter.id === 'antigravity') return this.agent.model ?? '<antigravity-default>'
+    if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }
 

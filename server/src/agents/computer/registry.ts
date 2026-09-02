@@ -94,7 +94,7 @@ export function mergeDetectedEngines(current: string[], detected: string[]): str
   return same ? null : next
 }
 
-const ENGINE_BINS: Record<string, string> = {
+const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   claude: 'claude',
   codex: 'codex',
   grok: 'grok',
@@ -157,7 +157,7 @@ function sanitizeVersionFields(rec: Record<string, unknown>): Partial<DetectedEn
 /** An engine we know is advertised but have no PATH/version report for. */
 function unreportedEngine(id: string): DetectedEngine {
   return {
-    id, bin: ENGINE_BINS[id] ?? id, path: null,
+    id, bin: ENGINE_BINS[id as keyof typeof ENGINE_BINS] ?? id, path: null,
     version: null, latest: null, outdated: false, updateCommand: null, blockedReason: null,
   }
 }
@@ -188,7 +188,7 @@ export function sanitizeDetectedEngines(
     const rec = item as Record<string, unknown>
     const id = typeof rec.id === 'string' ? rec.id : ''
     if (!PAIRABLE_ENGINES.has(id) || !allowed.includes(id)) continue
-    const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id] ?? id)
+    const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id as keyof typeof ENGINE_BINS] ?? id)
     const path = typeof rec.path === 'string' && rec.path.trim() ? rec.path.trim() : null
     // A reason is only meaningful on an engine we actually refused. Accepting
     // one on a runnable engine would let a daemon mark a working engine broken.
@@ -563,6 +563,7 @@ export async function mintAgentRuntimeToken(args: {
  *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
  *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
  *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL /
+ *  CUMORA_DEFAULT_GEMINI_MODEL / CUMORA_DEFAULT_QWEN_MODEL /
  *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL) so every BYOA
  *  daemon gets a consistent pin — independent of whatever model the local
  *  engine CLI happens to default to today. Critical: a model
@@ -583,6 +584,8 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const cursorDefault = process.env.CUMORA_DEFAULT_CURSOR_MODEL?.trim() || null
   const openCodeDefault = process.env.CUMORA_DEFAULT_OPENCODE_MODEL?.trim() || null
   const piDefault = process.env.CUMORA_DEFAULT_PI_MODEL?.trim() || null
+  const geminiDefault = process.env.CUMORA_DEFAULT_GEMINI_MODEL?.trim() || null
+  const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
     if (r.model) return r
@@ -598,9 +601,13 @@ export async function listAgentsForComputer(computerId: string): Promise<
               ? openCodeDefault
               : r.engine === 'pi'
                 ? piDefault
-                : r.engine === 'antigravity'
-                  ? antigravityDefault
-                : null
+                : r.engine === 'gemini'
+                  ? geminiDefault
+                  : r.engine === 'qwen'
+                    ? qwenDefault
+                    : r.engine === 'antigravity'
+                      ? antigravityDefault
+                    : null
     return dflt ? { ...r, model: dflt } : r
   })
 }
