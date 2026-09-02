@@ -14,6 +14,7 @@ import { after, before, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
+import { BASELINE_BOARD_COLUMN_KIND_BACKFILL_SQL } from '../db/migrate.js'
 import { runCli } from '../agents/cli.js'
 import { ensureSchemaOnce, resetAllTables, seedCompanyWithAgent, teardownAll } from './_helpers.js'
 
@@ -112,9 +113,9 @@ test('the migration classifies conventional columns and leaves custom ones alone
   const custom = await seedBoard(companyId, [['Backlog', null], ['In flight', null], ['Shipped', null]])
   const spaced = await seedBoard(companyId, [['  To Do  ', null]])
 
-  // Re-run the migrator; it is idempotent and re-applies the backfill.
-  const { ensureSchema } = await import('../db/migrate.js')
-  await ensureSchema()
+  // Exercise the exact frozen migration-0001 backfill without replaying the
+  // versioned migration ledger (applied migrations must never run again).
+  await pool.query(BASELINE_BOARD_COLUMN_KIND_BACKFILL_SQL)
 
   const kinds = async (ids: string[]): Promise<Array<string | null>> => {
     const { rows } = await pool.query<{ id: string; kind: string | null }>(
@@ -135,8 +136,7 @@ test('the backfill does not overwrite a column that already has a kind', async (
   const { companyId } = await seedCompanyWithAgent()
   const { columnIds } = await seedBoard(companyId, [['Done', 'todo']])
 
-  const { ensureSchema } = await import('../db/migrate.js')
-  await ensureSchema()
+  await pool.query(BASELINE_BOARD_COLUMN_KIND_BACKFILL_SQL)
 
   const { rows } = await pool.query<{ kind: string | null }>(
     `SELECT kind FROM board_columns WHERE id = $1`, [columnIds[0]],

@@ -195,13 +195,16 @@ After replacing `REPLACE-*` placeholders in
 `server/k8s/cumora-server.gke.yaml`:
 
 ```sh
+# For a manual installation, run the candidate image's migration command once
+# against the same DATABASE_URL before starting application replicas. The
+# production Deploy workflow creates and verifies this one-shot Job for you.
+npm run migrate
 kubectl apply -f server/k8s/cumora-server.gke.yaml
 kubectl rollout status deployment/cumora-server
 ```
 
-The init container runs migrations (advisory-locked, so the 2
-replicas don't race). Then the main container + Cloud SQL Proxy
-sidecar start.
+The application Pods only read `schema_migrations` and refuse to start outside
+their supported version range. They never execute DDL during startup.
 
 ## 7. Verify end-to-end
 
@@ -232,12 +235,11 @@ kubectl logs agent-<id>
   duplicate the Role + RoleBinding scoped there.
 - **Image upgrades** — tag both images with the same git sha;
   redeploy by updating both the server Deployment image and
-  `CUMORA_AGENT_COMPUTER_IMAGE` to the same tag. Migrations run in the init
-  container before the main rollout proceeds.
-- **PG schema changes** — the advisory lock means multiple init
-  containers in a rolling update will serialize. Each migration
-  must remain backward-compatible with the OLD server version
-  (still running on N-1 replicas during the rollout window).
+  `CUMORA_AGENT_COMPUTER_IMAGE` to the same tag. The Deploy workflow runs one
+  candidate migration Job before mutating the Deployment.
+- **PG schema changes** — append an immutable version and checksum; never edit
+  an applied migration. Use expand/contract changes that remain compatible with
+  the old server version still serving during the rolling-update window.
 - **Idle scheduler** — runs in-process on EACH server replica.
   That's fine because idle's tick currently publishes to
   CH_MESSAGE_NEW which SETNX-dedups; only one replica handles

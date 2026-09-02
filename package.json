@@ -21,7 +21,7 @@
   "scripts": {
     "setup": "npm install && npm install --prefix workers/email-gate",
     "dev": "vite --port 5180 --strictPort",
-    "dev:all": "concurrently -k -n web,api -c blue,magenta \"npm:dev\" \"npm:server:dev\"",
+    "dev:all": "npm run migrate && concurrently -k -n web,api -c blue,magenta \"npm:dev\" \"npm:server:dev\"",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host --port 5180",
     "typecheck": "tsc --noEmit",

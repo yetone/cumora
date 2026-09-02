@@ -20,8 +20,8 @@ import { env } from '../env.js'
 
 let schemaReady: Promise<void> | null = null
 
-/** Run the schema migrator exactly once per test process. Idempotent —
- *  ensureSchema is itself `IF NOT EXISTS` throughout. */
+/** Run the versioned schema migrator exactly once per test process. Applied
+ * ledger entries are immutable and are never replayed. */
 export function ensureSchemaOnce(): Promise<void> {
   if (!schemaReady) schemaReady = ensureSchema()
   return schemaReady

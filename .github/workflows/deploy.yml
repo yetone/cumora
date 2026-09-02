@@ -36,7 +36,7 @@ jobs:
   deploy:
     name: Roll cumora-server
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
     environment:
       name: production
       url: https://api.cumora.ai
@@ -113,6 +113,104 @@ jobs:
             fi
           fi
 
+      - name: Run candidate migrations once
+        id: migrate
+        env:
+          SERVER_IMAGE: ${{ steps.digest.outputs.server }}
+        run: |
+          set -euo pipefail
+          JOB="cumora-migrate-${GITHUB_SHA:0:7}-${GITHUB_RUN_ATTEMPT}"
+          DEPLOY_JSON="$RUNNER_TEMP/cumora-deployment.json"
+          JOB_JSON="$RUNNER_TEMP/cumora-migration-job.json"
+
+          # DATABASE_URL points at 127.0.0.1 because production reaches Cloud
+          # SQL through the proxy. Copy the live proxy container and workload
+          # identity settings into one candidate migration Job. A native
+          # sidecar init container exits automatically when the Job completes.
+          kubectl get deployment cumora-server -o json > "$DEPLOY_JSON"
+          jq --arg job "$JOB" --arg server "$SERVER_IMAGE" '
+            .spec.template.spec as $pod
+            | ([ $pod.initContainers[]?, $pod.containers[]? ]
+               | map(select(.name == "cloud-sql-proxy")) | first) as $proxy
+            | if $proxy == null then
+                error("cumora-server has no cloud-sql-proxy container")
+              else
+                {
+                  apiVersion: "batch/v1",
+                  kind: "Job",
+                  metadata: {
+                    name: $job,
+                    labels: { app: "cumora-schema-migration" }
+                  },
+                  spec: {
+                    backoffLimit: 0,
+                    activeDeadlineSeconds: 600,
+                    ttlSecondsAfterFinished: 600,
+                    template: {
+                      metadata: { labels: { app: "cumora-schema-migration" } },
+                      spec: {
+                        serviceAccountName: $pod.serviceAccountName,
+                        imagePullSecrets: ($pod.imagePullSecrets // []),
+                        restartPolicy: "Never",
+                        initContainers: [
+                          ($proxy
+                           | del(.readinessProbe, .livenessProbe, .lifecycle)
+                           | .restartPolicy = "Always"
+                           | .startupProbe = (.startupProbe // {
+                               httpGet: { path: "/readiness", port: 9090 },
+                               periodSeconds: 1,
+                               failureThreshold: 60
+                             }))
+                        ],
+                        containers: [
+                          {
+                            name: "migrate",
+                            image: $server,
+                            imagePullPolicy: "IfNotPresent",
+                            command: ["npm", "run", "migrate"],
+                            envFrom: [{ secretRef: { name: "cumora" } }],
+                            resources: {
+                              requests: { cpu: "100m", memory: "256Mi" },
+                              limits: { cpu: "1000m", memory: "1Gi" }
+                            }
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              end
+          ' "$DEPLOY_JSON" > "$JOB_JSON"
+
+          kubectl delete job "$JOB" --ignore-not-found --wait=true
+          kubectl apply -f "$JOB_JSON"
+
+          SUCCEEDED=N
+          for _ in $(seq 1 120); do
+            STATUS=$(kubectl get job "$JOB" -o json)
+            if [ "$(echo "$STATUS" | jq -r '.status.succeeded // 0')" -ge 1 ]; then
+              SUCCEEDED=Y
+              break
+            fi
+            if [ "$(echo "$STATUS" | jq -r '.status.failed // 0')" -ge 1 ]; then
+              break
+            fi
+            sleep 5
+          done
+
+          echo "::group::Migration output"
+          kubectl logs "job/$JOB" -c migrate --tail=300 2>&1 || true
+          echo "::endgroup::"
+          if [ "$SUCCEEDED" != "Y" ]; then
+            kubectl describe job "$JOB"
+            kubectl get pods -l job-name="$JOB" -o wide
+            echo "::error::Candidate database migration did not complete; deployment was not mutated."
+            exit 1
+          fi
+
+          kubectl delete job "$JOB" --wait=true
+          echo "job=$JOB" >> "$GITHUB_OUTPUT"
+
       - name: Patch deployment
         id: patch
         run: |
@@ -125,12 +223,9 @@ jobs:
           echo "→ rollback baseline server: $PREVIOUS_SERVER"
           echo "→ rollback baseline agent: ${PREVIOUS_AGENT:-'(unset)'}"
 
-          # Both the migrate init container and the main server container
-          # use the same image. set-image updates the main container; the
-          # init container needs an explicit JSON patch (its index is 1
-          # because cloud-sql-proxy lives at index 0 as a native sidecar).
-          #
-          # We also re-assert the liveness probe path here: liveness MUST hit
+          # Apply one atomic Pod-template patch: select the candidate server,
+          # remove the retired per-replica migration init container, and
+          # re-assert the liveness probe path. Liveness MUST hit
           # /api/livez (a DB-free "process alive" check), NOT /api/health
           # (which runs SELECT 1). A DB-backed liveness probe let a slow /
           # overloaded DB fail the probe and SIGTERM-kill otherwise-healthy
@@ -140,17 +235,26 @@ jobs:
           # path is already /api/livez. This keeps the fix durable even if the
           # Deployment is ever recreated from a base manifest that still has
           # the old /api/health liveness path.
-          kubectl set image deployment/cumora-server server="$SERVER"
-          kubectl patch deployment cumora-server --type=json -p="[
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/initContainers/1/image\",\"value\":\"$SERVER\"},
-            {\"op\":\"replace\",\"path\":\"/spec/template/spec/containers/0/livenessProbe/httpGet/path\",\"value\":\"/api/livez\"}
-          ]"
-
           AGENT="${{ steps.digest.outputs.agent }}"
-          if [ -n "$AGENT" ]; then
-            kubectl set env deployment/cumora-server -c server \
-              CUMORA_AGENT_COMPUTER_IMAGE="$AGENT"
-          fi
+          PATCH=$(jq -nc --arg server "$SERVER" --arg agent "$AGENT" '
+            {
+              spec: { template: { spec: {
+                initContainers: [
+                  { name: "migrate", "$patch": "delete" }
+                ],
+                containers: [
+                  ({
+                    name: "server",
+                    image: $server,
+                    livenessProbe: { httpGet: { path: "/api/livez" } }
+                  } + if $agent == "" then {} else {
+                    env: [{ name: "CUMORA_AGENT_COMPUTER_IMAGE", value: $agent }]
+                  } end)
+                ]
+              } } }
+            }
+          ')
+          kubectl patch deployment cumora-server --type=strategic -p="$PATCH"
 
       - name: Wait for rollout
         id: rollout
@@ -185,12 +289,6 @@ jobs:
           echo "::endgroup::"
           echo "::group::Recent cluster events"
           kubectl get events --sort-by=.lastTimestamp 2>&1 | tail -30
-          echo "::endgroup::"
-          echo "::group::Migrate init container logs (each pod)"
-          for POD in $(kubectl get pods -l app=cumora-server -o jsonpath='{.items[*].metadata.name}'); do
-            echo "==== $POD ===="
-            kubectl logs "$POD" -c migrate --tail=100 2>&1 || true
-          done
           echo "::endgroup::"
           echo "::group::Server container logs (current run)"
           for POD in $(kubectl get pods -l app=cumora-server -o jsonpath='{.items[*].metadata.name}'); do
@@ -239,5 +337,6 @@ jobs:
           echo "- server: \`${{ steps.digest.outputs.server }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- agent: \`${{ steps.digest.outputs.agent || '(unchanged)' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- previous server: \`${{ steps.patch.outputs.previous_server }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- migration owner: one pre-deploy Job (\`${{ steps.migrate.outputs.job }}\`)" >> $GITHUB_STEP_SUMMARY
           echo "- authenticated smoke: passed" >> $GITHUB_STEP_SUMMARY
           echo "- cluster: \`${{ env.CLUSTER }}\` / \`${{ env.CLUSTER_LOCATION }}\`" >> $GITHUB_STEP_SUMMARY

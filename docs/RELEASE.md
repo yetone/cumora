@@ -48,10 +48,12 @@ To deploy a candidate:
    image, completed rollout, and passed authenticated smoke.
 
 Deploy first proves that the existing production API and smoke credential are
-healthy, records the current revision as the rollback baseline, updates the
-server/init-container (and optionally agent runtime) by digest, waits for GKE,
-then exercises real authenticated tenant paths: auth, conversations, and the
-Shipping overview/schema. A failed post-deploy smoke automatically runs
+healthy, runs one candidate-image migration Job and verifies its immutable
+ledger/index gates, records the current revision as the rollback baseline,
+updates the server (and optionally agent runtime) by digest, waits for GKE, then
+exercises real authenticated tenant paths: auth, conversations, and the
+Shipping overview/schema. A migration failure leaves the Deployment untouched;
+a failed post-deploy smoke automatically runs
 `kubectl rollout undo`, waits for the old revision to become ready, and fails
 the workflow.
 

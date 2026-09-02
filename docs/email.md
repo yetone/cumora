@@ -97,9 +97,9 @@ EMAIL_DOMAIN=cumora.ai
 EMAIL_INBOUND_HMAC_SECRET=<openssl rand -hex 32>
 ```
 
-Restart the server. The migration (`server/src/db/migrate.ts`) runs
-automatically and adds the `participants.email`, `email_messages`,
-`email_contacts` tables.
+Run `npm run migrate` once, then restart the server. The versioned migration
+adds the `participants.email`, `email_messages`, and `email_contacts` tables;
+normal server startup only verifies the migration ledger.
 
 ### 2. Resend
 

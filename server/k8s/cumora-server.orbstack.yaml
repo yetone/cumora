@@ -54,10 +54,9 @@ roleRef:
   name: cumora-server-agent-pods
   apiGroup: rbac.authorization.k8s.io
 ---
-# Deployment — init container runs `npm run migrate` (advisory-lock
-# protected, idempotent), main container starts the server.
-# Multiple replicas: see e5e01e0 (wake-bus moved to Redis pubsub) +
-# 0c5f11d (migration advisory lock) — replicas: 2+ is now safe.
+# Deployment — run `npm run migrate` once before applying this manifest.
+# Application replicas only verify the immutable migration ledger and never
+# execute DDL while starting.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -72,13 +71,6 @@ spec:
       labels: { app: cumora-server }
     spec:
       serviceAccountName: cumora-server
-      initContainers:
-      - name: migrate
-        image: quay.io/yetoneful/cumora-server:dev
-        imagePullPolicy: IfNotPresent
-        command: ["npm", "run", "migrate"]
-        envFrom:
-        - secretRef: { name: cumora }
       containers:
       - name: server
         image: quay.io/yetoneful/cumora-server:dev

@@ -71,9 +71,8 @@ roleRef:
   name: cumora-server-agent-pods
   apiGroup: rbac.authorization.k8s.io
 ---
-# Deployment — 2 replicas by default (wake-bus is Redis-pubsub
-# backed, dedup via SETNX, advisory-locked migrations all make
-# multi-replica safe).
+# Deployment — 2 replicas by default. Database migrations are owned by one
+# pre-deploy Job; application replicas only verify schema compatibility.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -99,18 +98,6 @@ spec:
       #     --docker-username=... --docker-password=...
       imagePullSecrets:
       - name: quay-pull
-      initContainers:
-      - name: migrate
-        # REPLACE with the cumora-server image you pushed to a real
-        # registry. Tag with git sha or semver in prod, NOT :dev.
-        image: quay.io/yetoneful/cumora-server:REPLACE-TAG
-        imagePullPolicy: IfNotPresent
-        command: ["npm", "run", "migrate"]
-        envFrom:
-        - secretRef: { name: cumora }
-        resources:
-          requests: { cpu: "100m", memory: "256Mi" }
-          limits:   { cpu: "500m", memory: "512Mi" }
       containers:
       # Cloud SQL Proxy sidecar — exposes Cloud SQL on 127.0.0.1:5432.
       # Authentication via Workload Identity, no SA key file needed.

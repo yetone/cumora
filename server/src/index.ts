@@ -5,7 +5,7 @@ import { mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { env } from './env.js'
-import { ensureSchemaWithBootRetry } from './db/migrate.js'
+import { verifySchemaWithBootRetry } from './db/schema-version.js'
 import { seedIfEmpty } from './seed.js'
 import { api } from './api/router.js'
 import { storage, UPLOAD_DIR } from './storage.js'
@@ -37,7 +37,8 @@ import { startShippingMaintenance } from './shipping-maintenance.js'
 import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from './realtime-outbox.js'
 
 async function main() {
-  await ensureSchemaWithBootRetry()
+  const schemaVersion = await verifySchemaWithBootRetry()
+  console.log(`[boot] schema version ${schemaVersion} is compatible`)
   await seedIfEmpty()
   // Promote CUMORA_ADMIN_EMAILS members to is_admin on every boot —
   // idempotent, only flips FALSE→TRUE. Demotion goes through the panel.

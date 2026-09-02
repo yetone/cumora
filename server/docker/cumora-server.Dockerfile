@@ -7,7 +7,7 @@
 #
 # Entry points:
 #   npm run server:start  →  tsx server/src/index.ts  (main runtime)
-#   npm run migrate       →  tsx server/src/migrate-bin.ts  (init container)
+#   npm run migrate       →  tsx server/src/migrate-bin.ts  (pre-deploy Job)
 #
 # Why it ships kubectl: the orchestrator
 # (server/src/agents/runtime/orchestrator.ts) shells out to kubectl
@@ -109,6 +109,6 @@ COPY --from=spa-build /app/dist ./dist
 ENV NODE_ENV=production
 
 # tini for PID-1 reaping. Default command runs the server; the
-# init-container in our k8s manifests overrides to `npm run migrate`.
+# dedicated pre-deploy Job overrides it with `npm run migrate`.
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["npm", "run", "server:start"]

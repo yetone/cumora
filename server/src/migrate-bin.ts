@@ -4,27 +4,26 @@
  *   npx tsx server/src/migrate-bin.ts
  *   # or, in package.json scripts: npm run migrate
  *
- * Designed to be the entry point of a Kubernetes init container or
- * a pre-deploy Job. Runs `ensureSchema()` and exits — no HTTP
- * listener, no scheduler, no Redis subscription. In K8s init-
- * container shape:
+ * Designed to be the entry point of one pre-deploy Kubernetes Job. Runs
+ * `ensureSchema()` and exits — no HTTP listener, scheduler, or Redis
+ * subscription. Application Pods must not run this command as an init
+ * container; their startup path is read-only schema verification.
  *
+ *   kind: Job
  *   spec:
- *     initContainers:
- *     - name: migrate
- *       image: ghcr.io/yetoneful/cumora-server:<version>
- *       command: ["node", "/app/migrate-bin.cjs"]
- *       env:
- *       - { name: DATABASE_URL, valueFrom: { secretKeyRef: ... } }
- *     containers:
- *     - name: server
- *       ...
+ *     template:
+ *       spec:
+ *         containers:
+ *         - name: migrate
+ *           image: ghcr.io/yetoneful/cumora-server:<version>
+ *           command: ["node", "/app/migrate-bin.cjs"]
+ *           env:
+ *           - { name: DATABASE_URL, valueFrom: { secretKeyRef: ... } }
  *
- * The migration is wrapped in a pg_advisory_lock (see db/migrate.ts)
- * so multiple concurrent runners (rolling deploy, parallel init
- * containers across replicas) serialize cleanly. The DDL is fully
- * idempotent (IF NOT EXISTS / IF EXISTS shapes), so re-runs are
- * no-ops.
+ * The migration is wrapped in a pg_advisory_lock (see db/migrate.ts) as
+ * defense in depth against duplicate deploy jobs. Applied immutable versions
+ * are recorded in schema_migrations, so a rerun reads the ledger and executes
+ * no historical DDL.
  *
  * Exit codes:
  *   0  schema is up to date (or was, and migration finished cleanly)
@@ -34,20 +33,18 @@
 import { pool } from './db/pool.js'
 import { ensureSchema } from './db/migrate.js'
 
-// Postgres SQLSTATE codes for transient lock contention. ensureSchema is fully
-// idempotent (every DDL is IF NOT EXISTS / IF EXISTS shaped) and advisory-lock
-// serialized across replicas, so on these it is ALWAYS safe to back off and
-// re-run the whole thing:
+// Postgres SQLSTATE codes for transient lock contention. ensureSchema records
+// only completed immutable versions and is advisory-lock serialized, so a
+// failed attempt can safely back off and resume from the durable ledger:
 //   40P01 = deadlock_detected  — a no-op ALTER's brief AccessExclusiveLock
 //                                raced a live agent/server query into a cycle
 //                                and PG aborted one. Under constant traffic this
-//                                recurs, so a bare K8s init-container restart just
-//                                crash-loops the rollout to failure (the outage
-//                                this fixes) unless we retry IN-PROCESS in a
-//                                quieter moment.
+//                                recurs under sustained traffic, so the one
+//                                pre-deploy Job retries in-process in a quieter
+//                                moment instead of mutating the Deployment.
 //   55P03 = lock_not_available — lock_timeout (set inside ensureSchema) tripped
 //                                while WAITING for a table lock.
-const TRANSIENT_LOCK_CODES = new Set(['40P01', '55P03'])
+const TRANSIENT_LOCK_CODES = new Set(['40P01', '55P03', '40001'])
 const MAX_ATTEMPTS = 8
 
 async function main(): Promise<void> {
@@ -60,15 +57,16 @@ async function main(): Promise<void> {
       process.exit(0)
     } catch (err) {
       const code = (err as { code?: unknown } | null)?.code
-      if (typeof code === 'string' && TRANSIENT_LOCK_CODES.has(code) && attempt < MAX_ATTEMPTS) {
+      const message = err instanceof Error ? err.message : String(err)
+      const lockContention = typeof code === 'string' && TRANSIENT_LOCK_CODES.has(code)
+      const transportFailure = /timeout|terminated|ECONNREFUSED|ECONNRESET|EOF/i.test(message)
+      if ((lockContention || transportFailure) && attempt < MAX_ATTEMPTS) {
         // The advisory lock is released on the failed attempt (ensureSchema's
-        // finally), so each retry re-acquires cleanly and the idempotent DDL
-        // re-runs as no-ops up to the statement that lost the race, then retries
-        // that one. Exponential backoff + jitter, capped at 15s — this is the
-        // "retry in a quieter moment" the surrounding comments promised but the
-        // runner never actually did.
+        // finally), so each retry re-acquires cleanly and resumes from the last
+        // recorded version. Exponential backoff + jitter is capped at 15s.
         const backoffMs = Math.min(15_000, 1_000 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 500)
-        console.warn(`[migrate-bin] transient lock error ${code} (attempt ${attempt}/${MAX_ATTEMPTS}) — retrying in ${backoffMs}ms`)
+        const kind = lockContention ? `lock error ${code}` : 'transport error'
+        console.warn(`[migrate-bin] transient ${kind} (attempt ${attempt}/${MAX_ATTEMPTS}) — retrying in ${backoffMs}ms`)
         await new Promise((r) => setTimeout(r, backoffMs))
         continue
       }
