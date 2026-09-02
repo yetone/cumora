@@ -1,6 +1,6 @@
 {
   "name": "cumora",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "description": "Run Cumora agents on your own machine with Claude Code, Codex, Antigravity, and other BYOA engines.",
   "license": "MIT",
   "type": "module",
