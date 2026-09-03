@@ -2049,6 +2049,141 @@ interface VersionedMigration extends MigrationMetadata {
   up(client: import('pg').PoolClient): Promise<void>
 }
 
+/**
+ * Split a SQL batch into its top-level statements.
+ *
+ * Honors single-quoted strings (with `''` escapes), dollar-quoted bodies
+ * (`$$ … $$` and `$tag$ … $tag$`), `--` line comments and block comments, so a
+ * `;` inside a DO block, a string, or a comment never ends a statement.
+ * Comment-only chunks are dropped. Exported for the unit test.
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = []
+  const push = (chunk: string) => {
+    const trimmed = chunk.trim()
+    if (trimmed === '') return
+    const withoutComments = trimmed.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').trim()
+    if (withoutComments === '') return
+    statements.push(trimmed)
+  }
+  const n = sql.length
+  let start = 0
+  let i = 0
+  while (i < n) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+    if (ch === '-' && next === '-') {
+      const end = sql.indexOf('\n', i)
+      i = end === -1 ? n : end + 1
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      i = end === -1 ? n : end + 2
+      continue
+    }
+    if (ch === "'") {
+      let j = i + 1
+      while (j < n) {
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") { j += 2; continue }
+          break
+        }
+        j++
+      }
+      i = j + 1
+      continue
+    }
+    if (ch === '$') {
+      const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i, i + 64))?.[0]
+      if (tag) {
+        const end = sql.indexOf(tag, i + tag.length)
+        i = end === -1 ? n : end + tag.length
+        continue
+      }
+    }
+    if (ch === ';') {
+      push(sql.slice(start, i))
+      start = i + 1
+    }
+    i++
+  }
+  push(sql.slice(start))
+  return statements
+}
+
+// Postgres SQLSTATE codes for transient lock contention on one statement:
+// 40P01 deadlock_detected, 55P03 lock_not_available (lock_timeout), 40001
+// serialization_failure. Anything else is a real error and propagates.
+const BASELINE_STATEMENT_LOCK_CODES = new Set(['40P01', '55P03', '40001'])
+const BASELINE_STATEMENT_ATTEMPTS = 6
+
+/** Structural so the unit test can drive the runner with a fake client. */
+export type BaselineStatementClient = { query(sql: string): Promise<unknown> }
+
+/**
+ * Run the frozen baseline one statement at a time, retrying a statement that
+ * loses a lock race.
+ *
+ * Sent as a single simple-protocol query, the batch is ONE implicit
+ * transaction: every no-op `ALTER TABLE … IF NOT EXISTS` takes a brief
+ * AccessExclusiveLock and the transaction HOLDS all ~30 of them until commit.
+ * Under sustained production traffic those waits close into a cycle and
+ * Postgres aborts the whole batch with 40P01 — on every attempt. That is how
+ * the first ADR 0003 adoption Job (v0.14.0, 2026-09-03) failed eight times in
+ * a row without applying anything: the ledger was empty, so version 1 had to
+ * run, and version 1 could never commit. Before ADR 0003 the same batch ran on
+ * every boot and only ever got through production because a sentinel probe let
+ * a deadlocked no-op pass; that hatch is gone, and it would not have helped
+ * here anyway because the baseline had real columns to add.
+ *
+ * Per-statement autocommit holds one table's lock at a time and releases it
+ * immediately, so a no-op cannot participate in a lock cycle, and a real
+ * change waits at most `lock_timeout` (55P03) before this loop retries just
+ * that statement. Every statement in the baseline is idempotent (it ran on
+ * every application boot before ADR 0003), so a statement retry — or a rerun
+ * of the Job after a mid-batch failure — resumes safely; ensureSchema records
+ * version 1 only after the entire batch completed. Versioned migrations after
+ * the baseline keep their single-transaction atomicity.
+ */
+export async function runBaselineStatements(
+  client: BaselineStatementClient,
+  sql: string,
+  opts: { sleep?: (ms: number) => Promise<void>; maxAttempts?: number } = {},
+): Promise<number> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const maxAttempts = opts.maxAttempts ?? BASELINE_STATEMENT_ATTEMPTS
+  const statements = splitSqlStatements(sql)
+  for (let index = 0; index < statements.length; index++) {
+    const statement = statements[index]
+    const summary = statement.replace(/\s+/g, ' ').slice(0, 96)
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await client.query(statement)
+        break
+      } catch (err) {
+        const code = (err as { code?: unknown } | null)?.code
+        if (typeof code === 'string' && BASELINE_STATEMENT_LOCK_CODES.has(code) && attempt < maxAttempts) {
+          const backoffMs = Math.min(8_000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250)
+          console.warn(
+            `[db] baseline statement ${index + 1}/${statements.length} hit ${code} (attempt ${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms: ${summary}`,
+          )
+          await sleep(backoffMs)
+          continue
+        }
+        console.error(`[db] baseline statement ${index + 1}/${statements.length} failed: ${summary}`)
+        throw err
+      }
+    }
+  }
+  return statements.length
+}
+
+/** The frozen baseline text, for tests that check the splitter against it. */
+export function frozenBaselineSql(): string {
+  return DDL
+}
+
 async function applyLegacyBaseline(client: import('pg').PoolClient): Promise<void> {
   // pgvector remains optional: deployments without the extension retain the
   // recency-only memory path. All other baseline objects are mandatory.
@@ -2063,8 +2198,10 @@ async function applyLegacyBaseline(client: import('pg').PoolClient): Promise<voi
 
   // This is the frozen baseline for databases that predate versioned
   // migrations. It runs once, from the dedicated migration owner, and is never
-  // re-applied by application replicas.
-  await client.query(DDL)
+  // re-applied by application replicas. It is sent one statement at a time —
+  // see runBaselineStatements for why the single-batch form cannot complete
+  // against live production traffic.
+  await runBaselineStatements(client, DDL)
   await client.query(`
     DO $migrate$
     BEGIN

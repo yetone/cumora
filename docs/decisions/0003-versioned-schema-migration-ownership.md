@@ -45,6 +45,12 @@ application replica has no reason to create or alter schema while starting.
   version identity and required-index health.
 - A first adoption run executes the frozen legacy baseline once and records it.
   Subsequent runs read the ledger and execute only newly appended versions.
+  The baseline is sent one statement at a time with per-statement lock
+  retries: as a single implicit transaction it holds AccessExclusiveLocks on
+  ~30 tables until commit and deadlocks against live traffic on every attempt
+  (the first v0.14.0 adoption Job failed that way). Every baseline statement
+  is idempotent, so a rerun after a partial batch resumes safely; versions
+  after the baseline keep their single-transaction atomicity.
 - Local development and manual Kubernetes installation must run
   `npm run migrate` before starting the server; `npm run dev:all` performs that
   one explicit step automatically.
