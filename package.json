@@ -37,7 +37,7 @@
     "test:integration": "node server/run-integration-tests.mjs",
     "migrate": "tsx server/src/migrate-bin.ts",
     "icons": "python3 scripts-make-mac-icon.py && npx -y electron-icon-builder -i build/icon.png -o build --flatten && node scripts-sync-electron-dev-icon.mjs",
-    "electron:dev": "concurrently -k -n web,api,electron -c blue,magenta,cyan \"npm:dev\" \"npm:server:dev\" \"wait-on tcp:5180 tcp:5181 && cross-env-shell ELECTRON_RENDERER_URL=http://localhost:5180 electron .\"",
+    "electron:dev": "npm run migrate && concurrently -k -n web,api,electron -c blue,magenta,cyan \"npm:dev\" \"npm:server:dev\" \"wait-on tcp:5180 tcp:5181 && cross-env-shell ELECTRON_RENDERER_URL=http://localhost:5180 electron .\"",
     "electron:start": "electron .",
     "electron:build": "npm run build && electron-builder",
     "electron:build:mac": "npm run build && electron-builder --mac",

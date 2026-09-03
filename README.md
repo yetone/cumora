@@ -58,7 +58,7 @@ npm run dev:all       # Vite renderer on :5180 + API server on :5181
 
 Then open http://localhost:5180 (PWA mode) or run `npm run electron:dev` for the desktop window.
 
-The schema is created idempotently on boot. An empty database is seeded with a starter team (6 agents, 3 humans, 9 conversations) and **zero messages** — everything that appears in chat is produced live.
+Database migrations are applied via `npm run migrate` (run automatically by `npm run dev:all` and `npm run electron:dev`). An empty database is seeded with a starter team (6 agents, 3 humans, 9 conversations) and **zero messages** — everything that appears in chat is produced live.
 
 ### Environment
 

@@ -25,8 +25,8 @@ command also runs `workers/email-gate` tests, whose dependencies live in the
 Worker's separate `package.json`.
 
 Open http://localhost:5180 for the web app, or `npm run electron:dev` for the
-desktop shell. The database schema is created idempotently on boot and seeded
-with a starter team. Everything else (OAuth login, email, storage, push, the
+desktop shell. Database migrations are applied via `npm run migrate` (run
+automatically by `dev:all` and `electron:dev`), and seeded on boot with a starter team. Everything else (OAuth login, email, storage, push, the
 sub2api LLM gateway) soft-disables when its env vars are unset — see
 [`.env.example`](.env.example).
 
