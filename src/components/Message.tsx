@@ -1561,7 +1561,7 @@ export function SystemRow({ msg, delay = 0, animate = true }: { msg: { body: str
       <div className={cn('flex justify-center my-3', riseCls)} style={riseStyle}>
         <div className="max-w-[min(100%,540px)] flex items-start gap-2 px-3 py-1.5 rounded-md bg-coral-soft/60 border border-coral-soft text-coral-deep text-[11.5px] font-display">
           <span className="leading-[1.4] shrink-0">⚠</span>
-          <span className="leading-[1.4]">{payload.text}</span>
+          <span className="leading-[1.4] min-w-0 whitespace-pre-wrap" style={{ overflowWrap: 'anywhere' }}>{payload.text}</span>
         </div>
       </div>
     )
