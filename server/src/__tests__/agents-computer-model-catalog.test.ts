@@ -93,3 +93,19 @@ test('Claude settings ignore a relative config-root override instead of reading 
     prefersLocalDefault: false,
   })
 })
+
+test('Antigravity catalog parses tab-separated models, ignores fetching banner, and marks recommendations', () => {
+  const output = [
+    'Fetching available models...',
+    'gemini-3.8-flash-high\tGemini 3.8 Flash (High)',
+    'gemini-3.1-pro-high\tGemini 3.1 Pro (High)',
+    'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
+  ].join('\n')
+
+  const out = parseListedModels(output, 'antigravity')
+  assert.deepEqual(out, [
+    { id: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)', description: null, recommendedFor: ['small'] },
+    { id: 'gemini-3.1-pro-high', label: 'Gemini 3.1 Pro (High)', description: null, recommendedFor: ['big'] },
+    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)', description: null, recommendedFor: ['big'] },
+  ])
+})
