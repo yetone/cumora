@@ -2231,7 +2231,123 @@ async function applyLegacyBaseline(client: import('pg').PoolClient): Promise<voi
   await verifyRequiredIndexes(client, BASELINE_REQUIRED_SCHEMA_INDEXES)
 }
 
+/** Structural so the unit test can drive the precheck with a fake client. */
+export type MigrationPrecheckClient = {
+  query(sql: string): Promise<{ rows: Array<Record<string, unknown>> }>
+}
+
+const MIGRATION_0002_SAMPLE_LIMIT = 15
+
+// Member ids that migration 0002 cannot place in conversation_members: no
+// participant row with that id in the conversation's tenant, and not one of
+// the synthetic external:<addr> markers the migration strips on purpose.
+const UNRESOLVABLE_MEMBERS_CTE = `
+  WITH orphan AS (
+    SELECT c.id AS conversation_id, c.company_id, member.id AS member_id
+      FROM conversations c
+      CROSS JOIN LATERAL jsonb_array_elements_text(c.members) member(id)
+      LEFT JOIN participants p
+        ON p.id = member.id AND p.company_id = c.company_id
+     WHERE c.company_id IS NOT NULL
+       AND p.id IS NULL
+       AND member.id NOT LIKE 'external:%'
+  )`
+
+/**
+ * Read-only precondition report for migration 0002.
+ *
+ * The migration itself fails closed (23503) when a legacy JSONB member does
+ * not resolve to a same-tenant participant, which is the right call — but a
+ * bare "foreign or missing participant" from the pre-deploy Job tells the
+ * operator nothing about what the data looks like or how much of it there
+ * is. That is exactly where the first v0.14.1 adoption stopped (2026-09-03).
+ * This runs before the immutable SQL, on the same connection, and only reads:
+ * it counts the unresolvable (conversation, member) pairs, classifies them
+ * (id gone from participants entirely, id owned by another tenant, id that is
+ * a users row, id that authored messages in that conversation, …), prints a
+ * bounded sample, and raises the same 23503 with an actionable message. It
+ * lives outside the migration string so the v2 checksum is untouched.
+ */
+export async function checkConversationMembersResolvable(client: MigrationPrecheckClient): Promise<void> {
+  const { rows: [summary] } = await client.query(`${UNRESOLVABLE_MEMBERS_CTE}
+    SELECT
+      (SELECT count(*) FROM orphan)                                  AS pairs,
+      (SELECT count(DISTINCT conversation_id) FROM orphan)           AS conversations,
+      (SELECT count(DISTINCT member_id) FROM orphan)                 AS member_ids,
+      (SELECT count(*) FROM orphan o
+        WHERE NOT EXISTS (SELECT 1 FROM participants p WHERE p.id = o.member_id)) AS missing_everywhere,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM participants p
+                       WHERE p.id = o.member_id AND p.company_id <> o.company_id)) AS other_tenant,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.member_id))            AS user_rows,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM company_members cm
+                       WHERE cm.user_id = o.member_id AND cm.company_id = o.company_id)) AS company_members_without_participant,
+      (SELECT count(*) FROM orphan o WHERE o.company_id = 'personal')          AS personal_tenant,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM messages m
+                       WHERE m.conversation_id = o.conversation_id AND m.author_id = o.member_id)) AS authored_messages,
+      (SELECT count(*) FROM conversations WHERE company_id IS NULL)          AS null_company_conversations
+  `)
+  const n = (value: unknown): number => Number(value ?? 0)
+  const pairs = n(summary?.pairs)
+  const nullCompanies = n(summary?.null_company_conversations)
+  if (pairs === 0 && nullCompanies === 0) {
+    console.log('[db] migration 0002 precheck: every conversation member resolves to a same-tenant participant')
+    return
+  }
+
+  const { rows: samples } = await client.query(`${UNRESOLVABLE_MEMBERS_CTE}
+    SELECT o.conversation_id, o.company_id, o.member_id,
+           EXISTS (SELECT 1 FROM participants p WHERE p.id = o.member_id)   AS participant_elsewhere,
+           EXISTS (SELECT 1 FROM users u WHERE u.id = o.member_id)          AS is_user,
+           EXISTS (SELECT 1 FROM messages m
+                    WHERE m.conversation_id = o.conversation_id AND m.author_id = o.member_id) AS authored
+      FROM orphan o
+     ORDER BY o.company_id, o.conversation_id, o.member_id
+     LIMIT ${MIGRATION_0002_SAMPLE_LIMIT}
+  `)
+
+  // Ids are opaque, but never print a whole email address into a CI log.
+  const mask = (id: string): string => (id.includes('@') ? id.replace(/^(.{0,3}).*@/, '$1…@') : id)
+  const counts = [
+    `pairs=${pairs}`,
+    `conversations=${n(summary?.conversations)}`,
+    `member_ids=${n(summary?.member_ids)}`,
+    `missing_everywhere=${n(summary?.missing_everywhere)}`,
+    `other_tenant=${n(summary?.other_tenant)}`,
+    `user_rows=${n(summary?.user_rows)}`,
+    `company_members_without_participant=${n(summary?.company_members_without_participant)}`,
+    `personal_tenant=${n(summary?.personal_tenant)}`,
+    `authored_messages=${n(summary?.authored_messages)}`,
+    `null_company_conversations=${nullCompanies}`,
+  ]
+  console.error(`[db] migration 0002 precheck failed: ${counts.join(' ')}`)
+  for (const sample of samples) {
+    const flags = [
+      sample.participant_elsewhere ? 'participant-in-other-tenant' : 'no-participant-anywhere',
+      sample.is_user ? 'users-row' : null,
+      sample.authored ? 'authored-messages-here' : null,
+    ].filter(Boolean).join(',')
+    console.error(
+      `[db]   conversation=${String(sample.conversation_id)} company=${String(sample.company_id)} member=${mask(String(sample.member_id))} [${flags}]`,
+    )
+  }
+  const detail = [
+    pairs > 0
+      ? `${pairs} conversation member id(s) in ${n(summary?.conversations)} conversation(s) do not resolve to a same-tenant participant`
+      : null,
+    nullCompanies > 0 ? `${nullCompanies} conversation(s) have no company_id` : null,
+  ].filter(Boolean).join(' and ')
+  throw Object.assign(
+    new Error(`migration 0002 precondition failed: ${detail} — repair the data, then rerun the migration Job (see the precheck lines above and ADR 0004)`),
+    { code: '23503' },
+  )
+}
+
 async function applyNormalizedConversationMembers(client: import('pg').PoolClient): Promise<void> {
+  await checkConversationMembersResolvable(client)
   await client.query(NORMALIZED_CONVERSATION_MEMBERS_SQL)
 }
 
