@@ -51,3 +51,10 @@ test('frontend recurrence: every-2-weeks on Mon and Wed keeps both days in the s
     ],
   )
 })
+
+test('frontend recurrence: non-recurring event fires once then terminates', () => {
+  const seed = new Date('2026-04-14T09:00:00Z')
+  assert.deepEqual(nextOccurrenceOnOrAfter(seed, null, seed), seed)
+  assert.equal(nextOccurrenceOnOrAfter(seed, null, new Date(seed.getTime() + 1000)), null)
+})
+
