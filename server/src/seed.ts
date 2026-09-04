@@ -147,8 +147,12 @@ export async function seedIfEmpty(): Promise<void> {
 
     for (const c of SEED_CONVOS) {
       await client.query(
-        `INSERT INTO conversations (id, kind, title, subtitle, members, pinned, tag, pulled_by, project_id)
-         VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9)`,
+        // company_id is NOT NULL as of migration 0002 and has no column default,
+        // so omitting it aborts the seed — and the seed runs on the boot path.
+        // 'personal' is the same workspace the seeded participants and projects
+        // above are written into, and the baseline DDL creates that companies row.
+        `INSERT INTO conversations (id, company_id, kind, title, subtitle, members, pinned, tag, pulled_by, project_id)
+         VALUES ($1,'personal',$2,$3,$4,$5::jsonb,$6,$7,$8::jsonb,$9)`,
         [c.id, c.kind, c.title, c.subtitle ?? null, JSON.stringify(c.members), c.pinned ?? false, c.tag ?? null, c.pulledBy ? JSON.stringify(c.pulledBy) : null, c.projectId ?? null],
       )
       const maxSeq = SEED_MESSAGES.filter((m) => m.conversationId === c.id).reduce((a, b) => Math.max(a, b.sequence), 0)
