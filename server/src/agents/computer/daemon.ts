@@ -1884,6 +1884,13 @@ class AgentRunner {
     return this.token
   }
 
+  private invalidateToken(token: string): void {
+    // Do not erase a newer token if an older in-flight request finishes late.
+    if (this.token !== token) return
+    this.token = ''
+    this.tokenExpiresAt = 0
+  }
+
   /** Execute one shim request outside the model's sandbox. The broker accepts
    *  only argv strings; identity, URL, Authorization, redirects, and token
    *  refresh remain daemon-owned and cannot be changed by the model. */
@@ -1903,6 +1910,7 @@ class AgentRunner {
         signal: requestAbort.signal,
       })
       if (!res.ok) {
+        if (res.status === 401 || res.status === 403) this.invalidateToken(token)
         const body = await res.text().catch(() => '')
         return { exitCode: 70, error: `HTTP ${res.status} ${body.slice(0, 200)}`.trim() }
       }
@@ -3112,7 +3120,10 @@ class AgentRunner {
         const res = await fetch(`${this.cfg.serverUrl}/runtime/wake-stream`, {
           headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
         })
-        if (!res.ok || !res.body) throw new Error(`wake-stream HTTP ${res.status}`)
+        if (!res.ok || !res.body) {
+          if (res.status === 401 || res.status === 403) this.invalidateToken(token)
+          throw new Error(`wake-stream HTTP ${res.status}`)
+        }
         console.log(`[computer] ${this.agent.id} wake-stream connected (engine: ${this.adapter.id})`)
         connectedAt = Date.now()
         this.kickTurn('reconnect-catchup') // cold-start / reconnect catch-up

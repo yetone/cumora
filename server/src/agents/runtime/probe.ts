@@ -18,8 +18,13 @@ async function main(): Promise<void> {
     console.error('usage: tsx server/src/agents/runtime/probe.ts <agentId>')
     process.exit(2)
   }
-  const { rows } = await pool.query<{ id: string; company_id: string | null }>(
-    'SELECT id, company_id FROM participants WHERE id = $1',
+  const { rows } = await pool.query<{
+    id: string
+    company_id: string | null
+    computer_id: string | null
+    runtime_assignment_id: string
+  }>(
+    'SELECT id, company_id, computer_id, runtime_assignment_id FROM participants WHERE id = $1',
     [agentId],
   )
   if (rows.length === 0) {
@@ -27,7 +32,12 @@ async function main(): Promise<void> {
     process.exit(1)
   }
   const companyId = rows[0].company_id
-  const token = signAgentToken({ agentId, companyId })
+  const token = signAgentToken({
+    agentId,
+    companyId,
+    computerId: rows[0].computer_id,
+    assignmentId: rows[0].runtime_assignment_id,
+  })
   console.log(`COMPANY=${companyId ?? ''}`)
   console.log(`TOKEN=${token}`)
   await pool.end()

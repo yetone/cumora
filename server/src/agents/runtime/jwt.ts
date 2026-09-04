@@ -1,11 +1,11 @@
 /**
  * Minimal HS256 JWT for runtime-pod ↔ server auth.
  *
- * Server signs one token per spawned pod with `{ sub: agentId,
- * companyId, scope: 'agent-runner', iat, exp }`. Pod presents it on
- * every `/runtime/*` request. Server verifies sig + exp + scope and
- * pins the agentId to the token — endpoints never trust an agentId
- * from the request body.
+ * Server signs one token per runtime with `{ sub: agentId, companyId,
+ * computerId, assignmentId, scope: 'agent-runner', iat, exp }`. The runtime
+ * presents it on every `/runtime/*` request. Server verifies sig + exp + scope
+ * and pins both identity and live placement — endpoints never trust an agentId
+ * or Computer from the request body.
  *
  * Why homegrown instead of `jose`: the surface area is small (sign +
  * verify, fixed alg, fixed claim shape), the secret never leaves the
@@ -20,6 +20,10 @@ export interface AgentRuntimeClaims {
   sub: string
   /** company id the agent belongs to. Pinned so requests can't cross tenants. */
   companyId: string | null
+  /** Exact assigned Computer. Null represents an explicitly unassigned Agent. */
+  computerId: string | null
+  /** Opaque generation rotated by PostgreSQL on every authority-bearing move. */
+  assignmentId: string
   /** Fixed string; lets the server reject tokens minted for other purposes. */
   scope: 'agent-runner'
   /** issued-at, unix seconds. */
@@ -49,12 +53,16 @@ function sign(headerB64: string, payloadB64: string): string {
 export function signAgentToken(args: {
   agentId: string
   companyId: string | null
+  computerId: string | null
+  assignmentId: string
   ttlSeconds?: number
 }): string {
   const now = Math.floor(Date.now() / 1000)
   const claims: AgentRuntimeClaims = {
     sub: args.agentId,
     companyId: args.companyId,
+    computerId: args.computerId,
+    assignmentId: args.assignmentId,
     scope: 'agent-runner',
     iat: now,
     exp: now + (args.ttlSeconds ?? DEFAULT_TTL_SECONDS),
@@ -79,5 +87,14 @@ export function verifyAgentToken(token: string): AgentRuntimeClaims {
   const now = Math.floor(Date.now() / 1000)
   if (typeof claims.exp !== 'number' || claims.exp < now) throw new Error('token expired')
   if (typeof claims.sub !== 'string' || !claims.sub) throw new Error('missing sub')
+  if (claims.companyId !== null && (typeof claims.companyId !== 'string' || !claims.companyId)) {
+    throw new Error('invalid companyId')
+  }
+  if (claims.computerId !== null && (typeof claims.computerId !== 'string' || !claims.computerId)) {
+    throw new Error('invalid computerId')
+  }
+  if (typeof claims.assignmentId !== 'string' || !claims.assignmentId) {
+    throw new Error('missing assignmentId')
+  }
   return claims
 }

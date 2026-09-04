@@ -19,6 +19,7 @@ function fakeDb(rows: Record<string, unknown>[]): HostDb {
 const paidCloudRow = {
   company_id: 'co-1',
   computer_id: 'cloud-co-1',
+  runtime_assignment_id: 'assignment-1',
   resolved_computer_id: 'cloud-co-1',
   computer_company_id: 'co-1',
   kind: 'cloud',
@@ -51,6 +52,7 @@ test('resolveAgentHost distinguishes a missing agent from an unassigned paid age
     kind: null,
     computerId: null,
     companyId: 'co-1',
+    runtimeAssignmentId: 'assignment-1',
     tier: 'pro',
   })
 })
@@ -87,15 +89,16 @@ test('managedPodPlacement permits only paid managed or explicit unassigned hosts
     kind: 'cloud' as const,
     computerId: 'cloud-co-1',
     companyId: 'co-1',
+    runtimeAssignmentId: 'assignment-1',
     tier: 'pro' as const,
     ...overrides,
   })
 
   assert.deepEqual(managedPodPlacement(found()), {
-    status: 'allowed', companyId: 'co-1', computerId: 'cloud-co-1',
+    status: 'allowed', companyId: 'co-1', computerId: 'cloud-co-1', runtimeAssignmentId: 'assignment-1',
   })
   assert.deepEqual(managedPodPlacement(found({ kind: null, computerId: null })), {
-    status: 'allowed', companyId: 'co-1', computerId: null,
+    status: 'allowed', companyId: 'co-1', computerId: null, runtimeAssignmentId: 'assignment-1',
   })
   assert.equal(managedPodPlacement(found({ kind: 'local' })).status, 'denied')
   assert.equal(managedPodPlacement(found({ kind: 'vps' })).status, 'denied')

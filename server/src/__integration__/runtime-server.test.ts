@@ -29,7 +29,7 @@ import { createServer, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, before, beforeEach, test } from 'node:test'
-import { mintAgentRuntimeToken } from '../agents/computer/registry.js'
+import { mintAgentRuntimeToken, revokeComputer } from '../agents/computer/registry.js'
 import { signAgentToken, verifyAgentToken } from '../agents/runtime/jwt.js'
 import { pool } from '../db/pool.js'
 import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
@@ -130,6 +130,31 @@ async function waitForBlockedQuery(pattern: string, minimum = 1): Promise<void> 
   throw new Error(`query never reached the expected row lock: ${pattern}`)
 }
 
+async function signCurrentRuntimeToken(args: {
+  agentId: string
+  sourceCompanyId: string
+  claimCompanyId?: string | null
+  ttlSeconds?: number
+}): Promise<string> {
+  const { rows } = await pool.query<{
+    computer_id: string | null
+    runtime_assignment_id: string
+  }>(
+    `SELECT computer_id, runtime_assignment_id
+       FROM participants
+      WHERE id = $1 AND company_id = $2 AND kind = 'agent'`,
+    [args.agentId, args.sourceCompanyId],
+  )
+  assert.ok(rows[0], 'runtime token fixture requires a live Agent placement')
+  return signAgentToken({
+    agentId: args.agentId,
+    companyId: args.claimCompanyId === undefined ? args.sourceCompanyId : args.claimCompanyId,
+    computerId: rows[0].computer_id,
+    assignmentId: rows[0].runtime_assignment_id,
+    ttlSeconds: args.ttlSeconds,
+  })
+}
+
 async function seedAgent(): Promise<{ agentId: string; companyId: string; token: string }> {
   const companyId = `c-${randomUUID().slice(0, 8)}`
   const agentId = `a-${randomUUID().slice(0, 8)}`
@@ -142,7 +167,7 @@ async function seedAgent(): Promise<{ agentId: string; companyId: string; token:
        VALUES ($1, $2, 'agent', $3, 'tester', $4, '#abcdef', 'avail')`,
     [agentId, companyId, agentId, agentId.slice(0, 1).toUpperCase()],
   )
-  const token = signAgentToken({ agentId, companyId })
+  const token = await signCurrentRuntimeToken({ agentId, sourceCompanyId: companyId })
   return { agentId, companyId, token }
 }
 
@@ -153,7 +178,11 @@ async function seedPeerAgent(companyId: string): Promise<{ agentId: string; comp
        VALUES ($1, $2, 'agent', $3, 'tester', $4, '#abcdef', 'avail')`,
     [agentId, companyId, agentId, agentId.slice(0, 1).toUpperCase()],
   )
-  return { agentId, companyId, token: signAgentToken({ agentId, companyId }) }
+  return {
+    agentId,
+    companyId,
+    token: await signCurrentRuntimeToken({ agentId, sourceCompanyId: companyId }),
+  }
 }
 
 async function assertCannotMutateForeignRun(args: {
@@ -230,7 +259,7 @@ async function assertCannotMutateForeignRun(args: {
 async function mintAssignedAgentRuntimeToken(args: {
   agentId: string
   companyId: string
-}): Promise<string> {
+}): Promise<{ token: string; computerId: string }> {
   const computerId = `comp-${randomUUID().slice(0, 8)}`
   await pool.query(
     `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
@@ -244,7 +273,7 @@ async function mintAssignedAgentRuntimeToken(args: {
   )
   const minted = await mintAgentRuntimeToken({ computerId, agentId: args.agentId })
   assert.ok(minted, 'the production BYOA path should mint a token for an assigned agent')
-  return minted.token
+  return { token: minted.token, computerId }
 }
 
 async function seedContextConversation(opts: {
@@ -347,15 +376,23 @@ test('[integration] runtime: malformed token (not three segments) → 401', asyn
 test('[integration] runtime: expired token → 401', async () => {
   const { agentId, companyId } = await seedAgent()
   // ttlSeconds = -1 → exp = now - 1s, definitely expired.
-  const tok = signAgentToken({ agentId, companyId, ttlSeconds: -1 })
+  const tok = await signCurrentRuntimeToken({
+    agentId,
+    sourceCompanyId: companyId,
+    ttlSeconds: -1,
+  })
   const r = await call('/runtime/inbox', { method: 'GET', token: tok })
   assert.equal(r.status, 401)
   assert.match(String(r.body?.error ?? ''), /expired/i)
 })
 
 test('[integration] runtime: /context requires a tenant-pinned token', async () => {
-  const { agentId } = await seedAgent()
-  const token = signAgentToken({ agentId, companyId: null })
+  const { agentId, companyId } = await seedAgent()
+  const token = await signCurrentRuntimeToken({
+    agentId,
+    sourceCompanyId: companyId,
+    claimCompanyId: null,
+  })
   const r = await call('/runtime/context', { token, body: { conversationIds: [] } })
   assert.equal(r.status, 403)
   assert.match(String(r.body?.error ?? ''), /companyId claim required/i)
@@ -412,7 +449,7 @@ test('[integration] runtime: /context enforces tenant and conversation membershi
 test('[integration] runtime: every route rejects a stale production token after tenant reassignment', async () => {
   const originalTenant = await seedAgent()
   const currentTenant = await seedAgent()
-  const staleToken = await mintAssignedAgentRuntimeToken(originalTenant)
+  const { token: staleToken } = await mintAssignedAgentRuntimeToken(originalTenant)
 
   // Model a real stale-credential lifecycle without fabricating JWT claims:
   // the BYOA path minted the token while the agent belonged to tenant A, then
@@ -457,7 +494,7 @@ test('[integration] runtime: every route rejects a stale production token after 
       body: request.body,
     })
     assert.equal(r.status, 403, request.path)
-    assert.match(String(r.body?.error ?? ''), /token tenant/i, request.path)
+    assert.match(String(r.body?.error ?? ''), /assignment changed|revoked/i, request.path)
   }
 
   const { rows: statusRows } = await pool.query<{ status: string }>(
@@ -467,10 +504,77 @@ test('[integration] runtime: every route rejects a stale production token after 
   assert.deepEqual(statusRows, [{ status: 'avail' }])
 })
 
+test('[integration] runtime: host reassignment generations and Computer revocation invalidate old tokens', async () => {
+  const agent = await seedAgent()
+  const first = await mintAssignedAgentRuntimeToken(agent)
+  const firstClaims = verifyAgentToken(first.token)
+  assert.equal(firstClaims.computerId, first.computerId)
+
+  const secondComputerId = `comp-${randomUUID().slice(0, 8)}`
+  await pool.query(
+    `INSERT INTO computers (id, company_id, name, kind, available_engines, status)
+     VALUES ($1, $2, $3, 'local', '["codex"]'::jsonb, 'online')`,
+    [secondComputerId, agent.companyId, `Computer ${secondComputerId}`],
+  )
+  const moved = await pool.query<{ runtime_assignment_id: string }>(
+    `UPDATE participants SET computer_id = $1
+      WHERE id = $2 AND company_id = $3
+      RETURNING runtime_assignment_id`,
+    [secondComputerId, agent.agentId, agent.companyId],
+  )
+  assert.equal(moved.rowCount, 1)
+  assert.notEqual(moved.rows[0].runtime_assignment_id, firstClaims.assignmentId)
+
+  const movedAway = await call('/runtime/status', {
+    token: first.token,
+    body: { status: 'working' },
+  })
+  assert.equal(movedAway.status, 403)
+  assert.match(String(movedAway.body?.error ?? ''), /assignment changed|revoked/i)
+
+  const movedBack = await pool.query<{ runtime_assignment_id: string }>(
+    `UPDATE participants SET computer_id = $1
+      WHERE id = $2 AND company_id = $3
+      RETURNING runtime_assignment_id`,
+    [first.computerId, agent.agentId, agent.companyId],
+  )
+  assert.equal(movedBack.rowCount, 1)
+  assert.notEqual(movedBack.rows[0].runtime_assignment_id, moved.rows[0].runtime_assignment_id)
+  assert.notEqual(movedBack.rows[0].runtime_assignment_id, firstClaims.assignmentId)
+
+  // Computer id and tenant now equal the original claims again. Only the
+  // database-owned assignment generation prevents this ABA replay.
+  const replayed = await call('/runtime/inbox', { method: 'GET', token: first.token })
+  assert.equal(replayed.status, 403)
+  assert.match(String(replayed.body?.error ?? ''), /assignment changed|revoked/i)
+
+  const current = await mintAgentRuntimeToken({
+    computerId: first.computerId,
+    agentId: agent.agentId,
+  })
+  assert.ok(current)
+  assert.equal((await call('/runtime/inbox', { method: 'GET', token: current.token })).status, 200)
+
+  assert.equal(await revokeComputer({
+    computerId: first.computerId,
+    companyId: agent.companyId,
+  }), true)
+  assert.equal(await mintAgentRuntimeToken({
+    computerId: first.computerId,
+    agentId: agent.agentId,
+  }), null)
+  const revoked = await call('/runtime/status', {
+    token: current.token,
+    body: { status: 'working' },
+  })
+  assert.equal(revoked.status, 403)
+  assert.match(String(revoked.body?.error ?? ''), /assignment changed|revoked/i)
+})
+
 test('[integration] runtime: /inbox-triage/payload rejects a stale token before loading the new tenant inbox', async () => {
   const originalTenant = await seedAgent()
   const currentTenant = await seedAgent()
-  const staleToken = await mintAssignedAgentRuntimeToken(originalTenant)
+  const { token: staleToken } = await mintAssignedAgentRuntimeToken(originalTenant)
 
   const moved = await pool.query(
     `UPDATE participants
@@ -493,7 +597,7 @@ test('[integration] runtime: /inbox-triage/payload rejects a stale token before 
   })
 
   assert.equal(r.status, 403)
-  assert.match(String(r.body?.error ?? ''), /token tenant/i)
+  assert.match(String(r.body?.error ?? ''), /assignment changed|revoked/i)
 })
 
 test('[integration] runtime: a current token cannot use a stale member id to read or write the old tenant through /cli', async () => {
@@ -560,9 +664,9 @@ test('[integration] runtime: a current token cannot use a stale member id to rea
   } finally {
     mover.release()
   }
-  const currentToken = signAgentToken({
+  const currentToken = await signCurrentRuntimeToken({
     agentId: originalTenant.agentId,
-    companyId: currentTenant.companyId,
+    sourceCompanyId: currentTenant.companyId,
   })
 
   for (const argv of [
@@ -732,8 +836,12 @@ test('[integration] runtime: /cli still sends text-only agent email in mock mode
 })
 
 test('[integration] runtime: /faces requires a tenant-pinned token', async () => {
-  const { agentId } = await seedAgent()
-  const token = signAgentToken({ agentId, companyId: null })
+  const { agentId, companyId } = await seedAgent()
+  const token = await signCurrentRuntimeToken({
+    agentId,
+    sourceCompanyId: companyId,
+    claimCompanyId: null,
+  })
   const r = await call('/runtime/faces', { token, body: { participantIds: [agentId] } })
   assert.equal(r.status, 403)
   assert.match(String(r.body?.error ?? ''), /companyId claim required/i)

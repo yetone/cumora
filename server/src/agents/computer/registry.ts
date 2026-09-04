@@ -595,15 +595,28 @@ export async function mintAgentRuntimeToken(args: {
   computerId: string
   agentId: string
 }): Promise<{ token: string; expiresInSeconds: number } | null> {
-  const { rows } = await pool.query<{ company_id: string | null }>(
-    `SELECT company_id FROM participants
-      WHERE id = $1 AND kind = 'agent' AND computer_id = $2 LIMIT 1`,
+  const { rows } = await pool.query<{
+    company_id: string
+    computer_id: string
+    runtime_assignment_id: string
+  }>(
+    `SELECT p.company_id, p.computer_id, p.runtime_assignment_id
+       FROM participants p
+       JOIN computers c
+         ON c.id = p.computer_id
+        AND c.company_id = p.company_id
+        AND c.revoked_at IS NULL
+      WHERE p.id = $1 AND p.kind = 'agent' AND p.computer_id = $2
+        AND p.departed_at IS NULL
+      LIMIT 1`,
     [args.agentId, args.computerId],
   )
   if (!rows[0]) return null
   const token = signAgentToken({
     agentId: args.agentId,
     companyId: rows[0].company_id,
+    computerId: rows[0].computer_id,
+    assignmentId: rows[0].runtime_assignment_id,
     ttlSeconds: AGENT_TOKEN_TTL_SECONDS,
   })
   return { token, expiresInSeconds: AGENT_TOKEN_TTL_SECONDS }
@@ -725,6 +738,8 @@ export interface ResolvedAgentHost {
   computerId: string | null
   /** Active agent tenant. A found result never carries an empty tenant. */
   companyId: string
+  /** Opaque placement generation bound into every runtime token. */
+  runtimeAssignmentId: string
   /** Tenant tier read in the same database snapshot as the host assignment. */
   tier: Tier
 }
@@ -747,7 +762,7 @@ export type AgentHostResolution =
   | FailedAgentHostResolution
 
 export type ManagedPodPlacement =
-  | { status: 'allowed'; companyId: string; computerId: string | null }
+  | { status: 'allowed'; companyId: string; computerId: string | null; runtimeAssignmentId: string }
   | {
       status: 'denied'
       code: 'agent_not_found' | 'placement_lookup_failed' | 'placement_denied'
@@ -778,6 +793,7 @@ export async function resolveAgentHost(
     const { rows } = await db.query<{
       company_id: string | null
       computer_id: string | null
+      runtime_assignment_id: string | null
       resolved_computer_id: string | null
       computer_company_id: string | null
       kind: string | null
@@ -787,6 +803,7 @@ export async function resolveAgentHost(
     }>(
       `SELECT p.company_id,
               p.computer_id,
+              p.runtime_assignment_id,
               c.id AS resolved_computer_id,
               c.company_id AS computer_company_id,
               c.kind,
@@ -813,7 +830,7 @@ export async function resolveAgentHost(
     )
     const row = rows[0]
     if (!row) return { status: 'missing' }
-    if (!row.company_id || !row.resolved_company_id) {
+    if (!row.company_id || !row.resolved_company_id || !row.runtime_assignment_id) {
       return {
         status: 'error',
         code: 'invalid_assignment',
@@ -848,6 +865,7 @@ export async function resolveAgentHost(
       kind: row.computer_id === null ? null : row.kind as ComputerKind,
       computerId: row.computer_id,
       companyId: row.company_id,
+      runtimeAssignmentId: row.runtime_assignment_id,
       tier: normalizeTier(row.tier),
     }
   } catch (cause) {
@@ -892,6 +910,7 @@ export function managedPodPlacement(
     status: 'allowed',
     companyId: resolution.companyId,
     computerId: resolution.computerId,
+    runtimeAssignmentId: resolution.runtimeAssignmentId,
   }
 }
 

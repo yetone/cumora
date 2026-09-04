@@ -82,10 +82,25 @@ async function seedAgent(companyId?: string, agentId?: string): Promise<{
   token: string
 }> {
   const seeded = await seedCompanyWithAgent({ companyId, agentId })
+  const { rows } = await pool.query<{
+    computer_id: string | null
+    runtime_assignment_id: string
+  }>(
+    `SELECT computer_id, runtime_assignment_id
+       FROM participants
+      WHERE id = $1 AND company_id = $2 AND kind = 'agent'`,
+    [seeded.agentId, seeded.companyId],
+  )
+  assert.ok(rows[0], 'runtime token fixture requires a live Agent placement')
   return {
     companyId: seeded.companyId,
     agentId: seeded.agentId,
-    token: signAgentToken({ agentId: seeded.agentId, companyId: seeded.companyId }),
+    token: signAgentToken({
+      agentId: seeded.agentId,
+      companyId: seeded.companyId,
+      computerId: rows[0].computer_id,
+      assignmentId: rows[0].runtime_assignment_id,
+    }),
   }
 }
 

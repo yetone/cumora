@@ -641,7 +641,7 @@ export type EnsurePodResult =
     }
 
 export type ManagedPodPlacementVerification =
-  | { ok: true; companyId: string; computerId: string | null }
+  | { ok: true; companyId: string; computerId: string | null; runtimeAssignmentId: string }
   | {
       ok: false
       code: 'agent_not_found' | 'placement_lookup_failed' | 'placement_denied'
@@ -674,6 +674,7 @@ export async function verifyManagedPodPlacement(
     ok: true,
     companyId: decision.companyId,
     computerId: decision.computerId,
+    runtimeAssignmentId: decision.runtimeAssignmentId,
   }
 }
 
@@ -755,12 +756,16 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const recheckPlacement = async (): Promise<EnsurePodResult | null> => {
     const current = await verifyManagedPodPlacement(agentId)
     if (!current.ok) return { created: false, ...current }
-    if (current.companyId !== initialPlacement.companyId) {
+    if (
+      current.companyId !== initialPlacement.companyId
+      || current.computerId !== initialPlacement.computerId
+      || current.runtimeAssignmentId !== initialPlacement.runtimeAssignmentId
+    ) {
       return {
         created: false,
         ok: false,
         code: 'placement_denied',
-        reason: 'managed pod denied: agent company changed during placement',
+        reason: 'managed pod denied: agent placement changed during preparation',
       }
     }
     return null
@@ -874,6 +879,8 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
   const token = signAgentToken({
     agentId,
     companyId: persona.companyId,
+    computerId: initialPlacement.computerId,
+    assignmentId: initialPlacement.runtimeAssignmentId,
     ttlSeconds: TOKEN_TTL_SECONDS,
   })
 

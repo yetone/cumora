@@ -430,7 +430,19 @@ test('[integration] workspace deletion purges FK-backed and legacy soft-scoped d
      VALUES ('board-managed', 'co-managed', 'Managed board', $1)`, [OWNER_ID],
   )
 
-  assert.equal(await isRuntimeAgentAuthorized('agent-managed', 'co-managed'), true)
+  const runtimeIdentity = await pool.query<{ runtime_assignment_id: string }>(
+    `SELECT runtime_assignment_id
+       FROM participants
+      WHERE id = 'agent-managed' AND company_id = 'co-managed'`,
+  )
+  assert.ok(runtimeIdentity.rows[0])
+  const runtimeClaims = {
+    sub: 'agent-managed',
+    companyId: 'co-managed',
+    computerId: null,
+    assignmentId: runtimeIdentity.rows[0].runtime_assignment_id,
+  }
+  assert.equal(await isRuntimeAgentAuthorized(runtimeClaims), true)
 
   const response = await fetch(`${ownerBase}/api/companies/co-managed`, {
     method: 'DELETE', headers: companyHeaders('co-managed'),
@@ -454,7 +466,7 @@ test('[integration] workspace deletion purges FK-backed and legacy soft-scoped d
   }
   const alternative = await pool.query(`SELECT 1 FROM companies WHERE id = 'co-alternative'`)
   assert.equal(alternative.rowCount, 1)
-  assert.equal(await isRuntimeAgentAuthorized('agent-managed', 'co-managed'), false)
+  assert.equal(await isRuntimeAgentAuthorized(runtimeClaims), false)
   assert.equal((await pool.query(`SELECT 1 FROM user_preferences WHERE user_id = $1`, [TARGET_ID])).rowCount, 1)
   assert.equal((await pool.query(`SELECT 1 FROM agent_autonomy WHERE user_id = $1`, [TARGET_ID])).rowCount, 1)
   assert.equal((await pool.query(`SELECT 1 FROM llm_calls WHERE id = 'llm-managed'`)).rowCount, 1)

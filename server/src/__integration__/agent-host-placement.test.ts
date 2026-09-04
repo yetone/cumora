@@ -31,13 +31,13 @@ async function seedPlacementFixture(): Promise<void> {
   )
   await pool.query(
     `INSERT INTO participants
-       (id, company_id, kind, name, initial, avatar_bg, status, computer_id)
+       (id, company_id, kind, name, initial, avatar_bg, status, computer_id, runtime_assignment_id)
      VALUES
-       ('agent-cloud', 'co-pro', 'agent', 'Cloud', 'C', '#111111', 'resting', 'cloud-pro'),
-       ('agent-local', 'co-pro', 'agent', 'Local', 'L', '#222222', 'resting', 'local-pro'),
-       ('agent-free', 'co-free', 'agent', 'Free', 'F', '#333333', 'resting', NULL),
-       ('agent-revoked', 'co-pro', 'agent', 'Revoked', 'R', '#444444', 'resting', 'revoked-pro'),
-       ('agent-cross', 'co-pro', 'agent', 'Cross', 'X', '#555555', 'resting', 'other-cloud')`,
+       ('agent-cloud', 'co-pro', 'agent', 'Cloud', 'C', '#111111', 'resting', 'cloud-pro', 'assignment-cloud'),
+       ('agent-local', 'co-pro', 'agent', 'Local', 'L', '#222222', 'resting', 'local-pro', 'assignment-local'),
+       ('agent-free', 'co-free', 'agent', 'Free', 'F', '#333333', 'resting', NULL, 'assignment-free'),
+       ('agent-revoked', 'co-pro', 'agent', 'Revoked', 'R', '#444444', 'resting', 'revoked-pro', 'assignment-revoked'),
+       ('agent-cross', 'co-pro', 'agent', 'Cross', 'X', '#555555', 'resting', 'other-cloud', 'assignment-cross')`,
   )
 }
 
@@ -50,12 +50,14 @@ test('[integration] managed placement resolves host and tier from one tenant sna
     kind: 'cloud',
     computerId: 'cloud-pro',
     companyId: 'co-pro',
+    runtimeAssignmentId: 'assignment-cloud',
     tier: 'pro',
   })
   assert.deepEqual(await verifyManagedPodPlacement('agent-cloud'), {
     ok: true,
     companyId: 'co-pro',
     computerId: 'cloud-pro',
+    runtimeAssignmentId: 'assignment-cloud',
   })
 
   const byoa = await verifyManagedPodPlacement('agent-local')

@@ -1,22 +1,32 @@
 import type { PoolClient } from 'pg'
 import { pool } from '../../db/pool.js'
+import type { AgentRuntimeClaims } from './jwt.js'
 
 /**
- * A signed runtime token captures the agent's tenant at mint time. Resolve the
- * live participant row as the authorization source of truth so moving or
- * offboarding an agent revokes every previously minted token.
+ * A signed runtime token captures the agent's tenant and exact Computer
+ * placement at mint time. Resolve the live rows as the authorization source of
+ * truth so moving/offboarding an Agent or revoking its Computer invalidates
+ * every previously minted token. `assignmentId` closes the move-away/move-back
+ * case where tenant and Computer values end up equal again.
  */
 export async function isRuntimeAgentAuthorized(
-  agentId: string,
-  companyId: string | null,
+  claims: Pick<AgentRuntimeClaims, 'sub' | 'companyId' | 'computerId' | 'assignmentId'>,
 ): Promise<boolean> {
-  if (!companyId) return false
+  if (!claims.companyId) return false
   const { rowCount } = await pool.query(
-    `SELECT 1 FROM participants
-      WHERE id = $1 AND company_id = $2
-        AND kind = 'agent' AND departed_at IS NULL
+    `SELECT 1
+       FROM participants p
+       LEFT JOIN computers c
+         ON c.id = p.computer_id
+        AND c.company_id = p.company_id
+        AND c.revoked_at IS NULL
+      WHERE p.id = $1 AND p.company_id = $2
+        AND p.computer_id IS NOT DISTINCT FROM $3::text
+        AND p.runtime_assignment_id = $4
+        AND p.kind = 'agent' AND p.departed_at IS NULL
+        AND (p.computer_id IS NULL OR c.id IS NOT NULL)
       LIMIT 1`,
-    [agentId, companyId],
+    [claims.sub, claims.companyId, claims.computerId, claims.assignmentId],
   )
   return rowCount === 1
 }

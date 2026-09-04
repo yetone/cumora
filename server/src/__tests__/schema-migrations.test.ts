@@ -15,6 +15,7 @@ process.env.OPENAI_API_KEY ??= 'test-key'
 const { computedBaselineMigrationChecksum } = await import('../db/migrate.js')
 const { normalizedConversationMembersChecksum } = await import('../db/migrations/0002-normalized-conversation-members.js')
 const { workspaceCleanupJobsChecksum } = await import('../db/migrations/0003-workspace-cleanup-jobs.js')
+const { agentRuntimeAssignmentChecksum } = await import('../db/migrations/0004-agent-runtime-assignment.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -30,6 +31,10 @@ test('the normalized membership migration matches its immutable manifest checksu
 
 test('the workspace cleanup migration matches its immutable manifest checksum', () => {
   assert.equal(workspaceCleanupJobsChecksum(), SCHEMA_MIGRATIONS[2].checksum)
+})
+
+test('the runtime assignment migration matches its immutable manifest checksum', () => {
+  assert.equal(agentRuntimeAssignmentChecksum(), SCHEMA_MIGRATIONS[3].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {
