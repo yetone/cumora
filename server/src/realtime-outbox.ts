@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient, QueryResult, QueryResultRow } from 'pg'
 import { pool } from './db/pool.js'
+import { stripLoneSurrogates } from './agents/text-safety.js'
 import { publish, type BroadcastEvent } from './redis.js'
 
 /**
@@ -60,9 +61,34 @@ export async function enqueueBroadcast(
   await db.query(
     `INSERT INTO realtime_outbox (id, channel, payload)
      VALUES ($1, $2, $3::jsonb)`,
-    [id, channel, JSON.stringify(payload)],
+    [id, channel, serializePayload(payload)],
   )
   return id
+}
+
+/** Serialize an outbox payload so Postgres will accept it as `jsonb`.
+ *
+ *  A body truncated mid-emoji — `qr[0].body.slice(0, 240)` on the quote path —
+ *  ends in a lone UTF-16 surrogate. JSON.stringify turns that into the literal
+ *  ASCII escape `\ud83d`, which survives transport intact and is then rejected:
+ *
+ *    ERROR:  invalid input syntax for type json
+ *    DETAIL: Unicode low surrogate must follow a high surrogate.
+ *
+ *  That matters here and not before because the enqueue is INSIDE the caller's
+ *  transaction. The same payload used to go to redis.publish AFTER COMMIT, where
+ *  a lone surrogate was a cosmetic glyph; behind a `::jsonb` cast it rolls the
+ *  message back and 500s, so a quote-reply to one emoji-bearing message fails
+ *  forever. `messages.body` is TEXT and accepts the same bytes, which is why
+ *  only the outbox half dies.
+ *
+ *  Scrubbing here rather than at each call site is deliberate: every field of
+ *  every future event goes through this one cast. The replacer visits every
+ *  string in the tree, so nesting and arrays need no traversal of our own. */
+function serializePayload(payload: unknown): string {
+  return JSON.stringify(payload, (_key, value) =>
+    typeof value === 'string' ? stripLoneSurrogates(value) : value,
+  )
 }
 
 /** Run a mutation and all of its realtime invalidations in one transaction. */

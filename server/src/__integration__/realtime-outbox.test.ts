@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http'
 import { after, before, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { pool } from '../db/pool.js'
-import { drainRealtimeOutbox } from '../realtime-outbox.js'
+import { drainRealtimeOutbox, enqueueBroadcast } from '../realtime-outbox.js'
 import type { BroadcastEvent } from '../redis.js'
 import {
   buildApiTestApp, ensureSchemaOnce, resetAllTables,
@@ -153,4 +153,76 @@ test('[integration] document and calendar creates replay without duplicate rows 
     `SELECT COUNT(*)::int AS count FROM realtime_outbox`,
   )
   assert.equal(events.rows[0]?.count, 2)
+})
+
+// ── a body cut mid-emoji must not roll the transaction back ─────────────────
+//
+// The quote path truncates by UTF-16 code unit (`qr[0].body.slice(0, 240)`), so
+// a message with a non-BMP character straddling that index yields a lone
+// surrogate. JSON.stringify emits it as the ASCII escape `\ud83d`, which reaches
+// Postgres intact and is refused by the jsonb cast:
+//
+//   ERROR:  invalid input syntax for type json
+//   DETAIL: Unicode low surrogate must follow a high surrogate.
+//
+// Because the enqueue is inside the caller's transaction, that took the message
+// with it. `messages.body` is TEXT and accepts the same bytes, so only the
+// outbox half died — which is what made one emoji-bearing message permanently
+// un-quotable rather than merely ugly.
+
+/** Exactly what the quote path produces: 239 ASCII chars then an emoji, cut at 240. */
+const CUT_MID_EMOJI = `${'a'.repeat(239)}\u{1F600}`.slice(0, 240)
+
+test('[integration] a payload truncated mid-emoji still enqueues', async () => {
+  assert.equal(CUT_MID_EMOJI.charCodeAt(239), 0xd83d, 'fixture no longer ends in a lone surrogate')
+
+  const id = await enqueueBroadcast(pool, 'message:new', {
+    type: 'message.new',
+    conversationId: 'c-outbox',
+    quoted: { body: CUT_MID_EMOJI },
+  } as unknown as BroadcastEvent)
+
+  const { rows } = await pool.query<{ body: string }>(
+    `SELECT payload->'quoted'->>'body' AS body FROM realtime_outbox WHERE id = $1`,
+    [id],
+  )
+  assert.equal(rows.length, 1, 'the row was not written')
+  // The broken half is dropped, not the message: 239 readable characters survive.
+  assert.equal(rows[0].body, 'a'.repeat(239))
+})
+
+test('[integration] a lone surrogate anywhere in the tree is scrubbed, not just at the top', async () => {
+  // Payload fields grow over time; scrubbing lives at the single cast so a new
+  // nested field cannot reintroduce this.
+  const id = await enqueueBroadcast(pool, 'message:new', {
+    type: 'message.new',
+    conversationId: 'c-outbox',
+    quoted: { body: '\ud83d', authorName: 'tail \ud83d' },
+    tags: ['\ud83d', 'ok'],
+  } as unknown as BroadcastEvent)
+
+  const { rows } = await pool.query<{ payload: Record<string, unknown> }>(
+    `SELECT payload FROM realtime_outbox WHERE id = $1`, [id],
+  )
+  const payload = rows[0].payload as {
+    quoted: { body: string; authorName: string }; tags: string[]
+  }
+  assert.equal(payload.quoted.body, '')
+  assert.equal(payload.quoted.authorName, 'tail ')
+  assert.deepEqual(payload.tags, ['', 'ok'])
+})
+
+test('[integration] a well-formed emoji is untouched', async () => {
+  // The scrub must only remove UNPAIRED halves — a real emoji has to survive
+  // intact or every message carrying one arrives mangled.
+  const id = await enqueueBroadcast(pool, 'message:new', {
+    type: 'message.new',
+    conversationId: 'c-outbox',
+    quoted: { body: 'ship it \u{1F680} done' },
+  } as unknown as BroadcastEvent)
+  const { rows } = await pool.query<{ body: string }>(
+    `SELECT payload->'quoted'->>'body' AS body FROM realtime_outbox WHERE id = $1`,
+    [id],
+  )
+  assert.equal(rows[0].body, 'ship it \u{1F680} done')
 })
