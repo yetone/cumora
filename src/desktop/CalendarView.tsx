@@ -26,6 +26,7 @@ import { IPlus, ICalendar, IClock, IRepeat, ITrash } from '@/components/icons'
 import { EventEditor, type EventEditorPrefill } from '@/components/EventEditor'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
+import { nextOccurrenceOnOrAfter } from '@/lib/recurrence'
 import type { CalendarEvent, RecurrenceRule } from '@/types'
 
 interface AgendaItem {
@@ -77,47 +78,9 @@ function addDays(d: Date, n: number): Date { const out = new Date(d); out.setDat
 
 /* ─────────────────────────── recurrence (client mirror) ─────────────────────────── */
 
-function stepRule(from: Date, rule: RecurrenceRule): Date {
-  const interval = Math.max(1, Math.floor(rule.interval || 1))
-  switch (rule.freq) {
-    case 'daily':
-      return new Date(from.getTime() + interval * DAY_MS)
-    case 'weekly': {
-      const days = rule.byweekday && rule.byweekday.length ? [...rule.byweekday].sort((a, b) => a - b) : null
-      if (!days) return new Date(from.getTime() + interval * 7 * DAY_MS)
-      let cand = new Date(from.getTime() + ((interval - 1) * 7 + 1) * DAY_MS)
-      for (let i = 0; i < 14; i++) {
-        if (days.includes(cand.getDay())) return cand
-        cand = new Date(cand.getTime() + DAY_MS)
-      }
-      return cand
-    }
-    case 'monthly': {
-      const out = new Date(from); out.setMonth(out.getMonth() + interval); return out
-    }
-    case 'yearly': {
-      const out = new Date(from); out.setFullYear(out.getFullYear() + interval); return out
-    }
-  }
-}
-
 function nextOccurrence(event: CalendarEvent, from: Date): Date | null {
-  const startAt = new Date(event.startAt)
   if (event.status !== 'active') return null
-  if (!event.recurrence) return startAt.getTime() >= from.getTime() ? startAt : null
-  const rule = event.recurrence
-  const untilTs = rule.until ? new Date(rule.until).getTime() : Infinity
-  const maxCount = rule.count ?? Infinity
-  let current = new Date(startAt)
-  let fired = 1
-  for (let i = 0; i < 5000; i++) {
-    if (current.getTime() > untilTs) return null
-    if (fired > maxCount) return null
-    if (current.getTime() >= from.getTime()) return current
-    current = stepRule(current, rule)
-    fired += 1
-  }
-  return null
+  return nextOccurrenceOnOrAfter(new Date(event.startAt), event.recurrence ?? null, from)
 }
 
 function describeRecurrence(r: RecurrenceRule | null, t: ReturnType<typeof useT>): string {
