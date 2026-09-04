@@ -197,6 +197,7 @@ function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
     models,
     defaultModel: displayString(rec.defaultModel, 160),
     defaultFastModel: displayString(rec.defaultFastModel, 160),
+    ...(rec.prefersLocalDefault === true ? { prefersLocalDefault: true } : {}),
     supportsCustom: rec.supportsCustom !== false,
     fastModelScope,
     source,
@@ -612,23 +613,33 @@ export async function mintAgentRuntimeToken(args: {
  *  Includes the per-agent big-brain (`model`) + small-brain (`fastModel`)
  *  overrides so the daemon can pass them to the engine.
  *
- *  When a row has no explicit model, fall back to the deploy-level default
+ *  When a row has no explicit model, a reported custom-Claude provider default
+ *  takes precedence; otherwise fall back to the deploy-level default
  *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
  *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
  *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL /
  *  CUMORA_DEFAULT_GEMINI_MODEL / CUMORA_DEFAULT_QWEN_MODEL /
  *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL) so every BYOA
- *  daemon gets a consistent pin — independent of whatever model the local
- *  engine CLI happens to default to today. Critical: a model
+ *  daemon without a custom provider gets a consistent pin. Critical: a model
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
- *  agent behavior on every user's machine unless we pin here. */
+ *  agent behavior on every user's machine unless we pin here. A custom
+ *  provider can explicitly make its unnamed local default authoritative so a
+ *  vendor-specific deploy pin never crosses into the wrong namespace. */
 export async function listAgentsForComputer(computerId: string): Promise<
   Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
 > {
-  const { rows } = await pool.query<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>(
-    `SELECT id, name, role, system_prompt AS "systemPrompt", engine, model, fast_model AS "fastModel" FROM participants
-      WHERE computer_id = $1 AND kind = 'agent' AND departed_at IS NULL
-      ORDER BY name ASC`,
+  const { rows } = await pool.query<{
+    id: string; name: string; role: string | null; systemPrompt: string | null
+    engine: EngineId | null; model: string | null; fastModel: string | null
+    availableEngines?: string[]; detectedEngines?: unknown
+  }>(
+    `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
+            p.fast_model AS "fastModel", c.available_engines AS "availableEngines",
+            COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines"
+       FROM participants p
+       JOIN computers c ON c.id = p.computer_id
+      WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
+      ORDER BY p.name ASC`,
     [computerId],
   )
   const claudeDefault = process.env.CUMORA_DEFAULT_CLAUDE_MODEL?.trim() || null
@@ -641,7 +652,21 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
-    if (r.model) return r
+    const { availableEngines, detectedEngines, ...agent } = r
+    const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
+      .find((entry) => entry.id === agent.engine)?.modelCatalog
+    // A custom Claude endpoint owns its model namespace. Its reported defaults
+    // fill only unpinned fields; explicit per-Agent choices still win. When it
+    // cannot name a main/fast default, leave that field null so the CLI chooses
+    // instead of crossing an Anthropic deployment pin into the provider.
+    if (r.engine === 'claude' && localCatalog?.prefersLocalDefault) {
+      return {
+        ...agent,
+        model: agent.model ?? localCatalog.defaultModel,
+        fastModel: agent.fastModel ?? localCatalog.defaultFastModel,
+      }
+    }
+    if (agent.model) return agent
     const dflt = r.engine === 'codex'
       ? codexDefault
       : r.engine === 'claude'
@@ -661,7 +686,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
                     : r.engine === 'antigravity'
                       ? antigravityDefault
                     : null
-    return dflt ? { ...r, model: dflt } : r
+    return dflt ? { ...agent, model: dflt } : agent
   })
 }
 

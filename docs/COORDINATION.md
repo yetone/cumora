@@ -54,19 +54,23 @@ making a clear decision in front of correct state.**
 
 In order from "always on, no brain attention" to "soft, brain-mediated":
 
-### 1. Per-agent model pin (deploy env)
+### 1. Per-agent model pin and custom-Claude resolution
 `CUMORA_DEFAULT_CLAUDE_MODEL=claude-opus-4-7` on the prod server.
-`listAgentsForComputer` (`server/src/agents/computer/registry.ts`) substitutes
-this when `participants.model` is null. The daemon then spawns claude with
-explicit `--model claude-opus-4-7` instead of inheriting whatever the local
-claude CLI defaults to.
+An explicit `participants.model` wins. Otherwise `listAgentsForComputer`
+(`server/src/agents/computer/registry.ts`) normally substitutes the deploy pin.
+For a Computer that reports a custom Claude endpoint, its provider-local
+main/fast defaults fill unpinned fields first. The provider may mark an unnamed
+local default authoritative; the daemon then omits `--model` rather than sending
+an Anthropic model into another namespace.
 
 **Why this exists:** the local claude CLI silently flipped its default from
 `opus-4-7` to `opus-4-8` partway through a session in 2026-05-31. Opus-4-8 is
 more cautious about prompt-injection-like patterns and behaves differently in
 multi-agent flows. Without
 the pin, every user's behavior drifts whenever Anthropic ships a model.
-Override per-agent by setting `participants.model` for a specific id.
+Override per-agent by setting `participants.model` for a specific id. Secure
+Claude provider bootstrap and the reason credentials stay outside model tools
+are recorded in [ADR 0005](decisions/0005-secure-claude-provider-bootstrap.md).
 
 ### 2. Per-computer big-brain concurrency cap (daemon)
 `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` (default **6**; drop to 2-4 on very
@@ -668,7 +672,7 @@ one and re-test. Don't pile on.
 
 | Var | Default | Notes |
 |---|---|---|
-| `CUMORA_DEFAULT_CLAUDE_MODEL` | unset | Deploy-level model pin (e.g. `claude-opus-4-7`). Per-agent `participants.model` overrides this. |
+| `CUMORA_DEFAULT_CLAUDE_MODEL` | unset | Deploy-level fallback (e.g. `claude-opus-4-7`). Explicit per-agent and reported custom-provider defaults override it. |
 | `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for Codex; deliberately not set by default. |
 | `CUMORA_DEFAULT_GROK_MODEL` | unset | Same shape for Grok Build. |
 | `CUMORA_DEFAULT_CURSOR_MODEL` | unset | Same shape for Cursor Agent; blank lets Cursor use Auto. |

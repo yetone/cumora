@@ -256,8 +256,12 @@ provider hops; uncached input, output+reasoning, and cache read/write tokens map
 to Cumora's common usage ledger without double-counting. OpenCode may race its
 final `step_finish` against the terminal idle event, so a clean process exit is
 the completion signal and accounting is best-effort when that event is absent.
-Model selection: the per-agent `participants.model` / `fast_model`
-columns, else the matching deploy-level `CUMORA_DEFAULT_*_MODEL` pin.
+Model selection normally remains an explicit per-agent `participants.model` /
+`fast_model`, then the matching deploy-level `CUMORA_DEFAULT_*_MODEL` pin. When
+a Computer reports a custom Claude endpoint, its configured main/fast defaults
+fill unpinned fields first. It may also own an unnamed local default; in that
+case the daemon passes no model flag rather than crossing a vendor-specific
+deployment pin into the wrong namespace.
 
 ### Secure default and compatibility opt-in
 
@@ -267,9 +271,16 @@ fail-closed host boundary:
 - Claude Code on macOS, Linux, and WSL2 runs in restricted mode with filesystem
   isolation, an empty strict network allowlist, no Bash/PowerShell/web tools,
   no unsandboxed retry, and an explicit deny list for every inherited
-  environment variable not needed by the fixed Cumora MCP bridge. Claude Code
+  environment variable not needed by the fixed Cumora MCP bridge. Because
+  restricted mode ignores user settings, the daemon imports only
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and
+  `ANTHROPIC_SMALL_FAST_MODEL` from Claude's user settings into the trusted
+  Claude core; those names remain denied to model-spawned subprocesses and the
+  Cumora never serializes the values into argv, its logs, Agent files, or server
+  reports. Claude Code
   2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
-  `socat`; a missing dependency fails the turn.
+  `socat`; a missing dependency fails the turn. See
+  [ADR 0005](decisions/0005-secure-claude-provider-bootstrap.md).
 - Codex runs one-shot with user config and exec-policy rules ignored. A custom
   permission profile permits minimal runtime reads and writes only under the
   agent home, disables command network, and gives model-spawned commands only
@@ -297,23 +308,27 @@ because the daemon cannot prove that they preserve the sandbox.
 
 ### Running against a custom provider
 
-Those pins are resolved server-side and name Anthropic / OpenAI models. If your
-local engine CLI is pointed at a **custom provider** (CC Switch and
-friends), it has never heard of `claude-opus-4-7`, so every turn fails with
-*"There's an issue with the selected model"* even though the CLI works fine in
-your terminal.
+Custom providers (CC Switch and friends) often store their endpoint,
+authentication value, and default model in `~/.claude/settings.json`. Secure
+Claude imports only that provider bootstrap subset, reports the configured
+default model without reporting credentials or endpoint details, and gives it
+precedence over Cumora's deploy-level Anthropic pin for Agents left on **Follow
+engine default**. Explicit per-Agent model choices still win.
 
-Set `CUMORA_ENGINE_MODEL` on the daemon to fix it:
+`CUMORA_ENGINE_MODEL` remains the operator override when the provider needs a
+different policy or an older daemon has not reported its local default:
 
 | value | effect |
 | --- | --- |
-| unset | use the model Cumora pinned (default) |
+| unset | explicit Agent pin → reported local default → deploy pin → CLI default |
 | `local` | pass **no** model at all — the CLI runs on whatever it is already configured for, and the small/fast pin is dropped too |
 | any model id | use that model instead of the pinned one |
 
-Pair it with `CUMORA_TRIAGE_MODEL` if your provider also lacks the small brain
-(`haiku` / `gpt-5.4-mini`); `cumora agent computer doctor` probes the same model
-that triage will use, so a green doctor means real wakes will work.
+The configured `ANTHROPIC_SMALL_FAST_MODEL` is also used for local triage. When
+a custom endpoint does not name a fast model, Cumora passes no triage model and
+lets the provider choose instead of injecting the first-party `haiku` alias.
+`CUMORA_TRIAGE_MODEL` remains an explicit override, and `cumora agent computer
+doctor` probes that same resolution path.
 
 ```bash
 CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
@@ -377,8 +392,9 @@ inner state stays local.
 the operator's existing login, but model-spawned commands cannot read that
 login or inherit provider credentials in secure mode. Each agent gets its own
 writable home; its credential-free IPC namespace and executable bridge stay
-outside that home. Claude restricted mode ignores user/project settings while
-retaining core authentication; Codex `exec --ignore-user-config --ignore-rules`
+outside that home. Claude restricted mode ignores user/project settings;
+Cumora restores only its allowlisted provider bootstrap to the trusted core.
+Codex `exec --ignore-user-config --ignore-rules`
 does the same and marks the project untrusted. Secure engine startup also drops
 empty, relative, and agent-home entries from `PATH`, so a model-planted
 `claude`/`codex` executable cannot run before the next sandbox is established.

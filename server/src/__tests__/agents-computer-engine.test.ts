@@ -172,13 +172,24 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-secure-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
+  const configDir = join(root, 'claude-config')
   const home = join(root, 'home')
   await mkdir(binDir)
+  await mkdir(configDir)
   await mkdir(home)
+  await writeFile(join(configDir, 'settings.json'), JSON.stringify({
+    model: 'provider/default-model',
+    env: {
+      ANTHROPIC_API_KEY: 'settings-api-key-must-lose',
+      ANTHROPIC_AUTH_TOKEN: 'settings-auth-token',
+      ANTHROPIC_BASE_URL: 'https://provider.example.test',
+      UNRELATED_SECRET: 'must-not-be-imported',
+    },
+  }), 'utf8')
   await writeFakeCli(
     binDir,
     'claude',
-    "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB }))\nprocess.exit(1)\n",
+    "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, coreEnv: { apiKey: process.env.ANTHROPIC_API_KEY, authToken: process.env.ANTHROPIC_AUTH_TOKEN, baseUrl: process.env.ANTHROPIC_BASE_URL, unrelated: process.env.UNRELATED_SECRET } }))\nprocess.exit(1)\n",
   )
   useFakeCliPath(binDir)
 
@@ -188,14 +199,25 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
     home,
     prompt: 'wake',
     env: secureClaudeEnv(root, {
+      CLAUDE_CONFIG_DIR: configDir,
+      ANTHROPIC_API_KEY: 'explicit-daemon-api-key',
       OPENAI_API_KEY: 'must-not-appear-in-settings',
     }),
     onLog: (line) => logs.push(line),
     signal: new AbortController().signal,
   })
 
-  const captured = JSON.parse(logs[0] ?? '{}') as { argv?: string[]; scrub?: string }
+  const captured = JSON.parse(logs[0] ?? '{}') as {
+    argv?: string[]
+    scrub?: string
+    coreEnv?: { apiKey?: string; authToken?: string; baseUrl?: string; unrelated?: string }
+  }
   assert.equal(captured.scrub, '1')
+  assert.deepEqual(captured.coreEnv, {
+    apiKey: 'explicit-daemon-api-key',
+    authToken: 'settings-auth-token',
+    baseUrl: 'https://provider.example.test',
+  })
   assert.ok(captured.argv?.includes('--restricted'))
   assert.ok(captured.argv?.includes('dontAsk'))
   assert.ok(captured.argv?.includes('Read,Write,Edit,Glob,Grep,mcp__cumora__cli'))
@@ -229,7 +251,62 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
   assert.ok(settings.sandbox?.filesystem?.denyRead?.includes(process.platform === 'darwin' ? '/Users' : '/home'))
   assert.ok(settings.sandbox?.filesystem?.allowRead?.includes(home))
   assert.ok(settings.sandbox?.credentials?.envVars?.some((entry) => entry.name === 'OPENAI_API_KEY' && entry.mode === 'deny'))
+  for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']) {
+    assert.ok(settings.sandbox?.credentials?.envVars?.some((entry) => entry.name === name && entry.mode === 'deny'))
+  }
   assert.doesNotMatch(settingsText, /must-not-appear-in-settings/)
+  assert.doesNotMatch(settingsText, /settings-auth-token|explicit-daemon-api-key|provider\.example\.test/)
+})
+
+test('Claude secure triage stays inside the custom provider model namespace', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-provider-model-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const configDir = join(root, 'claude-config')
+  const cwd = join(root, 'triage')
+  await mkdir(binDir)
+  await mkdir(configDir)
+  await mkdir(cwd)
+  await writeFakeCli(
+    binDir,
+    'claude',
+    "process.stdout.write(JSON.stringify({ result: JSON.stringify({ argv: process.argv.slice(2) }) }))\n",
+  )
+  useFakeCliPath(binDir)
+
+  const settingsPath = join(configDir, 'settings.json')
+  await writeFile(settingsPath, JSON.stringify({
+    env: {
+      ANTHROPIC_AUTH_TOKEN: 'fixture-token',
+      ANTHROPIC_BASE_URL: 'https://provider.example.test',
+      ANTHROPIC_SMALL_FAST_MODEL: 'provider/fast-model',
+    },
+  }), 'utf8')
+  const env = secureClaudeEnv(root, {
+    CLAUDE_CONFIG_DIR: configDir,
+    CUMORA_TRIAGE_MODEL: undefined,
+    ANTHROPIC_SMALL_FAST_MODEL: undefined,
+  })
+  const configured = await getAdapter('claude').classify({
+    cwd, prompt: 'classify', env, signal: new AbortController().signal,
+  })
+  const configuredArgv = JSON.parse(configured.text) as { argv: string[] }
+  const configuredModel = configuredArgv.argv.indexOf('--model')
+  assert.ok(configuredModel >= 0)
+  assert.equal(configuredArgv.argv[configuredModel + 1], 'provider/fast-model')
+
+  await writeFile(settingsPath, JSON.stringify({
+    env: {
+      ANTHROPIC_AUTH_TOKEN: 'fixture-token',
+      ANTHROPIC_BASE_URL: 'https://provider.example.test',
+    },
+  }), 'utf8')
+  const unnamed = await getAdapter('claude').classify({
+    cwd, prompt: 'classify', env, signal: new AbortController().signal,
+  })
+  const unnamedArgv = JSON.parse(unnamed.text) as { argv: string[] }
+  assert.equal(unnamedArgv.argv.includes('--model'), false)
+  assert.equal(unnamedArgv.argv.includes('haiku'), false)
 })
 
 test('persistent Claude startup failure keeps stderr for first send', async () => {

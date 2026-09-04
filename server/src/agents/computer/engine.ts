@@ -30,6 +30,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
+import { withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersion } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 
@@ -1407,13 +1408,47 @@ function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv): string[] 
   ]
 }
 
+/** Restricted Claude ignores ~/.claude/settings.json wholesale. Recover only
+ * the provider bootstrap variables its trusted core needs; claudeSecureSettings
+ * denies those names to every model-spawned subprocess. Compatibility mode
+ * keeps Claude's native settings loading and its already-explicit host risk. */
+function claudeCoreEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return allowUnsandboxedByoa(env) ? { ...env } : withClaudeUserSettingsEnv(env)
+}
+
+/** Pick the small brain inside the local provider namespace. An explicit
+ * per-agent/computer pin wins; next use the provider's configured fast model.
+ * If a custom endpoint names no fast model, omit --model and let that endpoint
+ * choose instead of injecting Anthropic's `haiku` alias. */
+function claudeFastModelArgs(env: NodeJS.ProcessEnv, requested?: string | null): string[] {
+  const model = requested?.trim()
+    || env.CUMORA_TRIAGE_MODEL?.trim()
+    || env.ANTHROPIC_SMALL_FAST_MODEL?.trim()
+  if (model) return ['--model', model]
+  return env.ANTHROPIC_BASE_URL?.trim() ? [] : ['--model', 'haiku']
+}
+
+function claudeTurnEnv(env: NodeJS.ProcessEnv, fastModel?: string | null): NodeJS.ProcessEnv {
+  const core = claudeCoreEnv(env)
+  const turnEnv: NodeJS.ProcessEnv = {
+    ...core,
+    MAX_THINKING_TOKENS: core.MAX_THINKING_TOKENS ?? '0',
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa(core)
+      ? core.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+      : '1',
+  }
+  if (fastModel) turnEnv.ANTHROPIC_SMALL_FAST_MODEL = fastModel
+  return turnEnv
+}
+
 class ClaudeAdapter implements EngineAdapter {
   readonly id = 'claude' as const
   readonly bin = 'claude'
 
   async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
-    // Plain headless completion on Claude Code's own cheap fast model (Haiku) —
-    // exactly what Claude Code uses for its OWN quick judgments. NO tools, NO
+    // Plain headless completion on Claude Code's cheap fast model (Haiku for a
+    // first-party account, or the custom provider's configured/default model).
+    // NO tools, NO
     // MCP (--strict-mcp-config, no --mcp-config = zero MCP init, the slowest
     // part of a cold `claude` spawn), NO session, thinking off, neutral cwd (no
     // persona CLAUDE.md). Just text in → JSON out, locally. Never the cloud.
@@ -1421,7 +1456,8 @@ class ClaudeAdapter implements EngineAdapter {
     // token usage (incl. cache_read/cache_creation) → we unwrap `.result` as the
     // text and pass `.usage` up for the triage cost ledger.
     const flags = unsafeEngineArgs('CUMORA_TRIAGE_ARGS')
-    const model = ['--model', args.model || 'haiku']
+    const env = claudeCoreEnv(args.env)
+    const model = claudeFastModelArgs(env, args.model)
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const usingJson = flags.length === 0
     // On Windows the .cmd shim runs via the shell, which can't carry the big
@@ -1430,13 +1466,13 @@ class ClaudeAdapter implements EngineAdapter {
     // before (unchanged).
     const base = flags.length
       ? [...flags, '-p']
-      : allowUnsandboxedByoa()
+      : allowUnsandboxedByoa(env)
         ? ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
         : ['-p', ...model, '--output-format', 'json', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const res = await spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...args.env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0' },
       signal: args.signal,
       onLog: args.onLog,
       shell,
@@ -1456,18 +1492,19 @@ class ClaudeAdapter implements EngineAdapter {
 
   probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
     // Mirror classify's clean one-shot spawn, but pick the tier's model: 'small'
-    // → haiku (the cerebellum); 'big' → omit --model so Claude uses its DEFAULT
-    // (the main reasoning brain). One token in, "OK" out — proves the binary runs
+    // → the resolved provider-local cerebellum; 'big' → omit --model so Claude
+    // uses its default main reasoning brain. One token in, "OK" out — proves the binary runs
     // and that tier is authed/has quota, with NO tools/MCP/persona.
-    const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
+    const env = claudeCoreEnv(args.env)
+    const model = args.tier === 'small' ? claudeFastModelArgs(env) : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = allowUnsandboxedByoa()
+    const base = allowUnsandboxedByoa(env)
       ? ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
       : ['-p', ...model, '--output-format', 'text', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...args.env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0' },
       signal: args.signal,
       shell,
       stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
@@ -1491,8 +1528,9 @@ class ClaudeAdapter implements EngineAdapter {
     const promptFile = join(args.cwd, '.cumora-doctor-standing.md')
     try { await writeFile(promptFile, '', 'utf8') }
     catch (err) { return { ok: false, detail: `could not write standing-prompt probe file: ${err instanceof Error ? err.message : String(err)}` } }
+    const env = claudeCoreEnv(args.env)
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = allowUnsandboxedByoa()
+    const base = allowUnsandboxedByoa(env)
       ? ['-p', '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
       : [
           '-p', '--output-format', 'text', '--append-system-prompt-file', promptFile,
@@ -1501,7 +1539,7 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     const r = await spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...args.env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0' },
       signal: args.signal,
       shell,
       stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
@@ -1538,6 +1576,7 @@ class ClaudeAdapter implements EngineAdapter {
     // Big-brain model → --model; small-brain → ANTHROPIC_SMALL_FAST_MODEL env.
     const flags = unsafeEngineArgs('CUMORA_CLAUDE_ARGS')
     const model = args.model ? ['--model', args.model] : []
+    const env = claudeTurnEnv(args.env, args.fastModel)
     // Continuous context across wakes: resume the agent's prior session so it
     // remembers the running task (its place in a counting relay, what it already
     // said) instead of re-deriving from a frozen inbox snapshot each time.
@@ -1547,23 +1586,15 @@ class ClaudeAdapter implements EngineAdapter {
     // unchanged (prompt in argv).
     const base = flags.length
       ? [...flags, ...resume, '-p']
-      : allowUnsandboxedByoa()
+      : allowUnsandboxedByoa(env)
         ? ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
-        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, args.env)]
+        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, env)]
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     // BYOA turns are short reactive cycles (read inbox, maybe reply). Extended
     // thinking just adds latency + cost here, and in a group @all it makes the
     // slowest agent finish last and bow out on the "don't duplicate" rule. Disable
     // it by default (MAX_THINKING_TOKENS=0); a user can re-enable by exporting their
     // own MAX_THINKING_TOKENS before launching the daemon.
-    const env: NodeJS.ProcessEnv = {
-      ...args.env,
-      MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa()
-        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
-        : '1',
-    }
-    if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
   }
 
@@ -1572,6 +1603,7 @@ class ClaudeAdapter implements EngineAdapter {
     // persistent path — those flags are tuned for the one-shot run; fall back to run().
     if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) return null
     const model = args.model ? ['--model', args.model] : []
+    const env = claudeTurnEnv(args.env, args.fastModel)
     // --resume only on the FIRST spawn / after a restart, to continue a prior
     // session; inside a live process the session continues on its own.
     const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
@@ -1585,23 +1617,15 @@ class ClaudeAdapter implements EngineAdapter {
       try { atomicAgentWriteSync(file, args.standingPrompt); sys = ['--append-system-prompt-file', file]; carriesStanding = true }
       catch { /* couldn't write → leave it; the daemon inlines the standing prompt instead */ }
     }
-    const argv = allowUnsandboxedByoa()
+    const argv = allowUnsandboxedByoa(env)
       ? [
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
           ...resume, ...sys, ...model, '--dangerously-skip-permissions',
         ]
       : [
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, args.env),
+          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, env),
         ]
-    const env: NodeJS.ProcessEnv = {
-      ...args.env,
-      MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa()
-        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
-        : '1',
-    }
-    if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding)
   }
 }

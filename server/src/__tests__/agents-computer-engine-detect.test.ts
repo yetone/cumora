@@ -89,6 +89,48 @@ test('listAgentsForComputer keeps an explicit model and pins CUMORA_DEFAULT_* wh
   assert.equal(agents[4]?.engine, 'qwen')
 })
 
+test('listAgentsForComputer prefers a reported local default without overriding an explicit pin', async () => {
+  const catalog = {
+    models: [{ id: 'provider/opus', label: 'Provider Opus' }],
+    defaultModel: 'provider/opus',
+    defaultFastModel: 'provider/haiku',
+    prefersLocalDefault: true,
+    supportsCustom: true,
+    fastModelScope: 'agent',
+    source: 'cli',
+  }
+  const localComputer = {
+    availableEngines: ['claude'],
+    detectedEngines: [{ id: 'claude', bin: 'claude', path: '/bin/claude', modelCatalog: catalog }],
+  }
+  installPoolMock(({ sql }) => {
+    if (/FROM participants/.test(sql)) {
+      return { rows: [
+        { id: 'explicit', name: 'Explicit', role: null, systemPrompt: null, engine: 'claude', model: 'agent/pin', fastModel: null, ...localComputer },
+        { id: 'local', name: 'Local', role: null, systemPrompt: null, engine: 'claude', model: null, fastModel: null, ...localComputer },
+        {
+          id: 'unnamed', name: 'Unnamed', role: null, systemPrompt: null, engine: 'claude', model: null, fastModel: null,
+          availableEngines: ['claude'],
+          detectedEngines: [{
+            id: 'claude', bin: 'claude', path: '/bin/claude',
+            modelCatalog: { ...catalog, models: [], defaultModel: null },
+          }],
+        },
+      ] }
+    }
+    return { rows: [] }
+  })
+
+  const agents = await registry.listAgentsForComputer('comp-1')
+  assert.equal(agents[0]?.model, 'agent/pin')
+  assert.equal(agents[0]?.fastModel, 'provider/haiku')
+  assert.equal(agents[1]?.model, 'provider/opus')
+  assert.equal(agents[1]?.fastModel, 'provider/haiku')
+  assert.equal(agents[2]?.model, null, 'custom provider with unnamed default must not inherit the deploy pin')
+  assert.equal(agents[2]?.fastModel, 'provider/haiku')
+  assert.equal('detectedEngines' in (agents[1] ?? {}), false)
+})
+
 test('reportDetectedEngines keeps the previous default first when it is still installed', async () => {
   const calls = installPoolMock(({ sql }) => {
     if (/SELECT available_engines/.test(sql)) {

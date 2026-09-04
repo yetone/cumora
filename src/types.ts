@@ -20,6 +20,7 @@ export interface EngineModelCatalog {
   models: EngineModelOption[]
   defaultModel: string | null
   defaultFastModel: string | null
+  prefersLocalDefault?: boolean
   supportsCustom: boolean
   fastModelScope: 'agent' | 'computer' | 'unsupported'
   source: 'protocol' | 'cli' | 'presets'

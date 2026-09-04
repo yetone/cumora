@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process'
 import type { EngineId } from './engine.js'
+import { readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { versionCommandInvocation } from './cli-version.js'
 
 export type ModelCatalogSource = 'protocol' | 'cli' | 'presets'
@@ -19,6 +20,9 @@ export interface EngineModelCatalog {
   models: EngineModelOption[]
   defaultModel: string | null
   defaultFastModel: string | null
+  /** The local CLI/provider owns the default model namespace. An unpinned
+   * Agent must not inherit a deployment-level vendor model in its place. */
+  prefersLocalDefault?: boolean
   supportsCustom: boolean
   fastModelScope: FastModelScope
   source: ModelCatalogSource
@@ -310,7 +314,12 @@ function discoverCodex(command: string): Promise<{ models: EngineModelOption[]; 
 /** Discover the account/config-specific catalog without making a model call.
  * Failure is deliberately soft: a compact preset catalog plus custom entry is
  * still more useful than hiding the selector or blocking an engine rescan. */
-export async function discoverEngineModelCatalog(id: EngineId, binPath: string | null, refresh = false): Promise<EngineModelCatalog> {
+export async function discoverEngineModelCatalog(
+  id: EngineId,
+  binPath: string | null,
+  refresh = false,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<EngineModelCatalog> {
   const preset = clonePreset(id)
   if (!binPath) return preset
   const cacheKey = `${id}\u0000${binPath}`
@@ -318,7 +327,28 @@ export async function discoverEngineModelCatalog(id: EngineId, binPath: string |
   if (!refresh && cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.catalog
 
   let catalog: EngineModelCatalog | null = null
-  if (id === 'codex') {
+  if (id === 'claude') {
+    const settings = readClaudeUserSettings(env)
+    const coreEnv = withClaudeUserSettingsEnv(env)
+    const defaultFastModel = clean(coreEnv.ANTHROPIC_SMALL_FAST_MODEL, 160)
+    const prefersLocalDefault = !!clean(coreEnv.ANTHROPIC_BASE_URL, 4096)
+    const configured = [settings.defaultModel, defaultFastModel]
+      .filter((model): model is string => !!model)
+      .map((model) => ({ id: model, label: model }))
+    if (configured.length || prefersLocalDefault) {
+      catalog = {
+        ...preset,
+        // Anthropic aliases are useful first-party presets, but claiming they
+        // exist on an arbitrary custom endpoint is misleading. Operators can
+        // still type any provider-specific id via supportsCustom.
+        models: mergeModels(configured, prefersLocalDefault ? [] : preset.models),
+        defaultModel: settings.defaultModel,
+        defaultFastModel: defaultFastModel ?? (prefersLocalDefault ? null : preset.defaultFastModel),
+        prefersLocalDefault,
+        source: 'cli',
+      }
+    }
+  } else if (id === 'codex') {
     const result = await discoverCodex(binPath)
     if (result?.models.length) catalog = withPreset(id, result.models, 'protocol', result.defaultModel)
   } else if (id === 'cursor') {
