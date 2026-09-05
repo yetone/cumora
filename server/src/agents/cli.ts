@@ -2735,7 +2735,7 @@ on demand via \`cumora skills read ${name} references/<file>\`._
     const r = await pool.query(
       `DELETE FROM agent_workspace
         WHERE agent_id = $1 AND (path = $2 OR path LIKE $3)`,
-      [me, `skills/${name}/SKILL.md`, `skills/${name}/%`],
+      [me, `skills/${name}/SKILL.md`, `skills/${likeLiteral(name)}/%`],
     )
     if ((r.rowCount ?? 0) === 0) return err(`no such skill: ${name}`)
     return ok(`deleted skill "${name}" (${r.rowCount} files removed)`, [{
@@ -4020,6 +4020,22 @@ function normalizeMemoryKind(raw: unknown): MemoryKind {
  *  in the `meta` JSONB column. New writes stamp `source.conversationId` /
  *  `source.projectId` (issue #45); existing `source: null` rows stay GLOBAL
  *  — we never guess-migrate them into a project. See memory-scope.ts. */
+/** Escape LIKE metacharacters in a value that must match LITERALLY.
+ *
+ *  These patterns are built from a positional argument the MODEL supplies, and
+ *  `%` and `_` are wildcards to LIKE. `cumora memory delete %` became
+ *  `path LIKE 'memory/%/%.md'` and removed every memory the agent had, then
+ *  reported "deleted %" — verified against Postgres 16: three rows in, DELETE 3,
+ *  none left. `cumora skills delete %` is the same shape one command over.
+ *
+ *  Postgres's default LIKE escape is a backslash, and the pattern reaches it as
+ *  a bound parameter, so escaping here is sufficient — no ESCAPE clause needed.
+ *  Confirmed: `'…mem-aaa.md' LIKE 'memory/%/\%.md'` is false once escaped, and
+ *  a literal `%` in a name still matches itself. */
+export function likeLiteral(value: string): string {
+  return value.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+}
+
 async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
   const op = parsed.positional[0]
   const me = resolveAs(parsed)
@@ -4089,7 +4105,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
         const t = new Date(m.created_at).toLocaleDateString()
         const pin = m.pinned ? '★ ' : '  '
         const proj = m.projectId ? ` proj:${m.projectId}` : ' global'
-        return `  ${pin}[${m.id.slice(0, 10)}] ${m.kind.padEnd(11)} ${(m.about ?? '-').padEnd(10)} ${t}${proj}\n      ${m.body.slice(0, 280).replace(/\n/g, ' \\n ')}`
+        return `  ${pin}[${m.id}] ${m.kind.padEnd(11)} ${(m.about ?? '-').padEnd(10)} ${t}${proj}\n      ${m.body.slice(0, 280).replace(/\n/g, ' \\n ')}`
       }),
     ].join('\n'))
   }
@@ -4147,7 +4163,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
                    || jsonb_build_object('pinned', NOT COALESCE((meta->>'pinned')::boolean, false))
         WHERE agent_id = $1 AND path LIKE $2
         RETURNING meta`,
-      [me, `memory/%/${id}.md`],
+      [me, `memory/%/${likeLiteral(id)}.md`],
     )
     if ((r.rowCount ?? 0) === 0) return err(`no memory ${id} for ${me}`)
     return ok(`pinned: ${r.rows[0].meta?.pinned}`, [{
@@ -4163,7 +4179,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     if (!id) return err('usage: memory delete <id>')
     const r = await pool.query(
       `DELETE FROM agent_workspace WHERE agent_id = $1 AND path LIKE $2`,
-      [me, `memory/%/${id}.md`],
+      [me, `memory/%/${likeLiteral(id)}.md`],
     )
     if ((r.rowCount ?? 0) === 0) return err(`no memory ${id} for ${me}`)
     return ok(`deleted ${id}`, [{
