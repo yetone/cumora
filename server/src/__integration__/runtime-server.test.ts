@@ -332,7 +332,7 @@ test('[integration] runtime: FUSE whole-file writes authenticate before their la
 })
 
 test('[integration] runtime: FUSE preserves authenticated whole-file writes above 4MB', async () => {
-  const { agentId, token } = await seedAgent()
+  const { agentId, companyId, token } = await seedAgent()
   const fileBody = 'x'.repeat(5 * 1024 * 1024)
   const r = await call('/runtime/fs/write', {
     method: 'PUT',
@@ -341,13 +341,14 @@ test('[integration] runtime: FUSE preserves authenticated whole-file writes abov
   })
   assert.equal(r.status, 200)
   assert.deepEqual(r.body, { ok: true })
-  const { rows } = await pool.query<{ bytes: number }>(
-    `SELECT OCTET_LENGTH(body)::int AS bytes
+  const { rows } = await pool.query<{ bytes: number; company_id: string }>(
+    `SELECT OCTET_LENGTH(body)::int AS bytes, company_id
        FROM agent_workspace
       WHERE agent_id = $1 AND path = 'large-workspace-file.txt'`,
     [agentId],
   )
   assert.equal(rows[0]?.bytes, Buffer.byteLength(fileBody))
+  assert.equal(rows[0]?.company_id, companyId)
 })
 
 test('[integration] runtime: wrong scheme (Basic instead of Bearer) → 401', async () => {

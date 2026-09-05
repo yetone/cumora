@@ -1828,6 +1828,12 @@ api.delete('/companies/:id', safe(async (req, res) => {
     }
     if (agentIds.length > 0) {
       await client.query(`DELETE FROM board_mention_reads WHERE user_id = ANY($1::text[])`, [agentIds])
+      const agentScopedTables = [
+        'agent_workspace', 'agent_memory', 'agent_log', 'agent_tasks', 'agent_climate',
+      ] as const
+      for (const table of agentScopedTables) {
+        await client.query(`DELETE FROM ${table} WHERE agent_id = ANY($1::text[])`, [agentIds])
+      }
     }
     await client.query(`DELETE FROM documents WHERE company_id = $1`, [companyId])
     await client.query(`DELETE FROM conversations WHERE company_id = $1`, [companyId])

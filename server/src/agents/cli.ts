@@ -4125,8 +4125,8 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
       )
     }
     await pool.query(
-      `INSERT INTO agent_log (id, agent_id, kind, body, ref) VALUES ($1, $2, 'note', $3, $4::jsonb)`,
-      [`log-${randomUUID().slice(0, 12)}`, me, `noted: ${body.slice(0, 120)}`, JSON.stringify({ memoryId: id, path })],
+      `INSERT INTO agent_log (id, agent_id, company_id, kind, body, ref) VALUES ($1, $2, $3, 'note', $4, $5::jsonb)`,
+      [`log-${randomUUID().slice(0, 12)}`, me, tenant, `noted: ${body.slice(0, 120)}`, JSON.stringify({ memoryId: id, path })],
     )
     return ok(`saved memory ${id}`, [{
       event: 'memory.written',
@@ -4246,16 +4246,18 @@ async function cmdClimate(parsed: ParsedArgs): Promise<CliResult> {
       ...prevHistory.slice(-19),
       { at: new Date().toISOString(), affinity: nextAffinity, trust: nextTrust, note: note.slice(0, 400) },
     ]
+    const tenant = (await agentCompany(me)) ?? 'personal'
     await pool.query(
-      `INSERT INTO agent_climate (agent_id, about_id, affinity, trust, last_note, history, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+      `INSERT INTO agent_climate (agent_id, about_id, company_id, affinity, trust, last_note, history, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, NOW())
        ON CONFLICT (agent_id, about_id) DO UPDATE
-         SET affinity = EXCLUDED.affinity,
+         SET company_id = EXCLUDED.company_id,
+             affinity = EXCLUDED.affinity,
              trust    = EXCLUDED.trust,
              last_note = EXCLUDED.last_note,
              history   = EXCLUDED.history,
              updated_at = NOW()`,
-      [me, aboutId, nextAffinity, nextTrust, note.slice(0, 400), JSON.stringify(newHistory)],
+      [me, aboutId, tenant, nextAffinity, nextTrust, note.slice(0, 400), JSON.stringify(newHistory)],
     )
     return ok(`climate updated: ${me} → ${aboutId}  affinity=${nextAffinity.toFixed(2)}  trust=${nextTrust.toFixed(2)}`, [{
       event: 'climate.updated',
@@ -4293,9 +4295,10 @@ async function cmdLog(parsed: ParsedArgs): Promise<CliResult> {
     const body = parsed.positional[1]
     if (!body) return err('usage: log note <body> [--as id]')
     const id = `log-${randomUUID().slice(0, 12)}`
+    const tenant = await agentCompany(me)
     await pool.query(
-      `INSERT INTO agent_log (id, agent_id, kind, body) VALUES ($1, $2, 'note', $3)`,
-      [id, me, body],
+      `INSERT INTO agent_log (id, agent_id, company_id, kind, body) VALUES ($1, $2, $3, 'note', $4)`,
+      [id, me, tenant, body],
     )
     return ok(`logged ${id}`)
   }
@@ -4471,8 +4474,8 @@ async function cmdTasks(parsed: ParsedArgs): Promise<CliResult> {
     if (!title) return err('usage: tasks add <title> [--as id]')
     const id = `task-${randomUUID().slice(0, 12)}`
     await pool.query(
-      `INSERT INTO agent_tasks (id, agent_id, title) VALUES ($1, $2, $3)`,
-      [id, me, title],
+      `INSERT INTO agent_tasks (id, agent_id, company_id, title) VALUES ($1, $2, $3, $4)`,
+      [id, me, companyId, title],
     )
     return ok(`added task ${id}: ${title}`, [{
       event: 'task.created',

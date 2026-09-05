@@ -429,6 +429,23 @@ test('[integration] workspace deletion purges FK-backed and legacy soft-scoped d
     `INSERT INTO boards (id, company_id, title, created_by)
      VALUES ('board-managed', 'co-managed', 'Managed board', $1)`, [OWNER_ID],
   )
+  await pool.query(
+    `INSERT INTO agent_workspace (agent_id, path, body, company_id)
+     VALUES ('agent-managed', 'notes.md', 'workspace content', 'co-managed')`,
+  )
+  await pool.query(
+    `INSERT INTO agent_tasks (id, agent_id, title, company_id)
+     VALUES ('task-managed', 'agent-managed', 'test task', 'co-managed')`,
+  )
+  await pool.query(
+    `INSERT INTO agent_climate (agent_id, about_id, company_id, last_note)
+     VALUES ('agent-managed', $1, 'co-managed', 'climate note')`,
+    [OWNER_ID],
+  )
+  await pool.query(
+    `INSERT INTO agent_log (id, agent_id, kind, body, company_id)
+     VALUES ('log-managed', 'agent-managed', 'note', 'log body', 'co-managed')`,
+  )
 
   const runtimeIdentity = await pool.query<{ runtime_assignment_id: string }>(
     `SELECT runtime_assignment_id
@@ -460,6 +477,10 @@ test('[integration] workspace deletion purges FK-backed and legacy soft-scoped d
     ['computers', `company_id = 'co-managed'`],
     ['agent_runs', `company_id = 'co-managed'`],
     ['boards', `company_id = 'co-managed'`],
+    ['agent_workspace', `company_id = 'co-managed' OR agent_id = 'agent-managed'`],
+    ['agent_tasks', `company_id = 'co-managed' OR agent_id = 'agent-managed'`],
+    ['agent_climate', `company_id = 'co-managed' OR agent_id = 'agent-managed'`],
+    ['agent_log', `company_id = 'co-managed' OR agent_id = 'agent-managed'`],
   ] as const) {
     const remaining = await pool.query(`SELECT 1 FROM ${table} WHERE ${predicate}`)
     assert.equal(remaining.rowCount, 0, `${table} retained workspace rows`)
