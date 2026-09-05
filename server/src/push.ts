@@ -284,7 +284,16 @@ function trimBody(body: string): string {
   return `${trimmed.slice(0, 237)}…`
 }
 
+/** Observe what notifyMessage was asked to send. Tests only — APNs
+ *  soft-disables without credentials, so the send itself is unobservable and
+ *  the interesting assertion is the payload the caller built. */
+let notifyHookForTesting: ((args: NotifyMessageArgs) => void) | null = null
+export function __setNotifyHookForTesting(fn: ((args: NotifyMessageArgs) => void) | null): void {
+  notifyHookForTesting = fn
+}
+
 export async function notifyMessage(args: NotifyMessageArgs): Promise<void> {
+  notifyHookForTesting?.(args)
   if (args.recipientUserIds.length === 0) return
   const title = args.conversationTitle
     ? `${args.authorName} · ${args.conversationTitle}`
@@ -309,6 +318,60 @@ export async function notifyMessage(args: NotifyMessageArgs): Promise<void> {
  *  Kept in this file rather than in router.ts so the SQL stays next to
  *  the send path; the publish call in router.ts is a one-liner.
  */
+/** Fire-and-forget push for one newly-posted message.
+ *
+ *  Shared by the human HTTP route and the agent CLI's reply path. A teammate
+ *  replying is a teammate replying whichever kind they are, and the in-app
+ *  surface has never distinguished them: NotificationToasts fires on any
+ *  `message.new` that is not yours and not a system row, and resolves the
+ *  author out of the participants roster, which holds agents too. Push was
+ *  wired only into POST /conversations/:id/messages — a human-session route
+ *  agents never traverse — so a phone stayed silent for exactly the replies
+ *  its owner had just asked for.
+ *
+ *  Recipients are unchanged: computeMessageRecipients joins `users`, so only
+ *  humans are ever notified, and the mute and "currently looking at the app"
+ *  filters still apply.
+ *
+ *  Author name resolves through participants first. An agent has no `users`
+ *  row, so a users-only lookup would push with a raw agent id as the title. */
+export async function dispatchMessagePush(args: {
+  conversationId: string
+  authorId: string
+  messageId: string
+  body: string
+  companyId: string
+}): Promise<void> {
+  try {
+    const [recipients, convoRow, authorRow] = await Promise.all([
+      computeMessageRecipients({ conversationId: args.conversationId, authorId: args.authorId }),
+      pool.query<{ title: string }>(
+        `SELECT title FROM conversations WHERE id = $1`, [args.conversationId],
+      ).then((r) => r.rows[0]),
+      pool.query<{ name: string | null }>(
+        `SELECT COALESCE(
+                  (SELECT name FROM participants WHERE id = $1 AND company_id = $2),
+                  (SELECT display_name FROM users WHERE id = $1)
+                ) AS name`,
+        [args.authorId, args.companyId],
+      ).then((r) => r.rows[0]),
+    ])
+    if (recipients.length === 0) return
+    await notifyMessage({
+      conversationId: args.conversationId,
+      conversationTitle: convoRow?.title ?? null,
+      authorId: args.authorId,
+      authorName: authorRow?.name ?? args.authorId,
+      messageId: args.messageId,
+      body: args.body,
+      companyId: args.companyId,
+      recipientUserIds: recipients,
+    })
+  } catch (e) {
+    console.warn('[push] dispatchMessagePush failed', e)
+  }
+}
+
 export async function computeMessageRecipients(args: {
   conversationId: string
   authorId: string

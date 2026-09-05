@@ -16,6 +16,7 @@ import { env } from '../env.js'
 import type { CliResult, CliSideEffect } from './cli-result.js'
 import { fetchImageBytes } from './image-fetcher.js'
 import { stripLoneSurrogates } from './text-safety.js'
+import { dispatchMessagePush } from '../push.js'
 import {
   asMemorySource,
   memoryVisibleInScope,
@@ -2384,6 +2385,18 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   } finally {
     txClient.release()
   }
+  // The row is durable now, so the phone can be told. Fire-and-forget for the
+  // same reason the HTTP route's dispatch is: a push must never hold up the
+  // reply. Without this an agent's answer reached the websocket and the desktop
+  // toast and no phone at all — the surface a human is on when they ask a
+  // question and lock the screen.
+  void dispatchMessagePush({
+    conversationId: convoId,
+    authorId: me,
+    messageId,
+    body: finalBody,
+    companyId,
+  })
   // Advance the Redis "seen" boundary to my own just-inserted seq, so the
   // freshness preflight on my NEXT cumora reply compares against the post-
   // insertion state (peer messages with seq <= mine are "things I obviously

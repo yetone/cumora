@@ -18,7 +18,7 @@ import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
-import { notifyMessage, computeMessageRecipients } from '../push.js'
+import { dispatchMessagePush } from '../push.js'
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
 import {
   deleteSession, authMiddleware, type AuthedRequest,
@@ -4223,28 +4223,13 @@ api.post('/conversations/:id/messages', async (req, res) => {
   // (NotificationToasts handles those). Fire-and-forget — push delivery
   // must never block the HTTP response. The push module soft-disables
   // when APNs creds aren't configured, so this is safe even in dev.
-  void (async () => {
-    try {
-      const [recipients, convoRow, authorRow] = await Promise.all([
-        computeMessageRecipients({ conversationId: id, authorId: me }),
-        pool.query<{ title: string }>(`SELECT title FROM conversations WHERE id = $1`, [id]).then((r) => r.rows[0]),
-        pool.query<{ display_name: string }>(`SELECT display_name FROM users WHERE id = $1`, [me]).then((r) => r.rows[0]),
-      ])
-      if (recipients.length === 0) return
-      await notifyMessage({
-        conversationId: id,
-        conversationTitle: convoRow?.title ?? null,
-        authorId: me,
-        authorName: authorRow?.display_name ?? me,
-        messageId,
-        body,
-        companyId: tenant,
-        recipientUserIds: recipients,
-      })
-    } catch (e) {
-      console.warn('[push] notifyMessage post-/messages failed', e)
-    }
-  })()
+  void dispatchMessagePush({
+    conversationId: id,
+    authorId: me,
+    messageId,
+    body,
+    companyId: tenant,
+  })
 
   // Climate signal: @-mentioned agents feel mildly more affinity / trust
   // toward the speaker (engagement is positive). Fire-and-forget so we
