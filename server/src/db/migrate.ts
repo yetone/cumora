@@ -2048,8 +2048,9 @@ export function computedBaselineMigrationChecksum(): string {
   return createHash('sha256').update(DDL).digest('hex')
 }
 
-interface VersionedMigration extends MigrationMetadata {
+export interface VersionedMigration extends MigrationMetadata {
   sourceChecksum: string
+  transactional?: boolean
   up(client: import('pg').PoolClient): Promise<void>
 }
 
@@ -2369,24 +2370,59 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
     sourceChecksum: computedBaselineMigrationChecksum(),
+    transactional: false,
     up: applyLegacyBaseline,
   },
   {
     ...SCHEMA_MIGRATIONS[1],
     sourceChecksum: normalizedConversationMembersChecksum(),
+    transactional: true,
     up: applyNormalizedConversationMembers,
   },
   {
     ...SCHEMA_MIGRATIONS[2],
     sourceChecksum: workspaceCleanupJobsChecksum(),
+    transactional: true,
     up: applyWorkspaceCleanupJobs,
   },
   {
     ...SCHEMA_MIGRATIONS[3],
     sourceChecksum: agentRuntimeAssignmentChecksum(),
+    transactional: true,
     up: applyAgentRuntimeAssignment,
   },
 ]
+
+export async function applyPendingMigration(
+  client: import('pg').PoolClient,
+  migration: VersionedMigration,
+): Promise<void> {
+  const started = Date.now()
+  console.log(`[db] applying migration ${migration.version} ${migration.name}`)
+  if (migration.transactional !== false) {
+    await client.query('BEGIN')
+    try {
+      await migration.up(client)
+      await client.query(
+        `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+         VALUES ($1, $2, $3, $4)`,
+        [migration.version, migration.name, migration.checksum, Date.now() - started],
+      )
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => { /* swallow rollback err */ })
+      throw err
+    }
+  } else {
+    await migration.up(client)
+    await client.query(
+      `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+       VALUES ($1, $2, $3, $4)`,
+      [migration.version, migration.name, migration.checksum, Date.now() - started],
+    )
+  }
+  console.log(`[db] applied migration ${migration.version} in ${Date.now() - started}ms`)
+}
 
 function validateMigrationDefinitions(): void {
   if (VERSIONED_MIGRATIONS.length !== SCHEMA_MIGRATIONS.length) {
@@ -2445,15 +2481,7 @@ export async function ensureSchema(): Promise<void> {
         const migration = VERSIONED_MIGRATIONS.find((candidate) => candidate.version === metadata.version)
         if (!migration) throw new Error(`migration ${metadata.version} has metadata but no implementation`)
 
-        const started = Date.now()
-        console.log(`[db] applying migration ${migration.version} ${migration.name}`)
-        await migration.up(client)
-        await client.query(
-          `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
-           VALUES ($1, $2, $3, $4)`,
-          [migration.version, migration.name, migration.checksum, Date.now() - started],
-        )
-        console.log(`[db] applied migration ${migration.version} in ${Date.now() - started}ms`)
+        await applyPendingMigration(client, migration)
       }
 
       const finalHistory = validateMigrationHistory(await readHistory())

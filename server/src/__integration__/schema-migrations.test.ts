@@ -1,7 +1,12 @@
 import { after, before, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { pool } from '../db/pool.js'
-import { ensureSchema, REQUIRED_SCHEMA_INDEXES } from '../db/migrate.js'
+import {
+  applyPendingMigration,
+  ensureSchema,
+  REQUIRED_SCHEMA_INDEXES,
+  type VersionedMigration,
+} from '../db/migrate.js'
 import { SCHEMA_MIGRATIONS } from '../db/migrations/manifest.js'
 import { verifySchemaCompatibility } from '../db/schema-version.js'
 import { ensureSchemaOnce, teardownAll } from './_helpers.js'
@@ -68,3 +73,38 @@ test('promotion-required indexes are valid, ready, and live', async () => {
     assert.equal(row.indislive, true, `${name} must be live`)
   }
 })
+
+test('a failed versioned migration rolls back DDL changes and leaves no ledger entry on PostgreSQL', async () => {
+  const client = await pool.connect()
+  try {
+    const dummyMigration: VersionedMigration = {
+      version: 9999,
+      name: '9999-fail-atomicity',
+      checksum: 'f'.repeat(64),
+      sourceChecksum: 'f'.repeat(64),
+      transactional: true,
+      up: async (txClient) => {
+        await txClient.query('CREATE TABLE IF NOT EXISTS migration_atomicity_test_table (id INT)')
+        throw new Error('simulated DDL explosion')
+      },
+    }
+
+    await assert.rejects(
+      () => applyPendingMigration(client, dummyMigration),
+      /simulated DDL explosion/,
+    )
+
+    const { rows: tableRows } = await pool.query(
+      `SELECT 1 FROM information_schema.tables WHERE table_name = 'migration_atomicity_test_table'`,
+    )
+    assert.equal(tableRows.length, 0, 'rolled-back table must not exist in database')
+
+    const { rows: ledgerRows } = await pool.query(
+      `SELECT 1 FROM schema_migrations WHERE version = 9999`,
+    )
+    assert.equal(ledgerRows.length, 0, 'rolled-back ledger row must not exist')
+  } finally {
+    client.release()
+  }
+})
+
