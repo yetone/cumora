@@ -3258,6 +3258,18 @@ api.post('/agents/:id/rehire', async (req, res) => {
   res.json({ ok: true })
 })
 
+/**
+ * Ceiling on one sidebar page.
+ *
+ * The route has no cursor, so this is a backstop rather than pagination: it
+ * bounds the pathological workspace the performance review described (10,000
+ * conversations returned in one response) without changing the contract for
+ * the real ones, which are nowhere near it. If a workspace ever trips the log
+ * line below, that is the signal that real cursor paging has become worth its
+ * cost across the ~80 call sites that read this list.
+ */
+const CONVERSATION_LIST_LIMIT = 500
+
 api.get('/conversations', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { rows } = await pool.query(
@@ -3274,47 +3286,15 @@ api.get('/conversations', async (req, res) => {
         -- "until tomorrow" silence wears off without needing a sweeper job.
         (mu.user_id IS NOT NULL AND (mu.muted_until IS NULL OR mu.muted_until > NOW())) AS muted,
         mu.muted_until AS "mutedUntil",
-        (
-          SELECT json_build_object(
-            'id', m.id,
-            'authorId', m.author_id,
-            'kind', m.kind,
-            'body', m.body,
-            'tool', m.tool,
-            'attachment', m.attachment,
-            'createdAt', m.created_at,
-            -- For email messages, surface the subject + direction so the
-            -- sidebar preview can show "Re: contract draft" instead of a
-            -- raw body excerpt. NULL for non-email messages — the client
-            -- branches on last.kind === 'email'.
-            'email', (
-              SELECT jsonb_build_object(
-                'subject', em.subject,
-                'direction', em.direction,
-                'from', em.from_addr
-              )
-                FROM email_messages em
-               WHERE em.message_id = m.id
-            )
-          )
-          FROM messages m
-          WHERE m.conversation_id = c.id
-          ORDER BY m.sequence DESC
-          LIMIT 1
-        ) AS "lastMessage",
-        COALESCE((
-          SELECT COUNT(*)::int
-            FROM messages m
-           WHERE m.conversation_id = c.id
-             AND m.author_id <> $1
-             AND m.created_at > COALESCE(
-               (SELECT last_read_at FROM conversation_reads WHERE user_id = $1 AND conversation_id = c.id),
-               '1970-01-01T00:00:00Z'::timestamptz
-             )
-        ), 0) AS "unreadCount"
+        last_message.payload AS "lastMessage",
+        COALESCE(unread.n, 0) AS "unreadCount"
       FROM conversations c
       LEFT JOIN projects p ON p.id = c.project_id
       LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id AND mu.user_id = $1
+      -- Hoisted out of the unread subquery. As a correlated scalar it was
+      -- probed once per conversation, nested inside a COUNT that was itself
+      -- probed once per conversation.
+      LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
       LEFT JOIN LATERAL (
         SELECT p_other.name
           FROM conversation_members member
@@ -3327,6 +3307,41 @@ api.get('/conversations', async (req, res) => {
          ORDER BY member.ordinal
          LIMIT 1
       ) other_participant ON c.kind = 'direct'
+      LEFT JOIN LATERAL (
+        SELECT json_build_object(
+          'id', m.id,
+          'authorId', m.author_id,
+          'kind', m.kind,
+          'body', m.body,
+          'tool', m.tool,
+          'attachment', m.attachment,
+          'createdAt', m.created_at,
+          -- For email messages, surface the subject + direction so the
+          -- sidebar preview can show "Re: contract draft" instead of a
+          -- raw body excerpt. NULL for non-email messages — the client
+          -- branches on last.kind === 'email'.
+          'email', (
+            SELECT jsonb_build_object(
+              'subject', em.subject,
+              'direction', em.direction,
+              'from', em.from_addr
+            )
+              FROM email_messages em
+             WHERE em.message_id = m.id
+          )
+        ) AS payload
+          FROM messages m
+         WHERE m.conversation_id = c.id
+         ORDER BY m.sequence DESC
+         LIMIT 1
+      ) last_message ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS n
+          FROM messages m
+         WHERE m.conversation_id = c.id
+           AND m.author_id <> $1
+           AND m.created_at > COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz)
+      ) unread ON true
       WHERE c.company_id = $2
         -- Only conversations the caller is actually in. Without this,
         -- agent-to-agent direct chats (members=[agentA, agentB]) leak
@@ -3339,9 +3354,13 @@ api.get('/conversations', async (req, res) => {
              AND cm.company_id = c.company_id
              AND cm.participant_id = $1
         )
-      ORDER BY c.pinned DESC, c.updated_at DESC`,
+      ORDER BY c.pinned DESC, c.updated_at DESC
+      LIMIT ${CONVERSATION_LIST_LIMIT}`,
     [me, tenant],
   )
+  if (rows.length === CONVERSATION_LIST_LIMIT) {
+    console.warn(`[conversations] ${tenant} hit the ${CONVERSATION_LIST_LIMIT}-row sidebar ceiling; older rows are being withheld`)
+  }
   res.json(rows)
 })
 

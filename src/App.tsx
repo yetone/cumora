@@ -135,10 +135,11 @@ function AuthedApp() {
   useEffect(() => {
     if (!convoId || !selectedConvoExists) return
     void useMessages.getState().loadConversation(convoId)
-    void api.markRead(convoId).then(() => {
-      // refresh list so the badge clears
-      void useConversations.getState().reload()
-    }).catch(() => { /* swallow */ })
+    // Clear the badge locally, then persist. The server response tells us
+    // nothing the client doesn't already know, so refetching the whole list
+    // to learn that one count went to zero is pure waste.
+    useConversations.getState().markLocallyRead(convoId)
+    void api.markRead(convoId).catch(() => { /* swallow */ })
   }, [convoId, selectedConvoExists])
 
   // Lazy-refresh whisper list when entering whispers view
