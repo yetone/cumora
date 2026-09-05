@@ -85,11 +85,12 @@ Opus 4.7 on a 7-agent roster (the standard test rig as of 2026-06):
 | `werewolf` | 15-25 min | $15-25 | 2 | $30-50 |
 | `kanban` | 20-30 min | $8-15 | 2 | $16-30 |
 
-**Weekly cycle running all four scenarios: ~$58-101.** Weekly chain
-+ counting only: ~$12-21 (cheap regression watch). Daily all-four:
-$240-400/month (aggressive). Tune `BENCH_*_TRIALS` env vars or
-narrow scenarios on a given schedule to trade statistical confidence
-for cost.
+**One cycle running all four scenarios: ~$58-101.** At a weekly cadence
+that's ~$250-440/month; chain + counting only is ~$12-21 per cycle
+(~$52-91/month — a cheap regression watch). Running all four *daily* is
+~$1,740-3,030/month, which is why the schedule below doesn't. Tune
+`BENCH_*_TRIALS` env vars or narrow scenarios on a given schedule to trade
+statistical confidence for cost.
 
 The default workflow runs `chain counting` only on schedule (the
 cheap pair); use `workflow_dispatch` with an explicit scenario list

@@ -23,9 +23,11 @@ It does **not** deploy the API server. Backend production deploys are an
 explicit, separately approved action; a desktop tag must never silently mutate
 the backend.
 
-The auto-updater in the desktop app reads from `cumora-releases`, so
-once the release workflow finishes (~15–20 minutes), running clients
-will pick it up on their next periodic update check.
+The auto-updater in the desktop app reads from `https://updates.cumora.ai`
+(the R2-backed `generic` feed), with the `cumora-releases` GitHub Release as a
+fallback. Once the release workflow finishes (~15–20 minutes) and the R2 mirror
+step has run, running clients will pick it up on their next periodic update
+check.
 
 ## Backend release: build candidate, then ignite production
 
@@ -132,12 +134,40 @@ and still succeeds.
 
 ### One-time Cumora-side wiring
 
-- `build.publish` in `package.json` points at `yetone/cumora-releases`,
-  so the in-app auto-updater knows where to look.
-- `build.mac.notarize.teamId` reads `APPLE_TEAM_ID` from the workflow
+- `build.publish` in `package.json` is an **ordered array**: the first entry
+  is the `generic` feed at `https://updates.cumora.ai` (R2-backed) and is what
+  electron-updater actually polls; the `github` entry for
+  `yetone/cumora-releases` is the fallback feed. See `electron/autoUpdater.cjs`.
+- `build.mac.notarize` is `true`; electron-builder picks up `APPLE_TEAM_ID`
+  (alongside `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD`) from the workflow
   environment.
 - `build/entitlements.mac.plist` declares the hardened-runtime
   entitlements Electron needs (JIT, network access, dyld vars).
+
+## Releasing the `cumora` CLI to npm
+
+The BYOA daemon users install with `npx cumora@latest` is a **separate**
+artifact from the desktop app: the npm package `cumora`, built from
+`agent-cli/`. It has its own workflow and is not part of a `v*` tag release.
+
+`.github/workflows/publish.yml` publishes it on any push to `main` that
+touches `agent-cli/**` — typically the `chore(agent-cli): release cumora@X`
+version bump in `agent-cli/package.json`. To cut a CLI release:
+
+```bash
+# Bump agent-cli/package.json's own "version", then merge to main.
+# The workflow runs `node build.mjs` and `npm publish --access public`.
+```
+
+Notes:
+
+- It publishes only if that exact version isn't already on the registry, so
+  re-pushing `main` is a no-op rather than a failure.
+- It needs the repo secret `NPM_TOKEN` (an npm **automation** token, which
+  bypasses 2FA for writes). Until that secret exists the workflow no-ops
+  cleanly instead of failing.
+- `agent-cli/package.json`'s version is independent of the root
+  `package.json` version. Keep them in step by convention, not by tooling.
 
 ## Manual rebuild of a past release
 
@@ -163,6 +193,6 @@ etc.), use the `workflow_dispatch` form on `yetone/cumora-releases`:
 - **`latest-mac.yml` mentions only one architecture.** One of the two
   Mac runners failed before producing the yml. Look at the `Upload
   build artifacts` step on `build-mac-arm64` / `build-mac-x64`.
-- **The desktop app doesn't see the update.** The autoupdater polls
-  every 10 minutes (default for `electron-builder`). Force it from the
-  app menu or restart.
+- **The desktop app doesn't see the update.** The autoupdater checks 3
+  seconds after launch and then every **30 minutes** (`electron/autoUpdater.cjs`
+  sets that interval explicitly). Force it from the app menu or restart.

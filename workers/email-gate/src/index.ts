@@ -5,7 +5,8 @@
  *   1. Reject (550) if the recipient domain isn't in EMAIL_ROOT_DOMAINS.
  *   2. Stream the raw MIME, parse with postal-mime.
  *   3. Build a JSON payload (message-id, in-reply-to, references, from,
- *      to, cc, subject, text, html, raw size).
+ *      to, cc, subject, text, html, raw size, autoSubmitted, and
+ *      attachments[] as base64 — see MAX_ATTACHMENT_BYTES / the total cap).
  *   4. Sign with HMAC-SHA256(EMAIL_INBOUND_HMAC_SECRET, body) and POST
  *      to CUMORA_INBOUND_URL.
  *   5. Reject (550) if the server says "no recipient resolved" so the
@@ -235,7 +236,15 @@ export default {
       return
     }
     if (!res.ok) {
-      // 4xx other than 404, or 5xx → tempfail so the sender's MTA retries.
+      // 4xx other than 404, or 5xx.
+      //
+      // KNOWN GAP: this *should* tempfail on 5xx so the sender's MTA retries,
+      // but setReject() is a PERMANENT rejection — a single upstream blip
+      // loses the mail for good. Cloudflare issues a temporary failure when
+      // the handler throws, so the fix is to throw here on 5xx and keep
+      // setReject for 4xx. Not changed yet because it flips real delivery
+      // behaviour and wants its own test + rollout.
+      //
       // Reading the body keeps the response from leaking; ctx.waitUntil so
       // we don't block the email return.
       ctx.waitUntil(res.text().then((t) => console.error(`[email-gate] upstream ${res.status}: ${t.slice(0, 400)}`)))

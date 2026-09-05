@@ -7,8 +7,8 @@
 #   the agent runtime is unaffected by typical UI / docs / k8s changes.
 #
 # This workflow ONLY builds. Deploy is a separate manual workflow
-# (deploy.yml) so a bad commit on main doesn't auto-ship to prod —
-# trade-off chosen explicitly: "手动触发" / tag push.
+# (deploy.yml, workflow_dispatch only) so a bad commit on main doesn't
+# auto-ship to prod — trade-off chosen explicitly: "手动触发".
 
 name: Build
 

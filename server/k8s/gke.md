@@ -6,17 +6,21 @@ Memorystore for Redis. The end state matches what we verified in
 OrbStack locally — server in K8s, per-agent Pods on-demand,
 FUSE-backed workspace via the cumora-fuse → /runtime/fs/* path.
 
-Variables you'll fill in (replace `REPLACE-*` placeholders as you go):
+Variables you'll fill in (replace `REPLACE-*` placeholders as you go). The
+values shown are the ones production actually uses — note that the cluster is
+**zonal**, so every `gcloud container clusters …` call takes `--location`
+(a zone), not `--region`:
 
 ```
-PROJECT=your-gcp-project-id
-REGION=us-central1
-CLUSTER=cumora-prod
+PROJECT=cumora                  # GCP project id
+REGION=us-west2                 # region for Cloud SQL / Memorystore / AR
+LOCATION=us-west2-a             # ZONE of the cluster (see --location below)
+CLUSTER=cumora-prod-z
+AR_REPO=cumora                  # Artifact Registry repository
 SQL_INSTANCE=cumora-pg          # Cloud SQL instance name
 SQL_DB=cumora                   # database within the instance
 SQL_USER=cumora                 # PG user
 REDIS_INSTANCE=cumora-redis     # Memorystore instance
-QUAY_USER=...                   # quay.io credentials (or use Artifact Registry)
 ```
 
 ---
@@ -24,30 +28,39 @@ QUAY_USER=...                   # quay.io credentials (or use Artifact Registry)
 ## 1. Cluster + image registry
 
 ```sh
-# Standard GKE cluster with Workload Identity enabled
+# Standard GKE cluster with Workload Identity enabled.
+# --location takes a zone for a zonal cluster, a region for a regional one.
 gcloud container clusters create $CLUSTER \
-  --region $REGION \
+  --location $LOCATION \
   --workload-pool=$PROJECT.svc.id.goog \
   --release-channel regular \
   --num-nodes 2
 
-gcloud container clusters get-credentials $CLUSTER --region $REGION
+gcloud container clusters get-credentials $CLUSTER --location $LOCATION
 ```
 
-Push the two cumora images (use git sha or semver, NOT `:dev`):
+Push the two cumora images to **Artifact Registry** — this is what
+`build.yml` and `deploy.yml` use, and what production runs (use git sha or
+semver, NOT `:dev`):
 
 ```sh
 TAG=$(git rev-parse --short HEAD)
+AR=$REGION-docker.pkg.dev/$PROJECT/$AR_REPO
+
+gcloud auth configure-docker $REGION-docker.pkg.dev
 
 docker build -f server/docker/cumora-server.Dockerfile \
-  -t quay.io/yetoneful/cumora-server:$TAG .
-docker push quay.io/yetoneful/cumora-server:$TAG
+  -t $AR/server:$TAG .
+docker push $AR/server:$TAG
 
 node server/src/scripts/build-agent-bundle.mjs
 docker build -f server/docker/agent-computer.Dockerfile \
-  -t quay.io/yetoneful/cumora-agent-computer:$TAG .
-docker push quay.io/yetoneful/cumora-agent-computer:$TAG
+  -t $AR/agent-computer:$TAG .
+docker push $AR/agent-computer:$TAG
 ```
+
+> Older revisions of this guide pushed to `quay.io/yetoneful/cumora-*`. That
+> path is legacy: nothing in CI or production reads it any more.
 
 Substitute `REPLACE-TAG` in `cumora-server.gke.yaml` with `$TAG`.
 
@@ -78,10 +91,9 @@ To wipe a permanently off-boarded agent's PVC, call the orchestrator's
 `deleteChromeProfilePvc(agentId)` helper. The normal idle-exit path
 deliberately leaves the PVC bound so the next pod re-uses it.
 
-If using Artifact Registry instead of quay.io, push to
-`$REGION-docker.pkg.dev/$PROJECT/cumora/...` and drop the
-`imagePullSecrets` / quay-pull steps below (GKE nodes pull from AR
-with their default service account automatically).
+GKE nodes pull from Artifact Registry with their default service account, so
+no `imagePullSecrets` are needed. If you are resurrecting the legacy quay.io
+path instead, you'll also need the `quay-pull` secret described in step 4.
 
 ## 2. Cloud SQL + Memorystore
 
@@ -151,11 +163,12 @@ kubectl create secret generic cumora \
   --from-literal=OPENAI_API_KEY="sk-..." \
   --from-literal=AGENT_RUNTIME_SECRET="$(openssl rand -hex 32)"
 
-# Image pull secret for quay.io (skip if you switched to AR)
-kubectl create secret docker-registry quay-pull \
-  --docker-server=quay.io \
-  --docker-username=$QUAY_USER \
-  --docker-password="$QUAY_PASSWORD"
+# Not needed on the Artifact Registry path above. Only for the legacy
+# quay.io registry, and only if you also set QUAY_USER / QUAY_PASSWORD:
+# kubectl create secret docker-registry quay-pull \
+#   --docker-server=quay.io \
+#   --docker-username=$QUAY_USER \
+#   --docker-password="$QUAY_PASSWORD"
 ```
 
 ## 5. Generic Device Plugin (for FUSE)
@@ -178,10 +191,19 @@ kubectl describe node <any-node> | grep devic.es/fuse
 # Allocatable: devic.es/fuse: 800
 ```
 
-The server still applies an app-level `AGENT_POD_ADMISSION_MAX`
-ceiling (default `200`) before creating agent pods. Keep that lower
+The server also applies an app-level `AGENT_POD_ADMISSION_MAX`
+ceiling (default `40`) before creating agent pods. Keep that lower
 than the advertised FUSE count so bursts are bounded by Cumora's real
 CPU, memory, API-server, and provider concurrency budget.
+
+> **The cluster-wide FUSE ceiling is inert under the shipped RBAC.**
+> `getClusterFuseUtilization()` shells out to `kubectl get nodes`, and when
+> that call fails it fails *open* — the cap becomes `Infinity`. Neither
+> `cumora-server.gke.yaml` nor `cumora-server.orbstack.yaml` grants node reads:
+> they bind a namespaced `Role` over `pods`, `pods/log`, and
+> `persistentvolumeclaims` only. Until a `ClusterRole` +
+> `ClusterRoleBinding` for `nodes: [get, list]` is added, only
+> `AGENT_POD_ADMISSION_MAX` actually bounds admission.
 
 On **GKE Autopilot**: the plugin DaemonSet works but Autopilot may
 reject `securityContext.capabilities.add: [SYS_ADMIN]` depending on
@@ -205,6 +227,24 @@ kubectl rollout status deployment/cumora-server
 
 The application Pods only read `schema_migrations` and refuse to start outside
 their supported version range. They never execute DDL during startup.
+
+> **Patch the liveness probe after applying.** The checked-in manifest still
+> points `livenessProbe` at `/api/health`, which touches the database. The
+> Deploy workflow patches it to `/api/livez` on every rollout precisely
+> because a DB-backed liveness probe turned a connection-pool stall into a
+> restart loop (2026-05-27). A manual `kubectl apply` re-introduces the bad
+> config, so follow it with:
+>
+> ```sh
+> kubectl patch deployment/cumora-server --type=json -p='[{
+>   "op": "replace",
+>   "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/path",
+>   "value": "/api/livez"
+> }]'
+> ```
+>
+> Readiness should stay on `/api/health` — that one *should* pull a pod out of
+> rotation when its dependencies are gone.
 
 ## 7. Verify end-to-end
 

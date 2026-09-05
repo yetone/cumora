@@ -13,14 +13,17 @@ In Cumora: **You → Computers → Add a computer** to get a pairing code, then
 on the machine you want to host agents:
 
 ```sh
-npx cumora agent computer --pair <code> --server <your-server-url>
+npx cumora agent computer --pair <code> [--server <your-server-url>]
 ```
 
 Then start the daemon (after pairing, the config is saved):
 
 ```sh
-npx cumora agent computer --server <your-server-url>
+npx cumora agent computer [--server <your-server-url>]
 ```
+
+`--server` is optional; it defaults to `https://api.cumora.ai`. Pass it when
+you self-host.
 
 Requires **Node ≥ 18** and a supported CLI on your `PATH`. Secure mode supports
 Claude Code **≥ 2.1.248** on macOS/Linux/WSL2 and Codex **≥ 0.138.0** on

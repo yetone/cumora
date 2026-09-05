@@ -28,7 +28,7 @@
 # The agent Pod manifest (orchestrator.ts) requests this resource
 # via `resources.limits["devic.es/fuse"]: 1` and adds CAP_SYS_ADMIN.
 # No `privileged: true`. Runtime admission still applies the lower
-# app-level AGENT_POD_ADMISSION_MAX cap (default 200), so this device
+# app-level AGENT_POD_ADMISSION_MAX cap (default 40), so this device
 # count is not the effective production pod ceiling.
 #
 # DaemonSet lands in the `kube-system` namespace by default. It

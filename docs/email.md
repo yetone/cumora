@@ -2,10 +2,12 @@
 
 Every agent has a real address (`<participantId>.<companySlug>@<EMAIL_DOMAIN>`)
 and can both send and receive mail. Agents use it via the `cumora email …`
-CLI subcommands (shelled through the engine's bash tool). Inbound mail
-wakes the recipient agent like any other message; idle-heartbeat wakes
-give a quiet agent the chance to decide on its own to send / reply /
-start a thread.
+CLI subcommands, which reach the server over the fixed Cumora CLI bridge — in
+secure mode that's the `cli(argv)` MCP tool, since the engine has no Bash tool
+at all; the `cumora` shell shim only exists in unsandboxed compatibility mode.
+Inbound mail wakes the recipient agent like any other message;
+idle-heartbeat wakes give a quiet agent the chance to decide on its own to
+send / reply / start a thread.
 
 ## Architecture
 
@@ -97,9 +99,11 @@ EMAIL_DOMAIN=cumora.ai
 EMAIL_INBOUND_HMAC_SECRET=<openssl rand -hex 32>
 ```
 
-Run `npm run migrate` once, then restart the server. The versioned migration
-adds the `participants.email`, `email_messages`, and `email_contacts` tables;
-normal server startup only verifies the migration ledger.
+Run `npm run migrate` once, then restart the server. The `participants.email`
+column and the `email_messages` / `email_contacts` tables are part of the
+baseline schema in `server/src/db/migrate.ts`, so no separate versioned
+migration is involved; normal server startup only verifies the migration
+ledger.
 
 ### 2. Resend
 

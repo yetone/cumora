@@ -272,16 +272,21 @@ fail-closed host boundary:
   isolation, an empty strict network allowlist, no Bash/PowerShell/web tools,
   no unsandboxed retry, and an explicit deny list for every inherited
   environment variable not needed by the fixed Cumora MCP bridge. Because
-  restricted mode ignores user settings, the daemon imports only
-  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and
-  `ANTHROPIC_SMALL_FAST_MODEL` plus the three `ANTHROPIC_DEFAULT_*_MODEL`
-  aliases from Claude's user settings into the trusted
-  Claude core; those names remain denied to model-spawned subprocesses and
-  Cumora never serializes the values into argv, its logs, Agent files, or server
-  reports. Claude Code
-  2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
-  `socat`; a missing dependency fails the turn. See
-  [ADR 0005](decisions/0005-secure-claude-provider-bootstrap.md).
+  restricted mode ignores user settings, the daemon imports a fixed
+  seven-key allowlist from Claude's user settings into the trusted Claude
+  core — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_SMALL_FAST_MODEL`, and the three `ANTHROPIC_DEFAULT_*_MODEL`
+  aliases (`CLAUDE_CORE_ENV_KEYS` in
+  `server/src/agents/computer/claude-user-settings.ts`). Those names remain
+  denied to model-spawned subprocesses and Cumora never serializes the values
+  into argv, its logs, Agent files, or server reports. Explicit daemon
+  environment values take precedence over the settings file; a missing,
+  malformed, relative-config-root, or oversized settings file fails soft and
+  preserves Claude's native first-party OAuth/keychain behavior. Note that
+  `api.anthropic.com` is *not* treated as a custom provider, while a
+  `ANTHROPIC_BASE_URL` that won't parse is (it fails toward "custom"). Claude
+  Code 2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
+  `socat`; a missing dependency fails the turn.
 - Codex runs one-shot with user config and exec-policy rules ignored. A custom
   permission profile permits minimal runtime reads and writes only under the
   agent home, disables command network, and gives model-spawned commands only
@@ -342,8 +347,7 @@ An inherited effort is a preference, not a guarantee of thinking tokens:
 Claude can cap effort for a model or organization, and Opus 5 with thinking
 disabled may send `high` even when `xhigh` is saved. To request deeper
 reasoning, enable thinking as well as setting effort. See
-[Claude model configuration](https://code.claude.com/docs/en/model-config#adjust-effort-level)
-and [ADR 0007](decisions/0007-claude-turn-preferences.md).
+[Claude model configuration](https://code.claude.com/docs/en/model-config#adjust-effort-level).
 
 ### Running against a custom provider
 
@@ -537,16 +541,29 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
 ```
 
 - `agent-cli/` builds `dist/cli.js` — a single self-contained ESM file
-  (~140KB, zero runtime dependencies) that esbuild-bundles the daemon
+  (~330KB, zero runtime dependencies) that esbuild-bundles the daemon
   source from `server/src/agents/computer/` — one source of truth, no
   separate copy. The repo's root `package.json` stays `private`; only
-  this thin package is published.
-- `--install-service` installs the daemon as a supervised service
-  (launchd `io.cumora.daemon` on macOS, `systemd --user` on Linux, a per-user
-  Task Scheduler watchdog on Windows) so it restarts at user login (including
-  after a reboot) and — on macOS — runs in the GUI domain where the engine's
-  keychain-backed login actually works.
-- `--doctor` probes the big/small models and the wake path end-to-end.
+  this thin package is published. `.github/workflows/publish.yml` pushes it
+  to npm on any push to `main` touching `agent-cli/**` (see
+  [`RELEASE.md`](RELEASE.md)).
+- Setup flags: `--pair <code>`, `--server <url>`, `--engine <id>` (force one
+  of the registered engines instead of auto-detecting).
+- Service flags: `--install-service` installs the daemon as a supervised
+  service (launchd `io.cumora.daemon` on macOS, `systemd --user` on Linux, a
+  per-user Task Scheduler watchdog on Windows) so it restarts at user login
+  (including after a reboot) and — on macOS — runs in the GUI domain where the
+  engine's keychain-backed login actually works.
+  `--uninstall-service`, `--restart`, `--stop`, `--status`, and `--logs`
+  manage and inspect it.
+- Diagnostics: `--doctor` probes the big/small models and the wake path
+  end-to-end; `--version` / `-v` and `--help` / `-h` are one-shot too.
+- `--stop`, `--restart`, and `--pair` kill only the **long-running** daemon.
+  Every one-shot invocation — `--doctor`, `--help`, `--status`, and the rest of
+  `ONE_SHOT_FLAGS` — is excluded by `isStoppableDaemonCommand`, so a
+  concurrently running `--doctor` survives a `--stop` instead of dying
+  mid-probe.
+- With no flags the daemon runs in the foreground (pair first).
 - In-repo dev uses `./bin/cumora agent computer …` (tsx) — the same
   code, unbundled.
 

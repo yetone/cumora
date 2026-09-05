@@ -4,8 +4,8 @@ name: Release
 # Hand off to yetone/cumora-releases which has the matrix runners that
 # build + sign + publish the Electron app for every platform.
 #
-# The existing deploy.yml ALSO triggers on `v*` — it handles the GKE
-# backend roll-out. The two are orthogonal; both run from the same tag.
+# The GKE backend roll-out is deliberately NOT tied to this tag: deploy.yml
+# is `workflow_dispatch` only, so a desktop release never mutates production.
 
 on:
   push:

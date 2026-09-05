@@ -68,12 +68,15 @@ an Anthropic model into another namespace.
 more cautious about prompt-injection-like patterns and behaves differently in
 multi-agent flows. Without
 the pin, every user's behavior drifts whenever Anthropic ships a model.
-Override per-agent by setting `participants.model` for a specific id. Secure
-Claude provider bootstrap and the reason credentials stay outside model tools
-are recorded in [ADR 0005](decisions/0005-secure-claude-provider-bootstrap.md).
+Override per-agent by setting `participants.model` for a specific id. Provider
+credentials for a custom Claude endpoint are bootstrapped from a fixed
+seven-key allowlist in Claude's user settings, enter only the trusted Claude
+core process, and stay denied to every model-spawned subprocess — see
+`server/src/agents/computer/claude-user-settings.ts`.
 Agent turns now inherit validated Claude effort/thinking preferences instead
-of forcing thinking off. Triage retains its separate cheap-call policy; see
-[ADR 0007](decisions/0007-claude-turn-preferences.md) for precedence and scope.
+of forcing thinking off. Triage retains its separate cheap-call policy; the
+inherited keys, their validation, and the daemon-env-wins precedence rule are
+tabulated in [`BYOA.md`](BYOA.md).
 
 ### 2. Per-computer big-brain concurrency cap (daemon)
 `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` (default **6**; drop to 2-4 on very
@@ -799,3 +802,5 @@ fallback) and absent-member coverage (team-adapts principle).
 | `server/src/agents/runtime/server.ts` | `/runtime/inbox` endpoint with `?probe=1` flag for non-advancing reads. `/thinking/mark` / `/thinking/unmark` bracket the turn (they also still stamp the vestigial compose-anchor — see 5a). `/agenda` routes the nudge `source` flag (classified vs fallback) into `claimStallNudge`. |
 | `server/src/agents/runtime/inproc-client.ts` | `loadInbox()` — must remain a PURE READ. No more recordSeen side-effect (that broke a6e69aa). `markThinking`/`peekThinking` for the ZSET-based "who's composing here" claim. |
 | `server/src/agents/computer/registry.ts` | `listAgentsForComputer` with per-engine `CUMORA_DEFAULT_*_MODEL` fallbacks. |
+| `server/src/agents/computer/claude-user-settings.ts` | `CLAUDE_CORE_ENV_KEYS` (the seven-key provider bootstrap allowlist), `CLAUDE_TURN_ENV_KEYS` + their validation, and `isCustomAnthropicEndpoint()` — which treats `api.anthropic.com` as first-party and an unparseable base URL as custom (§1). |
+| `server/src/agents/computer/model-catalog.ts` | Reports the engine's configured defaults, including whether a custom endpoint owns an unnamed default, so a custom-provider default can outrank the deployment-level pin (§1). |

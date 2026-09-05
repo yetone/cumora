@@ -2134,9 +2134,10 @@ export type BaselineStatementClient = { query(sql: string): Promise<unknown> }
  * AccessExclusiveLock and the transaction HOLDS all ~30 of them until commit.
  * Under sustained production traffic those waits close into a cycle and
  * Postgres aborts the whole batch with 40P01 — on every attempt. That is how
- * the first ADR 0003 adoption Job (v0.14.0, 2026-09-03) failed eight times in
- * a row without applying anything: the ledger was empty, so version 1 had to
- * run, and version 1 could never commit. Before ADR 0003 the same batch ran on
+ * the first versioned-migration adoption Job (v0.14.0, 2026-09-03) failed
+ * eight times in a row without applying anything: the ledger was empty, so
+ * version 1 had to run, and version 1 could never commit. Before versioned
+ * migrations the same batch ran on
  * every boot and only ever got through production because a sentinel probe let
  * a deadlocked no-op pass; that hatch is gone, and it would not have helped
  * here anyway because the baseline had real columns to add.
@@ -2145,7 +2146,8 @@ export type BaselineStatementClient = { query(sql: string): Promise<unknown> }
  * immediately, so a no-op cannot participate in a lock cycle, and a real
  * change waits at most `lock_timeout` (55P03) before this loop retries just
  * that statement. Every statement in the baseline is idempotent (it ran on
- * every application boot before ADR 0003), so a statement retry — or a rerun
+ * every application boot before the ledger existed), so a statement retry — or
+ * a rerun
  * of the Job after a mid-batch failure — resumes safely; ensureSchema records
  * version 1 only after the entire batch completed. Versioned migrations after
  * the baseline keep their single-transaction atomicity.
@@ -2345,7 +2347,7 @@ export async function checkConversationMembersResolvable(client: MigrationPreche
     nullCompanies > 0 ? `${nullCompanies} conversation(s) have no company_id` : null,
   ].filter(Boolean).join(' and ')
   throw Object.assign(
-    new Error(`migration 0002 precondition failed: ${detail} — repair the data, then rerun the migration Job (see the precheck lines above and ADR 0004)`),
+    new Error(`migration 0002 precondition failed: ${detail} — repair the data, then rerun the migration Job (see the precheck lines above)`),
     { code: '23503' },
   )
 }
@@ -2538,9 +2540,11 @@ async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<
   const indexes: Array<{ name: string; create: string }> = [
     {
       name: 'idx_conversations_members_gin',
-      // members @> [agentId] containment — the hottest read path (loadInbox /
-      // loadContext / inbox-triage, called per wake + poll). Without it each
-      // call seq-scans every conversation and saturates the pool.
+      // Retained for the expand-release rollback window only. `loadInbox` /
+      // `loadContext` / inbox-triage no longer read `members @> [agentId]` —
+      // they resolve membership through the normalized `conversation_members`
+      // participant index (see inproc-client.ts). Drop this index once the
+      // rollback window closes.
       create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conversations_members_gin
                  ON conversations USING gin (members jsonb_path_ops)`,
     },

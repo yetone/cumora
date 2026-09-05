@@ -78,4 +78,7 @@ If you self-host, at minimum:
   `EMAIL_INBOUND_HMAC_SECRET`, `R2_URL_SIGNING_SECRET`, APNs/FCM credentials)
   out of the repo and in your deployment's secret store.
 
-See [`.env.example`](.env.example) for the full annotated list.
+`server/src/env.ts` is the authoritative list of every variable the server
+reads, including the ones above. [`.env.example`](.env.example) annotates a
+commonly-edited subset and does **not** cover `AGENT_RUNTIME_SECRET` or the
+APNs/FCM credentials.
