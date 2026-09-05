@@ -45,6 +45,7 @@ export interface RoutingClaim {
   candidates: string[]
   cursor: number
   status: ClaimStatus
+  cursorAdvancedAt?: Date | null
 }
 
 /** Read the wake candidates' roster rows (role + busy-status lease) for the
@@ -79,11 +80,11 @@ export async function claimPrimary(args: {
   const leaseMs = args.leaseMs ?? ELECTION_LEASE_MS
   const { rows } = await pool.query<RoutingClaimRow>(
     `INSERT INTO agent_routing_claims
-         (message_id, company_id, conversation_id, candidates, cursor, status, lease_expires_at)
-       VALUES ($1, $2, $3, $4::text[], 0, 'pending', NOW() + ($5::int * INTERVAL '1 millisecond'))
+         (message_id, company_id, conversation_id, candidates, cursor, cursor_advanced_at, status, lease_expires_at)
+       VALUES ($1, $2, $3, $4::text[], 0, NOW(), 'pending', NOW() + ($5::int * INTERVAL '1 millisecond'))
        ON CONFLICT (message_id) DO NOTHING
        RETURNING message_id AS "messageId", company_id AS "companyId", conversation_id AS "conversationId",
-                 candidates, cursor, status`,
+                 candidates, cursor, status, cursor_advanced_at AS "cursorAdvancedAt"`,
     [args.messageId, args.companyId, args.conversationId, [...args.orderedCandidates], leaseMs],
   )
   if (rows[0]) return toClaim(rows[0])
@@ -93,7 +94,7 @@ export async function claimPrimary(args: {
 export async function getClaim(messageId: string): Promise<RoutingClaim | null> {
   const { rows } = await pool.query<RoutingClaimRow>(
     `SELECT message_id AS "messageId", company_id AS "companyId", conversation_id AS "conversationId",
-            candidates, cursor, status
+            candidates, cursor, status, cursor_advanced_at AS "cursorAdvancedAt"
        FROM agent_routing_claims
       WHERE message_id = $1`,
     [messageId],
@@ -108,10 +109,19 @@ interface RoutingClaimRow {
   candidates: string[]
   cursor: number
   status: ClaimStatus
+  cursorAdvancedAt?: Date | null
 }
 
 function toClaim(r: RoutingClaimRow): RoutingClaim {
-  return { messageId: r.messageId, companyId: r.companyId, conversationId: r.conversationId, candidates: [...r.candidates], cursor: r.cursor, status: r.status }
+  return {
+    messageId: r.messageId,
+    companyId: r.companyId,
+    conversationId: r.conversationId,
+    candidates: [...r.candidates],
+    cursor: r.cursor,
+    status: r.status,
+    cursorAdvancedAt: r.cursorAdvancedAt,
+  }
 }
 
 /** One sweep pass. Returns the wakes the sweep decided on, if any — the caller
@@ -136,14 +146,23 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
   const decisions: SweepDecision[] = []
 
   const due = await pool.query<TakenRow>(
-    `UPDATE agent_routing_claims
+    `WITH due AS (
+       SELECT message_id
+         FROM agent_routing_claims
+        WHERE status = 'pending'
+          AND lease_expires_at < NOW()
+        ORDER BY lease_expires_at ASC
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+     )
+     UPDATE agent_routing_claims c
         SET lease_expires_at = NOW() + ($1::int * INTERVAL '1 millisecond'),
             updated_at = NOW()
-      WHERE status = 'pending'
-        AND lease_expires_at < NOW()
-      RETURNING message_id AS "messageId", company_id AS "companyId", conversation_id AS "conversationId",
-                candidates, cursor, status, created_at AS "createdAt"
-      LIMIT $2`,
+       FROM due
+      WHERE c.message_id = due.message_id
+     RETURNING c.message_id AS "messageId", c.company_id AS "companyId", c.conversation_id AS "conversationId",
+               c.candidates, c.cursor, c.status, c.created_at AS "createdAt",
+               c.cursor_advanced_at AS "cursorAdvancedAt"`,
     [leaseMs, SWEEP_BATCH],
   )
 
@@ -154,7 +173,8 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
       await pool.query(`UPDATE agent_routing_claims SET status = 'exhausted', updated_at = NOW() WHERE message_id = $1`, [row.messageId])
       continue
     }
-    if (await hasRunSince(primary, row.createdAt, row.companyId)) {
+    const anchor = row.cursorAdvancedAt ?? row.createdAt
+    if (await hasRunSince(primary, anchor, row.companyId)) {
       await pool.query(`UPDATE agent_routing_claims SET status = 'served', updated_at = NOW() WHERE message_id = $1`, [row.messageId])
       continue
     }
@@ -167,7 +187,10 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
     }
     await pool.query(
       `UPDATE agent_routing_claims
-          SET cursor = $2, lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'), updated_at = NOW()
+          SET cursor = $2,
+              cursor_advanced_at = NOW(),
+              lease_expires_at = NOW() + ($3::int * INTERVAL '1 millisecond'),
+              updated_at = NOW()
         WHERE message_id = $1 AND cursor = $4`,
       [row.messageId, nextCursor, leaseMs, row.cursor],
     )
@@ -185,7 +208,9 @@ export async function sweepRoutingClaimsOnce(opts: { leaseMs?: number; hasRunSin
   return decisions
 }
 
-interface TakenRow extends RoutingClaimRow { createdAt: Date }
+interface TakenRow extends RoutingClaimRow {
+  createdAt: Date
+}
 
 /** Did the agent start ANY turn since the claim? Coarse on purpose: a run in
  *  another room proves the agent is alive and turning, and wrongly "serving"

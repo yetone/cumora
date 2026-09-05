@@ -124,7 +124,7 @@ function mockPool(handler: QueryHandler): void {
 }
 
 const INSERT = 'INSERT INTO agent_routing_claims'
-const TAKE = 'UPDATE agent_routing_claims\n        SET lease_expires_at'
+const TAKE = 'WITH due AS'
 const SERVE_OR_EXHAUST = 'UPDATE agent_routing_claims SET status'
 const ADVANCE = 'UPDATE agent_routing_claims\n          SET cursor'
 const REAP = 'DELETE FROM agent_routing_claims'
@@ -227,3 +227,39 @@ test('the sweep leaves healthy claims alone and reaps terminal rows', async () =
 test('the election lease is generous enough for a cold pod or a reconnecting daemon', () => {
   assert.equal(ELECTION_LEASE_MS, 90_000)
 })
+
+test('the sweep anchors hasRunSince to cursorAdvancedAt rather than claim createdAt', async () => {
+  let passedSince: any = null
+  const claimCreated = new Date(NOW - 300_000)
+  const candidateAdvanced = new Date(NOW - 90_000)
+  mockPool((sql) => {
+    if (sql.startsWith(TAKE)) {
+      return {
+        rows: [{
+          messageId: 'm1',
+          companyId: 'c1',
+          conversationId: 'conv1',
+          candidates: ['iris', 'atlas'],
+          cursor: 1,
+          status: 'pending',
+          createdAt: claimCreated,
+          cursorAdvancedAt: candidateAdvanced,
+        }],
+      }
+    }
+    if (sql.startsWith('SELECT id FROM agent_runs')) return { rows: [] }
+    if (sql.startsWith(SERVE_OR_EXHAUST)) return { rows: [] }
+    if (sql.startsWith(ADVANCE)) return { rows: [] }
+    if (sql.startsWith(REAP)) return { rows: [] }
+    throw new Error('unexpected: ' + sql.slice(0, 60))
+  })
+  await sweepRoutingClaimsOnce({
+    hasRunSince: async (_agentId, since) => {
+      passedSince = since
+      return false
+    },
+  })
+  assert.ok(passedSince)
+  assert.equal(passedSince.getTime(), candidateAdvanced.getTime())
+})
+

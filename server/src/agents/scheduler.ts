@@ -792,7 +792,7 @@ async function wake(payload: MessageNewEvent): Promise<void> {
   // below. It deliberately does NOT resurrect the daemon-side `claimReply`
   // that was removed for breaking chains: this happens once per message,
   // before waking, and the woken agent still runs its own glance/yield.
-  if (!authorIsAgent && (conversation?.kind ?? 'group') !== 'direct' && recipients.length > 1) {
+  if (!authorIsAgent && (conversation?.kind ?? 'group') !== 'direct' && recipients.length > 1 && messageKind !== 'system' && !deliveryAgentId) {
     const targets = [
       ...mentionedAgentIds(messageBody, recipients),
       ...(quotedAuthorId && recipients.includes(quotedAuthorId) ? [quotedAuthorId] : []),
@@ -800,7 +800,7 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     const uniqueTargets = [...new Set(targets)]
     if (uniqueTargets.length > 0) {
       const mode = await routeMessage({
-        companyId: payload.companyId ?? null,
+        companyId: conversation.company_id,
         body: messageBody,
         conversationKind: conversation?.kind ?? 'group',
         candidates: recipients,
@@ -814,7 +814,7 @@ async function wake(payload: MessageNewEvent): Promise<void> {
     } else if (env.ROUTING_ONE_OF_US) {
       const roster = await loadElectionCandidates(recipients).catch(() => [] as ElectionCandidate[])
       const route = await routeUnaddressedMessage({
-        companyId: payload.companyId ?? null,
+        companyId: conversation.company_id,
         body: messageBody,
         conversationKind: conversation?.kind ?? 'group',
         candidates: roster.map((c) => ({ id: c.id, role: c.role })),
@@ -830,11 +830,14 @@ async function wake(payload: MessageNewEvent): Promise<void> {
           // re-electing, and skip entirely when the lease already resolved.
           const claim = await claimPrimary({
             messageId: payload.message.id,
-            companyId: payload.companyId ?? null,
+            companyId: conversation.company_id,
             conversationId,
             orderedCandidates: election.lineup,
           }).catch(() => null)
-          if (claim?.status === 'pending') {
+          if (claim?.status === 'served' || claim?.status === 'exhausted') {
+            console.log(`[scheduler] claim for message ${payload.message.id} is already ${claim.status} — skipping wake on re-delivery`)
+            recipients = []
+          } else if (claim?.status === 'pending') {
             const primary = claim.candidates[claim.cursor]
             if (primary && recipients.includes(primary)) {
               console.log(`[scheduler] routed ${conversationId} to ${primary} (mode=one-of-us, ${recipients.length - 1} wake(s) avoided)`)
