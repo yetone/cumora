@@ -385,7 +385,7 @@ async function sendReminder(event: CalendarEventRow, occurrence: Date, now: Date
 
 function sanitizeReminderSubject(event: CalendarEventRow, leadMinutes: number): string {
   // Strip control characters to stop header injection, keep subject short.
-  const title = event.title.replace(/[\r\n\t -]/g, ' ').slice(0, 160)
+  const title = event.title.replace(/[\r\n\t\x00-\x1f]/g, ' ').slice(0, 160)
   if (leadMinutes <= 1) return `Starting now: ${title}`
   if (leadMinutes < 60) return `In ${leadMinutes} min: ${title}`
   const h = Math.round(leadMinutes / 60)
@@ -453,7 +453,7 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
     const after = row.last_fired_at
       ? new Date(row.last_fired_at.getTime() + 1)
       : row.start_at
-    const slot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, after)
+    let slot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, after)
     if (!slot) {
       await withOutboxTransaction(async (client) => {
         await client.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
@@ -477,14 +477,48 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
     if (slot.getTime() > now.getTime()) continue           // not yet
     const lag = now.getTime() - slot.getTime()
     if (lag > MAX_CATCHUP_MS) {
-      await withOutboxTransaction(async (client) => {
-        await client.query(
-          `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
-          [row.id, slot],
-        )
-        await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
-      })
-      continue
+      if (!row.recurrence) {
+        await withOutboxTransaction(async (client) => {
+          await client.query(
+            `UPDATE calendar_events SET last_fired_at = $2, status = 'done', updated_at = NOW() WHERE id = $1`,
+            [row.id, slot],
+          )
+          await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+        })
+        continue
+      }
+
+      // Stale recurring event: fast-forward past the backlog in a single step
+      // instead of slow-crawling one slot per tick.
+      const catchupFloor = new Date(now.getTime() - MAX_CATCHUP_MS)
+      const nextSlot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, catchupFloor)
+      if (!nextSlot) {
+        await withOutboxTransaction(async (client) => {
+          await client.query(
+            `UPDATE calendar_events SET last_fired_at = $2, status = 'done', updated_at = NOW() WHERE id = $1`,
+            [row.id, slot],
+          )
+          await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+        })
+        continue
+      }
+
+      if (nextSlot.getTime() <= now.getTime()) {
+        // There is an occurrence inside the catch-up window [now - MAX_CATCHUP_MS, now].
+        // Jump directly to this slot so it can fire on this tick.
+        slot = nextSlot
+      } else {
+        // No occurrences fell inside the catch-up window; the next occurrence is in the future.
+        // Fast-forward last_fired_at to now so subsequent ticks await nextSlot without firing.
+        await withOutboxTransaction(async (client) => {
+          await client.query(
+            `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
+            [row.id, now],
+          )
+          await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+        })
+        continue
+      }
     }
     const result = await dispatchEvent(row, slot)
     if (result.status === 'dispatched' || result.status === 'skipped' || result.status === 'failed') {
