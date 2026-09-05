@@ -7,10 +7,15 @@ const { pool } = await import('../db/pool.js')
 const {
   __setBackgroundScannerWakeForTesting,
   _resetBackgroundScannerForTests,
-  runBackgroundScans,
+  scanOnce,
 } = await import('../agents/scanner.js')
 
 const originalQuery = pool.query.bind(pool)
+
+// Drives `scanOnce` rather than `runBackgroundScans`: this file stubs
+// `pool.query` to script the scan, and the leader lock in `runBackgroundScans`
+// takes a real connection via `pool.connect()`, which the stub cannot reach.
+// The lock is exercised for real in the integration suite instead.
 
 after(async () => {
   try { await pool.end() } catch { /* ignore */ }
@@ -21,12 +26,12 @@ after(async () => {
   } catch { /* ignore */ }
 })
 
-beforeEach(() => {
-  _resetBackgroundScannerForTests()
+beforeEach(async () => {
+  await _resetBackgroundScannerForTests()
 })
 
-afterEach(() => {
-  _resetBackgroundScannerForTests()
+afterEach(async () => {
+  await _resetBackgroundScannerForTests()
   ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
 })
 
@@ -82,19 +87,19 @@ test('scanner does not spend fingerprint or record audit log when wake is droppe
   })
 
   // First pass: wake is dropped by budget
-  await runBackgroundScans()
+  await scanOnce()
   assert.equal(wakeCallCount, 1, 'wakeScannerAgent should have been attempted once')
   assert.equal(auditLogs.length, 0, 'audit log must NOT be written when wake was dropped')
 
   // Second pass with same messages: budget now permits (shouldDropWake = false).
   // Because fingerprint was NOT spent, the agent must be re-evaluated and woken!
   shouldDropWake = false
-  await runBackgroundScans()
+  await scanOnce()
   assert.equal(wakeCallCount, 2, 'scanner must retry dropped activity on next pass')
   assert.equal(auditLogs.length, 1, 'audit log is recorded on successful wake')
 
   // Third pass with same messages: already scanned and wake succeeded.
   // Now fingerprint IS spent, so it should be skipped.
-  await runBackgroundScans()
+  await scanOnce()
   assert.equal(wakeCallCount, 2, 'scanner must not wake again once fingerprint was successfully spent')
 })

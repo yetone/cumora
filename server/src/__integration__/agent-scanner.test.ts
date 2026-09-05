@@ -11,6 +11,7 @@ import { randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
 import { ensureSchemaOnce, resetAllTables, teardownAll } from './_helpers.js'
 import {
+  __scannerCacheInternals,
   __setBackgroundScannerWakeForTesting,
   _resetBackgroundScannerForTests,
   runBackgroundScans,
@@ -23,11 +24,11 @@ before(async () => {
 
 beforeEach(async () => {
   await resetAllTables()
-  _resetBackgroundScannerForTests()
+  await _resetBackgroundScannerForTests()
 })
 
 after(async () => {
-  _resetBackgroundScannerForTests()
+  await _resetBackgroundScannerForTests()
   await teardownAll()
 })
 
@@ -153,4 +154,49 @@ test('[integration] background scanner does not spend fingerprint or write audit
   // Third pass: should be deduplicated now
   await runBackgroundScans()
   assert.equal(attempts, 2, 'scanner must not wake again after successful scan')
+})
+
+test('[integration] only one replica scans per tick', async () => {
+  await seedCompanyWithScannerAgent()
+  let attempts = 0
+  __setBackgroundScannerWakeForTesting(async () => {
+    attempts++
+    // Hold the pass open long enough that a concurrent caller is guaranteed to
+    // reach the lock while this one still owns it.
+    await new Promise((resolve) => setTimeout(resolve, 120))
+    return true
+  })
+
+  // Two passes in flight at once is exactly what N replicas do every 90s.
+  await Promise.all([runBackgroundScans(), runBackgroundScans()])
+  assert.equal(attempts, 1,
+    'the replica that loses the advisory lock must do nothing, not repeat the pass')
+
+  // And the lock is released, not leaked — a later tick still works. It finds
+  // the Redis claim from the first pass and skips, which is the correct
+  // outcome and proves the lock did not wedge.
+  await runBackgroundScans()
+  assert.equal(attempts, 1)
+})
+
+test('[integration] a fresh process does not re-wake activity another replica already claimed', async () => {
+  const { agentId } = await seedCompanyWithScannerAgent()
+  let attempts = 0
+  __setBackgroundScannerWakeForTesting(async () => { attempts++; return true })
+
+  await runBackgroundScans()
+  assert.equal(attempts, 1)
+
+  // Simulate the lock moving to a replica that has never seen this activity:
+  // same database, same Redis, empty in-process cache. Before the claim
+  // existed, this re-woke the agent on every restart and on every leader move.
+  __scannerCacheInternals.clear()
+  await runBackgroundScans()
+  assert.equal(attempts, 1, 'the Redis claim must survive an empty local cache')
+
+  const { rows } = await pool.query(
+    `SELECT 1 FROM agent_log WHERE agent_id = $1 AND body LIKE 'background scan wake queued%'`,
+    [agentId],
+  )
+  assert.equal(rows.length, 1, 'exactly one audit row, not one per replica')
 })

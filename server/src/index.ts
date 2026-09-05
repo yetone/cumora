@@ -255,8 +255,10 @@ async function main() {
 
   // Start generic background scans for agents that explicitly have
   // the background.scan capability.
-  // In a multi-instance deploy you'd elect a leader (or use a job queue) so
-  // only one instance runs the scan; for single-instance dev this is fine.
+  // Safe across replicas: each tick takes an advisory lock, so exactly one
+  // instance runs the pass, and wakes are claimed in Redis with a 24h TTL so
+  // the lock moving elsewhere doesn't re-wake agents for activity already
+  // scanned. See agents/scanner.ts.
   if (process.env.ENABLE_SCANNER !== 'false') {
     const handle = startScanner(env.SCANNER_INTERVAL_MS)
     console.log(`[boot] background scanner running every ${env.SCANNER_INTERVAL_MS}ms`)

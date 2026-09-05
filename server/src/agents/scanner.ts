@@ -1,5 +1,6 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { pool } from '../db/pool.js'
+import { redis } from '../redis.js'
 import { wakeAgent } from './scheduler.js'
 import type { AgentTurnOptions } from './turn.js'
 
@@ -19,7 +20,100 @@ interface BackgroundScanAgent {
   company_id: string
 }
 
-const PRECEDENT_SCANS = new Set<string>()
+/**
+ * Only one replica scans per tick.
+ *
+ * Every replica used to run the full pass every 90s: the agent roster query,
+ * an unread probe and a recent-activity query per agent, plus a roster load
+ * for each one that qualified — all of it duplicated R times for a result only
+ * one of them needed to produce. The dedup set below is per-process, so it
+ * could not stop the duplicate LLM wakes either.
+ *
+ * `pg_try_advisory_lock` is the same shape `llm-rollup.ts` uses for the same
+ * reason: no lease table, no leader election protocol, and a replica that dies
+ * mid-pass releases the lock with its session rather than blocking the next
+ * tick. Distinct from migrate's SCHEMA_LOCK_KEY (7_643_178_926_104n) and the
+ * rollup's ROLLUP_LOCK_KEY (7_643_178_926_211n).
+ */
+const SCANNER_LOCK_KEY = 7_643_178_926_318n
+
+const SCANNER_MIN_MESSAGES = 8
+const SCANNER_WINDOW_HOURS = 24
+
+/**
+ * Cross-replica dedup claim TTL. Matched to SCANNER_WINDOW_HOURS: a
+ * fingerprint names a specific set of recent messages, and once those age out
+ * of the window they can never be re-proposed, so the claim has nothing left
+ * to protect.
+ */
+const SCAN_CLAIM_TTL_SECONDS = SCANNER_WINDOW_HOURS * 3600
+
+/**
+ * Local accelerator only — Redis holds the truth.
+ *
+ * This was an unbounded `Set` of raw fingerprints, and a fingerprint carries up
+ * to 80 message ids (~3KB). At roughly 960 eligible passes per agent per day
+ * with nothing ever evicted, it grew for the lifetime of the process. Now it
+ * stores 64-char digests under a fixed cap, so the memory ceiling is ~32KB
+ * regardless of tenant count or uptime.
+ */
+const PRECEDENT_SCAN_CACHE_LIMIT = 512
+const PRECEDENT_SCANS = new Map<string, true>()
+
+/** Fingerprints are up to ~3KB of message ids; the digest is what we keep and
+ *  what becomes the Redis key, so neither store scales with activity volume. */
+function scanDigest(fingerprint: string): string {
+  return createHash('sha256').update(fingerprint).digest('hex')
+}
+
+function precedentHas(digest: string): boolean {
+  if (!PRECEDENT_SCANS.has(digest)) return false
+  // Touch: Map preserves insertion order, so re-inserting moves this entry to
+  // the young end and the eviction below stays true LRU rather than FIFO.
+  PRECEDENT_SCANS.delete(digest)
+  PRECEDENT_SCANS.set(digest, true)
+  return true
+}
+
+function precedentRemember(digest: string): void {
+  PRECEDENT_SCANS.delete(digest)
+  PRECEDENT_SCANS.set(digest, true)
+  while (PRECEDENT_SCANS.size > PRECEDENT_SCAN_CACHE_LIMIT) {
+    const oldest = PRECEDENT_SCANS.keys().next()
+    if (oldest.done) break
+    PRECEDENT_SCANS.delete(oldest.value)
+  }
+}
+
+/**
+ * Has any replica already woken an agent for this exact activity?
+ *
+ * Fails OPEN: a Redis outage degrades dedup to the local cache, which the
+ * leader lock keeps meaningful — one scanner at a time means the worst case is
+ * a repeat after the lock moves to a different replica, not R simultaneous
+ * wakes. Refusing to scan instead would silently disable the feature for the
+ * duration of the outage.
+ */
+async function scanAlreadyClaimed(digest: string): Promise<boolean> {
+  try {
+    return (await redis.exists(`cumora:scan:${digest}`)) === 1
+  } catch (e) {
+    console.warn('[scanner] claim lookup failed — falling back to local cache',
+      e instanceof Error ? e.message : e)
+    return false
+  }
+}
+
+/** Recorded only after a wake is accepted, mirroring how the local cache and
+ *  the audit row are spent — a dropped wake must stay retryable. */
+async function claimScan(digest: string): Promise<void> {
+  try {
+    await redis.set(`cumora:scan:${digest}`, '1', 'EX', SCAN_CLAIM_TTL_SECONDS)
+  } catch (e) {
+    console.warn('[scanner] claim write failed — other replicas may repeat this scan',
+      e instanceof Error ? e.message : e)
+  }
+}
 
 type WakeScannerAgentFn = typeof wakeAgent
 
@@ -29,14 +123,29 @@ let scannerRunning = false
 export function __setBackgroundScannerWakeForTesting(fn: WakeScannerAgentFn | null): void {
   wakeScannerAgent = fn ?? wakeAgent
 }
-const SCANNER_MIN_MESSAGES = 8
-const SCANNER_WINDOW_HOURS = 24
 const BACKGROUND_SCAN_CAPABILITIES = ['background.scan']
 
-export function _resetBackgroundScannerForTests(): void {
+/** Async because the cross-replica claims outlive the process: a leftover
+ *  24h key from a previous run would otherwise make the next run's first pass
+ *  silently skip the agent it is trying to assert on. */
+export async function _resetBackgroundScannerForTests(): Promise<void> {
   PRECEDENT_SCANS.clear()
   wakeScannerAgent = wakeAgent
   scannerRunning = false
+  try {
+    const stale = await redis.keys('cumora:scan:*')
+    if (stale.length > 0) await redis.del(...stale)
+  } catch { /* no Redis in this test env — the local cache clear is enough */ }
+}
+
+/** Exported so a test can drive the eviction boundary without 512 real scans. */
+export const __scannerCacheInternals = {
+  limit: PRECEDENT_SCAN_CACHE_LIMIT,
+  digest: scanDigest,
+  has: precedentHas,
+  remember: precedentRemember,
+  clear: (): void => PRECEDENT_SCANS.clear(),
+  size: (): number => PRECEDENT_SCANS.size,
 }
 
 async function loadBackgroundScanAgents(): Promise<BackgroundScanAgent[]> {
@@ -180,7 +289,11 @@ async function recordScanWake(agent: BackgroundScanAgent, fingerprint: string): 
   )
 }
 
-export async function runBackgroundScans(): Promise<void> {
+/**
+ * One scanning pass. Assumes the caller holds the leader lock — call
+ * `runBackgroundScans()` unless you are a test driving the pass directly.
+ */
+export async function scanOnce(): Promise<void> {
   const agents = await loadBackgroundScanAgents()
   const inFlight = new Set<string>()
   for (const agent of agents) {
@@ -191,8 +304,16 @@ export async function runBackgroundScans(): Promise<void> {
       if (recent.length < SCANNER_MIN_MESSAGES) continue
 
       const fingerprint = `${agent.company_id}|${agent.id}|${recent.map((r) => r.message_id).sort().join('|')}`
-      if (PRECEDENT_SCANS.has(fingerprint) || inFlight.has(fingerprint)) continue
-      inFlight.add(fingerprint)
+      const digest = scanDigest(fingerprint)
+      if (precedentHas(digest) || inFlight.has(digest)) continue
+      // The local cache is empty on every fresh process, so without this a
+      // restart — or the lock simply moving to another replica — re-woke every
+      // agent for activity that had already been scanned.
+      if (await scanAlreadyClaimed(digest)) {
+        precedentRemember(digest)
+        continue
+      }
+      inFlight.add(digest)
 
       try {
         const roster = await loadRoster(agent.company_id)
@@ -210,14 +331,38 @@ export async function runBackgroundScans(): Promise<void> {
           // so the next pass can re-evaluate as intended.
           continue
         }
-        PRECEDENT_SCANS.add(fingerprint)
+        precedentRemember(digest)
+        await claimScan(digest)
         await recordScanWake(agent, fingerprint)
       } finally {
-        inFlight.delete(fingerprint)
+        inFlight.delete(digest)
       }
     } catch (e) {
       console.warn(`[scanner] background scan failed for ${agent.id}`, e)
     }
+  }
+}
+
+/**
+ * Claim the scanner role for this tick, then scan. A replica that loses the
+ * race does nothing — the work is not sharded, so a second pass would only
+ * repeat queries the holder is already running.
+ */
+export async function runBackgroundScans(): Promise<void> {
+  const client = await pool.connect()
+  try {
+    const lock = await client.query<{ ok: boolean }>(
+      'SELECT pg_try_advisory_lock($1) AS ok', [SCANNER_LOCK_KEY],
+    )
+    if (lock.rows[0]?.ok !== true) return
+    try {
+      await scanOnce()
+    } finally {
+      await client.query('SELECT pg_advisory_unlock($1)', [SCANNER_LOCK_KEY])
+        .catch(() => { /* session teardown releases it anyway */ })
+    }
+  } finally {
+    client.release()
   }
 }
 
