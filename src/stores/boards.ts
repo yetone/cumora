@@ -186,12 +186,17 @@ export const useBoards = create<BoardsState>((set, get) => ({
 
   createBoard: async (title, description) => {
     const retry = pendingCreateRequestId('board', { title, description: description ?? null })
-    const r = await api.createBoard({ title, description, requestId: retry.requestId })
-    retry.complete()
-    await get().loadList()
-    set({ selectedId: r.id })
-    await get().loadBoard(r.id)
-    return r.id
+    try {
+      const r = await api.createBoard({ title, description, requestId: retry.requestId })
+      retry.complete()
+      await get().loadList()
+      set({ selectedId: r.id })
+      await get().loadBoard(r.id)
+      return r.id
+    } catch (err) {
+      retry.fail(err)
+      throw err
+    }
   },
 
   renameBoard: async (id, title) => {
