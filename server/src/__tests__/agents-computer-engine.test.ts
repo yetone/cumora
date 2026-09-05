@@ -10,6 +10,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
+import { CLAUDE_CORE_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
@@ -21,8 +22,18 @@ const tempDirs: string[] = []
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
 
 function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = { ...process.env }
+  // withClaudeUserSettingsEnv only imports a key from settings.json when the
+  // process environment does NOT already define it — an explicit value wins, by
+  // design. Spreading process.env therefore let the developer's own shell
+  // decide the outcome: anyone running Claude Code has ANTHROPIC_BASE_URL set,
+  // so the settings-import assertions below failed on their machine and nowhere
+  // else. Drop the bootstrap keys so these tests measure the import, not the
+  // shell. Sourced from the module under test so a fifth key cannot drift.
+  for (const key of CLAUDE_CORE_ENV_KEYS) delete base[key]
+  delete base.CLAUDE_CONFIG_DIR
   return {
-    ...process.env,
+    ...base,
     CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'),
     CUMORA_AGENT_MCP_SHIM: join(root, 'trusted', 'cumora-mcp'),
     ...overrides,
