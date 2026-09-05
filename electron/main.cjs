@@ -704,6 +704,14 @@ function getDockUnreadIcon() {
 
 function setDockUnreadDot(visible) {
   dockUnreadDotVisible = !!visible
+  // Mirror to the tray FIRST. The dock is macOS-only, but the tray is the
+  // Windows/Linux surface for this same state — and the darwin early-return
+  // below used to sit in front of this call, so on Win/Linux the tray image
+  // was set once when the tray was created and never again. The dot could not
+  // appear there at all: `dock:set-unread-dot` is the only path that carries a
+  // change, and it returned before reaching this line.
+  // Cheap to call when there is no tray (no-op).
+  setTrayUnreadDot(dockUnreadDotVisible)
   if (process.platform !== 'darwin' || !app.dock) return
   try {
     app.dock.setBadge('')
@@ -711,9 +719,6 @@ function setDockUnreadDot(visible) {
     if (!img.isEmpty()) app.dock.setIcon(img)
   } catch { /* swallow — Dock is macOS-only and not critical path */ }
   scheduleRegularDockRepair()
-  // Mirror to the system tray so menu bar / system tray surfaces stay
-  // in sync with the dock. Cheap to call when there's no tray (no-op).
-  setTrayUnreadDot(dockUnreadDotVisible)
 }
 
 /* ============================ System tray ============================
