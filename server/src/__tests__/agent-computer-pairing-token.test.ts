@@ -149,3 +149,29 @@ test('daemon run mode (supervised) is persisted on pair and heartbeat', async ()
   assert.equal(hb.params[1], '0.1.122')
   assert.equal(hb.params[2], false)
 })
+
+test('pairComputer accepts antigravity engine as primary and stores it in available_engines', async () => {
+  const calls = installPoolMock(({ sql }) => {
+    if (/SELECT pair_token FROM companies/.test(sql)) return { rows: [{ pair_token: 'company-token' }] }
+    if (/SELECT id, company_id/.test(sql)) return { rows: [] }
+    if (/SELECT id AS company_id, owner_user_id FROM companies/.test(sql)) {
+      return { rows: [{ company_id: 'co-1', owner_user_id: 'u-1' }] }
+    }
+    if (/SELECT id FROM computers/.test(sql)) return { rows: [{ id: 'comp-antigravity' }] }
+    if (/UPDATE computers\s+SET credential_hash/.test(sql)) return { rowCount: 1 }
+    throw new Error(`unexpected query: ${sql}`)
+  })
+
+  const paired = await registry.pairComputer({
+    code: 'company-token',
+    hostName: 'Dev Box',
+    engines: ['antigravity', 'claude'],
+    deferBroadcast: true,
+  })
+  assert.equal(paired?.computerId, 'comp-antigravity')
+
+  const update = calls.find((c) => /UPDATE computers\s+SET credential_hash/.test(c.sql))
+  assert.ok(update)
+  assert.equal(update.params[1], JSON.stringify(['antigravity', 'claude']))
+})
+

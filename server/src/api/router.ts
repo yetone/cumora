@@ -40,6 +40,7 @@ import {
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
   setComputerDefaultEngine,
+  PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
 import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
 import { companyTier } from '../tier.js'
@@ -1252,11 +1253,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // and any adopted agent are created with. Fall back to Claude if unreported.
   try {
     if ((await companyTier(paired.companyId)) === 'free') {
-      const engine = (
-        engines[0] === 'claude' || engines[0] === 'codex' || engines[0] === 'grok' ||
-        engines[0] === 'cursor' || engines[0] === 'opencode' || engines[0] === 'pi' ||
-        engines[0] === 'gemini' || engines[0] === 'qwen'
-      ) ? engines[0] : 'claude'
+      const engine: EngineId = PAIRABLE_ENGINES.has(engines[0]) ? (engines[0] as EngineId) : 'claude'
       // Adopt only agents that are stranded on the managed Cumora Cloud (or
       // unassigned) onto the just-paired machine — earlier builds' boot backfill
       // wrongly seeded free starters on cloud, where free can't run them. Agents

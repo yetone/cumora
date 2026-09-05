@@ -98,19 +98,29 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     source: 'presets',
   },
   qwen: {
-    models: [],
+    models: [
+      { id: 'qwen3-coder-plus', label: 'Qwen3 Coder Plus', recommendedFor: ['big'] },
+      { id: 'qwen3-coder-flash', label: 'Qwen3 Coder Flash', recommendedFor: ['small'] },
+      { id: 'qwen2.5-coder-32b-instruct', label: 'Qwen 2.5 Coder 32B Instruct' },
+    ],
     defaultModel: null,
-    defaultFastModel: null,
+    defaultFastModel: 'qwen3-coder-flash',
     supportsCustom: true,
-    fastModelScope: 'computer',
+    fastModelScope: 'agent',
     source: 'presets',
   },
   antigravity: {
-    models: [],
+    models: [
+      { id: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)', recommendedFor: ['small'] },
+      { id: 'gemini-3.7-flash-high', label: 'Gemini 3.7 Flash (High)', recommendedFor: ['small'] },
+      { id: 'gemini-3.1-pro-high', label: 'Gemini 3.1 Pro (High)', recommendedFor: ['big'] },
+      { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)', recommendedFor: ['big'] },
+      { id: 'claude-opus-4-6-thinking', label: 'Claude Opus 4.6 (Thinking)', recommendedFor: ['big'] },
+    ],
     defaultModel: null,
-    defaultFastModel: null,
+    defaultFastModel: 'gemini-3.8-flash-high',
     supportsCustom: true,
-    fastModelScope: 'computer',
+    fastModelScope: 'agent',
     source: 'presets',
   },
 }
@@ -206,14 +216,16 @@ function runText(command: string, args: string[]): Promise<string> {
   })
 }
 
-/** Parse model-list output shared by OpenCode, pi and Cursor. Exported so new
+/** Parse model-list output shared by OpenCode, pi, Cursor and Antigravity. Exported so new
  * adapters can add fixtures without spawning a real account-bound CLI. */
-export function parseListedModels(text: string, style: 'provider' | 'pi' | 'cursor'): EngineModelOption[] {
+export function parseListedModels(text: string, style: 'provider' | 'pi' | 'cursor' | 'antigravity'): EngineModelOption[] {
   const models: EngineModelOption[] = []
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').trim()
-    if (!line || /^(available\s+)?models?\b/i.test(line) || /^provider\s+model\b/i.test(line)) continue
+    if (!line || /^(available\s+)?models?\b/i.test(line) || /^provider\s+model\b/i.test(line) || /^fetching\b/i.test(line)) continue
     let id: string | null = null
+    let label: string | null = null
+    let recommendedFor: Array<'big' | 'small'> | undefined
     if (style === 'provider') {
       id = line.match(/(?:^|\s)([a-z0-9][\w.-]*\/[\w./:@+-]+)/i)?.[1] ?? null
     } else if (style === 'pi') {
@@ -224,12 +236,35 @@ export function parseListedModels(text: string, style: 'provider' | 'pi' | 'curs
           id = `${pair[0]}/${pair[1]}`
         }
       }
+    } else if (style === 'antigravity') {
+      const tabIdx = line.indexOf('\t')
+      const idPart = (tabIdx >= 0 ? line.slice(0, tabIdx) : line).trim()
+      const labelPart = (tabIdx >= 0 ? line.slice(tabIdx + 1) : idPart).trim()
+      const candidate = idPart.replace(/^[*✓>•-]+\s*/, '').match(/^([a-z0-9][\w./:@+-]*)/i)?.[1] ?? null
+      if (candidate) {
+        id = candidate
+        label = labelPart || candidate
+        const isSmall = /(?:^|[-_/])(?:flash|mini|haiku|lite)(?:[-_/]|$)/i.test(candidate)
+        const isBig = /(?:^|[-_/])(?:pro|opus|sonnet|120b)(?:[-_/]|$)/i.test(candidate)
+          || (!isSmall && /(?:^|[-_/])(?:thinking|plus|large)(?:[-_/]|$)/i.test(candidate))
+        const recs: Array<'big' | 'small'> = []
+        if (isBig) recs.push('big')
+        if (isSmall) recs.push('small')
+        if (recs.length) recommendedFor = recs
+      }
     } else {
       const candidate = line.replace(/^[*✓>•-]+\s*/, '').match(/^([a-z0-9][\w./:@+-]*)/i)?.[1] ?? null
       if (candidate && !/^(available|current|default|name|model)$/i.test(candidate)) id = candidate
     }
     const normalized = clean(id, 160)
-    if (normalized) models.push({ id: normalized, label: normalized })
+    if (normalized) {
+      models.push({
+        id: normalized,
+        label: clean(label, 160) ?? normalized,
+        description: null,
+        recommendedFor,
+      })
+    }
   }
   return mergeModels(models, [])
 }
@@ -359,6 +394,9 @@ export async function discoverEngineModelCatalog(
     if (models.length) catalog = withPreset(id, models, 'cli', null)
   } else if (id === 'pi') {
     const models = parseListedModels(await runText(binPath, ['--list-models']), 'pi')
+    if (models.length) catalog = withPreset(id, models, 'cli', null)
+  } else if (id === 'antigravity') {
+    const models = parseListedModels(await runText(binPath, ['models']), 'antigravity')
     if (models.length) catalog = withPreset(id, models, 'cli', null)
   }
 

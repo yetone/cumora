@@ -2201,7 +2201,7 @@ class AgentRunner {
     if (this.adapter.id === 'qwen') return 'qwen3-coder-flash'
     if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
     if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
-    if (this.adapter.id === 'antigravity') return this.agent.model ?? '<antigravity-default>'
+    if (this.adapter.id === 'antigravity') return this.agent.model ?? 'gemini-3.8-flash-high'
     if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }
