@@ -30,7 +30,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
-import { withClaudeUserSettingsEnv } from './claude-user-settings.js'
+import { isCustomAnthropicEndpoint, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersion } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 
@@ -1419,13 +1419,16 @@ function claudeCoreEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 /** Pick the small brain inside the local provider namespace. An explicit
  * per-agent/computer pin wins; next use the provider's configured fast model.
  * If a custom endpoint names no fast model, omit --model and let that endpoint
- * choose instead of injecting Anthropic's `haiku` alias. */
+ * choose instead of injecting Anthropic's `haiku` alias. Anthropic's OWN base
+ * URL is not a custom endpoint — Claude Code exports it into every child
+ * process, so keying on "the variable is set" dropped Haiku for first-party
+ * accounts. */
 function claudeFastModelArgs(env: NodeJS.ProcessEnv, requested?: string | null): string[] {
   const model = requested?.trim()
     || env.CUMORA_TRIAGE_MODEL?.trim()
     || env.ANTHROPIC_SMALL_FAST_MODEL?.trim()
   if (model) return ['--model', model]
-  return env.ANTHROPIC_BASE_URL?.trim() ? [] : ['--model', 'haiku']
+  return isCustomAnthropicEndpoint(env.ANTHROPIC_BASE_URL) ? [] : ['--model', 'haiku']
 }
 
 function claudeTurnEnv(env: NodeJS.ProcessEnv, fastModel?: string | null): NodeJS.ProcessEnv {

@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import type { EngineId } from './engine.js'
-import { readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
+import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { versionCommandInvocation } from './cli-version.js'
 
 export type ModelCatalogSource = 'protocol' | 'cli' | 'presets'
@@ -331,7 +331,7 @@ export async function discoverEngineModelCatalog(
     const settings = readClaudeUserSettings(env)
     const coreEnv = withClaudeUserSettingsEnv(env)
     const defaultFastModel = clean(coreEnv.ANTHROPIC_SMALL_FAST_MODEL, 160)
-    const prefersLocalDefault = !!clean(coreEnv.ANTHROPIC_BASE_URL, 4096)
+    const prefersLocalDefault = isCustomAnthropicEndpoint(clean(coreEnv.ANTHROPIC_BASE_URL, 4096))
     const configured = [settings.defaultModel, defaultFastModel]
       .filter((model): model is string => !!model)
       .map((model) => ({ id: model, label: model }))

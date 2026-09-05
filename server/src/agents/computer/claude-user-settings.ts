@@ -22,6 +22,31 @@ export const CLAUDE_CORE_ENV_KEYS = [
   'ANTHROPIC_SMALL_FAST_MODEL',
 ] as const
 
+/** Anthropic's own API origins. A base URL naming one of these is not a custom
+ *  provider — it is the default, written out.
+ *
+ *  This matters because Claude Code exports ANTHROPIC_BASE_URL into every
+ *  process it spawns, pointing at Anthropic's own endpoint. Treating "the
+ *  variable is set" as "a custom provider owns the model namespace" therefore
+ *  fires for an ordinary first-party account whenever the daemon is started
+ *  from a Claude Code session, or from any shell that exports it. */
+const ANTHROPIC_FIRST_PARTY_HOSTS: ReadonlySet<string> = new Set(['api.anthropic.com'])
+
+/** Does this base URL point somewhere other than Anthropic itself?
+ *
+ *  Unset is not custom. An unparseable value IS treated as custom: we cannot
+ *  vouch for it as first-party, and the conservative answer is to stop claiming
+ *  Anthropic's model aliases exist behind it. */
+export function isCustomAnthropicEndpoint(baseUrl: string | null | undefined): boolean {
+  const raw = baseUrl?.trim()
+  if (!raw) return false
+  try {
+    return !ANTHROPIC_FIRST_PARTY_HOSTS.has(new URL(raw).hostname.toLowerCase())
+  } catch {
+    return true
+  }
+}
+
 type ClaudeCoreEnvKey = typeof CLAUDE_CORE_ENV_KEYS[number]
 
 export interface ClaudeUserSettings {
@@ -80,7 +105,7 @@ export function readClaudeUserSettings(env: NodeJS.ProcessEnv = process.env): Cl
       // A custom endpoint owns its model namespace. When no explicit Agent pin
       // exists, the server must not replace that namespace with its Anthropic
       // deployment default even if the local config omits a named model.
-      prefersLocalDefault: !!coreEnv.ANTHROPIC_BASE_URL,
+      prefersLocalDefault: isCustomAnthropicEndpoint(coreEnv.ANTHROPIC_BASE_URL),
     }
   } catch {
     return EMPTY_SETTINGS
