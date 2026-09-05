@@ -226,27 +226,27 @@ export default {
         body,
       })
     } catch (e) {
-      message.setReject('Upstream unreachable')
       console.error('[email-gate] POST failed:', e instanceof Error ? e.message : String(e))
-      return
+      // Transient network or connection error — throw to signal a temporary failure
+      // (SMTP 4xx tempfail) in Cloudflare Email Routing so the sending MTA retries delivery later.
+      throw new Error(`Upstream unreachable: ${e instanceof Error ? e.message : String(e)}`)
     }
     if (res.status === 404) {
-      // Server says no agent matches this recipient — bounce.
+      // Server says no agent matches this recipient — permanent rejection (SMTP 550 bounce).
       message.setReject('No such recipient')
       return
     }
+    if (res.status >= 500) {
+      // 5xx upstream failure (server restarting, deploy in progress, database blip).
+      // Cloudflare Email Routing signals a temporary SMTP failure (4xx tempfail) when the
+      // handler throws, allowing sending MTAs (Gmail, Outlook, etc.) to retry delivery later.
+      const errorText = await res.text().catch(() => '')
+      console.error(`[email-gate] upstream ${res.status}: ${errorText.slice(0, 400)}`)
+      throw new Error(`Upstream temporary failure (${res.status}): ${errorText.slice(0, 200)}`)
+    }
     if (!res.ok) {
-      // 4xx other than 404, or 5xx.
-      //
-      // KNOWN GAP: this *should* tempfail on 5xx so the sender's MTA retries,
-      // but setReject() is a PERMANENT rejection — a single upstream blip
-      // loses the mail for good. Cloudflare issues a temporary failure when
-      // the handler throws, so the fix is to throw here on 5xx and keep
-      // setReject for 4xx. Not changed yet because it flips real delivery
-      // behaviour and wants its own test + rollout.
-      //
-      // Reading the body keeps the response from leaking; ctx.waitUntil so
-      // we don't block the email return.
+      // 4xx other than 404 (e.g. 400 bad request, 401 unauthorized HMAC, 413 payload too large).
+      // Permanent client rejection — retrying will not change the outcome.
       ctx.waitUntil(res.text().then((t) => console.error(`[email-gate] upstream ${res.status}: ${t.slice(0, 400)}`)))
       message.setReject(`Upstream ${res.status}`)
       return
