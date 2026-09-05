@@ -57,13 +57,21 @@ test('an explicit me is honoured', () => {
 test('each, unknown modes, junk and empty all read as each', () => {
   for (const raw of [
     '{"responseMode": "each"}',
-    '{"responseMode": "one-of-us"}',   // step two, not wired — must not narrow yet
     '{"responseMode": "nonsense"}',
     'the model wrote prose instead',
     '',
   ]) {
     assert.equal(parseRoute(raw), 'each', `should not narrow on: ${JSON.stringify(raw)}`)
   }
+})
+
+test('one-of-us parses as itself but never narrows the ADDRESSED route', () => {
+  // Step two is wired now (#70): parseRoute recognizes it. The addressed
+  // router is still instructed to answer me|each only, and even if a rogue
+  // model answers one-of-us, recipientsForRoute treats it like each — full
+  // fan-out. The unaddressed election parses through parseUnaddressedRoute.
+  assert.equal(parseRoute('{"responseMode": "one-of-us"}'), 'one-of-us')
+  assert.deepEqual(recipientsForRoute('one-of-us', ['a', 'b'], ['a']), ['a', 'b'])
 })
 
 test('me is found inside a fenced or chatty completion', () => {

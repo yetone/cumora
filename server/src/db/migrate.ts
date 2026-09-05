@@ -25,6 +25,10 @@ import {
   AGENT_RUNTIME_ASSIGNMENT_SQL,
   agentRuntimeAssignmentChecksum,
 } from './migrations/0004-agent-runtime-assignment.js'
+import {
+  AGENT_ROUTING_CLAIMS_SQL,
+  agentRoutingClaimsChecksum,
+} from './migrations/0005-agent-routing-claims.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2363,6 +2367,10 @@ async function applyAgentRuntimeAssignment(client: import('pg').PoolClient): Pro
   await client.query(AGENT_RUNTIME_ASSIGNMENT_SQL)
 }
 
+async function applyAgentRoutingClaims(client: import('pg').PoolClient): Promise<void> {
+  await client.query(AGENT_ROUTING_CLAIMS_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2383,6 +2391,11 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     ...SCHEMA_MIGRATIONS[3],
     sourceChecksum: agentRuntimeAssignmentChecksum(),
     up: applyAgentRuntimeAssignment,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[4],
+    sourceChecksum: agentRoutingClaimsChecksum(),
+    up: applyAgentRoutingClaims,
   },
 ]
 
