@@ -21,9 +21,12 @@ interface BackgroundScanAgent {
 
 const PRECEDENT_SCANS = new Set<string>()
 
-let wakeScannerAgent: typeof wakeAgent = wakeAgent
+type WakeScannerAgentFn = typeof wakeAgent
 
-export function __setBackgroundScannerWakeForTesting(fn: typeof wakeAgent | null): void {
+let wakeScannerAgent: WakeScannerAgentFn = wakeAgent
+let scannerRunning = false
+
+export function __setBackgroundScannerWakeForTesting(fn: WakeScannerAgentFn | null): void {
   wakeScannerAgent = fn ?? wakeAgent
 }
 const SCANNER_MIN_MESSAGES = 8
@@ -33,6 +36,7 @@ const BACKGROUND_SCAN_CAPABILITIES = ['background.scan']
 export function _resetBackgroundScannerForTests(): void {
   PRECEDENT_SCANS.clear()
   wakeScannerAgent = wakeAgent
+  scannerRunning = false
 }
 
 async function loadBackgroundScanAgents(): Promise<BackgroundScanAgent[]> {
@@ -178,6 +182,7 @@ async function recordScanWake(agent: BackgroundScanAgent, fingerprint: string): 
 
 export async function runBackgroundScans(): Promise<void> {
   const agents = await loadBackgroundScanAgents()
+  const inFlight = new Set<string>()
   for (const agent of agents) {
     try {
       if (await agentHasUnreadInbox(agent.id)) continue
@@ -186,20 +191,30 @@ export async function runBackgroundScans(): Promise<void> {
       if (recent.length < SCANNER_MIN_MESSAGES) continue
 
       const fingerprint = `${agent.company_id}|${agent.id}|${recent.map((r) => r.message_id).sort().join('|')}`
-      if (PRECEDENT_SCANS.has(fingerprint)) continue
-      PRECEDENT_SCANS.add(fingerprint)
+      if (PRECEDENT_SCANS.has(fingerprint) || inFlight.has(fingerprint)) continue
+      inFlight.add(fingerprint)
 
-      const roster = await loadRoster(agent.company_id)
-      const brief = buildBackgroundScanBrief({ agent, roster, recent })
-      await recordScanWake(agent, fingerprint)
-      const backgroundBrief: NonNullable<AgentTurnOptions['backgroundBrief']> = {
-        source: 'background_scanner',
-        title: 'Recent company activity scan',
-        body: brief,
+      try {
+        const roster = await loadRoster(agent.company_id)
+        const brief = buildBackgroundScanBrief({ agent, roster, recent })
+        const backgroundBrief: NonNullable<AgentTurnOptions['backgroundBrief']> = {
+          source: 'background_scanner',
+          title: 'Recent company activity scan',
+          body: brief,
+        }
+        const woken = await wakeScannerAgent(agent.id, 'background_scan', null, null, {
+          backgroundBrief,
+        })
+        if (woken === false) {
+          // Budget exceeded or wake dropped — do not record or spend the fingerprint,
+          // so the next pass can re-evaluate as intended.
+          continue
+        }
+        PRECEDENT_SCANS.add(fingerprint)
+        await recordScanWake(agent, fingerprint)
+      } finally {
+        inFlight.delete(fingerprint)
       }
-      await wakeScannerAgent(agent.id, 'background_scan', null, null, {
-        backgroundBrief,
-      })
     } catch (e) {
       console.warn(`[scanner] background scan failed for ${agent.id}`, e)
     }
@@ -209,6 +224,15 @@ export async function runBackgroundScans(): Promise<void> {
 /** Periodic kick — call from server boot. */
 export function startScanner(intervalMs: number): NodeJS.Timeout {
   return setInterval(() => {
-    runBackgroundScans().catch((e) => console.error('[scanner]', e))
+    if (scannerRunning) {
+      console.warn('[scanner] previous background scan pass still running — skipping tick')
+      return
+    }
+    scannerRunning = true
+    runBackgroundScans()
+      .catch((e) => console.error('[scanner]', e))
+      .finally(() => {
+        scannerRunning = false
+      })
   }, intervalMs)
 }

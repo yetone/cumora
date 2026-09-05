@@ -213,7 +213,7 @@ export async function wakeAgent(
   conversationId: string | null = null,
   steerPayload: SteerWakePayload | null = null,
   options: WakeOptions = {},
-): Promise<void> {
+): Promise<boolean> {
   return wakeOne(agentId, reason, conversationId, steerPayload, options)
 }
 
@@ -334,12 +334,12 @@ async function wakeOne(
   steerPayload: SteerWakePayload | null = null,
   options: WakeOptions = {},
   retryAttempt: number = 0,
-): Promise<void> {
+): Promise<boolean> {
   // Synthetic wakes can be dropped under load — the next idle tick
   // or next scanner pass will re-evaluate. Real wakes never are.
   if ((reason === 'idle' || reason === 'background_scan') && !_consumeLowPriorityWakeBudget()) {
     console.warn(`[scheduler] ${agentId} ${reason} wake dropped: budget ${LOW_PRIORITY_WAKE_BUDGET_PER_MIN}/min exceeded`)
-    return
+    return false
   }
 
   // Execution placement is an authorization decision, not a nullable hint.
@@ -383,13 +383,13 @@ async function wakeOne(
   let host: ResolvedAgentHost | null = null
   if (options.placementTriage) {
     host = await resolveHostForWake()
-    if (!host) return
+    if (!host) return false
     // BYOA daemons triage locally. Managed Agents are gated before a live-pod
     // wake or a new Pod; the flag is serialized into retries so recovery cannot
     // bypass the same placement + triage contract.
     if (!isByoaKind(host.kind) && reason === 'message.new' && !options.triageNote) {
       const verdict = await triageWakeRecipient(agentId, options.triageTarget ?? null)
-      if (!verdict) return
+      if (!verdict) return false
       options = { ...options, ...verdict }
     }
   }
@@ -462,11 +462,11 @@ async function wakeOne(
     }
   }
 
-  if (delivered > 0) return
+  if (delivered > 0) return true
 
   if (!host) {
     host = await resolveHostForWake()
-    if (!host) return
+    if (!host) return false
   }
 
   // BYOA agents run on a user-paired Computer (the `cumora agent computer`
@@ -477,7 +477,7 @@ async function wakeOne(
   // Skip the pod path entirely; do NOT ensurePod / wake-retry kubectl.
   if (isByoaKind(host.kind)) {
     console.log(`[scheduler] ${agentId} is BYOA (${host.kind}); daemon offline — wake deferred to reconnect`)
-    return
+    return true
   }
 
   // Free tier is BYOA-only: it must NEVER spin a managed Cumora Cloud pod. A free
@@ -490,7 +490,7 @@ async function wakeOne(
   // up separately. The wake stays durable in the inbox for whenever they pair.
   if (host.tier === 'free') {
     console.log(`[scheduler] ${agentId} is free-tier (BYOA-only); no managed pod — wake deferred until paired`)
-    return
+    return true
   }
 
   // Paid (pro/max) managed agent — spin up a Pod. The Pod will catch up on first
@@ -519,7 +519,7 @@ async function wakeOne(
       r.reason,
       r.code === 'placement_lookup_failed' ? 'host_resolution' : 'ensure_pod',
     )
-    return
+    return false
   } else if (r.reason === 'already pending' || r.reason === 'already running') {
     await scheduleWakeRetry(agentId, reason, conversationId, steerPayload, options, retryAttempt + 1, r.reason)
   }
@@ -533,10 +533,12 @@ async function wakeOne(
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 500))
       const replayed = await deliverWake(agentId, wakePayload).catch(() => 0)
-      if (replayed > 0) return
+      if (replayed > 0) return true
     }
     console.warn(`[scheduler] ${agentId} synthetic wake (${reason}) was not delivered after pod start`)
+    return false
   }
+  return true
 }
 
 /** Multi-instance dedup: every cumora-server replica subscribes to

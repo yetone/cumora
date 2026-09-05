@@ -30,7 +30,7 @@ import {
 // integration tests use them to capture wake calls without actually
 // spinning up a pod, and to make the agenda classifier deterministic
 // without burning real LLM credits.
-type WakeFn = typeof wakeAgent
+type WakeFn = (...args: Parameters<typeof wakeAgent>) => Promise<unknown>
 let wakeIdleAgent: WakeFn = wakeAgent
 export function __setIdleWakeForTesting(fn: WakeFn | null): void {
   wakeIdleAgent = fn ?? wakeAgent

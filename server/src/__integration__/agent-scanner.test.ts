@@ -89,6 +89,7 @@ test('[integration] background scanner wakes a capability-bearing agent through 
   }> = []
   __setBackgroundScannerWakeForTesting(async (wokenAgentId, reason, wokenConversationId, _steer, options) => {
     wakes.push({ agentId: wokenAgentId, reason, conversationId: wokenConversationId ?? null, options })
+    return true
   })
 
   await runBackgroundScans()
@@ -116,4 +117,40 @@ test('[integration] background scanner wakes a capability-bearing agent through 
     [conversationId],
   )
   assert.equal(pulledGroups, 0, 'scanner itself must not create groups; only the agent may do that with tools')
+})
+
+test('[integration] background scanner does not spend fingerprint or write audit log when wake drops', async () => {
+  const { agentId } = await seedCompanyWithScannerAgent()
+  let shouldDrop = true
+  let attempts = 0
+  __setBackgroundScannerWakeForTesting(async () => {
+    attempts++
+    if (shouldDrop) return false
+    return true
+  })
+
+  // First pass: dropped by budget
+  await runBackgroundScans()
+  assert.equal(attempts, 1)
+
+  const { rows: logsFirst } = await pool.query(
+    `SELECT 1 FROM agent_log WHERE agent_id = $1 AND body LIKE 'background scan wake queued%'`,
+    [agentId],
+  )
+  assert.equal(logsFirst.length, 0, 'no audit log should be written when wake was dropped')
+
+  // Second pass: budget allows
+  shouldDrop = false
+  await runBackgroundScans()
+  assert.equal(attempts, 2, 'scanner must retry on the next pass because fingerprint was not spent')
+
+  const { rows: logsSecond } = await pool.query(
+    `SELECT 1 FROM agent_log WHERE agent_id = $1 AND body LIKE 'background scan wake queued%'`,
+    [agentId],
+  )
+  assert.equal(logsSecond.length, 1, 'audit log should be written once wake succeeds')
+
+  // Third pass: should be deduplicated now
+  await runBackgroundScans()
+  assert.equal(attempts, 2, 'scanner must not wake again after successful scan')
 })
