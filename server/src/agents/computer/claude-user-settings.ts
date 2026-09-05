@@ -1,10 +1,9 @@
 /**
  * Claude Code's `--restricted` mode intentionally ignores user settings. That
  * is the right boundary for tools, hooks and MCP servers, but custom providers
- * commonly keep the small provider/bootstrap surface the Claude core needs in
- * ~/.claude/settings.json. Import only that narrow bootstrap surface into the
- * engine process environment; the adapter's restricted settings separately
- * deny every imported value to model-spawned subprocesses.
+ * keep provider bootstrap and model preferences in ~/.claude/settings.json.
+ * Import only validated, non-executable fields. Environment values enter the
+ * trusted core; the adapter denies those names to model-spawned subprocesses.
  */
 import { readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -20,7 +19,63 @@ export const CLAUDE_CORE_ENV_KEYS = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'ANTHROPIC_SMALL_FAST_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 ] as const
+
+/** Turn preferences must not raise the budget of triage or doctor calls. */
+export const CLAUDE_TURN_ENV_KEYS = [
+  'CLAUDE_CODE_EFFORT_LEVEL',
+  'MAX_THINKING_TOKENS',
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+  'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING',
+  'CLAUDE_CODE_DISABLE_THINKING',
+] as const
+
+type SavedEffort = 'low' | 'medium' | 'high' | 'xhigh'
+export interface ClaudeTurnSettings {
+  effortLevel?: SavedEffort
+  modelSettings?: Record<string, { effortLevel: SavedEffort }>
+  alwaysThinkingEnabled?: boolean
+  language?: string
+}
+
+function savedEffort(value: unknown): value is SavedEffort {
+  return typeof value === 'string' && ['low', 'medium', 'high', 'xhigh'].includes(value)
+}
+
+function turnSettings(record: Record<string, unknown>): ClaudeTurnSettings {
+  const result: ClaudeTurnSettings = {}
+  if (savedEffort(record.effortLevel)) result.effortLevel = record.effortLevel
+  if (typeof record.alwaysThinkingEnabled === 'boolean') result.alwaysThinkingEnabled = record.alwaysThinkingEnabled
+  const language = cleanString(record.language, 160)
+  if (language) result.language = language
+  if (record.modelSettings && typeof record.modelSettings === 'object' && !Array.isArray(record.modelSettings)) {
+    const entries = Object.entries(record.modelSettings).slice(0, 128).flatMap(([model, value]) => {
+      if (!model || model.length > 160 || /[\u0000-\u001f\u007f]/.test(model)
+        || !value || typeof value !== 'object' || Array.isArray(value)) return []
+      const effort = (value as Record<string, unknown>).effortLevel
+      return savedEffort(effort) ? [[model, { effortLevel: effort }] as const] : []
+    })
+    if (entries.length) result.modelSettings = Object.fromEntries(entries)
+  }
+  return result
+}
+
+function turnEnv(rawEnv: Record<string, unknown>): NodeJS.ProcessEnv {
+  const result: NodeJS.ProcessEnv = {}
+  for (const key of CLAUDE_TURN_ENV_KEYS) {
+    const value = rawEnv[key]
+    if (typeof value !== 'string') continue
+    if (key === 'CLAUDE_CODE_EFFORT_LEVEL') {
+      if (savedEffort(value) || value === 'max' || value === 'auto') result[key] = value
+    } else if (key === 'MAX_THINKING_TOKENS' || key === 'CLAUDE_CODE_MAX_OUTPUT_TOKENS') {
+      if (/^(0|[1-9]\d{0,8})$/.test(value) && (key === 'MAX_THINKING_TOKENS' || value !== '0')) result[key] = value
+    } else if (value === '0' || value === '1') result[key] = value
+  }
+  return result
+}
 
 /** Anthropic's own API origins. A base URL naming one of these is not a custom
  *  provider — it is the default, written out.
@@ -51,6 +106,8 @@ type ClaudeCoreEnvKey = typeof CLAUDE_CORE_ENV_KEYS[number]
 
 export interface ClaudeUserSettings {
   coreEnv: Partial<Record<ClaudeCoreEnvKey, string>>
+  turnEnv: NodeJS.ProcessEnv
+  turnSettings: ClaudeTurnSettings
   defaultModel: string | null
   defaultFastModel: string | null
   prefersLocalDefault: boolean
@@ -58,6 +115,8 @@ export interface ClaudeUserSettings {
 
 const EMPTY_SETTINGS: ClaudeUserSettings = {
   coreEnv: {},
+  turnEnv: {},
+  turnSettings: {},
   defaultModel: null,
   defaultFastModel: null,
   prefersLocalDefault: false,
@@ -79,7 +138,7 @@ function settingsPath(env: NodeJS.ProcessEnv): string | null {
   return join(dir, 'settings.json')
 }
 
-/** Read only the non-executable provider bootstrap subset of Claude's user
+/** Read only non-executable provider bootstrap and turn preferences from user
  * settings. Malformed, oversized or absent settings fail soft so first-party
  * OAuth/keychain users retain Claude's native behaviour. */
 export function readClaudeUserSettings(env: NodeJS.ProcessEnv = process.env): ClaudeUserSettings {
@@ -100,8 +159,11 @@ export function readClaudeUserSettings(env: NodeJS.ProcessEnv = process.env): Cl
     }
     return {
       coreEnv,
+      turnEnv: turnEnv(rawEnv),
+      turnSettings: turnSettings(record),
       defaultModel: cleanString(record.model, 160),
-      defaultFastModel: cleanString(rawEnv.ANTHROPIC_SMALL_FAST_MODEL, 160),
+      defaultFastModel: cleanString(rawEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 160)
+        ?? cleanString(rawEnv.ANTHROPIC_SMALL_FAST_MODEL, 160),
       // A custom endpoint owns its model namespace. When no explicit Agent pin
       // exists, the server must not replace that namespace with its Anthropic
       // deployment default even if the local config omits a named model.

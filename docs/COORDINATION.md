@@ -71,6 +71,9 @@ the pin, every user's behavior drifts whenever Anthropic ships a model.
 Override per-agent by setting `participants.model` for a specific id. Secure
 Claude provider bootstrap and the reason credentials stay outside model tools
 are recorded in [ADR 0005](decisions/0005-secure-claude-provider-bootstrap.md).
+Agent turns now inherit validated Claude effort/thinking preferences instead
+of forcing thinking off. Triage retains its separate cheap-call policy; see
+[ADR 0007](decisions/0007-claude-turn-preferences.md) for precedence and scope.
 
 ### 2. Per-computer big-brain concurrency cap (daemon)
 `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` (default **6**; drop to 2-4 on very

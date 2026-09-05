@@ -330,7 +330,8 @@ export async function discoverEngineModelCatalog(
   if (id === 'claude') {
     const settings = readClaudeUserSettings(env)
     const coreEnv = withClaudeUserSettingsEnv(env)
-    const defaultFastModel = clean(coreEnv.ANTHROPIC_SMALL_FAST_MODEL, 160)
+    const defaultFastModel = clean(coreEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 160)
+      ?? clean(coreEnv.ANTHROPIC_SMALL_FAST_MODEL, 160)
     const prefersLocalDefault = isCustomAnthropicEndpoint(clean(coreEnv.ANTHROPIC_BASE_URL, 4096))
     const configured = [settings.defaultModel, defaultFastModel]
       .filter((model): model is string => !!model)

@@ -10,7 +10,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
-import { CLAUDE_CORE_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
+import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
@@ -31,7 +31,8 @@ function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJ
   // else. Drop the bootstrap keys so these tests measure the import, not the
   // shell. Sourced from the module under test so a fifth key cannot drift.
   for (const key of CLAUDE_CORE_ENV_KEYS) delete base[key]
-  delete base.CLAUDE_CONFIG_DIR
+  for (const key of CLAUDE_TURN_ENV_KEYS) delete base[key]
+  base.CLAUDE_CONFIG_DIR = join(root, 'missing-claude-config')
   return {
     ...base,
     CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'),
@@ -290,7 +291,8 @@ test('Claude secure triage stays inside the custom provider model namespace', { 
     env: {
       ANTHROPIC_AUTH_TOKEN: 'fixture-token',
       ANTHROPIC_BASE_URL: 'https://provider.example.test',
-      ANTHROPIC_SMALL_FAST_MODEL: 'provider/fast-model',
+      ANTHROPIC_SMALL_FAST_MODEL: 'provider/legacy-fast-model',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'provider/fast-model',
     },
   }), 'utf8')
   const env = secureClaudeEnv(root, {
@@ -318,6 +320,94 @@ test('Claude secure triage stays inside the custom provider model namespace', { 
   const unnamedArgv = JSON.parse(unnamed.text) as { argv: string[] }
   assert.equal(unnamedArgv.argv.includes('--model'), false)
   assert.equal(unnamedArgv.argv.includes('haiku'), false)
+})
+
+test('Claude turn preferences reach one-shot and persistent children without widening tools or triage', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-preferences-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const configDir = join(root, 'config')
+  const home = join(root, 'home')
+  await Promise.all([mkdir(binDir), mkdir(configDir), mkdir(home)])
+  await writeFakeCli(binDir, 'claude', `
+const argv = process.argv.slice(2)
+const capture = () => JSON.stringify({ argv, env: Object.fromEntries(
+  ${JSON.stringify([...CLAUDE_CORE_ENV_KEYS, ...CLAUDE_TURN_ENV_KEYS])}.filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]])
+) })
+if (argv.includes('--input-format')) {
+  require('node:readline').createInterface({ input: process.stdin }).on('line', () => {
+    process.stderr.write(capture() + '\\n')
+    process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK', session_id:'fixture'}) + '\\n')
+  })
+} else if (argv.includes('--output-format') && argv[argv.indexOf('--output-format') + 1] === 'json') {
+  process.stdout.write(JSON.stringify({result: capture()}))
+} else {
+  process.stderr.write(capture() + '\\n')
+  process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK'}) + '\\n')
+}
+`)
+  useFakeCliPath(binDir)
+  const preferences = {
+    effortLevel: 'xhigh', modelSettings: { 'claude-opus-5': { effortLevel: 'medium' } },
+    alwaysThinkingEnabled: true, language: 'Chinese',
+  }
+  for (const thinking of [undefined, false, true]) {
+    await writeFile(join(configDir, 'settings.json'), JSON.stringify({
+      ...preferences, alwaysThinkingEnabled: thinking,
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'untrusted-command' }] }] },
+      permissions: { allow: ['Bash'], defaultMode: 'bypassPermissions' },
+      sandbox: { enabled: false },
+      env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'provider/main', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'provider/small', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8192' },
+    }))
+    const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir })
+    for (const persistent of [false, true]) {
+      const logs: string[] = []
+      const args = { home, env, model: 'opus', fastModel: 'agent/small', onLog: (line: string) => logs.push(line) }
+      if (persistent) {
+        const session = getAdapter('claude').startSession?.(args)
+        assert.ok(session)
+        liveSessions.push(session)
+        assert.equal((await session.send('wake')).exitCode, 0)
+        await session.stop()
+      } else {
+        assert.equal((await getAdapter('claude').run({ ...args, prompt: 'wake', signal: new AbortController().signal })).exitCode, 0)
+      }
+      const captured = JSON.parse(logs[0]) as { argv: string[]; env: NodeJS.ProcessEnv }
+      const settings = JSON.parse(captured.argv[captured.argv.indexOf('--settings') + 1])
+      assert.equal(settings.effortLevel, 'xhigh')
+      assert.deepEqual(settings.modelSettings, preferences.modelSettings)
+      assert.equal(settings.alwaysThinkingEnabled, thinking)
+      assert.equal(settings.language, 'Chinese')
+      assert.equal(captured.env.MAX_THINKING_TOKENS, undefined)
+      assert.equal(captured.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'provider/main')
+      assert.equal(captured.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'agent/small')
+      assert.equal(captured.env.ANTHROPIC_SMALL_FAST_MODEL, 'agent/small')
+      assert.equal(captured.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '8192')
+      assert.equal(settings.hooks, undefined)
+      assert.equal(settings.sandbox.enabled, true)
+      assert.equal(settings.permissions.defaultMode, 'dontAsk')
+      assert.ok(settings.sandbox.credentials.envVars.some((x: {name: string; mode: string}) => x.name === 'CLAUDE_CODE_MAX_OUTPUT_TOKENS' && x.mode === 'deny'))
+      assert.doesNotMatch(JSON.stringify(captured.argv), /untrusted-command|provider\/main/)
+    }
+  }
+  await writeFile(join(configDir, 'settings.json'), JSON.stringify({
+    effortLevel: 'xhigh', alwaysThinkingEnabled: true,
+    env: { MAX_THINKING_TOKENS: '4096', CLAUDE_CODE_EFFORT_LEVEL: 'max', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8192' },
+  }))
+  const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir, MAX_THINKING_TOKENS: '0', CLAUDE_CODE_EFFORT_LEVEL: 'low' })
+  const logs: string[] = []
+  await getAdapter('claude').run({ home, env, prompt: 'wake', onLog: l => logs.push(l), signal: new AbortController().signal })
+  const captured = JSON.parse(logs[0])
+  assert.equal(captured.env.MAX_THINKING_TOKENS, '0')
+  assert.equal(captured.env.CLAUDE_CODE_EFFORT_LEVEL, 'low')
+  const triage = await getAdapter('claude').classify({
+    cwd: home, env: secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir }), prompt: 'classify', signal: new AbortController().signal,
+  })
+  const cheap = JSON.parse(triage.text)
+  assert.equal(cheap.env.MAX_THINKING_TOKENS, '0')
+  assert.equal(cheap.env.CLAUDE_CODE_EFFORT_LEVEL, undefined)
+  assert.equal(cheap.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, undefined)
+  assert.equal(cheap.argv.includes('--settings'), false)
 })
 
 test('persistent Claude startup failure keeps stderr for first send', async () => {

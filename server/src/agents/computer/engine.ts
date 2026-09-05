@@ -30,7 +30,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
-import { isCustomAnthropicEndpoint, withClaudeUserSettingsEnv } from './claude-user-settings.js'
+import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersion } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 
@@ -1355,6 +1355,7 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string
   pathDirs.push(dirname(process.execPath))
   const allowRead = [...new Set([agentHome, ...pathDirs])]
   return JSON.stringify({
+    ...readClaudeUserSettings(env).turnSettings,
     permissions: {
       defaultMode: 'dontAsk',
       // Restricted mode confines file tools to the working directory. Keep the
@@ -1426,6 +1427,7 @@ function claudeCoreEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 function claudeFastModelArgs(env: NodeJS.ProcessEnv, requested?: string | null): string[] {
   const model = requested?.trim()
     || env.CUMORA_TRIAGE_MODEL?.trim()
+    || env.ANTHROPIC_DEFAULT_HAIKU_MODEL?.trim()
     || env.ANTHROPIC_SMALL_FAST_MODEL?.trim()
   if (model) return ['--model', model]
   return isCustomAnthropicEndpoint(env.ANTHROPIC_BASE_URL) ? [] : ['--model', 'haiku']
@@ -1433,14 +1435,21 @@ function claudeFastModelArgs(env: NodeJS.ProcessEnv, requested?: string | null):
 
 function claudeTurnEnv(env: NodeJS.ProcessEnv, fastModel?: string | null): NodeJS.ProcessEnv {
   const core = claudeCoreEnv(env)
+  if (!allowUnsandboxedByoa(core)) {
+    for (const [key, value] of Object.entries(readClaudeUserSettings(env).turnEnv)) {
+      if (core[key] === undefined) core[key] = value
+    }
+  }
   const turnEnv: NodeJS.ProcessEnv = {
     ...core,
-    MAX_THINKING_TOKENS: core.MAX_THINKING_TOKENS ?? '0',
     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa(core)
       ? core.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
       : '1',
   }
-  if (fastModel) turnEnv.ANTHROPIC_SMALL_FAST_MODEL = fastModel
+  if (fastModel) {
+    turnEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = fastModel
+    turnEnv.ANTHROPIC_SMALL_FAST_MODEL = fastModel
+  }
   return turnEnv
 }
 
@@ -1593,11 +1602,8 @@ class ClaudeAdapter implements EngineAdapter {
         ? ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
         : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, env)]
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
-    // BYOA turns are short reactive cycles (read inbox, maybe reply). Extended
-    // thinking just adds latency + cost here, and in a group @all it makes the
-    // slowest agent finish last and bow out on the "don't duplicate" rule. Disable
-    // it by default (MAX_THINKING_TOKENS=0); a user can re-enable by exporting their
-    // own MAX_THINKING_TOKENS before launching the daemon.
+    // Agent turns can be substantial engineering/design work. Preserve the
+    // operator's reasoning preferences; only triage/doctor force thinking off.
     return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
   }
 

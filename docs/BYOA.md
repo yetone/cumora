@@ -274,8 +274,9 @@ fail-closed host boundary:
   environment variable not needed by the fixed Cumora MCP bridge. Because
   restricted mode ignores user settings, the daemon imports only
   `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and
-  `ANTHROPIC_SMALL_FAST_MODEL` from Claude's user settings into the trusted
-  Claude core; those names remain denied to model-spawned subprocesses and the
+  `ANTHROPIC_SMALL_FAST_MODEL` plus the three `ANTHROPIC_DEFAULT_*_MODEL`
+  aliases from Claude's user settings into the trusted
+  Claude core; those names remain denied to model-spawned subprocesses and
   Cumora never serializes the values into argv, its logs, Agent files, or server
   reports. Claude Code
   2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
@@ -306,11 +307,49 @@ This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides and Codex's
 persistent app-server path. Without it, opaque engine arguments are ignored
 because the daemon cannot prove that they preserve the sandbox.
 
+### Claude reasoning and response preferences
+
+Secure Claude agent turns inherit a validated subset of the operator's
+`~/.claude/settings.json` (or absolute `CLAUDE_CONFIG_DIR`):
+
+| Setting | Behavior |
+| --- | --- |
+| `effortLevel` | Inherit `low`, `medium`, `high`, or `xhigh`. |
+| `modelSettings.*.effortLevel` | Inherit per-model effort; Claude resolves canonical names and aliases and gives these entries precedence over the global setting. |
+| `alwaysThinkingEnabled` | Preserve both `true` and `false`; unset keeps Claude's native default. |
+| `language` | Inherit the response language preference. |
+| `env.CLAUDE_CODE_EFFORT_LEVEL` | Explicit effort override, including `max` and `auto`. |
+| `env.MAX_THINKING_TOKENS` | Preserve the operator's budget, including an explicit `0`. |
+| `env.CLAUDE_CODE_MAX_OUTPUT_TOKENS` | Preserve a positive output-token limit. |
+| `env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING`, `env.CLAUDE_CODE_DISABLE_THINKING` | Preserve explicit `0`/`1` model or gateway compatibility switches. |
+
+Daemon environment values override corresponding settings-file environment
+entries. Claude applies its native precedence between environment, global,
+and per-model preferences. Cumora no longer supplies `MAX_THINKING_TOKENS=0`
+for agent turns; triage and doctor calls retain their separate thinking-off
+policy and do not import turn-only preferences. Per-Agent model selections
+still win over local model defaults. The three `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` environment
+settings are inherited so provider-specific aliases retain their meaning.
+
+Preferences are loaded at engine-process creation, including session resume;
+restart the daemon to apply edits to existing persistent sessions. In
+unsandboxed compatibility mode Claude continues loading its own settings.
+Hooks, plugins, MCP servers, permissions, arbitrary environment values,
+output styles, and workflow modes are not imported by this preference bridge.
+
+An inherited effort is a preference, not a guarantee of thinking tokens:
+Claude can cap effort for a model or organization, and Opus 5 with thinking
+disabled may send `high` even when `xhigh` is saved. To request deeper
+reasoning, enable thinking as well as setting effort. See
+[Claude model configuration](https://code.claude.com/docs/en/model-config#adjust-effort-level)
+and [ADR 0007](decisions/0007-claude-turn-preferences.md).
+
 ### Running against a custom provider
 
 Custom providers (CC Switch and friends) often store their endpoint,
 authentication value, and default model in `~/.claude/settings.json`. Secure
-Claude imports only that provider bootstrap subset, reports the configured
+Claude imports that provider bootstrap subset, reports the configured
 default model without reporting credentials or endpoint details, and gives it
 precedence over Cumora's deploy-level Anthropic pin for Agents left on **Follow
 engine default**. Explicit per-Agent model choices still win.
@@ -324,7 +363,8 @@ different policy or an older daemon has not reported its local default:
 | `local` | pass **no** model at all — the CLI runs on whatever it is already configured for, and the small/fast pin is dropped too |
 | any model id | use that model instead of the pinned one |
 
-The configured `ANTHROPIC_SMALL_FAST_MODEL` is also used for local triage. When
+The configured `ANTHROPIC_DEFAULT_HAIKU_MODEL` (falling back to the legacy
+`ANTHROPIC_SMALL_FAST_MODEL`) is also used for local triage. When
 a custom endpoint does not name a fast model, Cumora passes no triage model and
 lets the provider choose instead of injecting the first-party `haiku` alias.
 `CUMORA_TRIAGE_MODEL` remains an explicit override, and `cumora agent computer
@@ -393,7 +433,8 @@ the operator's existing login, but model-spawned commands cannot read that
 login or inherit provider credentials in secure mode. Each agent gets its own
 writable home; its credential-free IPC namespace and executable bridge stay
 outside that home. Claude restricted mode ignores user/project settings;
-Cumora restores only its allowlisted provider bootstrap to the trusted core.
+Cumora restores only its allowlisted provider bootstrap and validated model
+preferences to the trusted core.
 Codex `exec --ignore-user-config --ignore-rules`
 does the same and marks the project untrusted. Secure engine startup also drops
 empty, relative, and agent-home entries from `PATH`, so a model-planted
