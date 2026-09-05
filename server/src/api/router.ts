@@ -1828,8 +1828,15 @@ api.delete('/companies/:id', safe(async (req, res) => {
     }
     if (agentIds.length > 0) {
       await client.query(`DELETE FROM board_mention_reads WHERE user_id = ANY($1::text[])`, [agentIds])
+      // Sweep by owner as well as by tenant. #207 added the five tables whose
+      // writers were dropping company_id; these three are here so the sweep does
+      // not depend on writer discipline at all. Their writers do pass a tenant
+      // today — the point is that the other five did too, until they didn't, and
+      // these are the tables that carry per-run history and cost, so a row that
+      // slips through resurfaces on a billing report rather than in a UI.
       const agentScopedTables = [
         'agent_workspace', 'agent_memory', 'agent_log', 'agent_tasks', 'agent_climate',
+        'agent_events', 'agent_runs', 'agent_triages',
       ] as const
       for (const table of agentScopedTables) {
         await client.query(`DELETE FROM ${table} WHERE agent_id = ANY($1::text[])`, [agentIds])
