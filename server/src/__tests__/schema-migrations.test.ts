@@ -17,6 +17,7 @@ const { normalizedConversationMembersChecksum } = await import('../db/migrations
 const { workspaceCleanupJobsChecksum } = await import('../db/migrations/0003-workspace-cleanup-jobs.js')
 const { agentRuntimeAssignmentChecksum } = await import('../db/migrations/0004-agent-runtime-assignment.js')
 const { searchTrigramIndexChecksum } = await import('../db/migrations/0005-search-trigram-index.js')
+const { emailMessagesCompanySmtpIdChecksum } = await import('../db/migrations/0006-email-messages-company-smtp-id.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -40,6 +41,10 @@ test('the runtime assignment migration matches its immutable manifest checksum',
 
 test('the search trigram migration matches its immutable manifest checksum', () => {
   assert.equal(searchTrigramIndexChecksum(), SCHEMA_MIGRATIONS[4].checksum)
+})
+
+test('the email messages company smtp id migration matches its immutable manifest checksum', () => {
+  assert.equal(emailMessagesCompanySmtpIdChecksum(), SCHEMA_MIGRATIONS[5].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

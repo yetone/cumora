@@ -265,12 +265,22 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     res.status(400).json({ error: `unparseable from: ${payload.from}` })
     return
   }
-  const recipients = [...(payload.to ?? []), ...(payload.cc ?? [])]
+  const rawRecipients = [...(payload.to ?? []), ...(payload.cc ?? [])]
     .map((s) => parseAddress(s))
     .filter((x): x is { addr: string; name: string | null } => Boolean(x))
-  if (recipients.length === 0) {
+  if (rawRecipients.length === 0) {
     res.status(400).json({ error: 'no recipients' })
     return
+  }
+
+  // De-duplicate recipients by address (e.g. same recipient appearing in both To and Cc).
+  const seenAddrs = new Set<string>()
+  const recipients: Array<{ addr: string; name: string | null }> = []
+  for (const r of rawRecipients) {
+    const key = r.addr.toLowerCase()
+    if (seenAddrs.has(key)) continue
+    seenAddrs.add(key)
+    recipients.push(r)
   }
 
   const subject = (payload.subject ?? '').trim()
@@ -282,22 +292,53 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     return
   }
 
+  // Group resolved recipients by company up-front.
+  // Cumora is strictly tenant-isolated; recipients across different tenants
+  // receive separate deliveries, while all recipients in the SAME tenant
+  // are grouped onto the same conversation.
+  type ResolvedRecipientInfo = NonNullable<Awaited<ReturnType<typeof resolveRecipient>>> & {
+    addr: string
+    name: string | null
+  }
+  const byCompany = new Map<string, ResolvedRecipientInfo[]>()
+  for (const rcpt of recipients) {
+    const resolved = await resolveRecipient(rcpt.addr)
+    if (!resolved) continue
+    const list = byCompany.get(resolved.companyId) ?? []
+    list.push({ ...resolved, addr: rcpt.addr, name: rcpt.name })
+    byCompany.set(resolved.companyId, list)
+  }
+
+  if (byCompany.size === 0) {
+    // No recognized recipient in any tenant. Reject so the worker can
+    // bounce upstream — better signal than silently dropping.
+    console.log(JSON.stringify({
+      evt: 'email.inbound.no_recipient', smtp_message_id: messageIdNorm,
+      attempted_recipients: recipients.map((r) => r.addr),
+    }))
+    inc('email.inbound.no_recipient')
+    res.status(404).json({ error: 'no recipient resolved to a known agent' })
+    return
+  }
+
   // Idempotency: same Message-ID arriving twice (worker retried, MTA
-  // duplicate, etc.) must not create duplicate threads. The unique index
-  // on email_messages.smtp_message_id already enforces this on insert,
-  // but a pre-check spares us the partial-write rollback on the common
-  // retry path.
-  const dup = await pool.query<{ message_id: string }>(
-    `SELECT message_id FROM email_messages WHERE LOWER(smtp_message_id) = $1 LIMIT 1`,
-    [messageIdNorm],
+  // duplicate, etc.) must not create duplicate threads.
+  // Pre-check whether this Message-ID already exists across all target companies.
+  const targetCompanyIds = Array.from(byCompany.keys())
+  const existingRows = await pool.query<{ company_id: string; message_id: string; conversation_id: string }>(
+    `SELECT company_id, message_id, conversation_id FROM email_messages
+      WHERE LOWER(smtp_message_id) = $1 AND company_id = ANY($2::text[])`,
+    [messageIdNorm, targetCompanyIds],
   )
-  if (dup.rows[0]) {
+  const existingCompanyMap = new Map(existingRows.rows.map((r) => [r.company_id, r]))
+  const allAlreadyDelivered = targetCompanyIds.every((cid) => existingCompanyMap.has(cid))
+  if (allAlreadyDelivered) {
     console.log(JSON.stringify({
       evt: 'email.inbound.dedup', smtp_message_id: messageIdNorm,
-      existing_message_id: dup.rows[0].message_id,
+      existing_message_id: existingRows.rows[0]?.message_id,
     }))
     inc('email.inbound.dedup')
-    res.json({ ok: true, deduplicated: true, messageId: dup.rows[0].message_id })
+    res.json({ ok: true, deduplicated: true, messageId: existingRows.rows[0]?.message_id })
     return
   }
 
@@ -380,27 +421,26 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
     }
   }
 
-  // Fan out to every recipient that resolves to an agent in some tenant.
-  // Cross-tenant deliveries land in each tenant separately; cumora has no
-  // notion of "the same conversation across tenants" because tenants
-  // can't read each other's data anyway.
+  // Fan out to each company that contains recognized recipients.
+  // Cross-tenant deliveries land in each tenant separately.
   const inserts: Array<{ companyId: string; conversationId: string; messageId: string }> = []
-  for (const rcpt of recipients) {
-    const resolved = await resolveRecipient(rcpt.addr)
-    if (!resolved) continue
-    const companyId = resolved.companyId
+  for (const [companyId, companyRecipients] of byCompany.entries()) {
+    const existingDelivery = existingCompanyMap.get(companyId)
+    if (existingDelivery) {
+      inserts.push({
+        companyId,
+        conversationId: existingDelivery.conversation_id,
+        messageId: existingDelivery.message_id,
+      })
+      continue
+    }
+
     const sender = await resolveSender({
       fromAddr: fromParsed.addr,
       fromName: fromParsed.name,
       companyId,
     })
-    const allRecipientParticipantIds: string[] = []
-    // Find every recognized recipient that's in THIS company so they can
-    // all be on the same conversation. Skip non-tenant recipients here.
-    for (const r of recipients) {
-      const rr = await resolveRecipient(r.addr)
-      if (rr && rr.companyId === companyId) allRecipientParticipantIds.push(rr.participantId)
-    }
+    const allRecipientParticipantIds = companyRecipients.map((r) => r.participantId)
     const memberIds = Array.from(new Set([sender.participantId, ...allRecipientParticipantIds]))
 
     const conv = await findOrCreateEmailConversation({
@@ -437,34 +477,58 @@ inboundEmailRouter.post('/inbound', async (req: Request, res: Response) => {
       })
       inserts.push({ companyId, conversationId: conv.conversationId, messageId: persisted.messageId })
     } catch (e) {
-      // The unique index on smtp_message_id can race-trip if two workers
-      // delivered the same message in parallel. Treat as dedup, not error.
+      // If we just created this conversation and persisting the message failed,
+      // clean up the empty conversation so we don't leave a ghost thread behind.
+      if (conv.created) {
+        await pool.query(
+          `DELETE FROM conversations
+            WHERE id = $1 AND company_id = $2
+              AND NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1)`,
+          [conv.conversationId, companyId],
+        ).catch((delErr) => {
+          console.warn(`[email] failed to clean up ghost conversation ${conv.conversationId}`, delErr)
+        })
+      }
+
+      // The unique index on (company_id, LOWER(smtp_message_id)) can race-trip if two
+      // workers delivered the same message in parallel. Treat as dedup, not error.
       const msg = e instanceof Error ? e.message : String(e)
-      if (/uniq_email_messages_smtp_id|duplicate key/i.test(msg)) {
+      if (/uniq_email_messages_company_smtp_id|uniq_email_messages_smtp_id|duplicate key/i.test(msg)) {
         console.log(JSON.stringify({
           evt: 'email.inbound.race_dedup', smtp_message_id: messageIdNorm,
-          recipient: rcpt.addr,
+          company_id: companyId,
         }))
+        const raceWinner = await pool.query<{ message_id: string; conversation_id: string }>(
+          `SELECT message_id, conversation_id FROM email_messages
+            WHERE company_id = $1 AND LOWER(smtp_message_id) = $2
+            LIMIT 1`,
+          [companyId, messageIdNorm],
+        )
+        if (raceWinner.rows[0]) {
+          inserts.push({
+            companyId,
+            conversationId: raceWinner.rows[0].conversation_id,
+            messageId: raceWinner.rows[0].message_id,
+          })
+        }
         continue
       }
       console.error(JSON.stringify({
-        evt: 'email.inbound.persist_error', recipient: rcpt.addr,
+        evt: 'email.inbound.persist_error', company_id: companyId,
         smtp_message_id: messageIdNorm, error: msg,
       }))
     }
   }
 
   if (inserts.length === 0) {
-    // No recognized recipient in any tenant. Reject so the worker can
-    // bounce upstream — better signal than silently dropping.
-    console.log(JSON.stringify({
-      evt: 'email.inbound.no_recipient', smtp_message_id: messageIdNorm,
+    console.error(JSON.stringify({
+      evt: 'email.inbound.persist_failed_all', smtp_message_id: messageIdNorm,
       attempted_recipients: recipients.map((r) => r.addr),
     }))
-    inc('email.inbound.no_recipient')
-    res.status(404).json({ error: 'no recipient resolved to a known agent' })
+    res.status(500).json({ error: 'failed to persist email message' })
     return
   }
+
   console.log(JSON.stringify({
     evt: 'email.inbound.delivered', smtp_message_id: messageIdNorm,
     delivery_count: inserts.length, auto_submitted: Boolean(payload.autoSubmitted),

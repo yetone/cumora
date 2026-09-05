@@ -31,6 +31,12 @@ import {
   SEARCH_TRIGRAM_INDEX_SQL,
   searchTrigramIndexChecksum,
 } from './migrations/0005-search-trigram-index.js'
+import {
+  DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  emailMessagesCompanySmtpIdChecksum,
+} from './migrations/0006-email-messages-company-smtp-id.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2381,6 +2387,21 @@ async function applySearchTrigramIndex(client: import('pg').PoolClient): Promise
   await ensureConcurrentIndex(client, SEARCH_TRIGRAM_INDEX_NAME, SEARCH_TRIGRAM_INDEX_SQL)
 }
 
+/**
+ * Declared `transactional: false` below: PostgreSQL refuses CONCURRENTLY
+ * inside a transaction block. Both statements are idempotent:
+ * `ensureConcurrentIndex` repairs an INVALID index left by an interrupted
+ * build, and DROP INDEX CONCURRENTLY IF EXISTS is a safe no-op on retry.
+ */
+async function applyEmailMessagesCompanySmtpId(client: import('pg').PoolClient): Promise<void> {
+  await ensureConcurrentIndex(
+    client,
+    EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+    EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  )
+  await client.query(DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2412,6 +2433,13 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
     transactional: false,
     up: applySearchTrigramIndex,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[5],
+    sourceChecksum: emailMessagesCompanySmtpIdChecksum(),
+    // CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
+    transactional: false,
+    up: applyEmailMessagesCompanySmtpId,
   },
 ]
 
@@ -2683,6 +2711,7 @@ export const REQUIRED_SCHEMA_INDEXES = [
   'conversation_members_conversation_ordinal_key',
   'idx_conversation_members_participant',
   SEARCH_TRIGRAM_INDEX_NAME,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
 ] as const
 
 /** Promotion gate: every required index must exist and be valid, ready, and
