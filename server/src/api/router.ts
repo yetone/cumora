@@ -8,6 +8,7 @@ import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox, withOutboxTransaction } from '../realtime-outbox.js'
 import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspace-cleanup.js'
+import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/rooms.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
@@ -1811,6 +1812,14 @@ api.delete('/companies/:id', safe(async (req, res) => {
         const key = messageAttachmentStorageKey(candidate as { key?: unknown; url?: unknown })
         if (key) storageKeys.add(key)
       }
+    }
+    const { rows: docRows } = await client.query<{ id: string }>(
+      `SELECT id FROM documents WHERE company_id = $1`, [companyId],
+    )
+    for (const docRow of docRows) {
+      const docKeys = await collectDocumentStorageKeys(docRow.id, client)
+      for (const key of docKeys) storageKeys.add(key)
+      evictDocumentRoom(docRow.id)
     }
 
     // Child/root rows with soft company_id references. FK-backed trees such as
@@ -7028,10 +7037,19 @@ api.delete('/documents/:id', safe(async (req, res) => {
     const role = roleRows[0]?.role ?? 'member'
     if (!PRIVILEGED_ROLES.has(role)) throw new HttpError(403, 'only the creator or an owner can delete')
   }
+  let docKeys: string[] = []
   await withOutboxTransaction(async (client) => {
+    docKeys = await collectDocumentStorageKeys(id, client)
     await client.query(`DELETE FROM documents WHERE id = $1`, [id])
+    if (docKeys.length > 0) {
+      await enqueueWorkspaceCleanup(client, { companyId, agentIds: [], storageKeys: docKeys })
+    }
     await enqueueDocumentChanged(client, companyId, id, 'document.deleted', userId)
   })
+  evictDocumentRoom(id)
+  if (docKeys.length > 0) {
+    nudgeWorkspaceCleanupWorker()
+  }
   res.json({ ok: true })
 }))
 

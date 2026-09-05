@@ -517,6 +517,103 @@ function xmlAttrString(el: Y.XmlElement, key: string): string {
   return typeof value === 'string' ? value : ''
 }
 
+/** Pure in-memory extraction of all storage keys referenced in a document.
+ *  Checks native image nodes, markdown image paragraphs, link marks, and
+ *  embedded attachment references without triggering any URL refresh or DB write. */
+export function extractStorageKeysFromDoc(doc: Y.Doc): string[] {
+  const keys = new Set<string>()
+  const fragment = pmFragment(doc)
+
+  function inspectString(val: string) {
+    if (!val) return
+    const direct = normalizeStorageKey(val) ?? storageKeyFromPublicUrl(val)
+    if (direct) {
+      keys.add(direct)
+      return
+    }
+    const matches = val.matchAll(/(?:attachments|email-attachments|avatars)\/[A-Za-z0-9_.-]+/g)
+    for (const m of matches) {
+      const k = normalizeStorageKey(m[0])
+      if (k) keys.add(k)
+    }
+  }
+
+  function walk(parent: Y.XmlFragment | Y.XmlElement) {
+    for (let i = 0; i < parent.length; i++) {
+      const child = parent.get(i) as Y.AbstractType<unknown>
+      if (child instanceof Y.XmlElement) {
+        if (child.nodeName === 'image') {
+          const key = imageStorageKey(child)
+          if (key) {
+            keys.add(key)
+          } else {
+            inspectString(xmlAttrString(child, 'src'))
+          }
+        } else if (child.nodeName === 'paragraph') {
+          const replacement = paragraphImageNode(child)
+          if (replacement && 'attrs' in replacement && replacement.attrs?.src) {
+            inspectString(String(replacement.attrs.src))
+          }
+        }
+        walk(child)
+      } else if (child instanceof Y.XmlText) {
+        const delta = child.toDelta() as Array<{ insert?: unknown; attributes?: unknown }>
+        for (const op of delta) {
+          const href = hrefFromDeltaAttributes(op.attributes)
+          if (href) inspectString(href)
+          if (typeof op.insert === 'string' && (op.insert.includes('attachments/') || op.insert.includes('avatars/'))) {
+            inspectString(op.insert)
+          }
+        }
+      }
+    }
+  }
+
+  walk(fragment)
+  return Array.from(keys)
+}
+
+/** Collect storage keys for a document. Reuses an active in-memory room if present,
+ *  otherwise hydrates a temporary in-memory Y.Doc without adding to the room map,
+ *  registering listeners, or refreshing presigned URLs. */
+export async function collectDocumentStorageKeys(
+  documentId: string,
+  dbClient?: PoolClient,
+): Promise<string[]> {
+  const existing = rooms.get(roomKey(documentId))
+  if (existing) {
+    try {
+      await existing.loaded
+      return extractStorageKeysFromDoc(existing.doc)
+    } catch {
+      // Fall through to cold hydration if existing room threw
+    }
+  }
+
+  const doc = new Y.Doc()
+  try {
+    await hydrateDoc(documentId, doc, dbClient)
+    return extractStorageKeysFromDoc(doc)
+  } finally {
+    doc.destroy()
+  }
+}
+
+/** Evict an in-memory document room immediately, e.g. upon document deletion. */
+export function evictDocumentRoom(documentId: string): void {
+  const pending = evictions.get(documentId)
+  if (pending) {
+    clearTimeout(pending)
+    evictions.delete(documentId)
+  }
+  const room = rooms.get(roomKey(documentId))
+  if (room) {
+    rooms.delete(roomKey(documentId))
+    room.subs.clear()
+    room.doc.destroy()
+  }
+}
+
 function escapeMarkdownImageText(text: string): string {
   return text.replace(/\\/g, '\\\\').replace(/]/g, '\\]')
 }
@@ -735,13 +832,20 @@ export async function applyAgentEdit(
     | { kind: 'imageDelete'; match: AgentImageDeleteMatch }
   >,
   dbClient?: PoolClient,
-): Promise<{ replaced: number; imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null; imagesDeleted: number; blocksReplaced: number }> {
+): Promise<{
+  replaced: number
+  imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null
+  imagesDeleted: number
+  blocksReplaced: number
+  deletedStorageKeys: string[]
+}> {
   const room = await getOrCreateRoom(documentId, companyId, dbClient)
   const fragment = pmFragment(room.doc)
   let replaced = 0
   let imagePlaced: 'absolute' | 'anchor' | 'anchor-missed' | null = null
   let imagesDeleted = 0
   let blocksReplaced = 0
+  const deletedStorageKeys: string[] = []
   const origin = { originId: `agent:${agentId}`, authorId: agentId } as never
   room.doc.transact(() => {
     for (const op of ops) {
@@ -825,6 +929,8 @@ export async function applyAgentEdit(
         // images but possible).
         matches.sort((a, b) => b.index - a.index)
         for (const m of matches) {
+          const key = imageStorageKey(m.element)
+          if (key) deletedStorageKeys.push(key)
           m.container.delete(m.index, 1)
           imagesDeleted++
         }
@@ -843,7 +949,7 @@ export async function applyAgentEdit(
     }
     normalizeMarkdownImageParagraphChildren(fragment)
   }, origin)
-  return { replaced, imagePlaced, imagesDeleted, blocksReplaced }
+  return { replaced, imagePlaced, imagesDeleted, blocksReplaced, deletedStorageKeys }
 }
 
 /** Cross-instance bus bootstrap. Idempotent — safe to call from index.ts
