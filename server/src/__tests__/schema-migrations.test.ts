@@ -16,6 +16,7 @@ const { computedBaselineMigrationChecksum } = await import('../db/migrate.js')
 const { normalizedConversationMembersChecksum } = await import('../db/migrations/0002-normalized-conversation-members.js')
 const { workspaceCleanupJobsChecksum } = await import('../db/migrations/0003-workspace-cleanup-jobs.js')
 const { agentRuntimeAssignmentChecksum } = await import('../db/migrations/0004-agent-runtime-assignment.js')
+const { searchTrigramIndexChecksum } = await import('../db/migrations/0005-search-trigram-index.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -35,6 +36,10 @@ test('the workspace cleanup migration matches its immutable manifest checksum', 
 
 test('the runtime assignment migration matches its immutable manifest checksum', () => {
   assert.equal(agentRuntimeAssignmentChecksum(), SCHEMA_MIGRATIONS[3].checksum)
+})
+
+test('the search trigram migration matches its immutable manifest checksum', () => {
+  assert.equal(searchTrigramIndexChecksum(), SCHEMA_MIGRATIONS[4].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

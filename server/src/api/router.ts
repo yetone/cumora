@@ -4961,6 +4961,90 @@ api.post('/messages/:id/reactions', async (req, res) => {
  */
 
 /**
+ * Hard deadline for the message-body bucket of global search.
+ *
+ * `idx_messages_body_trgm` (migration 0005) answers most `%term%` patterns from
+ * the index, but a pattern shorter than three characters produces no complete
+ * trigram and still plans as a scan — two-character CJK queries are the common
+ * case. The pool's global 60s `statement_timeout` is far too generous for
+ * something the sidebar re-issues on every typing pause: a handful of those in
+ * flight is enough to hold every slot. Three seconds is well past a healthy
+ * indexed search and reaps the rest.
+ */
+const SEARCH_MESSAGE_TIMEOUT_MS = 3_000
+
+/**
+ * A single trigram needs three characters, so `%ab%` has none to look up and
+ * the planner falls back to a scan. Two-character queries are ordinary in CJK,
+ * so we still run them (bounded by the deadline above) — but a ONE-character
+ * pattern matches most of the corpus, meaning a full scan whose top-15 rows are
+ * effectively "the newest messages", which is not an answer to anything.
+ */
+const SEARCH_MESSAGE_MIN_LENGTH = 2
+
+/** Raised when the caller disconnects before the query is even issued. */
+class QueryAbandonedError extends Error {}
+
+/**
+ * Run the message-body search on its own connection under a bounded deadline,
+ * and actually cancel it when the caller walks away.
+ *
+ * The sidebar aborts its fetch on every keystroke after the debounce. Aborting
+ * the HTTP request does nothing to the query already executing in PostgreSQL —
+ * that backend keeps its pool slot until it finishes on its own. So we capture
+ * the backend pid up front and, if the response closes early, issue
+ * `pg_cancel_backend` from a *different* connection (the busy one cannot accept
+ * a command). A cancelled or timed-out search resolves to no rows rather than
+ * throwing: there is no longer anyone to show an error to, and a partial
+ * dropdown is a better failure than a 500.
+ */
+async function searchMessagesBounded(
+  res: Response,
+  params: unknown[],
+  sql: string,
+): Promise<{ rows: Array<{ body: string } & Record<string, unknown>> }> {
+  const client = await pool.connect()
+  let backendPid: number | null = null
+  let abandoned = false
+  const cancelIfRunning = (): void => {
+    // `close` also fires on a normal, fully-written response — only an early
+    // close means the caller is gone.
+    if (res.writableEnded) return
+    abandoned = true
+    if (backendPid == null) return
+    void pool.query('SELECT pg_cancel_backend($1)', [backendPid]).catch(() => { /* best effort */ })
+  }
+  res.on('close', cancelIfRunning)
+  try {
+    await client.query('BEGIN')
+    // SET LOCAL, not SET: the deadline dies with this transaction, so releasing
+    // the connection cannot leak a 3s timeout onto the next borrower.
+    await client.query(`SET LOCAL statement_timeout = ${SEARCH_MESSAGE_TIMEOUT_MS}`)
+    const pid = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+    backendPid = pid.rows[0]?.pid ?? null
+    if (abandoned) throw new QueryAbandonedError()
+    const result = await client.query<{ body: string } & Record<string, unknown>>(sql, params)
+    await client.query('COMMIT')
+    return { rows: result.rows }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => { /* connection may be dead */ })
+    // 57014 = query_canceled, raised by both statement_timeout and our own
+    // pg_cancel_backend. Everything else is a real fault worth surfacing.
+    const code = (error as { code?: unknown } | null)?.code
+    if (code === '57014' || error instanceof QueryAbandonedError) {
+      if (!abandoned) {
+        console.warn(`[search] message bucket exceeded ${SEARCH_MESSAGE_TIMEOUT_MS}ms and was cancelled`)
+      }
+      return { rows: [] }
+    }
+    throw error
+  } finally {
+    res.off('close', cancelIfRunning)
+    client.release()
+  }
+}
+
+/**
  * Universal search across the workspace.
  *
  * Returns four ranked buckets in this order of importance:
@@ -5101,7 +5185,10 @@ api.get('/search', async (req, res) => {
 
   // Skip `tool` / `system` rows — those bodies are machine output, not
   // human-written content, and they'd flood the list with JSON snippets.
-  const messagesP = pool.query(
+  // (`idx_messages_body_trgm` is partial on exactly this predicate.)
+  const messagesP = raw.length < SEARCH_MESSAGE_MIN_LENGTH
+    ? Promise.resolve({ rows: [] as Array<{ body: string } & Record<string, unknown>> })
+    : searchMessagesBounded(res, [tenant, me, contains],
     `SELECT m.id,
             m.conversation_id AS "conversationId",
             CASE
@@ -5139,7 +5226,6 @@ api.get('/search', async (req, res) => {
         AND m.body ILIKE $3 ESCAPE '\\'
       ORDER BY m.created_at DESC
       LIMIT ${M_LIMIT}`,
-    [tenant, me, contains],
   )
 
   const [participants, rooms, groups, messages] = await Promise.all([

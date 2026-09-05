@@ -25,6 +25,12 @@ import {
   AGENT_RUNTIME_ASSIGNMENT_SQL,
   agentRuntimeAssignmentChecksum,
 } from './migrations/0004-agent-runtime-assignment.js'
+import {
+  SEARCH_TRIGRAM_EXTENSION_SQL,
+  SEARCH_TRIGRAM_INDEX_NAME,
+  SEARCH_TRIGRAM_INDEX_SQL,
+  searchTrigramIndexChecksum,
+} from './migrations/0005-search-trigram-index.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2366,6 +2372,15 @@ async function applyAgentRuntimeAssignment(client: import('pg').PoolClient): Pro
   await client.query(AGENT_RUNTIME_ASSIGNMENT_SQL)
 }
 
+/** Declared `transactional: false` below: PostgreSQL refuses CONCURRENTLY
+ * inside a transaction block. Both statements are idempotent, and
+ * `ensureConcurrentIndex` repairs an INVALID index left by an interrupted
+ * build, so an aborted run is safe to rerun. */
+async function applySearchTrigramIndex(client: import('pg').PoolClient): Promise<void> {
+  await client.query(SEARCH_TRIGRAM_EXTENSION_SQL)
+  await ensureConcurrentIndex(client, SEARCH_TRIGRAM_INDEX_NAME, SEARCH_TRIGRAM_INDEX_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2390,6 +2405,13 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: agentRuntimeAssignmentChecksum(),
     transactional: true,
     up: applyAgentRuntimeAssignment,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[4],
+    sourceChecksum: searchTrigramIndexChecksum(),
+    // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
+    transactional: false,
+    up: applySearchTrigramIndex,
   },
 ]
 
@@ -2564,6 +2586,40 @@ async function ensureMessageClientIdIndex(client: import('pg').PoolClient): Prom
  * stops promotion but cannot crash-loop application replicas because replicas
  * never run this code.
  */
+/**
+ * Build one `CREATE INDEX CONCURRENTLY` idempotently.
+ *
+ * `IF NOT EXISTS` alone is not enough: an interrupted concurrent build leaves an
+ * INVALID index behind that `IF NOT EXISTS` would then skip forever, so the
+ * table keeps paying for an index no planner will use. Check the catalog first
+ * and drop the dead entry before rebuilding.
+ *
+ * MUST run outside any transaction block — PostgreSQL forbids CONCURRENTLY
+ * inside one. Callers from the versioned ledger therefore declare
+ * `transactional: false`.
+ */
+export async function ensureConcurrentIndex(
+  client: import('pg').PoolClient,
+  name: string,
+  create: string,
+): Promise<void> {
+  const { rows } = await client.query<{ indisvalid: boolean; indisready: boolean; indislive: boolean }>(
+    `SELECT i.indisvalid, i.indisready, i.indislive FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = current_schema() AND c.relname = $1`,
+    [name],
+  )
+  if (rows[0] && (!rows[0].indisvalid || !rows[0].indisready || !rows[0].indislive)) {
+    console.warn(`[db] dropping invalid leftover index ${name} before rebuild`)
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`)
+  } else if (rows[0]) {
+    return
+  }
+  await client.query(create)
+  console.log(`[db] concurrent index ready: ${name}`)
+}
+
 async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<void> {
   const indexes: Array<{ name: string; create: string }> = [
     {
@@ -2605,21 +2661,7 @@ async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<
     },
   ]
   for (const ix of indexes) {
-    const { rows } = await client.query<{ indisvalid: boolean; indisready: boolean; indislive: boolean }>(
-      `SELECT i.indisvalid, i.indisready, i.indislive FROM pg_class c
-         JOIN pg_index i ON i.indexrelid = c.oid
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = current_schema() AND c.relname = $1`,
-      [ix.name],
-    )
-    if (rows[0] && (!rows[0].indisvalid || !rows[0].indisready || !rows[0].indislive)) {
-      console.warn(`[db] dropping invalid leftover index ${ix.name} before rebuild`)
-      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${ix.name}`)
-    } else if (rows[0]) {
-      continue
-    }
-    await client.query(ix.create)
-    console.log(`[db] concurrent index ready: ${ix.name}`)
+    await ensureConcurrentIndex(client, ix.name, ix.create)
   }
 }
 
@@ -2640,6 +2682,7 @@ export const REQUIRED_SCHEMA_INDEXES = [
   ...BASELINE_REQUIRED_SCHEMA_INDEXES,
   'conversation_members_conversation_ordinal_key',
   'idx_conversation_members_participant',
+  SEARCH_TRIGRAM_INDEX_NAME,
 ] as const
 
 /** Promotion gate: every required index must exist and be valid, ready, and
