@@ -459,15 +459,27 @@ function armAuthHandoff() {
 function consumeAuthNonce(nonce) {
   const armed = armedAuthNonce
   const expiry = armedAuthExpiry
-  armedAuthNonce = null
-  armedAuthExpiry = 0
-  if (!armed || Date.now() > expiry) return false
-  if (typeof nonce !== 'string' || nonce.length !== armed.length) return false
-  try {
-    return crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(armed))
-  } catch {
+  // Clear only on a MATCH (or a genuine expiry). Clearing first meant any
+  // inbound value disarmed the pending sign-in: click sign-in twice, finish the
+  // first tab, and its now-stale nonce took the second one's arming with it —
+  // so the obvious recovery, going back and finishing the other tab, failed too.
+  if (!armed || Date.now() > expiry) {
+    armedAuthNonce = null
+    armedAuthExpiry = 0
     return false
   }
+  if (typeof nonce !== 'string' || nonce.length !== armed.length) return false
+  let ok = false
+  try {
+    ok = crypto.timingSafeEqual(Buffer.from(nonce), Buffer.from(armed))
+  } catch {
+    ok = false
+  }
+  if (ok) {
+    armedAuthNonce = null
+    armedAuthExpiry = 0
+  }
+  return ok
 }
 
 /** Pull token + companyId + nonce out of a `cumora://auth#token=…` URL. The OS
@@ -495,7 +507,7 @@ function parseAuthDeepLink(rawUrl) {
 function dispatchAuthToken(token, companyId, nonce) {
   if (!consumeAuthNonce(nonce)) {
     console.warn('[auth] dropped inbound token: no matching armed nonce (possible drive-by deep link)')
-    return
+    return false
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
     if (mainWindow.isMinimized()) mainWindow.restore()
@@ -505,6 +517,7 @@ function dispatchAuthToken(token, companyId, nonce) {
   } else {
     pendingAuthToken = { token, companyId }
   }
+  return true
 }
 let pendingAuthToken = null
 
@@ -545,8 +558,15 @@ function startAuthLoopback() {
           }
           const companyId = typeof parsed.companyId === 'string' ? parsed.companyId : null
           const nonce = typeof parsed.nonce === 'string' ? parsed.nonce : null
-          dispatchAuthToken(parsed.token, companyId, nonce)
-          res.statusCode = 204; res.end()
+          // Answer what actually happened. A 204 for a token the app dropped
+          // made the browser page report "Signed in — Cumora has your session"
+          // while nothing had been handed over; the page keys on `r.ok` and its
+          // catch branch is the one that tells the user to open Cumora itself.
+          if (dispatchAuthToken(parsed.token, companyId, nonce)) {
+            res.statusCode = 204; res.end()
+          } else {
+            res.statusCode = 409; res.end('no armed sign-in')
+          }
         } catch {
           res.statusCode = 400; res.end('bad json')
         }
