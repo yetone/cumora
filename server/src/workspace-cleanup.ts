@@ -8,6 +8,7 @@ import {
   storage,
   storageKeyFromPublicUrl,
 } from './storage.js'
+import { collectDocumentStorageKeys } from './documents/rooms.js'
 
 interface CleanupJob {
   id: string
@@ -74,16 +75,18 @@ async function claimBatch(limit: number): Promise<CleanupJob[]> {
   return rows
 }
 
-async function findReferencedStorageKeys(keys: string[]): Promise<Set<string>> {
-  if (keys.length === 0) return new Set()
+export async function findReferencedStorageKeys(keys: string[], client?: PoolClient): Promise<Set<string>> {
+  const uniqueKeys = Array.from(new Set(keys.map(normalizeStorageKey).filter((k): k is string => Boolean(k))))
+  if (uniqueKeys.length === 0) return new Set()
+  const db = client ?? pool
   const referenced = new Set<string>()
 
-  const [emailFiles, messageFiles, avatars] = await Promise.all([
-    pool.query<{ storage_key: string }>(
+  const [emailFiles, messageFiles, avatars, docCandidates] = await Promise.all([
+    db.query<{ storage_key: string }>(
       `SELECT storage_key FROM email_attachments WHERE storage_key = ANY($1::text[])`,
-      [keys],
+      [uniqueKeys],
     ),
-    pool.query<{ attachment: unknown }>(
+    db.query<{ attachment: unknown }>(
       `SELECT attachment
          FROM messages m
         WHERE attachment IS NOT NULL
@@ -91,9 +94,9 @@ async function findReferencedStorageKeys(keys: string[]): Promise<Set<string>> {
             SELECT 1 FROM unnest($1::text[]) candidate(key)
              WHERE m.attachment::text LIKE '%' || candidate.key || '%'
           )`,
-      [keys],
+      [uniqueKeys],
     ),
-    pool.query<{ avatar_url: string }>(
+    db.query<{ avatar_url: string }>(
       `SELECT avatar_url
          FROM participants p
         WHERE avatar_url IS NOT NULL
@@ -101,26 +104,47 @@ async function findReferencedStorageKeys(keys: string[]): Promise<Set<string>> {
             SELECT 1 FROM unnest($1::text[]) candidate(key)
              WHERE p.avatar_url LIKE '%' || candidate.key || '%'
           )`,
-      [keys],
+      [uniqueKeys],
+    ),
+    db.query<{ document_id: string }>(
+      `SELECT DISTINCT document_id FROM (
+         SELECT document_id
+           FROM document_updates u, unnest($1::text[]) candidate(key)
+          WHERE position(convert_to(candidate.key, 'UTF8') in u.update_bytes) > 0
+         UNION ALL
+         SELECT document_id
+           FROM document_snapshots s, unnest($1::text[]) candidate(key)
+          WHERE position(convert_to(candidate.key, 'UTF8') in s.state_bytes) > 0
+       ) candidates
+       WHERE document_id IN (SELECT id FROM documents)`,
+      [uniqueKeys],
     ),
   ])
 
   for (const row of emailFiles.rows) {
     const key = normalizeStorageKey(row.storage_key)
-    if (key && keys.includes(key)) referenced.add(key)
+    if (key && uniqueKeys.includes(key)) referenced.add(key)
   }
   for (const row of messageFiles.rows) {
     const attachments = Array.isArray(row.attachment) ? row.attachment : [row.attachment]
     for (const attachment of attachments) {
       if (!attachment || typeof attachment !== 'object') continue
       const key = messageAttachmentStorageKey(attachment as { key?: unknown; url?: unknown })
-      if (key && keys.includes(key)) referenced.add(key)
+      if (key && uniqueKeys.includes(key)) referenced.add(key)
     }
   }
   for (const row of avatars.rows) {
     const key = storageKeyFromPublicUrl(row.avatar_url)
-    if (key && keys.includes(key)) referenced.add(key)
+    if (key && uniqueKeys.includes(key)) referenced.add(key)
   }
+  await Promise.all(
+    docCandidates.rows.map(async (row) => {
+      const docKeys = await collectDocumentStorageKeys(row.document_id, client)
+      for (const key of docKeys) {
+        if (uniqueKeys.includes(key)) referenced.add(key)
+      }
+    }),
+  )
   return referenced
 }
 

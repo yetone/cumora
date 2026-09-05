@@ -6342,6 +6342,14 @@ async function cmdDocAsActiveAgent(
     if (result.imagesDeleted === 0) {
       return err(`no images in ${docId} matched the criterion`)
     }
+    if (result.deletedStorageKeys && result.deletedStorageKeys.length > 0) {
+      const { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } = await import('../workspace-cleanup.js')
+      await enqueueWorkspaceCleanup(dbClient, { companyId, agentIds: [], storageKeys: result.deletedStorageKeys })
+      onFinally(() => {
+        nudgeWorkspaceCleanupWorker()
+        return Promise.resolve()
+      })
+    }
     await onChanged('document.updated', docId)
     return ok(`deleted ${result.imagesDeleted} image${result.imagesDeleted === 1 ? '' : 's'} from ${docId}`, [{
       event: 'document.updated',
@@ -6438,7 +6446,18 @@ async function cmdDocAsActiveAgent(
     )
     if (rows.length === 0) return err(`document ${docId} not found`)
     if (rows[0].created_by !== me) return err(`only the creator can delete document ${docId}`)
+    const { collectDocumentStorageKeys, evictDocumentRoom } = await import('../documents/rooms.js')
+    const storageKeys = await collectDocumentStorageKeys(docId, dbClient)
     await dbClient.query(`DELETE FROM documents WHERE id = $1`, [docId])
+    if (storageKeys.length > 0) {
+      const { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } = await import('../workspace-cleanup.js')
+      await enqueueWorkspaceCleanup(dbClient, { companyId, agentIds: [], storageKeys })
+      onFinally(() => {
+        nudgeWorkspaceCleanupWorker()
+        return Promise.resolve()
+      })
+    }
+    evictDocumentRoom(docId)
     await onChanged('document.deleted', docId)
     return ok(`deleted document ${docId}`, [{
       event: 'document.deleted',
