@@ -1,4 +1,6 @@
 import { create } from 'zustand'
+import { isForActiveWorkspace } from '@/lib/tenant-events'
+import { useAuth } from '@/stores/auth'
 import { api, ws, type ApiParticipant } from '@/api/client'
 import type { Participant, Status } from '@/types'
 import { invalidateAvatar, clearAvatarCache } from '@/lib/avatarCache'
@@ -164,6 +166,13 @@ export function bootParticipants() {
         return { byId: { ...s.byId, [e.participantId]: { ...cur, avatarUrl: e.avatarUrl } } }
       })
     } else if (e.type === 'participants.added') {
+      // The socket carries every workspace this user belongs to, so a member of
+      // two workspaces receives the other one's roster events while looking at
+      // this one. The sibling handlers above are self-limiting — they patch an
+      // existing row and bail when the id is unknown — but this one INSERTS, so
+      // a foreign participant would land in the active workspace's roster and
+      // from there into assignee pickers and mention lists.
+      if (!isForActiveWorkspace(e.companyId, useAuth.getState().activeCompanyId)) return
       // A new human (or agent) joined the workspace. Upsert into byId so
       // the system-row referencing them resolves immediately (otherwise
       // SystemRow returns null on unknown participantId and the inviter

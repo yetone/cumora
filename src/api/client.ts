@@ -1520,7 +1520,7 @@ export type WsEvent =
   | { type: 'participants.status'; participantId: string; status: Status; statusUpdatedAt?: string }
   | { type: 'participants.avatar'; participantId: string; avatarUrl: string }
   | { type: 'computers.status'; computerId: string; status: ComputerStatus }
-  | { type: 'participants.added'; conversationId?: string; participant: {
+  | { type: 'participants.added'; companyId?: string; conversationId?: string; participant: {
       id: string; kind: 'human' | 'agent'; name: string; role: string | null;
       initial: string; avatarBg: string; avatarUrl: string | null;
       status: Status; statusUpdatedAt: string | null;
