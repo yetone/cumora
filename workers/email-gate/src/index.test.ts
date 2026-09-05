@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import {
+import worker, {
   recipientAccepted,
   readArrayHeader,
   toBase64,
@@ -133,3 +133,99 @@ test('attachment byte limits are sensibly ordered', () => {
   assert.ok(MAX_ATTACHMENT_BYTES < MAX_TOTAL_ATTACHMENT_BYTES)
   assert.ok(MAX_TOTAL_ATTACHMENT_BYTES * 1.34 < 25 * 1024 * 1024)
 })
+
+/* ==================== email() handler error handling ======================= */
+
+function createFakeMessage() {
+  const rejected: string[] = []
+  const rawStream = new Response(
+    'From: alice@example.com\r\nTo: agent@cumora.ai\r\nSubject: Test\r\nMessage-ID: <msg-1@example.com>\r\n\r\nHello',
+  ).body!
+  const message = {
+    to: 'agent@cumora.ai',
+    from: 'alice@example.com',
+    raw: rawStream,
+    setReject: (reason: string) => { rejected.push(reason) },
+  } as unknown as Parameters<typeof worker.email>[0]
+  return { message, rejected }
+}
+
+const fakeEnv = {
+  EMAIL_ROOT_DOMAINS: 'cumora.ai',
+  EMAIL_INBOUND_HMAC_SECRET: 'test-secret-value-12345',
+  CUMORA_INBOUND_URL: 'http://upstream.local/inbound',
+} as unknown as Parameters<typeof worker.email>[1]
+
+const fakeCtx = {
+  waitUntil: (promise: Promise<unknown>) => { void promise.catch(() => {}) },
+  passThroughOnException: () => {},
+} as unknown as Parameters<typeof worker.email>[2]
+
+test('email handler throws on upstream network error (triggering SMTP tempfail)', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => {
+    throw new Error('connection reset by peer')
+  }
+  try {
+    await assert.rejects(
+      () => worker.email(message, fakeEnv, fakeCtx),
+      /Upstream unreachable: connection reset by peer/,
+    )
+    assert.deepEqual(rejected, [], 'setReject must NOT be called on transient network error')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('email handler throws on upstream 5xx error (triggering SMTP tempfail)', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('Internal Server Error', { status: 502 })
+  try {
+    await assert.rejects(
+      () => worker.email(message, fakeEnv, fakeCtx),
+      /Upstream temporary failure \(502\)/,
+    )
+    assert.deepEqual(rejected, [], 'setReject must NOT be called on 5xx error')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('email handler rejects with 550 bounce on 404 no recipient', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('Not Found', { status: 404 })
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+    assert.deepEqual(rejected, ['No such recipient'])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('email handler rejects with 550 bounce on 4xx client errors', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('Bad Request', { status: 400 })
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+    assert.deepEqual(rejected, ['Upstream 400'])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
+test('email handler accepts email on 200 response without setReject', async () => {
+  const { message, rejected } = createFakeMessage()
+  const originalFetch = globalThis.fetch
+  globalThis.fetch = async () => new Response('OK', { status: 200 })
+  try {
+    await worker.email(message, fakeEnv, fakeCtx)
+    assert.deepEqual(rejected, [])
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+})
+
