@@ -15,7 +15,10 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { isStoppableDaemonCommand } from '../agents/computer/daemon.js'
+import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { isStoppableDaemonCommand, ONE_SHOT_FLAGS } from '../agents/computer/daemon.js'
 
 // ── real long-running daemons: must be killed ────────────────────────────────
 
@@ -62,16 +65,58 @@ test('the supervised daemon IS stoppable even with env noise in the command line
 // ── one-shot CLIs: must be spared ────────────────────────────────────────────
 
 test('every one-shot flag is spared', () => {
-  for (const flag of [
-    '--stop', '--status', '--restart', '--logs', '--version',
-    '--install-service', '--uninstall-service', '--pair',
-  ]) {
+  for (const flag of ONE_SHOT_FLAGS) {
     assert.equal(
-      isStoppableDaemonCommand(`node /usr/local/bin/cumora agent computer ${flag}`),
+      isStoppableDaemonCommand(`node /usr/local/bin/cumora agent computer --${flag}`),
       false,
       flag,
     )
   }
+})
+
+test('every mode the parser treats as one-shot is in that list', () => {
+  // The old version of the test above restated the matcher's own eight flags,
+  // so a mode missing from BOTH could never be caught — which is how --doctor
+  // spent minutes of engine probes being killed by a concurrent --stop.
+  // Derive the expectation from parseArgs instead, so the next one-shot flag
+  // added there fails here until --stop knows to spare it.
+  const source = readFileSync(
+    join(dirname(fileURLToPath(import.meta.url)), '..', 'agents', 'computer', 'daemon.ts'),
+    'utf8',
+  )
+  // Anchor inside the body: parseArgs' return type is a multi-line object
+  // literal, so slicing from the declaration would stop at the type, not the code.
+  const from = source.indexOf('const out: ReturnType<typeof parseArgs>')
+  const body = from < 0 ? '' : source.slice(from, source.indexOf('return out', from))
+  assert.ok(
+    body.includes("argv[i] === '--status'"),
+    'parseArgs moved — update this guard alongside the refactor',
+  )
+
+  // Long flags the parser recognises, minus the ones that configure a daemon
+  // rather than replacing it.
+  // The only two that CONFIGURE a daemon rather than replacing it.
+  const CONFIGURES_A_DAEMON = new Set(['server', 'engine'])
+  const parsed = [...body.matchAll(/argv\[i\] === '--([a-z-]+)'/g)].map((m) => m[1])
+  const oneShot = parsed.filter((flag) => !CONFIGURES_A_DAEMON.has(flag))
+
+  const known = new Set<string>(ONE_SHOT_FLAGS)
+  const missing = oneShot.filter((flag) => !known.has(flag))
+  assert.deepEqual(missing, [], `--stop would kill these one-shot invocations: ${missing.join(', ')}`)
+})
+
+test('the bare `doctor` subcommand is spared too', () => {
+  // parseArgs accepts `doctor` as well as `--doctor`, and that form has no `--`
+  // to anchor on.
+  assert.equal(isStoppableDaemonCommand('npx cumora@latest agent computer doctor'), false)
+})
+
+test('a path containing the word doctor is still a daemon', () => {
+  // The bare-word rule must stay as tight as the `--` one.
+  assert.equal(
+    isStoppableDaemonCommand('node /opt/doctor-tools/cumora agent computer --server https://api.cumora.ai'),
+    true,
+  )
 })
 
 test('--pair with a value is spared', () => {

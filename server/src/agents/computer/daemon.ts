@@ -3906,8 +3906,18 @@ export async function restartService(hooks: RestartServiceHooks = {}): Promise<v
 /** One-shot CLI invocations: these do a thing and exit, so they are never the
  *  long-running daemon we mean to stop. Anchored to the `--` so the words can't
  *  match incidentally elsewhere in the command line. */
-const ONE_SHOT_FLAG_RE =
-  /--(stop|status|restart|logs|version|install-service|uninstall-service|pair)\b/
+export const ONE_SHOT_FLAGS = [
+  'stop', 'status', 'restart', 'logs', 'version', 'install-service',
+  'uninstall-service', 'pair', 'doctor', 'help',
+] as const
+const ONE_SHOT_FLAG_RE = new RegExp(`--(?:${ONE_SHOT_FLAGS.join('|')})\\b`)
+
+/** `--doctor` and `--help` also answer to bare `doctor` / `help` (parseArgs
+ *  accepts both spellings), and those forms carry no `--` to anchor on. Anchor
+ *  them to the command instead of matching the bare word, so a path like
+ *  /opt/doctor-tools/ still reads as a daemon — the same rule the `--`
+ *  anchoring exists for. */
+const ONE_SHOT_SUBCOMMAND_RE = /\bagent computer (?:doctor|help)\b/
 
 /** Is this `ps`-reported command line a long-running BYOA daemon that `--stop`
  *  should kill? True only for `agent computer` with no one-shot flag.
@@ -3919,7 +3929,8 @@ const ONE_SHOT_FLAG_RE =
  *  candidate set. Killing the wrapper's child is what actually stops the daemon,
  *  and the wrapper exits with it. */
 export function isStoppableDaemonCommand(cmd: string): boolean {
-  return /agent computer/.test(cmd) && !ONE_SHOT_FLAG_RE.test(cmd)
+  if (!/agent computer/.test(cmd)) return false
+  return !ONE_SHOT_FLAG_RE.test(cmd) && !ONE_SHOT_SUBCOMMAND_RE.test(cmd)
 }
 
 async function commandLineForPid(pid: number): Promise<string> {
