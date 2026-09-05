@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const http = require('node:http')
 const crypto = require('node:crypto')
 const { pathToFileURL } = require('node:url')
+const { initialWindowSize } = require('./window-size.cjs')
 const autoUpdater = require('./autoUpdater.cjs')
 
 const isDev = !app.isPackaged
@@ -1084,16 +1085,18 @@ function attachDisplayListeners() {
 }
 
 function createWindow() {
-  const saved = readWindowState() ?? DEFAULT_WINDOW_STATE
+  const savedState = readWindowState()
+  const saved = savedState ?? DEFAULT_WINDOW_STATE
   const rect = visibleRect(saved)
-  // Cap initial size to fit comfortably inside the primary display's
-  // work area — 90% of work area, with the configured default as the
-  // upper ceiling. Without this, the 1480×920 default would exceed
-  // smaller laptop displays and macOS would clamp on launch, making
-  // every first-run feel "fullscreen".
-  const wa = screen.getPrimaryDisplay().workArea
-  const initW = Math.min(saved.width ?? DEFAULT_WINDOW_STATE.width, Math.round(wa.width * 0.9))
-  const initH = Math.min(saved.height ?? DEFAULT_WINDOW_STATE.height, Math.round(wa.height * 0.9))
+  // The 90% cap is for FIRST RUN — it stops the 1480×920 default exceeding a
+  // small laptop, which macOS would clamp on launch so the app felt like it
+  // opened fullscreen. A size the user chose is not capped, only fitted, and
+  // fitted against the display it is actually landing on rather than the
+  // primary one. See window-size.cjs for what the old expression cost.
+  const wa = (rect ? screen.getDisplayMatching(rect) : screen.getPrimaryDisplay()).workArea
+  const { width: initW, height: initH } = initialWindowSize(
+    saved, DEFAULT_WINDOW_STATE, wa, Boolean(savedState),
+  )
   mainWindow = new BrowserWindow({
     width: initW,
     height: initH,
