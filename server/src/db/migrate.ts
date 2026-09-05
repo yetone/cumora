@@ -25,6 +25,10 @@ import {
   AGENT_RUNTIME_ASSIGNMENT_SQL,
   agentRuntimeAssignmentChecksum,
 } from './migrations/0004-agent-runtime-assignment.js'
+import {
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  emailMessagesCompanySmtpIdChecksum,
+} from './migrations/0005-email-messages-company-smtp-id.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2365,6 +2369,10 @@ async function applyAgentRuntimeAssignment(client: import('pg').PoolClient): Pro
   await client.query(AGENT_RUNTIME_ASSIGNMENT_SQL)
 }
 
+async function applyEmailMessagesCompanySmtpId(client: import('pg').PoolClient): Promise<void> {
+  await client.query(EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2385,6 +2393,11 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     ...SCHEMA_MIGRATIONS[3],
     sourceChecksum: agentRuntimeAssignmentChecksum(),
     up: applyAgentRuntimeAssignment,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[4],
+    sourceChecksum: emailMessagesCompanySmtpIdChecksum(),
+    up: applyEmailMessagesCompanySmtpId,
   },
 ]
 
