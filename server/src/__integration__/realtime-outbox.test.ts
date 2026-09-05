@@ -3,7 +3,8 @@ import { after, before, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import { pool } from '../db/pool.js'
 import { drainRealtimeOutbox, enqueueBroadcast } from '../realtime-outbox.js'
-import type { BroadcastEvent } from '../redis.js'
+import { CH_DOC_MENTION, type BroadcastEvent, type DocMentionEvent } from '../redis.js'
+import { processDocMention } from '../ws.js'
 import {
   buildApiTestApp, ensureSchemaOnce, resetAllTables,
   seedUserMembership, teardownAll,
@@ -153,6 +154,72 @@ test('[integration] document and calendar creates replay without duplicate rows 
     `SELECT COUNT(*)::int AS count FROM realtime_outbox`,
   )
   assert.equal(events.rows[0]?.count, 2)
+})
+
+// ── a doc mention is a durable write, so its toast must ride the outbox ─────
+//
+// `document_mentions` is the dedup ledger: processDocMention() skips any
+// (doc, mentioner, mentioned) tuple written in the last 60 seconds. Once those
+// rows commit, every retry inside that window is a no-op. A post-COMMIT
+// `publish()` that threw on a Redis outage therefore destroyed the notice
+// permanently AND reported failure for work that had already succeeded.
+
+test('[integration] a Redis outage delays a doc mention toast instead of losing it', async () => {
+  const RECIPIENT_ID = 'u-outbox-mentioned'
+  const DOCUMENT_ID = 'doc-outbox-mention'
+  await seedUserMembership(RECIPIENT_ID, COMPANY_ID, { displayName: 'Mentioned Human' })
+  await pool.query(
+    `INSERT INTO documents (id, company_id, title, created_by)
+     VALUES ($1, $2, 'Quarterly plan', $3)`,
+    [DOCUMENT_ID, COMPANY_ID, USER_ID],
+  )
+
+  await processDocMention({
+    documentId: DOCUMENT_ID,
+    companyId: COMPANY_ID,
+    mentionerId: USER_ID,
+    requestedIds: [RECIPIENT_ID],
+  })
+
+  const committed = await pool.query<{ mentions: number; pending: number; channel: string }>(
+    `SELECT
+       (SELECT COUNT(*)::int FROM document_mentions WHERE document_id = $1) AS mentions,
+       (SELECT COUNT(*)::int FROM realtime_outbox WHERE published_at IS NULL) AS pending,
+       (SELECT channel FROM realtime_outbox LIMIT 1) AS channel`,
+    [DOCUMENT_ID],
+  )
+  assert.deepEqual(committed.rows[0], {
+    mentions: 1, pending: 1, channel: CH_DOC_MENTION,
+  }, 'the toast must be enqueued in the same transaction as the mention row')
+
+  const failed = await drainRealtimeOutbox({
+    publishFn: async () => { throw new Error('redis unavailable') },
+  })
+  assert.deepEqual(failed, { claimed: 1, published: 0, failed: 1, discarded: 0 })
+
+  // The dedup window has NOT been consumed by the failure: the durable row and
+  // its undelivered event both survive, so recovery is a replay, not a re-send.
+  await pool.query(`UPDATE realtime_outbox SET available_at = NOW()`)
+  const delivered: BroadcastEvent[] = []
+  const recovered = await drainRealtimeOutbox({
+    publishFn: async (_channel, event) => { delivered.push(event) },
+  })
+  assert.deepEqual(recovered, { claimed: 1, published: 1, failed: 0, discarded: 0 })
+  assert.equal(delivered.length, 1)
+  assert.equal(delivered[0].type, 'doc.mention')
+  assert.deepEqual(
+    (delivered[0] as DocMentionEvent).mentionedIds, [RECIPIENT_ID],
+  )
+
+  // And the ledger still holds exactly one mention — the outage never widened
+  // into a duplicate notice.
+  const settled = await pool.query<{ mentions: number; pending: number }>(
+    `SELECT
+       (SELECT COUNT(*)::int FROM document_mentions WHERE document_id = $1) AS mentions,
+       (SELECT COUNT(*)::int FROM realtime_outbox WHERE published_at IS NULL) AS pending`,
+    [DOCUMENT_ID],
+  )
+  assert.deepEqual(settled.rows[0], { mentions: 1, pending: 0 })
 })
 
 // ── a body cut mid-emoji must not roll the transaction back ─────────────────

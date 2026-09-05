@@ -14,6 +14,7 @@ import type { MessageNewEvent } from './redis.js'
 import { env } from './env.js'
 import { consumeWsTicket } from './auth.js'
 import { pool } from './db/pool.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from './realtime-outbox.js'
 import { setStatus } from './status.js'
 import {
   subscribe as docSubscribe,
@@ -522,8 +523,12 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
  *  most recent mention-row for the same (doc, mentioner, mentioned)
  *  tuple — we don't want a noisily editing user spamming the
  *  recipient. For mentioned AGENTS, also writes an `agent_log` row so
- *  the agent's history surfaces the mention. */
-async function processDocMention(args: {
+ *  the agent's history surfaces the mention.
+ *
+ *  Exported for the integration suite: the only production caller is the
+ *  `doc.mention.notify` WS frame above, and standing up a socket just to
+ *  assert the durable/outbox contract would test the transport instead. */
+export async function processDocMention(args: {
   documentId: string
   companyId: string
   mentionerId: string
@@ -608,7 +613,26 @@ async function processDocMention(args: {
       }
       freshRows.push(row)
     }
+    // The toast rides the transactional outbox rather than a post-COMMIT
+    // publish. `document_mentions` is the dedup ledger: once these rows
+    // commit, the 60s window above swallows every retry, so a Redis outage
+    // that threw here used to lose the notice permanently while the caller
+    // saw a failure for work that had actually succeeded. Enqueued in-band,
+    // a degraded Redis only delays it. See realtime-outbox.ts.
+    if (freshRows.length > 0) {
+      const event: DocMentionEvent = {
+        type: 'doc.mention',
+        companyId,
+        documentId,
+        documentTitle,
+        mentionerId,
+        mentionerName,
+        mentionedIds: freshRows.map((row) => row.id),
+      }
+      await enqueueBroadcast(client, CH_DOC_MENTION, event)
+    }
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -630,18 +654,6 @@ async function processDocMention(args: {
       console.warn(`[doc.mention] wake post for ${row.id} failed`, e)
     }
   }
-  const freshIds = freshRows.map((row) => row.id)
-
-  const event: DocMentionEvent = {
-    type: 'doc.mention',
-    companyId,
-    documentId,
-    documentTitle,
-    mentionerId,
-    mentionerName,
-    mentionedIds: freshIds,
-  }
-  await publish(CH_DOC_MENTION, event)
 }
 
 /** Post a synthetic chat message that wakes the mentioned agent with

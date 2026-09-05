@@ -3717,13 +3717,22 @@ api.post('/conversations/:id/typing', async (req, res) => {
     // field name is a legacy from when only agents emitted typing — the
     // client treats it as an opaque participant id and doesn't care
     // whether the typer is human or agent.
+    //
+    // Fail-open on a Redis outage. A typing indicator is pure ephemera
+    // that the renderer expires on its own; surfacing the outage as a 500
+    // would only teach a composer that fires one of these every few
+    // seconds to spam the error path. Matches how the agent-side emitters
+    // treat the same channel (inproc-client.ts, scheduler.ts).
     await publish(CH_TYPING, {
       type: 'typing',
       conversationId: id,
       agentId: me,
       done,
       companyId,
-    })
+    }).catch((err) =>
+      console.warn(`[typing] publish for ${id} failed — dropping`,
+        err instanceof Error ? err.message : err),
+    )
     res.json({ ok: true })
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500
