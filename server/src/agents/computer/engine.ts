@@ -1230,7 +1230,7 @@ class ClaudeSession implements EngineSession {
       if (this.pending) pushTail(this.pending.stdout, line)
       this.onLog(line)
       if (!line.startsWith('{')) continue
-      let ev: { type?: unknown; session_id?: unknown; is_error?: unknown; subtype?: unknown; status?: unknown; result?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
+      let ev: { type?: unknown; session_id?: unknown; is_error?: unknown; subtype?: unknown; status?: unknown; result?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown }; error?: unknown }
       try { ev = JSON.parse(line) } catch { continue }
       if (typeof ev.session_id === 'string' && ev.session_id) this.sid = ev.session_id
       // Capture the real model id (assistant events carry message.model) for pricing.
@@ -1273,11 +1273,38 @@ class ClaudeSession implements EngineSession {
         this.hopIndex = 0        // reset the per-turn hop counter
         this.steerQueue = [] // turn ending — any unflushed steer falls to the daemon's coalesced rerun
         const isErr = ev.is_error === true
+        let error: string | undefined
+        if (isErr) {
+          let detail =
+            (typeof ev.result === 'string' && ev.result.trim()) ||
+            (Array.isArray((ev as { errors?: unknown[] }).errors) &&
+              ((ev as { errors: unknown[] }).errors.filter(Boolean).map(String).join('\n').trim())) ||
+            (typeof ev.error === 'string' && ev.error.trim()) ||
+            (typeof (ev.error as { message?: unknown })?.message === 'string' && ((ev.error as { message: string }).message.trim())) ||
+            ''
+          if (!detail || detail === 'see log') {
+            const stderrLines = (this.pending?.stderr.length ? this.pending.stderr : this.stderrTail)
+              .filter(Boolean)
+              .slice(-30)
+              .join('\n')
+              .trim()
+            if (stderrLines) {
+              detail = stderrLines
+            } else {
+              const stdoutLines = (this.pending?.stdout.length ? this.pending.stdout : this.stdoutTail)
+                .filter((l) => !l.startsWith('{'))
+                .slice(-30)
+                .join('\n')
+                .trim()
+              if (stdoutLines) detail = stdoutLines
+            }
+          }
+          if (!detail) detail = 'see log'
+          error = `engine turn error${typeof ev.subtype === 'string' ? ` (${ev.subtype})` : ''}: ${detail.slice(0, MAX_FAILURE_CHARS)}`
+        }
         this.settle({
           exitCode: isErr ? 1 : 0,
-          error: isErr
-            ? `engine turn error${typeof ev.subtype === 'string' ? ` (${ev.subtype})` : ''}: ${typeof ev.result === 'string' ? ev.result.slice(0, MAX_FAILURE_CHARS) : 'see log'}`
-            : undefined,
+          error,
           sessionId: this.sid,
           usage: ev.usage && typeof ev.usage === 'object' ? ev.usage : undefined,
           model: this.curModel,

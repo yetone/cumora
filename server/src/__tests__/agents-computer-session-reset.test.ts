@@ -58,6 +58,11 @@ test('Claude: "No conversation found with session ID" IS a stale resume target',
   assert.equal(isStaleResumeError(err), true)
 })
 
+test('Claude: engine turn error with "No conversation found with session ID" IS a stale resume target', () => {
+  const err = 'local claude failed (exit 1): engine turn error (error_during_execution): No conversation found with session ID: 6f1c2e30-2b77-4a3f-9d51-4c0a1b2e3f44'
+  assert.equal(isStaleResumeError(err), true)
+})
+
 test('a stale resume target reported inside a FAILED result event still resets', () => {
   // Same verdict whether the engine puts it on stderr or in an error event.
   const err = 'local claude failed (exit 1): process exited with code 1\n' +

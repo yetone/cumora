@@ -48,7 +48,7 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineAdapter, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 
 export { conversationHeader }
 
@@ -86,7 +86,11 @@ const AGENTS_ROOT = join(CONFIG_DIR, 'agents')
 // own cwd can't clobber it). Survives a daemon restart so the next wake can
 // `--resume` the SAME engine session — recovering the in-turn context an
 // interrupted long task was building, instead of starting cold.
-const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
+export const SESSIONS_DIR = join(CONFIG_DIR, 'sessions')
+
+export function sessionFileFor(agentId: string, engine: EngineId): string {
+  return join(SESSIONS_DIR, `${agentId}.${engine}.session`)
+}
 // Bounded grace on a forced shutdown (SIGTERM/SIGINT): let an in-flight turn try
 // to finish before we kill the engine child. The OS supervisor SIGKILLs not long
 // after SIGTERM, so this is best-effort for SHORT turns; long tasks rely on the
@@ -415,13 +419,13 @@ function versionGt(a: string, b: string): boolean {
   return false
 }
 
-interface DaemonConfig {
+export interface DaemonConfig {
   serverUrl: string
   computerId: string
   deviceToken: string
 }
 
-interface AgentInfo {
+export interface AgentInfo {
   id: string
   name: string
   role: string | null
@@ -746,6 +750,15 @@ export function engineDiagnosticProse(err: string): string {
 /** True when an engine error really says the `--resume` target is gone. */
 export function isStaleResumeError(err: string): boolean {
   return STALE_RESUME_RE.test(engineDiagnosticProse(err))
+}
+
+/** True when usage indicates that the model actually ran and consumed tokens.
+ *  Engines rejecting a bogus resume target before running report zero usage,
+ *  which makes an in-turn retry safe; turns that produced non-zero usage must
+ *  not be retried in-turn to avoid duplicate side effects and double billing. */
+export function hasNonZeroUsage(u?: EngineUsage): boolean {
+  if (!u) return false
+  return (u.input_tokens ?? 0) > 0 || (u.output_tokens ?? 0) > 0
 }
 
 export function authFailureHint(engine: EngineId, detail: string): string {
@@ -1568,7 +1581,7 @@ export function resolveTriageModel(
   return resolveEngineFastModel(configured, engineOverride)?.trim() || computerDefault?.trim() || undefined
 }
 
-class AgentRunner {
+export class AgentRunner {
   /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
    *  engine child dies with its runner, the way the persistent session already
    *  does. Without it those children were orphaned: they keep the `cumora` IPC
@@ -1581,7 +1594,7 @@ class AgentRunner {
   private binDir: string
   private trustedCliDir: string
   private ipcDir: string
-  private sessionFile: string
+  readonly sessionFile: string
   private busy = false
   private pendingRerun = false
   // Triage-trouble backoff: when the small-brain triage is rate-limited OR
@@ -1646,7 +1659,7 @@ class AgentRunner {
   private lastGroupSteeredMsgId: string | null = null
   private lastGroupSteerAt = 0
   private pollTimer: ReturnType<typeof setInterval> | undefined
-  private readonly adapter
+  private readonly adapter: EngineAdapter
   /** Privileged local broker: the engine sees only its IPC directory, while the
    *  daemon keeps the short-lived runtime JWT in memory. */
   private cliBroker: RuntimeCliBroker | null = null
@@ -1663,6 +1676,7 @@ class AgentRunner {
     private readonly cfg: DaemonConfig,
     private readonly agent: AgentInfo,
     engine: EngineId,
+    adapter?: EngineAdapter,
   ) {
     this.home = join(AGENTS_ROOT, agent.id)
     this.binDir = join(this.home, 'bin')
@@ -1673,8 +1687,8 @@ class AgentRunner {
     // granted only the two leaf request/response directories; Claude reaches
     // them through the fixed MCP bridge, not a model-controlled shell.
     this.ipcDir = join(CONFIG_DIR, '.runtime-cli-ipc', this.agent.id)
-    this.sessionFile = join(SESSIONS_DIR, `${agent.id}.session`)
-    this.adapter = getAdapter(engine)
+    this.sessionFile = sessionFileFor(agent.id, engine)
+    this.adapter = adapter ?? getAdapter(engine)
   }
 
   private get reporter(): HopReporter {
@@ -1723,9 +1737,11 @@ class AgentRunner {
    *  restarting/auto-updating mid-turn.) */
   get isBusy(): boolean { return this.busy }
 
+  get currentSessionId(): string | null { return this.sessionId }
+
   /** Update the engine session id AND persist it to disk, so a daemon restart can
    *  `--resume` the same session and recover the interrupted turn's context. */
-  private setSessionId(id: string | null): void {
+  setSessionId(id: string | null): void {
     if (id === this.sessionId) return
     this.sessionId = id
     void this.persistSessionId()
@@ -1743,7 +1759,7 @@ class AgentRunner {
    *      only when the engine SAYS SO: a mid-turn crash (OOM, sleep, provider
    *      hangup) leaves a resumable session, so it must NOT reset — that would
    *      discard the context the interrupted turn was building. */
-  private mustResetSession(err: string, hadResume: boolean): boolean {
+  mustResetSession(err: string, hadResume: boolean): boolean {
     if (this.isContextOverflow(err)) return true
     if (this.isPoisonedTranscript(err)) return true
     if (hadResume && isStaleResumeError(err)) return true
@@ -1767,7 +1783,7 @@ class AgentRunner {
 
   /** Drop the session id AND tear down any persistent engine process so the next
    *  wake spawns a genuinely clean session (no --resume of the bad context). */
-  private async resetEngineSession(reason: string): Promise<void> {
+  async resetEngineSession(reason: string): Promise<void> {
     console.warn(`[computer] ${this.agent.id} ${reason} — starting a FRESH engine session next wake`)
     this.setSessionId(null)
     await this.engineSession?.stop({ force: true })
@@ -1780,7 +1796,7 @@ class AgentRunner {
     finally { if (this.activeEngineRun === run) this.activeEngineRun = null }
   }
 
-  private async persistSessionId(): Promise<void> {
+  async persistSessionId(): Promise<void> {
     try {
       if (this.sessionId) {
         await mkdir(SESSIONS_DIR, { recursive: true })
@@ -1791,12 +1807,20 @@ class AgentRunner {
     } catch { /* best-effort — a lost session id just means a cold next wake */ }
   }
 
-  private async loadSessionId(): Promise<void> {
+  async loadSessionId(): Promise<void> {
+    // Versions before session isolation stored an unscoped `<agentId>.session`.
+    // Do not migrate legacy sessions when engine ownership cannot be verified;
+    // remove the stale file so it cannot poison any engine path.
+    try {
+      const legacy = join(SESSIONS_DIR, `${this.agent.id}.session`)
+      await rm(legacy, { force: true })
+    } catch { /* best-effort */ }
+
     try {
       const s = (await readFile(this.sessionFile, 'utf8')).trim()
       if (s) {
         this.sessionId = s
-        console.log(`[computer] ${this.agent.id} restored engine session ${s.slice(0, 8)} from disk — will --resume (continuity across restart)`)
+        console.log(`[computer] ${this.agent.id} restored ${this.adapter.id} engine session ${s.slice(0, 8)} from disk — will --resume (continuity across restart)`)
       }
     } catch { /* no prior session on disk — start cold */ }
   }
@@ -1965,7 +1989,7 @@ class AgentRunner {
    *  fallback, or custom args) — the caller then uses one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
-  private ensureEngineSession(): EngineSession | null {
+  private ensureEngineSession(resumeSessionId: string | null = this.sessionId): EngineSession | null {
     if (!this.adapter.startSession) return null
     if (this.persistentUnusable) return null
     if (this.engineSession?.alive) return this.engineSession
@@ -1974,7 +1998,7 @@ class AgentRunner {
       env: this.engineEnv(),
       model: this.engineModel(),
       fastModel: this.engineFastModel(),
-      resumeSessionId: this.sessionId,
+      resumeSessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
       // Trajectory hook — every assistant hop (Claude) / turn-completed (Codex)
@@ -1984,9 +2008,102 @@ class AgentRunner {
       onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
     })
     if (this.engineSession) {
-      console.log(`[computer] ${this.agent.id} engine session ${this.sessionId ? `respawned (resume ${this.sessionId.slice(0, 8)})` : 'spawned fresh'} — persistent, no per-wake cold start`)
+      console.log(`[computer] ${this.agent.id} engine session ${resumeSessionId ? `respawned (resume ${resumeSessionId.slice(0, 8)})` : 'spawned fresh'} — persistent, no per-wake cold start`)
     }
     return this.engineSession
+  }
+
+  /** Execute a single engine attempt for chat or agenda. Session capture,
+   *  hop tracking, and the persistent-to-one-shot fallback live here. */
+  async runEngineAttempt(
+    delta: string,
+    resumeSessionId: string | null,
+    purpose: PendingHop['purpose'],
+  ): Promise<EngineRunResult> {
+    const session = this.ensureEngineSession(resumeSessionId)
+    const prompt = this.turnPrompt(session, delta)
+    let result: EngineRunResult
+    if (session) {
+      // PERSISTENT path: feed this turn into the long-lived process — no cold
+      // start (the first turn paid it; turns 2..N reuse the booted process).
+      // Persist the session id EARLY (the engine reports it ~1-2s in) so an
+      // interrupt mid-turn — even on a brand-new session — still leaves a
+      // resumable id on disk, not just when the turn finishes.
+      const capture = setInterval(() => { if (session.sessionId) this.setSessionId(session.sessionId) }, 2000)
+      capture.unref?.()
+      try {
+        result = await this.trackEngineRun(session.send(prompt))
+      } finally {
+        clearInterval(capture)
+      }
+      if (session.sessionId) this.setSessionId(session.sessionId)
+      // Process died during/after the turn → drop it so the next wake respawns
+      // (with --resume this.sessionId to carry context across the restart).
+      if (!session.alive) this.engineSession = null
+      // A persistent process that dies without producing a turn is not a
+      // transient hiccup, it is this machine telling us the persistent
+      // transport does not work here. Retry THIS turn one-shot and stay
+      // there: the alternative is failing every wake forever, which is the
+      // shape the codex sandbox outage took.
+      // No usage means the model never ran — the process died in the
+      // transport, not mid-answer, so re-running the turn cannot duplicate
+      // work or double-charge.
+      //
+      // BUT a stale resume target is NOT a transport failure — the requested
+      // session is simply missing. Do not permanently poison persistentUnusable
+      // when the failure is a stale resume target.
+      if (result.error && !result.usage && !session.alive) {
+        if (!isStaleResumeError(result.error)) {
+          this.persistentUnusable = true
+          this.engineSession = null
+          this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
+          result = await this.trackEngineRun(this.adapter.run({
+            home: this.home,
+            prompt: this.turnPrompt(null, delta),
+            env: this.engineEnv(),
+            model: this.engineModel(),
+            fastModel: this.engineFastModel(),
+            resumeSessionId,
+            onLog: (line) => this.logEngineLine(line),
+            onHopUsage: (r) => this.onEngineHop(r, purpose),
+            signal: this.teardown.signal,
+          }))
+          if (result.sessionId) this.setSessionId(result.sessionId)
+        }
+      }
+    } else {
+      // One-shot path: Cursor/OpenCode, Codex fallback, or a custom args override.
+      result = await this.trackEngineRun(this.adapter.run({
+        home: this.home,
+        prompt,
+        env: this.engineEnv(),
+        model: this.engineModel(),
+        fastModel: this.engineFastModel(),
+        resumeSessionId,
+        onLog: (line) => this.logEngineLine(line),
+        onHopUsage: (r) => this.onEngineHop(r, purpose),
+        signal: this.teardown.signal,
+      }))
+      if (result.sessionId) this.setSessionId(result.sessionId)
+    }
+    return result
+  }
+
+  /** Execute an engine turn with single-attempt retry on stale resume target.
+   *  Scoped strictly to stale resumes where no model usage occurred, preventing
+   *  duplicate side effects or double billing. */
+  async runEngineTurn(
+    delta: string,
+    resumeSessionId: string | null,
+    purpose: PendingHop['purpose'],
+  ): Promise<EngineRunResult> {
+    let result = await this.runEngineAttempt(delta, resumeSessionId, purpose)
+    if (result.error && !hasNonZeroUsage(result.usage) && resumeSessionId && isStaleResumeError(result.error)) {
+      console.log(`[computer] ${this.agent.id} resume target is stale — resetting and retrying turn fresh`)
+      await this.resetEngineSession('stale resume target')
+      result = await this.runEngineAttempt(delta, null, purpose)
+    }
+    return result
   }
 
   /** Enter, or clear, this agent's engine pause for a finished turn. Both turn
@@ -2524,24 +2641,8 @@ class AgentRunner {
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
       const resumeSessionId = this.sessionId
-      const session = this.ensureEngineSession()
-      const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster))
-      const engineRun = session
-        ? session.send(prompt)
-        : this.adapter.run({
-          home: this.home, prompt, env: this.engineEnv(),
-          model: this.engineModel(), fastModel: this.engineFastModel(),
-          resumeSessionId: this.sessionId, onLog: (line) => this.logEngineLine(line),
-          // Same trajectory hook as the persistent-session path so the
-          // one-shot fallback (or codex `exec` path) also lands hops in the
-          // universal ledger.
-          onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-          signal: this.teardown.signal,
-        })
-      const result = await this.trackEngineRun(engineRun)
-      if (session?.sessionId) this.setSessionId(session.sessionId)
-      if (session && !session.alive) this.engineSession = null
-      if (!session && result.sessionId) this.setSessionId(result.sessionId)
+      const delta = this.agendaDelta(ag.brief, memoryDigest, roster)
+      const result = await this.runEngineTurn(delta, resumeSessionId, 'agent-turn')
       exitCode = result.exitCode
       turnUsage = result.usage
       turnModel = result.model
@@ -2922,78 +3023,14 @@ class AgentRunner {
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
           const resumeSessionId = this.sessionId
-          let result: EngineRunResult
-          const session = this.ensureEngineSession()
-          // Standing scaffold rides the session's system-prompt file; send only the
-          // small per-turn delta when it does (else inline it — see turnPrompt).
           const delta = turnBackgroundBrief
             ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
             : this.chatDelta(memoryDigest, triageNote, digest, roster)
-          const prompt = this.turnPrompt(session, delta)
-          if (session) {
-            // PERSISTENT path: feed this turn into the long-lived process — no cold
-            // start (the first turn paid it; turns 2..N reuse the booted process).
-            // Persist the session id EARLY (the engine reports it ~1-2s in) so an
-            // interrupt mid-turn — even on a brand-new session — still leaves a
-            // resumable id on disk, not just when the turn finishes.
-            const capture = setInterval(() => { if (session.sessionId) this.setSessionId(session.sessionId) }, 2000)
-            capture.unref?.()
-            try {
-              result = await this.trackEngineRun(session.send(prompt))
-            } finally {
-              clearInterval(capture)
-            }
-            if (session.sessionId) this.setSessionId(session.sessionId)
-            // Process died during/after the turn → drop it so the next wake respawns
-            // (with --resume this.sessionId to carry context across the restart).
-            if (!session.alive) this.engineSession = null
-            // A persistent process that dies without producing a turn is not a
-            // transient hiccup, it is this machine telling us the persistent
-            // transport does not work here. Retry THIS turn one-shot and stay
-            // there: the alternative is failing every wake forever, which is the
-            // shape the codex sandbox outage took.
-            // No usage means the model never ran — the process died in the
-            // transport, not mid-answer, so re-running the turn cannot duplicate
-            // work or double-charge.
-            if (result.error && !result.usage && !session.alive) {
-              this.persistentUnusable = true
-              this.engineSession = null
-              this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
-              result = await this.trackEngineRun(this.adapter.run({
-                home: this.home,
-                prompt: this.turnPrompt(null, delta),
-                env: this.engineEnv(),
-                model: this.engineModel(),
-                fastModel: this.engineFastModel(),
-                resumeSessionId,
-                onLog: (line) => this.logEngineLine(line),
-                onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-                signal: this.teardown.signal,
-              }))
-              if (result.sessionId) this.setSessionId(result.sessionId)
-            }
-          } else {
-            // One-shot path: Cursor/OpenCode, Codex fallback, or a custom args override.
-            result = await this.trackEngineRun(this.adapter.run({
-              home: this.home,
-              prompt,
-              env: this.engineEnv(),
-              model: this.engineModel(),
-              fastModel: this.engineFastModel(),
-              resumeSessionId,
-              onLog: (line) => this.logEngineLine(line),
-              onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-              signal: this.teardown.signal,
-            }))
-            if (result.sessionId) this.setSessionId(result.sessionId)
-          }
+          const result = await this.runEngineTurn(delta, resumeSessionId, 'agent-turn')
           exitCode = result.exitCode
           turnUsage = result.usage
           turnModel = result.model
           if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
-          // A stale resume OR a context-window overflow means this session can't
-          // be carried forward — drop it AND tear down any persistent process so
-          // the next wake starts clean (otherwise --resume re-overflows forever).
           if (engineError && this.mustResetSession(engineError, !!resumeSessionId)) {
             await this.resetEngineSession(this.resetReason(engineError))
           }
