@@ -48,8 +48,9 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
+import { runWithSessionRecovery } from './session-recovery.js'
 
 export { conversationHeader }
 
@@ -923,6 +924,56 @@ export interface EngineInventory {
   current: EngineId[]
 }
 
+/** Hysteresis for trustworthy scans. A previously runnable engine survives a
+ * transient capability probe and two consecutive PATH misses. Confirmed
+ * incompatibility removes it immediately because the security floor is not a
+ * liveness signal and must never be debounced. */
+export class EngineInventoryStabilizer {
+  private readonly missingCounts = new Map<EngineId, number>()
+
+  constructor(private readonly missingThreshold = 3) {}
+
+  stabilize(
+    previous: readonly EngineId[],
+    installed: readonly EngineId[],
+    evaluated: RunnableEngineEvaluation,
+  ): EngineId[] {
+    const installedSet = new Set(installed)
+    const runnableSet = new Set(evaluated.runnable)
+    const transientSet = new Set([
+      ...evaluated.temporarilyUnverifiable ?? [],
+      ...evaluated.blocked.filter((entry) => entry.state === 'temporarily-unverifiable').map((entry) => entry.id),
+    ])
+    const incompatibleSet = new Set(evaluated.blocked
+      .filter((entry) => entry.state === 'confirmed-incompatible')
+      .map((entry) => entry.id))
+    const next: EngineId[] = []
+
+    for (const id of previous) {
+      if (incompatibleSet.has(id)) {
+        this.missingCounts.delete(id)
+        continue
+      }
+      if (installedSet.has(id)) {
+        this.missingCounts.delete(id)
+        if (runnableSet.has(id) || transientSet.has(id)) next.push(id)
+        continue
+      }
+      const misses = (this.missingCounts.get(id) ?? 0) + 1
+      this.missingCounts.set(id, misses)
+      if (misses < this.missingThreshold) next.push(id)
+    }
+
+    for (const id of installed) {
+      if (runnableSet.has(id)) {
+        this.missingCounts.delete(id)
+        if (!next.includes(id)) next.push(id)
+      }
+    }
+    return next
+  }
+}
+
 /** Replace the shared engine inventory after a trustworthy PATH scan. */
 export function replaceEngineInventory(inventory: EngineInventory, next: readonly EngineId[]): boolean {
   const current = inventory.current
@@ -1794,6 +1845,72 @@ class AgentRunner {
     finally { if (this.activeEngineRun === run) this.activeEngineRun = null }
   }
 
+  /** Execute exactly one engine attempt. Session capture and the persistent to
+   * one-shot transport fallback live here so chat and agenda cannot drift. */
+  private async runEngineAttempt(delta: string, resumeSessionId: string | null): Promise<EngineRunResult> {
+    const session = this.ensureEngineSession(resumeSessionId)
+    const prompt = this.turnPrompt(session, delta)
+    let result: EngineRunResult
+    if (session) {
+      const capture = setInterval(() => { if (session.sessionId) this.setSessionId(session.sessionId) }, 2000)
+      capture.unref?.()
+      try {
+        result = await this.trackEngineRun(session.send(prompt))
+      } finally {
+        clearInterval(capture)
+      }
+      if (session.sessionId) this.setSessionId(session.sessionId)
+      if (!session.alive) this.engineSession = null
+      const persistentFailure = engineFailureOf(result, !!resumeSessionId)
+      if (persistentFailure && !result.failure) result.failure = persistentFailure
+      // A dead persistent transport that never reached the model is safe to
+      // retry one-shot. Preserve the same resume target for continuity.
+      if (result.error && !result.usage && !session.alive && persistentFailure?.kind !== 'resume-not-found') {
+        this.persistentUnusable = true
+        this.engineSession = null
+        this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
+        result = await this.trackEngineRun(this.adapter.run({
+          home: this.home,
+          prompt: this.turnPrompt(null, delta),
+          env: this.engineEnv(),
+          model: this.engineModel(),
+          fastModel: this.engineFastModel(),
+          resumeSessionId,
+          onLog: (line) => this.logEngineLine(line),
+          onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
+          signal: this.teardown.signal,
+        }))
+      }
+    } else {
+      result = await this.trackEngineRun(this.adapter.run({
+        home: this.home,
+        prompt,
+        env: this.engineEnv(),
+        model: this.engineModel(),
+        fastModel: this.engineFastModel(),
+        resumeSessionId,
+        onLog: (line) => this.logEngineLine(line),
+        onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
+        signal: this.teardown.signal,
+      }))
+    }
+    if (result.sessionId) this.setSessionId(result.sessionId)
+    return result
+  }
+
+  /** A missing resume target proves the model never began the requested turn,
+   * so one fresh retry is safe. Every other failure returns immediately to
+   * avoid duplicating tool side effects after an ambiguous crash or timeout. */
+  private async runWithSessionRecovery(delta: string): Promise<EngineRunResult> {
+    const resumeSessionId = this.resumeSessionId()
+    return runWithSessionRecovery({
+      resumeSessionId,
+      run: (resume) => this.runEngineAttempt(delta, resume),
+      reset: () => this.resetEngineSession(`${this.engine} resume target ${sessionIdPreview(resumeSessionId ?? '')} does not exist`),
+      onFreshRetry: () => console.warn(`[computer] ${this.agent.id} retrying turn once with a fresh ${this.engine} session`),
+    })
+  }
+
   private async loadSessionId(): Promise<void> {
     await this.sessionStore.quarantineLegacy()
     const s = await this.sessionStore.load()
@@ -1968,7 +2085,7 @@ class AgentRunner {
    *  fallback, or custom args) — the caller then uses one-shot run(). If the
    *  prior process has died it respawns, resuming this.sessionId so context
    *  carries across the restart. */
-  private ensureEngineSession(): EngineSession | null {
+  private ensureEngineSession(resumeSessionId = this.resumeSessionId()): EngineSession | null {
     if (!this.adapter.startSession) return null
     if (this.persistentUnusable) return null
     if (this.engineSession?.alive) return this.engineSession
@@ -1977,7 +2094,7 @@ class AgentRunner {
       env: this.engineEnv(),
       model: this.engineModel(),
       fastModel: this.engineFastModel(),
-      resumeSessionId: this.resumeSessionId(),
+      resumeSessionId,
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
       // Trajectory hook — every assistant hop (Claude) / turn-completed (Codex)
@@ -2526,30 +2643,12 @@ class AgentRunner {
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
-      const resumeSessionId = this.resumeSessionId()
-      const session = this.ensureEngineSession()
-      const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster))
-      const engineRun = session
-        ? session.send(prompt)
-        : this.adapter.run({
-          home: this.home, prompt, env: this.engineEnv(),
-          model: this.engineModel(), fastModel: this.engineFastModel(),
-          resumeSessionId, onLog: (line) => this.logEngineLine(line),
-          // Same trajectory hook as the persistent-session path so the
-          // one-shot fallback (or codex `exec` path) also lands hops in the
-          // universal ledger.
-          onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-          signal: this.teardown.signal,
-        })
-      const result = await this.trackEngineRun(engineRun)
-      if (session?.sessionId) this.setSessionId(session.sessionId)
-      if (session && !session.alive) this.engineSession = null
-      if (!session && result.sessionId) this.setSessionId(result.sessionId)
+      const result = await this.runWithSessionRecovery(this.agendaDelta(ag.brief, memoryDigest, roster))
       exitCode = result.exitCode
       turnUsage = result.usage
       turnModel = result.model
-      if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
-      if (engineError && this.mustResetSession(engineError, !!resumeSessionId)) {
+      if (result.error) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
+      if (engineError && result.failure?.kind !== 'resume-not-found' && this.mustResetSession(engineError, false)) {
         await this.resetEngineSession(this.resetReason(engineError))
       }
     } catch (err) {
@@ -2924,80 +3023,18 @@ class AgentRunner {
             runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
-          const resumeSessionId = this.resumeSessionId()
-          let result: EngineRunResult
-          const session = this.ensureEngineSession()
-          // Standing scaffold rides the session's system-prompt file; send only the
-          // small per-turn delta when it does (else inline it — see turnPrompt).
           const delta = turnBackgroundBrief
             ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
             : this.chatDelta(memoryDigest, triageNote, digest, roster)
-          const prompt = this.turnPrompt(session, delta)
-          if (session) {
-            // PERSISTENT path: feed this turn into the long-lived process — no cold
-            // start (the first turn paid it; turns 2..N reuse the booted process).
-            // Persist the session id EARLY (the engine reports it ~1-2s in) so an
-            // interrupt mid-turn — even on a brand-new session — still leaves a
-            // resumable id on disk, not just when the turn finishes.
-            const capture = setInterval(() => { if (session.sessionId) this.setSessionId(session.sessionId) }, 2000)
-            capture.unref?.()
-            try {
-              result = await this.trackEngineRun(session.send(prompt))
-            } finally {
-              clearInterval(capture)
-            }
-            if (session.sessionId) this.setSessionId(session.sessionId)
-            // Process died during/after the turn → drop it so the next wake respawns
-            // (with --resume this.sessionId to carry context across the restart).
-            if (!session.alive) this.engineSession = null
-            // A persistent process that dies without producing a turn is not a
-            // transient hiccup, it is this machine telling us the persistent
-            // transport does not work here. Retry THIS turn one-shot and stay
-            // there: the alternative is failing every wake forever, which is the
-            // shape the codex sandbox outage took.
-            // No usage means the model never ran — the process died in the
-            // transport, not mid-answer, so re-running the turn cannot duplicate
-            // work or double-charge.
-            if (result.error && !result.usage && !session.alive) {
-              this.persistentUnusable = true
-              this.engineSession = null
-              this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
-              result = await this.trackEngineRun(this.adapter.run({
-                home: this.home,
-                prompt: this.turnPrompt(null, delta),
-                env: this.engineEnv(),
-                model: this.engineModel(),
-                fastModel: this.engineFastModel(),
-                resumeSessionId,
-                onLog: (line) => this.logEngineLine(line),
-                onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-                signal: this.teardown.signal,
-              }))
-              if (result.sessionId) this.setSessionId(result.sessionId)
-            }
-          } else {
-            // One-shot path: Cursor/OpenCode, Codex fallback, or a custom args override.
-            result = await this.trackEngineRun(this.adapter.run({
-              home: this.home,
-              prompt,
-              env: this.engineEnv(),
-              model: this.engineModel(),
-              fastModel: this.engineFastModel(),
-              resumeSessionId,
-              onLog: (line) => this.logEngineLine(line),
-              onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
-              signal: this.teardown.signal,
-            }))
-            if (result.sessionId) this.setSessionId(result.sessionId)
-          }
+          const result = await this.runWithSessionRecovery(delta)
           exitCode = result.exitCode
           turnUsage = result.usage
           turnModel = result.model
-          if (result.error) engineError = this.visibleEngineError(exitCode, result.error)
+          if (result.error) engineError = this.visibleEngineError(exitCode, result.failure?.message ?? result.error)
           // A stale resume OR a context-window overflow means this session can't
           // be carried forward — drop it AND tear down any persistent process so
           // the next wake starts clean (otherwise --resume re-overflows forever).
-          if (engineError && this.mustResetSession(engineError, !!resumeSessionId)) {
+          if (engineError && result.failure?.kind !== 'resume-not-found' && this.mustResetSession(engineError, false)) {
             await this.resetEngineSession(this.resetReason(engineError))
           }
         } catch (err) {
@@ -3266,6 +3303,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
 
   const runners = new Map<string, AgentRunner>()
+  const engineInventoryStabilizer = new EngineInventoryStabilizer()
 
   const syncOnce = async (): Promise<void> => {
     let agents: AgentInfo[]
@@ -3342,11 +3380,19 @@ async function doRun(serverOverride?: string): Promise<void> {
       const detected = await detectEnginesWithStatus()
       if (!detected.reliable) return  // broken `which` / `where` — keep the last good list
       const evaluated = await evaluateRunnableEngines(detected.engines)
-      const next = evaluated.runnable
-      const capabilityWarning = evaluated.blocked.map(({ id, reason }) => `${id} (${reason})`).join('; ')
+      const next = engineInventoryStabilizer.stabilize(engineInventory.current, detected.engines, evaluated)
+      const blocked = evaluated.blocked.filter(({ id }) => !next.includes(id))
+      const retainedTransient = [...new Set([
+        ...evaluated.temporarilyUnverifiable ?? [],
+        ...evaluated.blocked.filter(({ id, state }) => state === 'temporarily-unverifiable' && next.includes(id)).map(({ id }) => id),
+      ])]
+      const capabilityWarning = [
+        ...blocked.map(({ id, reason }) => `${id} (${reason})`),
+        ...retainedTransient.map((id) => `${id} (version temporarily unverifiable; retaining last-known-good availability)`),
+      ].join('; ')
       if (capabilityWarning !== lastCapabilityWarning) {
         lastCapabilityWarning = capabilityWarning
-        if (capabilityWarning) console.warn(`[computer] secure engine(s) disabled: ${capabilityWarning}`)
+        if (capabilityWarning) console.warn(`[computer] secure engine capability update: ${capabilityWarning}`)
       }
       const previous = engineInventory.current
       const changed = replaceEngineInventory(engineInventory, next)
@@ -3365,12 +3411,12 @@ async function doRun(serverOverride?: string): Promise<void> {
       // at — so an engine could disappear from the card with no explanation
       // anywhere they could see. They stay OUT of `next`: that list becomes
       // available_engines and picks an agent's adapter.
-      const blockedIds = evaluated.blocked.map(({ id }) => id)
+      const blockedIds = blocked.map(({ id }) => id)
       // One enrich over the whole list: it maps entry-by-entry, so splitting it
       // bought nothing and only risked the two halves drifting apart.
       const snapshot = await enrichDetectedEngines([
         ...await snapshotDetectedEngines(next),
-        ...await blockedSnapshotRows(evaluated.blocked),
+        ...await blockedSnapshotRows(blocked),
       ], forceReport)
       // Report on version drift too, not just install/uninstall — upgrading an
       // engine in place leaves the engine *list* identical, and that is exactly

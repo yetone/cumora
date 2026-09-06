@@ -24,14 +24,14 @@
  */
 import { type ChildProcess, execFile, execFileSync, spawn as nodeSpawn, type SpawnOptions } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
 import { isCustomAnthropicEndpoint, withClaudeUserSettingsEnv } from './claude-user-settings.js'
-import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersion } from './cli-version.js'
+import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersionWithRetry } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -387,7 +387,38 @@ export function runnableEngineIds(
 
 export interface RunnableEngineEvaluation {
   runnable: EngineId[]
-  blocked: Array<{ id: EngineId; reason: string }>
+  blocked: Array<{
+    id: EngineId
+    reason: string
+    state?: 'confirmed-incompatible' | 'temporarily-unverifiable'
+  }>
+  /** Engines kept runnable from a last-known-good verification while their
+   * current version command was temporarily inconclusive. */
+  temporarilyUnverifiable?: EngineId[]
+}
+
+interface VerifiedEngineVersion {
+  fingerprint: string
+  minimum: string
+  version: string
+}
+
+const verifiedEngineVersions = new Map<EngineId, VerifiedEngineVersion>()
+
+/** Test seam and cache invalidation hook for a changed security policy. */
+export function clearVerifiedEngineVersions(): void {
+  verifiedEngineVersions.clear()
+}
+
+function engineBinaryFingerprint(path: string | null): string | null {
+  if (!path) return null
+  try {
+    const real = realpathSync(path)
+    const info = statSync(real)
+    return `${real}:${info.dev}:${info.ino}:${info.size}:${info.mtimeMs}`
+  } catch {
+    return null
+  }
 }
 
 export function secureEngineCapabilityReason(
@@ -421,22 +452,41 @@ export async function evaluateRunnableEngines(
   if (allowUnsandboxedByoa(env)) return { runnable: candidates, blocked: [] }
 
   const snapshot = await snapshotDetectedEngines(candidates)
-  const versions = new Map<EngineId, string | null>(await Promise.all(snapshot.map(async (entry) => [
-    entry.id,
-    await probeLocalEngineVersion(entry.id, entry.path),
-  ] as const)))
+  const probes = new Map(await Promise.all(snapshot.map(async (entry) => {
+    const minimum = SECURE_ENGINE_MIN_VERSIONS[entry.id] ?? ''
+    const fingerprint = engineBinaryFingerprint(entry.path)
+    const probed = await probeLocalEngineVersionWithRetry(entry.id, entry.path)
+    if (probed && fingerprint && minimum) {
+      verifiedEngineVersions.set(entry.id, { fingerprint, minimum, version: probed })
+    }
+    const cached = verifiedEngineVersions.get(entry.id)
+    const cachedVersion = !probed && fingerprint && cached?.fingerprint === fingerprint && cached.minimum === minimum
+      ? cached.version
+      : null
+    return [entry.id, { version: probed ?? cachedVersion, temporarilyUnverifiable: !probed }] as const
+  })))
   const linuxSandboxDeps = platform === 'linux'
     ? { bwrap: await binOnPath('bwrap'), socat: await binOnPath('socat') }
     : { bwrap: true, socat: true }
   const runnable: EngineId[] = []
   const blocked: RunnableEngineEvaluation['blocked'] = []
+  const temporarilyUnverifiable: EngineId[] = []
   for (const id of candidates) {
-    const version = versions.get(id) ?? null
+    const probe = probes.get(id)
+    const version = probe?.version ?? null
     const reason = secureEngineCapabilityReason(id, version, platform, linuxSandboxDeps)
-    if (reason) { blocked.push({ id, reason }); continue }
+    if (reason) {
+      blocked.push({
+        id,
+        reason,
+        state: version ? 'confirmed-incompatible' : 'temporarily-unverifiable',
+      })
+      continue
+    }
     runnable.push(id)
+    if (probe?.temporarilyUnverifiable) temporarilyUnverifiable.push(id)
   }
-  return { runnable, blocked }
+  return { runnable, blocked, temporarilyUnverifiable }
 }
 
 export interface EnginePersona {
@@ -487,9 +537,83 @@ export interface EngineUsage {
   cache_creation_input_tokens?: number
 }
 
+export type EngineFailureKind =
+  | 'resume-not-found'
+  | 'context-overflow'
+  | 'authentication'
+  | 'rate-limit'
+  | 'transport'
+  | 'unknown'
+
+/** Machine-readable failure alongside the existing operator-facing error.
+ * `diagnostic` retains the bounded engine output used for classification;
+ * callers must not display it without the daemon's normal redaction. */
+export interface EngineFailure {
+  kind: EngineFailureKind
+  message: string
+  diagnostic: string
+}
+
+const RESUME_NOT_FOUND_RE = new RegExp([
+  String.raw`\bno (?:such )?(?:\w+ )?(?:conversation|session|thread)s?\b`,
+  String.raw`\b(?:conversation|session|thread)s?(?: id)?\b[^\n]{0,24}?\b(?:not found|no longer exists?|do(?:es)? not exist|doesn't exist|has expired|is expired|is invalid|is unknown)\b`,
+  String.raw`\b(?:invalid|unknown|expired|stale|malformed) (?:\w+ )?(?:conversation|session|thread)s?\b`,
+  String.raw`\b(?:could ?n(?:o|')?t|cannot|can't|unable to|failed to)\b[^\n]{0,24}?\bresume\b`,
+  String.raw`\bthread/resume failed\b`,
+].join('|'), 'i')
+
+const ENGINE_CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceeded|maximum context|reached its context|prompt is too long|input is too long|too many tokens/i
+const ENGINE_RATE_LIMIT_RE = /rate.?limit|usage limit|quota|too many requests|overloaded|over capacity|credit balance is too low/i
+const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?:please )?(?:sign|log) ?in|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
+const ENGINE_TRANSPORT_RE = /ECONN(?:RESET|REFUSED)|EPIPE|socket hang up|network|connection (?:closed|lost|terminated|timed out)|transport|process (?:exited|terminated)|failed to (?:spawn|write)/i
+
+export function classifyEngineFailure(diagnostic: string, hadResume = false): EngineFailureKind {
+  if (hadResume && RESUME_NOT_FOUND_RE.test(diagnostic)) return 'resume-not-found'
+  if (ENGINE_CONTEXT_OVERFLOW_RE.test(diagnostic)) return 'context-overflow'
+  if (ENGINE_RATE_LIMIT_RE.test(diagnostic)) return 'rate-limit'
+  if (ENGINE_AUTH_RE.test(diagnostic)) return 'authentication'
+  if (ENGINE_TRANSPORT_RE.test(diagnostic)) return 'transport'
+  return 'unknown'
+}
+
+/** Extract diagnostic prose without mistaking a model-authored stream event for
+ * an engine error. Failed result/error fields are retained; ordinary JSON event
+ * structure and successful assistant text are discarded. */
+export function engineDiagnosticText(raw: string): string {
+  const out: string[] = []
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed.startsWith('{')) { out.push(line); continue }
+    let event: { is_error?: unknown; result?: unknown; error?: unknown }
+    try { event = JSON.parse(trimmed) } catch { continue }
+    if (event.is_error === true && typeof event.result === 'string') out.push(event.result)
+    if (typeof event.error === 'string') out.push(event.error)
+    else if (event.error && typeof event.error === 'object') {
+      const message = (event.error as { message?: unknown }).message
+      if (typeof message === 'string') out.push(message)
+    }
+  }
+  return out.join('\n').trim().slice(0, MAX_FAILURE_CHARS)
+}
+
+/** Add a structured classification to adapters that still return the legacy
+ * string field. Adapter-provided classifications win over the generic fallback. */
+export function engineFailureOf(result: EngineRunResult, hadResume = false): EngineFailure | null {
+  if (result.failure) return result.failure
+  if (!result.error) return null
+  return {
+    kind: classifyEngineFailure(result.error, hadResume),
+    message: result.error,
+    diagnostic: result.error,
+  }
+}
+
 export interface EngineRunResult {
   exitCode: number
+  /** Concise operator-facing compatibility field. New control flow must use
+   * `failure.kind`, never parse this presentation string. */
   error?: string
+  failure?: EngineFailure
   /** The engine session id parsed from this run's stream-json output, to be
    *  fed back as `resumeSessionId` on the next wake. Null if the engine emits
    *  no session id (e.g. Codex, or a non-stream-json flag override). */
@@ -1128,6 +1252,10 @@ class ClaudeSession implements EngineSession {
   private readonly child: ChildProcess
   private readonly onLog: (line: string) => void
   private readonly onHopUsage?: (r: EngineHopReport) => void
+  /** True only until the first result from a process started with --resume.
+   * Later turns are ordinary continuation and must not treat session wording in
+   * model/tool output as a failed resume handshake. */
+  private resumePending: boolean
   private outBuf = ''
   private sid: string | null
   private curModel: string | null = null
@@ -1152,6 +1280,7 @@ class ClaudeSession implements EngineSession {
   constructor(bin: string, args: string[], opts: EngineSessionArgs, carriesStandingPrompt: boolean) {
     this.onLog = opts.onLog
     this.onHopUsage = opts.onHopUsage
+    this.resumePending = !!opts.resumeSessionId
     this.sid = opts.resumeSessionId ?? null
     this.carriesStandingPrompt = carriesStandingPrompt
     // Cross-platform spawn: on Windows resolve the real claude(.cmd) + shell so a
@@ -1230,7 +1359,7 @@ class ClaudeSession implements EngineSession {
       if (this.pending) pushTail(this.pending.stdout, line)
       this.onLog(line)
       if (!line.startsWith('{')) continue
-      let ev: { type?: unknown; session_id?: unknown; is_error?: unknown; subtype?: unknown; status?: unknown; result?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
+      let ev: { type?: unknown; session_id?: unknown; is_error?: unknown; subtype?: unknown; status?: unknown; result?: unknown; error?: unknown; usage?: EngineUsage; model?: unknown; message?: { model?: unknown; usage?: EngineUsage; content?: unknown } }
       try { ev = JSON.parse(line) } catch { continue }
       if (typeof ev.session_id === 'string' && ev.session_id) this.sid = ev.session_id
       // Capture the real model id (assistant events carry message.model) for pricing.
@@ -1273,11 +1402,23 @@ class ClaudeSession implements EngineSession {
         this.hopIndex = 0        // reset the per-turn hop counter
         this.steerQueue = [] // turn ending — any unflushed steer falls to the daemon's coalesced rerun
         const isErr = ev.is_error === true
+        const diagnostic = isErr
+          ? engineDiagnosticText([
+            ...(this.pending?.stderr ?? []),
+            ...(this.pending?.stdout ?? []),
+          ].join('\n'))
+          : ''
+        const message = diagnostic || `engine turn error${typeof ev.subtype === 'string' ? ` (${ev.subtype})` : ''}: see log`
+        const wasResume = this.resumePending
+        this.resumePending = false
         this.settle({
           exitCode: isErr ? 1 : 0,
-          error: isErr
-            ? `engine turn error${typeof ev.subtype === 'string' ? ` (${ev.subtype})` : ''}: ${typeof ev.result === 'string' ? ev.result.slice(0, MAX_FAILURE_CHARS) : 'see log'}`
-            : undefined,
+          error: isErr ? message : undefined,
+          failure: isErr ? {
+            kind: classifyEngineFailure(diagnostic || message, wasResume),
+            message,
+            diagnostic: diagnostic || message,
+          } : undefined,
           sessionId: this.sid,
           usage: ev.usage && typeof ev.usage === 'object' ? ev.usage : undefined,
           model: this.curModel,

@@ -10,7 +10,7 @@
  */
 
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -21,6 +21,7 @@ process.env.OPENAI_API_KEY ??= 'test-key'
 const {
   parseCliVersion, isCliOutdated, isCliVersionAtLeast, inferUpdateCommand,
   parseCursorAbout, parseGrokCheck, ENGINE_VERSION_SPECS, versionCommandInvocation,
+  probeLocalEngineVersionWithRetry,
 } = await import('../agents/computer/cli-version.js')
 const { sanitizeDetectedEngines } = await import('../agents/computer/registry.js')
 
@@ -48,6 +49,28 @@ test('Windows version probe replaces an extensionless npm shim with its runnable
       args: ['/d', '/s', '/c', `""${shim}.cmd" --version"`],
       windowsVerbatimArguments: true,
     })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('an inconclusive local version probe retries and stops on the first concrete version', { skip: process.platform === 'win32' }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-engine-version-retry-'))
+  try {
+    const counter = join(root, 'counter')
+    const cli = join(root, 'claude')
+    await writeFile(cli, [
+      '#!/usr/bin/env node',
+      "const fs = require('node:fs')",
+      `const counter = ${JSON.stringify(counter)}`,
+      "const n = Number(fs.existsSync(counter) ? fs.readFileSync(counter, 'utf8') : '0') + 1",
+      "fs.writeFileSync(counter, String(n))",
+      "if (n >= 3) process.stdout.write('claude 2.1.248\\n')",
+    ].join('\n'))
+    await chmod(cli, 0o755)
+
+    assert.equal(await probeLocalEngineVersionWithRetry('claude', cli, [0, 1, 1]), '2.1.248')
+    assert.equal(await readFile(counter, 'utf8'), '3')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
