@@ -49,6 +49,7 @@ import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 
 export { conversationHeader }
 
@@ -82,7 +83,7 @@ export function createEngineRescanQueue(
 const CONFIG_DIR = join(homedir(), '.cumora')
 const CONFIG_PATH = join(CONFIG_DIR, 'computer.json')
 const AGENTS_ROOT = join(CONFIG_DIR, 'agents')
-// Per-agent engine session id, persisted OUTSIDE the agent home (so the engine's
+// Per-agent, per-engine session id, persisted OUTSIDE the agent home (so the engine's
 // own cwd can't clobber it). Survives a daemon restart so the next wake can
 // `--resume` the SAME engine session — recovering the in-turn context an
 // interrupted long task was building, instead of starting cold.
@@ -1581,7 +1582,8 @@ class AgentRunner {
   private binDir: string
   private trustedCliDir: string
   private ipcDir: string
-  private sessionFile: string
+  private readonly engine: EngineId
+  private readonly sessionStore: EngineSessionStore
   private busy = false
   private pendingRerun = false
   // Triage-trouble backoff: when the small-brain triage is rate-limited OR
@@ -1664,6 +1666,7 @@ class AgentRunner {
     private readonly agent: AgentInfo,
     engine: EngineId,
   ) {
+    this.engine = engine
     this.home = join(AGENTS_ROOT, agent.id)
     this.binDir = join(this.home, 'bin')
     // The fixed MCP server runs outside the model sandbox. Its source and the
@@ -1673,7 +1676,7 @@ class AgentRunner {
     // granted only the two leaf request/response directories; Claude reaches
     // them through the fixed MCP bridge, not a model-controlled shell.
     this.ipcDir = join(CONFIG_DIR, '.runtime-cli-ipc', this.agent.id)
-    this.sessionFile = join(SESSIONS_DIR, `${agent.id}.session`)
+    this.sessionStore = new EngineSessionStore(SESSIONS_DIR, agent.id, engine)
     this.adapter = getAdapter(engine)
   }
 
@@ -1727,8 +1730,19 @@ class AgentRunner {
    *  `--resume` the same session and recover the interrupted turn's context. */
   private setSessionId(id: string | null): void {
     if (id === this.sessionId) return
+    const previous = this.sessionId
     this.sessionId = id
-    void this.persistSessionId()
+    void this.sessionStore.save(id)
+    if (id) console.log(`[computer] ${this.agent.id} saved ${this.engine} session ${sessionIdPreview(id)}`)
+    else if (previous) console.log(`[computer] ${this.agent.id} cleared ${this.engine} session ${sessionIdPreview(previous)}`)
+  }
+
+  /** Defense in depth: the store and adapter are both fixed at construction.
+   * Refuse resume if a future refactor ever lets those bindings diverge. */
+  private resumeSessionId(): string | null {
+    if (this.engine === this.adapter.id && this.sessionStore.engine === this.engine) return this.sessionId
+    console.error(`[computer] ${this.agent.id} refused cross-engine resume: store=${this.sessionStore.engine}, runner=${this.engine}, adapter=${this.adapter.id}`)
+    return null
   }
 
   /** True when an engine error means the session is unusable and the NEXT wake
@@ -1780,25 +1794,13 @@ class AgentRunner {
     finally { if (this.activeEngineRun === run) this.activeEngineRun = null }
   }
 
-  private async persistSessionId(): Promise<void> {
-    try {
-      if (this.sessionId) {
-        await mkdir(SESSIONS_DIR, { recursive: true })
-        await writeFile(this.sessionFile, this.sessionId, 'utf8')
-      } else {
-        await rm(this.sessionFile, { force: true })
-      }
-    } catch { /* best-effort — a lost session id just means a cold next wake */ }
-  }
-
   private async loadSessionId(): Promise<void> {
-    try {
-      const s = (await readFile(this.sessionFile, 'utf8')).trim()
-      if (s) {
-        this.sessionId = s
-        console.log(`[computer] ${this.agent.id} restored engine session ${s.slice(0, 8)} from disk — will --resume (continuity across restart)`)
-      }
-    } catch { /* no prior session on disk — start cold */ }
+    await this.sessionStore.quarantineLegacy()
+    const s = await this.sessionStore.load()
+    if (s) {
+      this.sessionId = s
+      console.log(`[computer] ${this.agent.id} restored ${this.engine} session ${sessionIdPreview(s)} from disk — will --resume (continuity across restart)`)
+    }
   }
 
   async start(): Promise<void> {
@@ -1857,6 +1859,7 @@ class AgentRunner {
       session?.stop({ force: options.forceEngine }) ?? Promise.resolve(),
       this.activeEngineRun ?? Promise.resolve(),
     ])
+    await this.sessionStore.flush()
   }
 
   /** Does this runner's live config still match the latest server state? The
@@ -1974,7 +1977,7 @@ class AgentRunner {
       env: this.engineEnv(),
       model: this.engineModel(),
       fastModel: this.engineFastModel(),
-      resumeSessionId: this.sessionId,
+      resumeSessionId: this.resumeSessionId(),
       standingPrompt: this.standingPrompt(),
       onLog: (line) => this.logEngineLine(line),
       // Trajectory hook — every assistant hop (Claude) / turn-completed (Codex)
@@ -2523,7 +2526,7 @@ class AgentRunner {
         this.memoryDigest(),
         runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token).then((r) => r?.roster ?? '').catch(() => ''),
       ])
-      const resumeSessionId = this.sessionId
+      const resumeSessionId = this.resumeSessionId()
       const session = this.ensureEngineSession()
       const prompt = this.turnPrompt(session, this.agendaDelta(ag.brief, memoryDigest, roster))
       const engineRun = session
@@ -2531,7 +2534,7 @@ class AgentRunner {
         : this.adapter.run({
           home: this.home, prompt, env: this.engineEnv(),
           model: this.engineModel(), fastModel: this.engineFastModel(),
-          resumeSessionId: this.sessionId, onLog: (line) => this.logEngineLine(line),
+          resumeSessionId, onLog: (line) => this.logEngineLine(line),
           // Same trajectory hook as the persistent-session path so the
           // one-shot fallback (or codex `exec` path) also lands hops in the
           // universal ledger.
@@ -2921,7 +2924,7 @@ class AgentRunner {
             runtimeGet<{ roster: string }>(this.cfg.serverUrl, '/roster', token)
               .then((r) => r?.roster ?? '').catch(() => ''),
           ])
-          const resumeSessionId = this.sessionId
+          const resumeSessionId = this.resumeSessionId()
           let result: EngineRunResult
           const session = this.ensureEngineSession()
           // Standing scaffold rides the session's system-prompt file; send only the
