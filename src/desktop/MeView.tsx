@@ -1189,20 +1189,24 @@ function ComputersTab() {
             </div>
             {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
             <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display" dangerouslySetInnerHTML={{ __html: t('me.engineRequired') }} />
-            <div className="flex items-center gap-2.5 mb-2.5">
-              <span className="text-[12px] text-ink-500">{t('me.engineLabel')}</span>
-              <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                {RUNNABLE_ENGINES.map((id) => (
-                  <button key={id} type="button" onClick={() => setEngine(id)}
-                    className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
-                    style={engine === id
-                      ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
-                      : { color: 'var(--ink-500)' }}>
-                    {engineLabel(id)}
-                  </button>
-                ))}
+            <div className="mb-2.5">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="text-[12px] text-ink-500 shrink-0">{t('me.engineLabel')}</span>
+                <div className="flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                  <div className="inline-flex min-w-max rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
+                    {RUNNABLE_ENGINES.map((id) => (
+                      <button key={id} type="button" onClick={() => setEngine(id)}
+                        className="shrink-0 whitespace-nowrap px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
+                        style={engine === id
+                          ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
+                          : { color: 'var(--ink-500)' }}>
+                        {engineLabel(id)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
-              <span className="text-[11px] text-ink-400">{t('me.engineDefaultHint')}</span>
+              <div className="mt-1.5 text-[11px] leading-relaxed text-ink-400">{t('me.engineDefaultHint')}</div>
             </div>
             <label className="flex items-start gap-2 mb-2.5 cursor-pointer select-none">
               <input type="checkbox" checked={asService} onChange={(e) => setAsService(e.target.checked)} className="mt-[3px]" />
