@@ -44,6 +44,8 @@ To deploy a candidate:
    is available; Deploy resolves either tag to a digest before touching GKE.
 3. Set `include_agent=Y` when the build changed `server/src/agents/**`, the
    bundled CLI/runtime, or the agent-computer image. Otherwise use `N`.
+   Leave `repair_0002=off` unless you are clearing the migration 0002
+   precondition — see below.
 4. Approve the protected `production` environment. The approver should not be
    the person who built the feature for high-risk changes.
 5. Verify the workflow summary contains the selected digest, previous server
@@ -58,6 +60,50 @@ Shipping overview/schema. A migration failure leaves the Deployment untouched;
 a failed post-deploy smoke automatically runs
 `kubectl rollout undo`, waits for the old revision to become ready, and fails
 the workflow.
+
+#### When migration 0002 refuses to apply
+
+Migration 0002 normalizes conversation membership (ADR 0004) and fails closed
+when a `conversations.members` entry names an id with no participant in that
+conversation's tenant. The Job log carries a precheck report first — counts by
+category plus a masked sample — so read that before doing anything.
+
+These entries predate the tenant guard in `startPulledGroup` and grant nothing
+today: every read path is tenant-scoped, so a foreign member id is unreachable
+membership, and ADR 0004's composite FK cannot represent it at all. Rerunning
+Deploy with `repair_0002=archive-detach` lets 0002 clear its own precondition:
+
+- every offending `(conversation, member)` pair is copied into
+  `conversation_members_detached_0002` — with its ordinal *and* the whole
+  pre-detach members array — before it is removed;
+- `messages` is never touched, so an archived member that posted in the
+  conversation keeps its authorship;
+- the precheck re-runs afterwards, so anything a detach cannot fix (a
+  conversation with no `company_id`, say) still stops the deploy;
+- all of it runs inside 0002's transaction, so any later failure rolls the
+  detach back with it.
+
+The archive is a complete record, not a one-click undo. Once 0002 has applied,
+its projection trigger enforces ADR 0004 on every write, so putting a detached
+id back into `conversations.members` fails until that id is a real participant
+in that tenant — which is the invariant the migration exists to establish. What
+the archive gives you is the ability to see exactly what was removed and from
+where:
+
+```sql
+SELECT conversation_id, member_id, ordinal, authored_messages,
+       participant_elsewhere, original_members
+  FROM conversation_members_detached_0002
+ ORDER BY conversation_id, ordinal;
+```
+
+A genuine restore means first making the id resolvable (recreate or move the
+participant into that tenant), then re-adding it through `addConversationMember`.
+`original_members` records the exact pre-detach array to restore against.
+
+`repair_0002` applies to that one run only — it is passed as an explicit
+container `env` entry that overrides the `cumora` Secret, and defaults to
+`off`, so an ordinary deploy keeps failing closed.
 
 Shipping features additionally track a production readback deadline, default
 24 hours after a successful release. The Ship workspace surfaces due items;

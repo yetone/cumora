@@ -2365,8 +2365,148 @@ export async function checkConversationMembersResolvable(client: MigrationPreche
   )
 }
 
+/** Where `archive-detach` parks the member ids it removes from
+ *  `conversations.members`, so the detach can be undone. */
+export const MIGRATION_0002_ARCHIVE_TABLE = 'conversation_members_detached_0002'
+
+export const MIGRATION_0002_ARCHIVE_DDL = `
+CREATE TABLE IF NOT EXISTS ${MIGRATION_0002_ARCHIVE_TABLE} (
+  conversation_id       TEXT NOT NULL,
+  company_id            TEXT NOT NULL,
+  member_id             TEXT NOT NULL,
+  ordinal               INTEGER NOT NULL,
+  original_members      JSONB NOT NULL,
+  authored_messages     BOOLEAN NOT NULL,
+  participant_elsewhere BOOLEAN NOT NULL,
+  archived_at           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, member_id)
+)`
+
+// Same predicate as UNRESOLVABLE_MEMBERS_CTE, plus everything needed to say
+// afterwards exactly what was removed: `ordinal` is where the id sat and
+// `original_members` is the whole pre-detach array, so the old state can be
+// reconstructed without re-deriving an interleaving. `authored_messages` /
+// `participant_elsewhere` record *why* the id was unresolvable.
+const MIGRATION_0002_ARCHIVE_ORPHANS = `
+INSERT INTO ${MIGRATION_0002_ARCHIVE_TABLE} (
+  conversation_id, company_id, member_id, ordinal, original_members,
+  authored_messages, participant_elsewhere
+)
+SELECT c.id, c.company_id, member.id, (member.ord - 1)::integer, c.members,
+       EXISTS (SELECT 1 FROM messages m
+                WHERE m.conversation_id = c.id AND m.author_id = member.id),
+       EXISTS (SELECT 1 FROM participants p WHERE p.id = member.id)
+  FROM conversations c
+  CROSS JOIN LATERAL jsonb_array_elements_text(c.members)
+         WITH ORDINALITY AS member(id, ord)
+  LEFT JOIN participants p
+    ON p.id = member.id AND p.company_id = c.company_id
+ WHERE c.company_id IS NOT NULL
+   AND p.id IS NULL
+   AND member.id NOT LIKE 'external:%'
+ON CONFLICT (conversation_id, member_id) DO NOTHING`
+
+// Rewrite only the affected conversations, preserving the relative order of
+// the members that stay. `external:` markers are kept on purpose — migration
+// 0002 strips them itself and they are not participants by design.
+const MIGRATION_0002_DETACH_ORPHANS = `
+WITH affected AS (
+  SELECT DISTINCT a.conversation_id FROM ${MIGRATION_0002_ARCHIVE_TABLE} a
+), kept AS (
+  SELECT c.id,
+         COALESCE(
+           jsonb_agg(member.id ORDER BY member.ord) FILTER (
+             WHERE member.id LIKE 'external:%'
+                OR EXISTS (SELECT 1 FROM participants p
+                            WHERE p.id = member.id AND p.company_id = c.company_id)
+           ),
+           '[]'::jsonb
+         ) AS members
+    FROM conversations c
+    JOIN affected a ON a.conversation_id = c.id
+    CROSS JOIN LATERAL jsonb_array_elements_text(c.members)
+           WITH ORDINALITY AS member(id, ord)
+   GROUP BY c.id
+)
+UPDATE conversations c
+   SET members = kept.members
+  FROM kept
+ WHERE c.id = kept.id
+   AND c.members IS DISTINCT FROM kept.members`
+
+export type Migration0002RepairMode = 'off' | 'archive-detach'
+
+/**
+ * Read `MIGRATION_0002_REPAIR`. Unset means `off` — a deploy that has not
+ * asked for a repair keeps failing closed, which is the whole point of the
+ * precheck. An unrecognized value is a hard error rather than a silent `off`,
+ * because a typo in the one flag that touches production rows must not read
+ * as "operator declined".
+ */
+export function migration0002RepairMode(raw = process.env.MIGRATION_0002_REPAIR): Migration0002RepairMode {
+  const value = (raw ?? '').trim().toLowerCase()
+  if (value === '' || value === 'off') return 'off'
+  if (value === 'archive-detach') return 'archive-detach'
+  throw new Error(`MIGRATION_0002_REPAIR must be unset, 'off', or 'archive-detach' (got '${raw}')`)
+}
+
+/**
+ * Opt-in repair for the 0002 precondition (ADR 0004).
+ *
+ * The unresolvable rows are legacy `conversations.members` entries naming an
+ * id with no participant in that conversation's tenant — most of them ids
+ * that do exist, under a *different* company. They predate the tenant guard
+ * in `startPulledGroup`, which now refuses to build a cross-tenant members
+ * array at all. Such an id grants nothing today: every read path is
+ * tenant-scoped, so a foreign member id is unreachable membership, and ADR
+ * 0004's composite FK has no way to represent it in the first place.
+ *
+ * So the repair detaches them — but archives each one first, along with the
+ * conversation's whole pre-detach members array, so nothing is destroyed
+ * silently. That archive is a record, not a one-click undo: once 0002 has
+ * applied, its projection trigger enforces ADR 0004 on every write, so
+ * putting a detached id back requires making it a real participant in that
+ * tenant first. `messages` is never touched: an archived member that authored
+ * in the conversation keeps its authorship, it just stops being listed as a
+ * member.
+ *
+ * Runs inside migration 0002's transaction, so a failure later in the
+ * migration rolls the detach back with it.
+ */
+export async function repairConversationMembers(
+  client: MigrationPrecheckClient,
+): Promise<{ archived: number; conversations: number }> {
+  await client.query(MIGRATION_0002_ARCHIVE_DDL)
+  await client.query(MIGRATION_0002_ARCHIVE_ORPHANS)
+  await client.query(MIGRATION_0002_DETACH_ORPHANS)
+  const { rows: [totals] } = await client.query(`
+    SELECT count(*) AS archived, count(DISTINCT conversation_id) AS conversations
+      FROM ${MIGRATION_0002_ARCHIVE_TABLE}`)
+  return {
+    archived: Number(totals?.archived ?? 0),
+    conversations: Number(totals?.conversations ?? 0),
+  }
+}
+
 async function applyNormalizedConversationMembers(client: import('pg').PoolClient): Promise<void> {
-  await checkConversationMembersResolvable(client)
+  const repair = migration0002RepairMode()
+  try {
+    await checkConversationMembersResolvable(client)
+  } catch (error) {
+    // The precheck only SELECTs; the 23503 it raises is constructed in JS
+    // after those reads succeeded, so the surrounding transaction is still
+    // live and the repair can run on this same connection.
+    if (repair !== 'archive-detach' || (error as { code?: string }).code !== '23503') throw error
+    const repaired = await repairConversationMembers(client)
+    console.warn(
+      `[db] migration 0002 repair(archive-detach): detached ${repaired.archived} member id(s) ` +
+      `from ${repaired.conversations} conversation(s) into ${MIGRATION_0002_ARCHIVE_TABLE}`,
+    )
+    // Re-run rather than assume. A conversation with no company_id, for
+    // instance, is not something detaching members can fix, and must still
+    // stop the deploy.
+    await checkConversationMembersResolvable(client)
+  }
   await client.query(NORMALIZED_CONVERSATION_MEMBERS_SQL)
 }
 
