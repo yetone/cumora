@@ -1453,7 +1453,7 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
   // engines list, which the server stores as available_engines[0] and uses as
   // the engine for the starter team and any agent assigned here without an
   // explicit override. (No separate column needed: "first = default".)
-  let engines = detected
+  let engines = [...detected]
   if (preferredEngine) {
     if (!ENGINE_IDS.includes(preferredEngine as EngineId)) {
       throw new Error(`--engine must be one of: ${ENGINE_IDS.join(', ')} (got "${preferredEngine}")`)
@@ -3282,7 +3282,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   if (serverOverride) cfg.serverUrl = serverOverride
   let initialEngines: EngineId[]
   try {
-    initialEngines = (await requireLocalEngine()).runnable
+    initialEngines = [...(await requireLocalEngine()).runnable]
   } catch (err) {
     console.error(`[computer] ${err instanceof Error ? err.message : String(err)}`)
     process.exitCode = 70

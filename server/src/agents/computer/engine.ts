@@ -386,7 +386,9 @@ export function runnableEngineIds(
 }
 
 export interface RunnableEngineEvaluation {
-  runnable: EngineId[]
+  /** Evaluation consumers only inspect this inventory; accepting readonly
+   * arrays also keeps literal test fixtures and immutable snapshots type-safe. */
+  runnable: readonly EngineId[]
   blocked: Array<{
     id: EngineId
     reason: string
@@ -5322,7 +5324,7 @@ export interface DetectedEngineSnapshot {
 
 /** Snapshot the installed engines, optionally in a caller-supplied order
  *  (pairing puts the chosen default first). Does not spawn the CLIs. */
-export async function snapshotDetectedEngines(ids?: EngineId[]): Promise<DetectedEngineSnapshot[]> {
+export async function snapshotDetectedEngines(ids?: readonly EngineId[]): Promise<DetectedEngineSnapshot[]> {
   const present = ids ?? await detectEngines()
   return Promise.all(present.map(async (id) => {
     const bin = ADAPTERS[id].bin
