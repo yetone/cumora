@@ -2,11 +2,18 @@
 
 GitHub Actions authenticates to GCP without any long-lived service-account
 key. Instead, GitHub mints a short-lived OIDC token, and a Workload Identity
-Pool maps it to a real GCP service account. The repo only needs to know two
-values, both stored as repo secrets:
+Pool maps it to a real GCP service account. **GCP authentication** needs only
+two values, both stored as repo secrets:
 
 - `GCP_WIF_PROVIDER` — the full Workload Identity Provider resource name
 - `GCP_DEPLOY_SA` — the email of the GCP service account GH Actions impersonates
+
+The Deploy workflow has two further prerequisites beyond GCP auth:
+
+- Repo secrets `CUMORA_SMOKE_TOKEN` and `CUMORA_SMOKE_COMPANY_ID`, used by the
+  post-rollout authenticated smoke check that gates automatic rollback
+- A GitHub **environment** named `production` (`deploy.yml` declares
+  `environment: production`), which supplies the independent approval step
 
 Run the steps below **once**, in your terminal (not in CI).
 
@@ -66,8 +73,11 @@ Or do it via the web UI: https://github.com/yetone/cumora/settings/secrets/actio
 ### Once that's set up
 
 - Every push to `main` triggers the Build workflow → images appear in AR
-- Manual deploy: GitHub → Actions → Deploy → Run workflow → pick a tag
-- Tag deploy: `git tag v0.1.0 && git push origin v0.1.0` → auto-rolls that version
+- Deploy is **always** a manual dispatch: GitHub → Actions → Deploy → Run
+  workflow → pick a tag. `deploy.yml` has no `push` trigger at all, by design —
+  a bad commit on `main` must not auto-ship to prod.
+- Pushing a `v*` tag fires the **Release** workflow only (the Electron desktop
+  hand-off to `yetone/cumora-releases`). It does not touch GKE.
 
 ### Tightening later
 

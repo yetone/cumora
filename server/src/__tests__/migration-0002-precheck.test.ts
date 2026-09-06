@@ -4,7 +4,12 @@ import { test } from 'node:test'
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
-const { checkConversationMembersResolvable } = await import('../db/migrate.js')
+const {
+  checkConversationMembersResolvable,
+  migration0002RepairMode,
+  repairConversationMembers,
+  MIGRATION_0002_ARCHIVE_TABLE,
+} = await import('../db/migrate.js')
 
 const fakeClient = (summary: Record<string, unknown>, samples: Array<Record<string, unknown>> = []) => {
   const statements: string[] = []
@@ -66,4 +71,44 @@ test('a conversation without a tenant is reported even when every member resolve
   } finally {
     console.error = originalError
   }
+})
+
+test('the repair flag defaults to off and rejects anything it does not recognize', () => {
+  assert.equal(migration0002RepairMode(undefined), 'off')
+  assert.equal(migration0002RepairMode(''), 'off')
+  assert.equal(migration0002RepairMode('  OFF '), 'off')
+  assert.equal(migration0002RepairMode('Archive-Detach'), 'archive-detach')
+  // A typo must not read as "operator declined the repair".
+  assert.throws(() => migration0002RepairMode('true'), /must be unset/)
+  assert.throws(() => migration0002RepairMode('detach'), /got 'detach'/)
+})
+
+test('the repair archives every orphan with its ordinal before detaching it', async () => {
+  const statements: string[] = []
+  const client = {
+    async query(sql: string) {
+      statements.push(sql)
+      return { rows: [{ archived: '534', conversations: '23' }] }
+    },
+  }
+  const summary = await repairConversationMembers(client)
+  assert.deepEqual(summary, { archived: 534, conversations: 23 })
+
+  assert.equal(statements.length, 4)
+  assert.match(statements[0], new RegExp(`CREATE TABLE IF NOT EXISTS ${MIGRATION_0002_ARCHIVE_TABLE}`))
+  // The archive has to be written before the rows it describes are removed.
+  assert.match(statements[1], new RegExp(`^\\s*INSERT INTO ${MIGRATION_0002_ARCHIVE_TABLE}`))
+  assert.match(statements[2], /UPDATE conversations/)
+  assert.match(statements[1], /member\.ord - 1/)
+  assert.match(statements[1], /ON CONFLICT \(conversation_id, member_id\) DO NOTHING/)
+
+  // Messages are evidence of what happened; the repair must never rewrite them.
+  for (const sql of statements) {
+    assert.doesNotMatch(sql, /(?:UPDATE|DELETE\s+FROM)\s+messages\b/i)
+    assert.doesNotMatch(sql, /(?:UPDATE|DELETE\s+FROM|INSERT\s+INTO)\s+participants\b/i)
+    assert.doesNotMatch(sql, /DELETE\s+FROM\s+conversations\b/i)
+  }
+
+  // `external:` markers are not participants by design and must survive.
+  assert.match(statements[2], /member\.id LIKE 'external:%'/)
 })

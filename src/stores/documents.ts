@@ -43,10 +43,15 @@ export const useDocuments = create<DocumentsState>((set, get) => ({
       title: normalized.title ?? 'Untitled',
       conversationId: normalized.conversationId ?? null,
     })
-    const doc = await api.createDocument({ ...normalized, requestId: retry.requestId })
-    retry.complete()
-    set((s) => ({ list: [doc, ...s.list.filter((d) => d.id !== doc.id)], selectedId: doc.id }))
-    return doc
+    try {
+      const doc = await api.createDocument({ ...normalized, requestId: retry.requestId })
+      retry.complete()
+      set((s) => ({ list: [doc, ...s.list.filter((d) => d.id !== doc.id)], selectedId: doc.id }))
+      return doc
+    } catch (err) {
+      retry.fail(err)
+      throw err
+    }
   },
   rename: async (id, title) => {
     await api.renameDocument(id, title)

@@ -16,7 +16,7 @@ recipient calculation) is already in the repo.
 
 | Surface | Location |
 | --- | --- |
-| `@capacitor/push-notifications` plugin | `package.json` + `ios/App/Podfile`-equivalent SPM bundle (synced by `npx cap sync ios`) |
+| `@capacitor/push-notifications` plugin | `package.json` + `ios/App/CapApp-SPM/Package.swift` (synced by `npx cap sync ios`) |
 | AppDelegate APNs callbacks → Capacitor bridge | `ios/App/App/AppDelegate.swift` |
 | `aps-environment` entitlement | `ios/App/App/App.Debug.entitlements` (development) + `ios/App/App/App.Release.entitlements` (production) — selected automatically by Xcode build config |
 | `push_devices` table | `server/src/db/migrate.ts` |
@@ -24,7 +24,7 @@ recipient calculation) is already in the repo.
 | APNs sender (HTTP/2 + ES256 JWT, no third-party lib) | `server/src/push.ts` |
 | FCM sender (HTTP v1, service-account JWT) | `server/src/fcm.ts` |
 | Recipient filter (skips author, currently-online users, muted convos) | `computeMessageRecipients` in `server/src/push.ts` |
-| Outbound dispatch on new message | inside POST `/conversations/:id/messages` |
+| Outbound dispatch on new message | `dispatchMessagePush` in `server/src/push.ts`, called from **both** POST `/conversations/:id/messages` (`server/src/api/router.ts`) and `cmdReply` (`server/src/agents/cli.ts`) — an agent's reply travels the second path only |
 | Client lifecycle (request perms, register, deep-link, sign-out) | `src/lib/push.ts` + `src/mobile/MobileApp.tsx` + `src/mobile/MobileMe.tsx` |
 | User preference `notify.push` (in-app kill switch) | `TOGGLE_PREFS` in `src/mobile/MobileMe.tsx` |
 
@@ -82,11 +82,12 @@ Two Secrets:
    kubectl create secret generic cumora-apns-key \
      --from-file=AuthKey_<KEY_ID>.p8=/path/to/AuthKey_<KEY_ID>.p8
    ```
-   The deployment mounts this at `/var/run/secrets/cumora-apns/` and
-   sets `APNS_KEY_PATH` accordingly (add the volume + mount to your
-   production deployment manifest).
-   The mount is declared `optional: true` so pods boot cleanly even
-   when this secret is absent — the push path soft-disables itself.
+   `server/k8s/cumora-server.gke.yaml` does **not** yet declare this volume —
+   it only wires `envFrom: secretRef: {name: cumora}`. Add the volume and
+   mount yourself, at `/var/run/secrets/cumora-apns/`, and set
+   `APNS_KEY_PATH` to the mounted file. Mark the volume `optional: true` so
+   pods still boot when the secret is absent — the push path soft-disables
+   itself.
 
 3. **Apply the deployment** to pick up the new volume mount:
    ```sh
@@ -154,13 +155,10 @@ like APNs.
 | 410 / device disabled | Expected; `push_devices.disabled_at` is set. Re-install or sign back in to re-register |
 | Foreground app shows OS banner instead of in-app toast | Expected only when the app is backgrounded. Foreground deliveries fall through to `NotificationToasts`. |
 | Push fires for a user looking at the chat | Their `participants.status` is not `'avail'` — check WS connectivity. The server suppresses pushes only for users marked `'avail'` |
+| Flipped `notify.push` on but nothing arrives | The toggle only writes the preference. Unregistration/registration happens on the next `initPushNotifications` call — tap **Re-register** in You → Push status, or background and re-foreground the app (`installVisibilityHook` in `src/lib/push.ts` retries when there's no token). No relaunch needed |
 
 ## Open items (deliberate)
 
-- **Per-OS toggle persistence.** Flipping `notify.push` off currently
-  unregisters the device immediately, but flipping it back on requires
-  an app relaunch. Capacitor's plugin doesn't expose mid-session
-  re-register cleanly.
 - **Doc-mention pushes / calendar reminder pushes.** Both already have
   WS events (`doc.mention`, `calendar.reminder`); wiring them into
   `notifyMessage`-style senders is a follow-up.

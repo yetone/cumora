@@ -15,8 +15,8 @@
  *       spec:
  *         containers:
  *         - name: migrate
- *           image: ghcr.io/yetoneful/cumora-server:<version>
- *           command: ["node", "/app/migrate-bin.cjs"]
+ *           image: us-west2-docker.pkg.dev/cumora/cumora/server@sha256:<digest>
+ *           command: ["npm", "run", "migrate"]
  *           env:
  *           - { name: DATABASE_URL, valueFrom: { secretKeyRef: ... } }
  *

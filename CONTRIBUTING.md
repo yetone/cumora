@@ -9,8 +9,10 @@ project's [MIT License](LICENSE).
 
 ## Getting set up
 
-You need **Node ≥ 18** (CI runs on Node 24), plus **Postgres** and **Redis**
-running locally.
+You need **Node ≥ 22** (CI runs on Node 24), plus **Postgres** and **Redis**
+running locally. Node 18 and 20 can no longer install the dependency tree —
+`@capacitor/cli` requires `node >= 22` and `@aws-sdk/client-s3` requires
+`node >= 20`.
 
 ```bash
 createdb -h localhost cumora
@@ -38,13 +40,25 @@ daemon), `MOBILE_IOS.md`, `PUSH_NOTIFICATIONS.md`, `email.md`.
 Run the same gates CI runs. All of these must pass:
 
 ```bash
-npm run lint               # Biome lint (autofix with `npm run lint:fix`)
-npm run typecheck          # frontend types
-npm run server:typecheck   # server types
-npm test                   # unit tests (node:test) for server + workers
-npm run test:integration   # integration suite (needs local Postgres + Redis)
-npm run guard:big-brain    # architecture guard, see below
-npm run guard:llm-tracked  # architecture guard, see below
+npm run lint                   # Biome lint (autofix with `npm run lint:fix`)
+npm run typecheck              # frontend types
+npm run server:typecheck       # server types
+npm test                       # unit tests (node:test) for server + workers + frontend lib
+npm run test:integration       # integration suite, see the env var below
+npm run guard:big-brain        # architecture guard, see below
+npm run guard:llm-tracked      # architecture guard, see below
+npm run guard:engine-registry  # architecture guard, see below
+```
+
+`npm run test:integration` needs a **dedicated** database and does nothing
+without `INTEGRATION_DATABASE_URL` — it prints `[integration] skipped` and
+exits 0, which looks exactly like a pass. The suite `TRUNCATE`s every table,
+so point it at a throwaway DB:
+
+```bash
+createdb -h localhost cumora_test
+INTEGRATION_DATABASE_URL=postgres://$USER@localhost:5432/cumora_test \
+  npm run test:integration
 ```
 
 Biome is configured (`biome.json`) as a **linter only** — it is not a
@@ -54,11 +68,14 @@ rules are on; noisy or intentional-pattern style rules are off, while the a11y
 rules are enforced incrementally (useButtonType, ARIA roles/props, and core
 accessibility rules are active).
 
-Both TypeScript projects are `strict`. There are no frontend unit tests yet;
-server and worker logic is covered by `server/src/__tests__` and
-`server/src/__integration__`.
+Both TypeScript projects are `strict`. Tests live in four places, and
+`npm test` runs the first, third and fourth: `tests/` (frontend lib units),
+`server/src/__integration__` (integration, opt-in via the env var above),
+`server/src/__tests__` (server units), and `workers/email-gate/src`
+(Worker units — this is why you want `npm run setup` over a bare
+`npm install`).
 
-## Two architecture invariants (enforced in CI)
+## Three architecture invariants (enforced in CI)
 
 These aren't style preferences — they're the product's core cost model, and a
 guard script will fail your build if you break them:
@@ -71,6 +88,10 @@ guard script will fail your build if you break them:
 2. **Every LLM call must be tracked** in the cost ledger. Untracked spend is a
    correctness bug here, not just an oversight. `npm run guard:llm-tracked`
    checks this.
+3. **A BYOA engine is wired into all of its registries or none.** A
+   half-wired engine does not error — `normalizeByoaSource()` maps anything
+   unknown to `byoa-claude`, so its runs quietly bill to the wrong engine.
+   `npm run guard:engine-registry` checks this.
 
 The multi-agent coordination model (how N agents share a room without
 colliding, and why the prompt is kept deliberately minimal) is documented in

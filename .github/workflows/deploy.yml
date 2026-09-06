@@ -20,6 +20,19 @@ on:
         description: 'Also update CUMORA_AGENT_COMPUTER_IMAGE (Y/N)'
         required: false
         default: 'Y'
+      repair_0002:
+        description: >-
+          Let migration 0002 repair its own precondition (off | archive-detach).
+          archive-detach copies every conversations.members id that has no
+          participant in that conversation's tenant into
+          conversation_members_detached_0002 (with its ordinal, so it is
+          reversible) and removes it from the array. Messages are untouched.
+          Runs inside 0002's transaction. Leave off unless you have read the
+          precheck report from a failed run.
+        required: false
+        default: 'off'
+        type: choice
+        options: ['off', 'archive-detach']
 
 permissions:
   contents: read
@@ -117,8 +130,16 @@ jobs:
         id: migrate
         env:
           SERVER_IMAGE: ${{ steps.digest.outputs.server }}
+          REPAIR_0002: ${{ inputs.repair_0002 || 'off' }}
         run: |
           set -euo pipefail
+          case "$REPAIR_0002" in
+            off|archive-detach) ;;
+            *) echo "::error::repair_0002 must be 'off' or 'archive-detach' (got '$REPAIR_0002')"; exit 1 ;;
+          esac
+          if [ "$REPAIR_0002" != off ]; then
+            echo "::warning::migration 0002 will run repair mode '$REPAIR_0002' — it rewrites conversations.members and archives what it removes into conversation_members_detached_0002"
+          fi
           JOB="cumora-migrate-${GITHUB_SHA:0:7}-${GITHUB_RUN_ATTEMPT}"
           DEPLOY_JSON="$RUNNER_TEMP/cumora-deployment.json"
           JOB_JSON="$RUNNER_TEMP/cumora-migration-job.json"
@@ -128,7 +149,7 @@ jobs:
           # identity settings into one candidate migration Job. A native
           # sidecar init container exits automatically when the Job completes.
           kubectl get deployment cumora-server -o json > "$DEPLOY_JSON"
-          jq --arg job "$JOB" --arg server "$SERVER_IMAGE" '
+          jq --arg job "$JOB" --arg server "$SERVER_IMAGE" --arg repair "$REPAIR_0002" '
             .spec.template.spec as $pod
             | ([ $pod.initContainers[]?, $pod.containers[]? ]
                | map(select(.name == "cloud-sql-proxy")) | first) as $proxy
@@ -169,6 +190,11 @@ jobs:
                             imagePullPolicy: "IfNotPresent",
                             command: ["npm", "run", "migrate"],
                             envFrom: [{ secretRef: { name: "cumora" } }],
+                            # After envFrom on purpose: an explicit `env` entry
+                            # wins over one supplied by envFrom, so the
+                            # operator choice for this one run cannot be
+                            # shadowed by whatever the Secret happens to hold.
+                            env: [{ name: "MIGRATION_0002_REPAIR", value: $repair }],
                             resources: {
                               requests: { cpu: "100m", memory: "256Mi" },
                               limits: { cpu: "1000m", memory: "1Gi" }

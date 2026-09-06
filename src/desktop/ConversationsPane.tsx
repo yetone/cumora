@@ -649,6 +649,12 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
   // Backend search: debounced API call with abort. We must not load every
   // message into the client — the universal search hits SQL on each
   // keystroke (after debounce) and returns four ranked buckets.
+  //
+  // 300ms, not 150: at typing speed the shorter window fired a second query
+  // before the first had returned, and each one occupies a connection for as
+  // long as the message-body bucket runs. The server now cancels an abandoned
+  // search (see `searchMessagesBounded`), but not issuing it at all is cheaper
+  // still, and the extra 150ms is imperceptible against the round trip.
   const [results, setResults] = useState<ApiSearchResults | null>(null)
   const [searching, setSearching] = useState(false)
   useEffect(() => {
@@ -665,7 +671,7 @@ export function ConversationsPane({ onResizeStart }: { onResizeStart?: (e: React
           console.warn('[search] failed', err)
           setSearching(false)
         })
-    }, 150)
+    }, 300)
     return () => { window.clearTimeout(handle); ctl.abort() }
   }, [query])
 

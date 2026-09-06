@@ -1,6 +1,7 @@
 import { create } from 'zustand'
-import { api, ws, type ApiConversation } from '@/api/client'
+import { api, ws, type ApiConversation, type ApiMessage } from '@/api/client'
 import type { Conversation } from '@/types'
+import { bySidebarOrder, lastMessageFromWs, timeFromIso } from '@/lib/conversationRow'
 import { useApp } from '@/stores/app'
 import { commitIfContextCurrent, useAuth } from '@/stores/auth'
 import { useMessages } from '@/stores/messages'
@@ -11,19 +12,23 @@ interface ConversationsState {
   loaded: boolean
   load: () => Promise<void>
   reload: () => Promise<void>
-}
-
-function timeFromIso(iso?: string): string {
-  if (!iso) return ''
-  const d = new Date(iso)
-  const now = new Date()
-  if (d.toDateString() === now.toDateString()) {
-    const h = String(d.getHours()).padStart(2, '0')
-    const m = String(d.getMinutes()).padStart(2, '0')
-    return `${h}:${m}`
-  }
-  if ((now.getTime() - d.getTime()) < 86400e3 * 2) return 'Yest'
-  return `${d.getMonth() + 1}/${d.getDate()}`
+  /**
+   * Repaint one sidebar row from a `message.new` event.
+   *
+   * Every new message used to trigger a full `reload()` — a fresh
+   * `GET /conversations` per online client per message, each one recomputing
+   * the last message and unread count for every conversation in the
+   * workspace. The event already carries the message, so the row can be
+   * patched in place. Returns false when the conversation isn't in the list
+   * yet and a fetch was issued instead.
+   */
+  applyIncomingMessage: (
+    conversationId: string,
+    message: ApiMessage,
+    opts: { read: boolean },
+  ) => boolean
+  /** Clear a row's badge without waiting for the server round trip. */
+  markLocallyRead: (conversationId: string) => void
 }
 
 /** Render a system-row JSON payload as a human-readable preview line.
@@ -61,69 +66,84 @@ function renderSystemPreview(
   }
 }
 
-function fromApi(c: ApiConversation): Conversation {
-  const last = c.lastMessage
+/**
+ * Render a conversation row's preview line from its last message.
+ *
+ * Shared by the list fetch and the WS patch below, which is the point: a
+ * `message.new` event carries everything this needs, so a new message can
+ * repaint one row without refetching the list — but only if both paths agree
+ * on how a preview is spelled. Two encoders would drift the moment either
+ * grows a case.
+ */
+function previewOf(last: ApiConversation['lastMessage']): string {
   // Empty string when there's no message yet — the row renderer skips the
   // preview line entirely so an empty conversation doesn't show a stray "—".
-  let preview = ''
-  if (last) {
-    // Resolve the author's DISPLAY NAME from the participants store. If the
-    // participant isn't loaded yet, omit the author prefix entirely — never
-    // fall back to the raw id (which may carry a server-side collision
-    // suffix like `iris-a0ab` that we shouldn't be exposing to UI).
-    const meId = useAuth.getState().user?.id
-    const byId = useParticipants.getState().byId
-    const resolveName = (id: string): string | null => {
-      if (id === meId) return 'You'
-      return byId[id]?.name ?? null
-    }
-    const authorName = resolveName(last.authorId)
-    // Rewrite raw `@<id>` mention tokens to `@<DisplayName>` so previews
-    // don't leak participant ids like `@u-27c9522d-3b7`. Mirror the regex
-    // used by parseBody() so we tokenize exactly what the chat renderer
-    // treats as a mention. `@all` is preserved as-is.
-    const humanizeMentions = (s: string): string =>
-      s.replace(/@[A-Za-z][\w-]*/g, (m) => {
-        const id = m.slice(1)
-        if (id === 'all') return m
-        const name = resolveName(id)
-        return name ? `@${name}` : m
-      })
-    const trimmedBody = humanizeMentions(last.body?.trim() ?? '')
-    if (last.kind === 'tool' && last.tool) {
-      const t = last.tool as { name?: string; arg?: string }
-      preview = authorName
-        ? `${authorName}: used ${t.name ?? 'tool'}`
-        : `used ${t.name ?? 'tool'}`
-    } else if (last.kind === 'email' && last.email) {
-      // Subject leads — that's how mailbox apps preview a thread. Body
-      // excerpt follows in muted text only when there's room.
-      const arrow = last.email.direction === 'in' ? '↓' : '↑'
-      const subject = last.email.subject || '(no subject)'
-      const snippet = trimmedBody ? ` — ${trimmedBody.slice(0, 60)}` : ''
-      preview = `${arrow} ${subject}${snippet}`
-    } else if (last.kind === 'system') {
-      // System rows ship as JSON bodies — translate to a short
-      // human-readable line ("Bram joined the group" / "Scout removed
-      // Iris") instead of leaking raw `{"kind":"left",...}` payloads.
-      preview = renderSystemPreview(last.body, resolveName) ?? '(system)'
-    } else if (last.attachment) {
-      // Attachment messages (user uploads) — the row stores attachment
-      // metadata in a separate jsonb column and `body` carries only the
-      // optional caption. Prefix with a 📎 + filename so the row reads
-      // as "shared a file" instead of going blank when the user uploads
-      // without a caption.
-      const a = last.attachment
-      const verb = a.kind === 'img' ? '📷' : '📎'
-      const filename = a.name ?? (a.kind === 'img' ? 'image' : 'file')
-      const label = trimmedBody
-        ? `${verb} ${filename} — ${trimmedBody.slice(0, 80)}`
-        : `${verb} ${filename}`
-      preview = authorName ? `${authorName}: ${label}` : label
-    } else if (trimmedBody) {
-      preview = authorName ? `${authorName}: ${trimmedBody.slice(0, 100)}` : trimmedBody.slice(0, 100)
-    }
+  if (!last) return ''
+  // Resolve the author's DISPLAY NAME from the participants store. If the
+  // participant isn't loaded yet, omit the author prefix entirely — never
+  // fall back to the raw id (which may carry a server-side collision
+  // suffix like `iris-a0ab` that we shouldn't be exposing to UI).
+  const meId = useAuth.getState().user?.id
+  const byId = useParticipants.getState().byId
+  const resolveName = (id: string): string | null => {
+    if (id === meId) return 'You'
+    return byId[id]?.name ?? null
   }
+  const authorName = resolveName(last.authorId)
+  // Rewrite raw `@<id>` mention tokens to `@<DisplayName>` so previews
+  // don't leak participant ids like `@u-27c9522d-3b7`. Mirror the regex
+  // used by parseBody() so we tokenize exactly what the chat renderer
+  // treats as a mention. `@all` is preserved as-is.
+  const humanizeMentions = (s: string): string =>
+    s.replace(/@[A-Za-z][\w-]*/g, (m) => {
+      const id = m.slice(1)
+      if (id === 'all') return m
+      const name = resolveName(id)
+      return name ? `@${name}` : m
+    })
+  const trimmedBody = humanizeMentions(last.body?.trim() ?? '')
+  if (last.kind === 'tool' && last.tool) {
+    const t = last.tool as { name?: string; arg?: string }
+    return authorName
+      ? `${authorName}: used ${t.name ?? 'tool'}`
+      : `used ${t.name ?? 'tool'}`
+  }
+  if (last.kind === 'email' && last.email) {
+    // Subject leads — that's how mailbox apps preview a thread. Body
+    // excerpt follows in muted text only when there's room.
+    const arrow = last.email.direction === 'in' ? '↓' : '↑'
+    const subject = last.email.subject || '(no subject)'
+    const snippet = trimmedBody ? ` — ${trimmedBody.slice(0, 60)}` : ''
+    return `${arrow} ${subject}${snippet}`
+  }
+  if (last.kind === 'system') {
+    // System rows ship as JSON bodies — translate to a short
+    // human-readable line ("Bram joined the group" / "Scout removed
+    // Iris") instead of leaking raw `{"kind":"left",...}` payloads.
+    return renderSystemPreview(last.body, resolveName) ?? '(system)'
+  }
+  if (last.attachment) {
+    // Attachment messages (user uploads) — the row stores attachment
+    // metadata in a separate jsonb column and `body` carries only the
+    // optional caption. Prefix with a 📎 + filename so the row reads
+    // as "shared a file" instead of going blank when the user uploads
+    // without a caption.
+    const a = last.attachment
+    const verb = a.kind === 'img' ? '📷' : '📎'
+    const filename = a.name ?? (a.kind === 'img' ? 'image' : 'file')
+    const label = trimmedBody
+      ? `${verb} ${filename} — ${trimmedBody.slice(0, 80)}`
+      : `${verb} ${filename}`
+    return authorName ? `${authorName}: ${label}` : label
+  }
+  if (trimmedBody) {
+    return authorName ? `${authorName}: ${trimmedBody.slice(0, 100)}` : trimmedBody.slice(0, 100)
+  }
+  return ''
+}
+
+function fromApi(c: ApiConversation): Conversation {
+  const last = c.lastMessage
   return {
     id: c.id,
     kind: c.kind,
@@ -138,7 +158,7 @@ function fromApi(c: ApiConversation): Conversation {
     lastMessageId: last?.id ?? null,
     lastAt: timeFromIso(last?.createdAt ?? c.updatedAt),
     lastAtIso: last?.createdAt ?? c.updatedAt,
-    preview,
+    preview: previewOf(last),
     tag: (c.tag ?? undefined) as Conversation['tag'],
     pulledBy: c.pulledBy ?? undefined,
     projectId: c.projectId,
@@ -177,7 +197,7 @@ export function isMuted(c: Pick<Conversation, 'muted' | 'mutedUntil'>): boolean 
   return new Date(c.mutedUntil).getTime() > Date.now()
 }
 
-export const useConversations = create<ConversationsState>((set) => ({
+export const useConversations = create<ConversationsState>((set, get) => ({
   list: [],
   loaded: false,
   async load() {
@@ -205,6 +225,41 @@ export const useConversations = create<ConversationsState>((set) => ({
       console.warn('[conversations] reload failed', err)
     }
   },
+  applyIncomingMessage(conversationId, message, opts) {
+    const existing = get().list.find((c) => c.id === conversationId)
+    // A conversation we've never seen — a group just created, or one we were
+    // added to. There is no row to patch, so fall back to a fetch.
+    if (!existing) { void get().reload(); return false }
+
+    const last = lastMessageFromWs(message)
+    // The server counts unread as `author_id <> me AND created_at > last_read`.
+    // Mirror the author half here: a message this user sent from the CLI or
+    // another device echoes back over WS, and counting it would show a badge
+    // that the next reconcile silently takes away again.
+    const mine = message.authorId === useAuth.getState().user?.id
+    const unread = opts.read
+      ? undefined                                    // the user is looking at it
+      : mine
+        ? existing.unread                            // own message: no change
+        : (existing.unread ?? 0) + 1
+    const next: Conversation = {
+      ...existing,
+      lastMessageId: last.id,
+      lastAt: timeFromIso(last.createdAt),
+      lastAtIso: last.createdAt,
+      preview: previewOf(last),
+      unread,
+    }
+    const list = get().list.map((c) => (c.id === conversationId ? next : c)).sort(bySidebarOrder)
+    set({ list })
+    refreshActiveMessagesIfSidebarMoved(list)
+    return true
+  },
+  markLocallyRead(conversationId) {
+    set((s) => ({
+      list: s.list.map((c) => (c.id === conversationId ? { ...c, unread: undefined } : c)),
+    }))
+  },
 }))
 
 // WS bindings are attached once for the page lifetime; data reload runs
@@ -226,17 +281,27 @@ export function bootConversations() {
       void useConversations.getState().reload()
       return
     }
-    if (e.type === 'message.new' || e.type === 'group.pulled') {
-      // If a new message arrives for the conversation the user is currently
-      // viewing, treat it as already-seen — mark read on the server BEFORE we
-      // reload, so the badge never blinks up to 1 just to drop back to 0.
+    if (e.type === 'message.new') {
+      // Patch the one row this message touched. The event carries the whole
+      // message, so a refetch would only re-derive what we already have —
+      // for every conversation in the workspace, on every online client.
       const active = useApp.getState().selectedConversationId
-      if (e.type === 'message.new' && e.conversationId === active) {
-        void api.markRead(e.conversationId).then(() => useConversations.getState().reload())
-        return
+      const isActive = e.conversationId === active
+      useConversations.getState().applyIncomingMessage(e.conversationId, e.message, { read: isActive })
+      // Still tell the server the user has seen it, so the badge stays gone
+      // across reloads and other devices. Local state is already correct, so
+      // this no longer needs to be awaited before repainting.
+      if (isActive) {
+        void api.markRead(e.conversationId).catch(() => { /* retried on next view */ })
       }
+      return
+    }
+    if (e.type === 'group.pulled') {
+      // A group that did not exist a moment ago — there is no row to patch.
       void useConversations.getState().reload()
-    } else if (e.type === 'conversation.updated') {
+      return
+    }
+    if (e.type === 'conversation.updated') {
       // Surgical patch — apply patch fields to the matching conversation in
       // place without a full network reload.
       useConversations.setState((s) => ({

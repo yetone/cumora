@@ -40,7 +40,7 @@ Two "brain" paths:
 ```
 
 - **Frontend** (`src/`) is pure UI: React 18 + Vite + TypeScript + Tailwind, with `desktop/`, `mobile/`, `web/`, and `admin/` shells over the same components.
-- **Backend** (`server/`) is a stateless Node service: Express + `ws`, Postgres as the source of truth (pg pool + Drizzle schema), Redis for pub/sub fan-out and presence. Durable board/document/calendar writes enqueue realtime invalidations in a transactional PostgreSQL outbox; Redis degradation delays live refresh but never changes the command result, and clients reconcile by pulling the API. Any number of instances can drain the outbox through leased `SKIP LOCKED` claims. See [ADR 0001](docs/decisions/0001-transactional-realtime-outbox.md).
+- **Backend** (`server/`) is a stateless Node service: Express + `ws`, Postgres as the source of truth (pg pool + Drizzle schema), Redis for pub/sub fan-out and presence. Durable board/document/calendar writes enqueue realtime invalidations in a transactional PostgreSQL outbox; Redis degradation delays live refresh but never changes the command result, and clients reconcile by pulling the API. Any number of instances can drain the outbox through leased `SKIP LOCKED` claims — see `server/src/realtime-outbox.ts`.
 - **Agent runtime**: cloud agents live in per-agent Kubernetes pods (orchestrated via `kubectl` from the server; a Go FUSE driver mounts their server-side workspace); BYOA agents live wherever you run the daemon. Both act on the world through the same `cumora` CLI protocol, and every LLM call — cloud or BYOA — lands in one `llm_calls` cost ledger.
 - **Coordination**: agents in the same room don't trample each other. The server arbitrates with a seen-cursor freshness gate (a stale reply is HELD and shown the newer messages to re-decide), atomic claims on real units of work, and a small-brain triage gate that shields the big model. Design notes in [`docs/COORDINATION.md`](docs/COORDINATION.md).
 
@@ -71,16 +71,23 @@ Database migrations are applied via `npm run migrate` (run automatically by `npm
 | `OPENAI_MODEL` / `OPENAI_MODEL_SUPPORT` | big-brain / support-brain models |
 | `PORT` | `5181` |
 
-Optional feature groups (OAuth login, email via Resend + Cloudflare Email Routing, R2 storage/CDN, APNs/FCM push, the sub2api per-user LLM gateway, waitlist/invites, metrics) are documented inline in [`.env.example`](.env.example) and `server/src/env.ts`.
+Optional feature groups (OAuth login, email via Resend + Cloudflare Email Routing, R2 storage/CDN, APNs/FCM push, the sub2api per-user LLM gateway, invites, metrics) are declared in `server/src/env.ts`, which is the authoritative list. [`.env.example`](.env.example) annotates a commonly-edited subset of them.
 
 ### Tests
 
 ```bash
-npm test                  # unit tests (node:test) for server + workers
-npm run test:integration  # integration suite (needs local Postgres/Redis)
+npm test                  # unit tests (node:test) for server + workers + frontend lib
 npm run typecheck && npm run server:typecheck
 npm run guard:big-brain   # CI guard: only agent turns may use the big model
+
+# Integration suite. Without INTEGRATION_DATABASE_URL it prints
+# `[integration] skipped` and exits 0 — which looks like a pass. It
+# TRUNCATEs every table, so give it a throwaway database.
+INTEGRATION_DATABASE_URL=postgres://$USER@localhost:5432/cumora_test \
+  npm run test:integration
 ```
+
+[`CONTRIBUTING.md`](CONTRIBUTING.md) lists the full set of gates CI runs.
 
 ## Repo layout
 
@@ -95,6 +102,8 @@ npm run guard:big-brain   # CI guard: only agent turns may use the big model
 | `workers/` | Cloudflare Workers: `email-gate` (inbound mail) and `r2-gate` (signed CDN) |
 | `website/` | marketing site for cumora.ai (Cloudflare Pages) |
 | `benchmarks/` | real-LLM multi-agent coordination benchmarks (chain / counting / werewolf / kanban) |
+| `tests/` | frontend lib unit tests (run by `npm test`) |
+| `scripts/` | CI guard scripts + one-off generators |
 | `server/k8s/` | deployment manifests + GKE notes |
 
 ## Docs

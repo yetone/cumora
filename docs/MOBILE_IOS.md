@@ -2,7 +2,9 @@
 
 This document walks the end-to-end flow for building, testing and
 submitting the Cumora iOS app via Capacitor. It assumes a clean macOS
-machine with Xcode 15+ and Ruby/CocoaPods installed.
+machine with Xcode 15+. There is no Podfile and no CocoaPods step — native
+dependencies are Swift Package Manager packages, resolved into
+`ios/App/CapApp-SPM/Package.swift` by `npx cap sync ios`.
 
 ## Architecture summary
 
@@ -33,7 +35,9 @@ npm install
 npm install --no-save sharp
 node scripts-gen-ios-assets.mjs
 
-# Build the web bundle and copy native assets/plugins into ios/.
+# Build the web bundle, then copy assets and resolve native plugins.
+# `mobile:sync` is `npm run build && npx cap sync` — no platform
+# argument, so it syncs BOTH ios/ and android/.
 npm run mobile:sync
 ```
 
@@ -46,9 +50,10 @@ npm run mobile:sync
 npm run mobile:ios:run
 ```
 
-To run against a remote dev API, temporarily uncomment a `server.url`
-in capacitor.config.ts (don't commit) or set `cumora.serverUrl` via
-localStorage in the in-WebView devtools.
+To run against a remote dev API, temporarily **add** a `server.url` to
+capacitor.config.ts (it is deliberately absent from the checked-in config —
+don't commit one) or set `cumora.serverUrl` via localStorage in the in-WebView
+devtools.
 
 ## Release build for App Store / TestFlight
 
@@ -94,8 +99,7 @@ localStorage in the in-WebView devtools.
 
 ## Required Info.plist keys
 
-Add these to `ios/App/App/Info.plist` before submission (the Capacitor
-defaults are too minimal for App Review):
+`ios/App/App/Info.plist` already declares the four keys App Review needs:
 
 ```xml
 <key>NSCameraUsageDescription</key>
@@ -104,14 +108,20 @@ defaults are too minimal for App Review):
 <string>Cumora needs access to your photo library to attach images to messages.</string>
 <key>NSMicrophoneUsageDescription</key>
 <string>Cumora can record short voice notes for your conversations.</string>
-<key>NSUserTrackingUsageDescription</key>
-<string>Cumora does not track you across other apps and websites.</string>
 <key>ITSAppUsesNonExemptEncryption</key>
 <false/>
 ```
 
-(Only include the camera/photo/mic strings if those features ship; App
-Review rejects bundles that declare permissions they don't use.)
+The one key **not** present is `NSUserTrackingUsageDescription`. Only add it
+if the app actually calls App Tracking Transparency — today it doesn't, and
+declaring a permission you don't use is itself a rejection reason:
+
+```xml
+<key>NSUserTrackingUsageDescription</key>
+<string>Cumora does not track you across other apps and websites.</string>
+```
+
+Likewise, drop the camera/photo/mic strings if those features stop shipping.
 
 ## App Store screenshots — required sizes
 
@@ -172,4 +182,7 @@ npm run build
 npx cap doctor ios
 ```
 
-If `cap doctor` flags missing pods, run `cd ios/App && pod install`.
+If `cap doctor` flags unresolved native dependencies, re-run
+`npx cap sync ios` and let Xcode resolve the Swift packages
+(File → Packages → Resolve Package Versions). There is no `pod install`
+step in this project.

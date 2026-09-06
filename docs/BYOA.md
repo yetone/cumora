@@ -272,15 +272,21 @@ fail-closed host boundary:
   isolation, an empty strict network allowlist, no Bash/PowerShell/web tools,
   no unsandboxed retry, and an explicit deny list for every inherited
   environment variable not needed by the fixed Cumora MCP bridge. Because
-  restricted mode ignores user settings, the daemon imports only
-  `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`, and
-  `ANTHROPIC_SMALL_FAST_MODEL` from Claude's user settings into the trusted
-  Claude core; those names remain denied to model-spawned subprocesses and the
-  Cumora never serializes the values into argv, its logs, Agent files, or server
-  reports. Claude Code
-  2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
-  `socat`; a missing dependency fails the turn. See
-  [ADR 0005](decisions/0005-secure-claude-provider-bootstrap.md).
+  restricted mode ignores user settings, the daemon imports a fixed
+  seven-key allowlist from Claude's user settings into the trusted Claude
+  core — `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+  `ANTHROPIC_SMALL_FAST_MODEL`, and the three `ANTHROPIC_DEFAULT_*_MODEL`
+  aliases (`CLAUDE_CORE_ENV_KEYS` in
+  `server/src/agents/computer/claude-user-settings.ts`). Those names remain
+  denied to model-spawned subprocesses and Cumora never serializes the values
+  into argv, its logs, Agent files, or server reports. Explicit daemon
+  environment values take precedence over the settings file; a missing,
+  malformed, relative-config-root, or oversized settings file fails soft and
+  preserves Claude's native first-party OAuth/keychain behavior. Note that
+  `api.anthropic.com` is *not* treated as a custom provider, while a
+  `ANTHROPIC_BASE_URL` that won't parse is (it fails toward "custom"). Claude
+  Code 2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
+  `socat`; a missing dependency fails the turn.
 - Codex runs one-shot with user config and exec-policy rules ignored. A custom
   permission profile permits minimal runtime reads and writes only under the
   agent home, disables command network, and gives model-spawned commands only
@@ -306,11 +312,48 @@ This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides and Codex's
 persistent app-server path. Without it, opaque engine arguments are ignored
 because the daemon cannot prove that they preserve the sandbox.
 
+### Claude reasoning and response preferences
+
+Secure Claude agent turns inherit a validated subset of the operator's
+`~/.claude/settings.json` (or absolute `CLAUDE_CONFIG_DIR`):
+
+| Setting | Behavior |
+| --- | --- |
+| `effortLevel` | Inherit `low`, `medium`, `high`, or `xhigh`. |
+| `modelSettings.*.effortLevel` | Inherit per-model effort; Claude resolves canonical names and aliases and gives these entries precedence over the global setting. |
+| `alwaysThinkingEnabled` | Preserve both `true` and `false`; unset keeps Claude's native default. |
+| `language` | Inherit the response language preference. |
+| `env.CLAUDE_CODE_EFFORT_LEVEL` | Explicit effort override, including `max` and `auto`. |
+| `env.MAX_THINKING_TOKENS` | Preserve the operator's budget, including an explicit `0`. |
+| `env.CLAUDE_CODE_MAX_OUTPUT_TOKENS` | Preserve a positive output-token limit. |
+| `env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING`, `env.CLAUDE_CODE_DISABLE_THINKING` | Preserve explicit `0`/`1` model or gateway compatibility switches. |
+
+Daemon environment values override corresponding settings-file environment
+entries. Claude applies its native precedence between environment, global,
+and per-model preferences. Cumora no longer supplies `MAX_THINKING_TOKENS=0`
+for agent turns; triage and doctor calls retain their separate thinking-off
+policy and do not import turn-only preferences. Per-Agent model selections
+still win over local model defaults. The three `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+`ANTHROPIC_DEFAULT_SONNET_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` environment
+settings are inherited so provider-specific aliases retain their meaning.
+
+Preferences are loaded at engine-process creation, including session resume;
+restart the daemon to apply edits to existing persistent sessions. In
+unsandboxed compatibility mode Claude continues loading its own settings.
+Hooks, plugins, MCP servers, permissions, arbitrary environment values,
+output styles, and workflow modes are not imported by this preference bridge.
+
+An inherited effort is a preference, not a guarantee of thinking tokens:
+Claude can cap effort for a model or organization, and Opus 5 with thinking
+disabled may send `high` even when `xhigh` is saved. To request deeper
+reasoning, enable thinking as well as setting effort. See
+[Claude model configuration](https://code.claude.com/docs/en/model-config#adjust-effort-level).
+
 ### Running against a custom provider
 
 Custom providers (CC Switch and friends) often store their endpoint,
 authentication value, and default model in `~/.claude/settings.json`. Secure
-Claude imports only that provider bootstrap subset, reports the configured
+Claude imports that provider bootstrap subset, reports the configured
 default model without reporting credentials or endpoint details, and gives it
 precedence over Cumora's deploy-level Anthropic pin for Agents left on **Follow
 engine default**. Explicit per-Agent model choices still win.
@@ -324,7 +367,8 @@ different policy or an older daemon has not reported its local default:
 | `local` | pass **no** model at all — the CLI runs on whatever it is already configured for, and the small/fast pin is dropped too |
 | any model id | use that model instead of the pinned one |
 
-The configured `ANTHROPIC_SMALL_FAST_MODEL` is also used for local triage. When
+The configured `ANTHROPIC_DEFAULT_HAIKU_MODEL` (falling back to the legacy
+`ANTHROPIC_SMALL_FAST_MODEL`) is also used for local triage. When
 a custom endpoint does not name a fast model, Cumora passes no triage model and
 lets the provider choose instead of injecting the first-party `haiku` alias.
 `CUMORA_TRIAGE_MODEL` remains an explicit override, and `cumora agent computer
@@ -393,7 +437,8 @@ the operator's existing login, but model-spawned commands cannot read that
 login or inherit provider credentials in secure mode. Each agent gets its own
 writable home; its credential-free IPC namespace and executable bridge stay
 outside that home. Claude restricted mode ignores user/project settings;
-Cumora restores only its allowlisted provider bootstrap to the trusted core.
+Cumora restores only its allowlisted provider bootstrap and validated model
+preferences to the trusted core.
 Codex `exec --ignore-user-config --ignore-rules`
 does the same and marks the project untrusted. Secure engine startup also drops
 empty, relative, and agent-home entries from `PATH`, so a model-planted
@@ -496,16 +541,29 @@ npx cumora@latest agent computer --pair <code> [--server <url>]
 ```
 
 - `agent-cli/` builds `dist/cli.js` — a single self-contained ESM file
-  (~140KB, zero runtime dependencies) that esbuild-bundles the daemon
+  (~330KB, zero runtime dependencies) that esbuild-bundles the daemon
   source from `server/src/agents/computer/` — one source of truth, no
   separate copy. The repo's root `package.json` stays `private`; only
-  this thin package is published.
-- `--install-service` installs the daemon as a supervised service
-  (launchd `io.cumora.daemon` on macOS, `systemd --user` on Linux, a per-user
-  Task Scheduler watchdog on Windows) so it restarts at user login (including
-  after a reboot) and — on macOS — runs in the GUI domain where the engine's
-  keychain-backed login actually works.
-- `--doctor` probes the big/small models and the wake path end-to-end.
+  this thin package is published. `.github/workflows/publish.yml` pushes it
+  to npm on any push to `main` touching `agent-cli/**` (see
+  [`RELEASE.md`](RELEASE.md)).
+- Setup flags: `--pair <code>`, `--server <url>`, `--engine <id>` (force one
+  of the registered engines instead of auto-detecting).
+- Service flags: `--install-service` installs the daemon as a supervised
+  service (launchd `io.cumora.daemon` on macOS, `systemd --user` on Linux, a
+  per-user Task Scheduler watchdog on Windows) so it restarts at user login
+  (including after a reboot) and — on macOS — runs in the GUI domain where the
+  engine's keychain-backed login actually works.
+  `--uninstall-service`, `--restart`, `--stop`, `--status`, and `--logs`
+  manage and inspect it.
+- Diagnostics: `--doctor` probes the big/small models and the wake path
+  end-to-end; `--version` / `-v` and `--help` / `-h` are one-shot too.
+- `--stop`, `--restart`, and `--pair` kill only the **long-running** daemon.
+  Every one-shot invocation — `--doctor`, `--help`, `--status`, and the rest of
+  `ONE_SHOT_FLAGS` — is excluded by `isStoppableDaemonCommand`, so a
+  concurrently running `--doctor` survives a `--stop` instead of dying
+  mid-probe.
+- With no flags the daemon runs in the foreground (pair first).
 - In-repo dev uses `./bin/cumora agent computer …` (tsx) — the same
   code, unbundled.
 

@@ -3,8 +3,10 @@
 # Why this exists: the npm account has 2FA (auth + writes), so a manual
 # `npm publish` prompts for an interactive OTP every release. An npm
 # *automation* token bypasses 2FA for writes, so CI can publish without a
-# human-entered code — mirroring how the server already auto-deploys on
-# push to main (build.yml → deploy.yml).
+# human-entered code. Unlike the server (build.yml produces a candidate image
+# that deploy.yml then rolls out on an explicit dispatch), the CLI publishes
+# straight from a push to main — an npm version is immutable and additive, so
+# there's no production state to mutate.
 #
 # Setup (one-time): create an automation token at
 #   npmjs.com → Access Tokens → Generate → "Automation"

@@ -63,7 +63,7 @@ const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   qwen: true,
   antigravity: true,
 }
-const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
+export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
 type Queryable = {
   query<T extends object = Record<string, unknown>>(

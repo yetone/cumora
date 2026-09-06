@@ -8,6 +8,7 @@ import { pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox, withOutboxTransaction } from '../realtime-outbox.js'
 import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspace-cleanup.js'
+import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/rooms.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
@@ -40,6 +41,7 @@ import {
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
   setComputerDefaultEngine,
+  PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
 import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
 import { companyTier } from '../tier.js'
@@ -1252,11 +1254,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // and any adopted agent are created with. Fall back to Claude if unreported.
   try {
     if ((await companyTier(paired.companyId)) === 'free') {
-      const engine = (
-        engines[0] === 'claude' || engines[0] === 'codex' || engines[0] === 'grok' ||
-        engines[0] === 'cursor' || engines[0] === 'opencode' || engines[0] === 'pi' ||
-        engines[0] === 'gemini' || engines[0] === 'qwen'
-      ) ? engines[0] : 'claude'
+      const engine: EngineId = PAIRABLE_ENGINES.has(engines[0]) ? (engines[0] as EngineId) : 'claude'
       // Adopt only agents that are stranded on the managed Cumora Cloud (or
       // unassigned) onto the just-paired machine — earlier builds' boot backfill
       // wrongly seeded free starters on cloud, where free can't run them. Agents
@@ -1812,6 +1810,14 @@ api.delete('/companies/:id', safe(async (req, res) => {
         if (key) storageKeys.add(key)
       }
     }
+    const { rows: docRows } = await client.query<{ id: string }>(
+      `SELECT id FROM documents WHERE company_id = $1`, [companyId],
+    )
+    for (const docRow of docRows) {
+      const docKeys = await collectDocumentStorageKeys(docRow.id, client)
+      for (const key of docKeys) storageKeys.add(key)
+      evictDocumentRoom(docRow.id)
+    }
 
     // Child/root rows with soft company_id references. FK-backed trees such as
     // boards, calendar, projects, invitations, and shipping cascade from the
@@ -1828,8 +1834,15 @@ api.delete('/companies/:id', safe(async (req, res) => {
     }
     if (agentIds.length > 0) {
       await client.query(`DELETE FROM board_mention_reads WHERE user_id = ANY($1::text[])`, [agentIds])
+      // Sweep by owner as well as by tenant. #207 added the five tables whose
+      // writers were dropping company_id; these three are here so the sweep does
+      // not depend on writer discipline at all. Their writers do pass a tenant
+      // today — the point is that the other five did too, until they didn't, and
+      // these are the tables that carry per-run history and cost, so a row that
+      // slips through resurfaces on a billing report rather than in a UI.
       const agentScopedTables = [
         'agent_workspace', 'agent_memory', 'agent_log', 'agent_tasks', 'agent_climate',
+        'agent_events', 'agent_runs', 'agent_triages',
       ] as const
       for (const table of agentScopedTables) {
         await client.query(`DELETE FROM ${table} WHERE agent_id = ANY($1::text[])`, [agentIds])
@@ -3258,6 +3271,18 @@ api.post('/agents/:id/rehire', async (req, res) => {
   res.json({ ok: true })
 })
 
+/**
+ * Ceiling on one sidebar page.
+ *
+ * The route has no cursor, so this is a backstop rather than pagination: it
+ * bounds the pathological workspace the performance review described (10,000
+ * conversations returned in one response) without changing the contract for
+ * the real ones, which are nowhere near it. If a workspace ever trips the log
+ * line below, that is the signal that real cursor paging has become worth its
+ * cost across the ~80 call sites that read this list.
+ */
+const CONVERSATION_LIST_LIMIT = 500
+
 api.get('/conversations', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { rows } = await pool.query(
@@ -3274,47 +3299,15 @@ api.get('/conversations', async (req, res) => {
         -- "until tomorrow" silence wears off without needing a sweeper job.
         (mu.user_id IS NOT NULL AND (mu.muted_until IS NULL OR mu.muted_until > NOW())) AS muted,
         mu.muted_until AS "mutedUntil",
-        (
-          SELECT json_build_object(
-            'id', m.id,
-            'authorId', m.author_id,
-            'kind', m.kind,
-            'body', m.body,
-            'tool', m.tool,
-            'attachment', m.attachment,
-            'createdAt', m.created_at,
-            -- For email messages, surface the subject + direction so the
-            -- sidebar preview can show "Re: contract draft" instead of a
-            -- raw body excerpt. NULL for non-email messages — the client
-            -- branches on last.kind === 'email'.
-            'email', (
-              SELECT jsonb_build_object(
-                'subject', em.subject,
-                'direction', em.direction,
-                'from', em.from_addr
-              )
-                FROM email_messages em
-               WHERE em.message_id = m.id
-            )
-          )
-          FROM messages m
-          WHERE m.conversation_id = c.id
-          ORDER BY m.sequence DESC
-          LIMIT 1
-        ) AS "lastMessage",
-        COALESCE((
-          SELECT COUNT(*)::int
-            FROM messages m
-           WHERE m.conversation_id = c.id
-             AND m.author_id <> $1
-             AND m.created_at > COALESCE(
-               (SELECT last_read_at FROM conversation_reads WHERE user_id = $1 AND conversation_id = c.id),
-               '1970-01-01T00:00:00Z'::timestamptz
-             )
-        ), 0) AS "unreadCount"
+        last_message.payload AS "lastMessage",
+        COALESCE(unread.n, 0) AS "unreadCount"
       FROM conversations c
       LEFT JOIN projects p ON p.id = c.project_id
       LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id AND mu.user_id = $1
+      -- Hoisted out of the unread subquery. As a correlated scalar it was
+      -- probed once per conversation, nested inside a COUNT that was itself
+      -- probed once per conversation.
+      LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
       LEFT JOIN LATERAL (
         SELECT p_other.name
           FROM conversation_members member
@@ -3327,6 +3320,41 @@ api.get('/conversations', async (req, res) => {
          ORDER BY member.ordinal
          LIMIT 1
       ) other_participant ON c.kind = 'direct'
+      LEFT JOIN LATERAL (
+        SELECT json_build_object(
+          'id', m.id,
+          'authorId', m.author_id,
+          'kind', m.kind,
+          'body', m.body,
+          'tool', m.tool,
+          'attachment', m.attachment,
+          'createdAt', m.created_at,
+          -- For email messages, surface the subject + direction so the
+          -- sidebar preview can show "Re: contract draft" instead of a
+          -- raw body excerpt. NULL for non-email messages — the client
+          -- branches on last.kind === 'email'.
+          'email', (
+            SELECT jsonb_build_object(
+              'subject', em.subject,
+              'direction', em.direction,
+              'from', em.from_addr
+            )
+              FROM email_messages em
+             WHERE em.message_id = m.id
+          )
+        ) AS payload
+          FROM messages m
+         WHERE m.conversation_id = c.id
+         ORDER BY m.sequence DESC
+         LIMIT 1
+      ) last_message ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS n
+          FROM messages m
+         WHERE m.conversation_id = c.id
+           AND m.author_id <> $1
+           AND m.created_at > COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz)
+      ) unread ON true
       WHERE c.company_id = $2
         -- Only conversations the caller is actually in. Without this,
         -- agent-to-agent direct chats (members=[agentA, agentB]) leak
@@ -3339,9 +3367,13 @@ api.get('/conversations', async (req, res) => {
              AND cm.company_id = c.company_id
              AND cm.participant_id = $1
         )
-      ORDER BY c.pinned DESC, c.updated_at DESC`,
+      ORDER BY c.pinned DESC, c.updated_at DESC
+      LIMIT ${CONVERSATION_LIST_LIMIT}`,
     [me, tenant],
   )
+  if (rows.length === CONVERSATION_LIST_LIMIT) {
+    console.warn(`[conversations] ${tenant} hit the ${CONVERSATION_LIST_LIMIT}-row sidebar ceiling; older rows are being withheld`)
+  }
   res.json(rows)
 })
 
@@ -3717,13 +3749,22 @@ api.post('/conversations/:id/typing', async (req, res) => {
     // field name is a legacy from when only agents emitted typing — the
     // client treats it as an opaque participant id and doesn't care
     // whether the typer is human or agent.
+    //
+    // Fail-open on a Redis outage. A typing indicator is pure ephemera
+    // that the renderer expires on its own; surfacing the outage as a 500
+    // would only teach a composer that fires one of these every few
+    // seconds to spam the error path. Matches how the agent-side emitters
+    // treat the same channel (inproc-client.ts, scheduler.ts).
     await publish(CH_TYPING, {
       type: 'typing',
       conversationId: id,
       agentId: me,
       done,
       companyId,
-    })
+    }).catch((err) =>
+      console.warn(`[typing] publish for ${id} failed — dropping`,
+        err instanceof Error ? err.message : err),
+    )
     res.json({ ok: true })
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500
@@ -4952,6 +4993,90 @@ api.post('/messages/:id/reactions', async (req, res) => {
  */
 
 /**
+ * Hard deadline for the message-body bucket of global search.
+ *
+ * `idx_messages_body_trgm` (migration 0005) answers most `%term%` patterns from
+ * the index, but a pattern shorter than three characters produces no complete
+ * trigram and still plans as a scan — two-character CJK queries are the common
+ * case. The pool's global 60s `statement_timeout` is far too generous for
+ * something the sidebar re-issues on every typing pause: a handful of those in
+ * flight is enough to hold every slot. Three seconds is well past a healthy
+ * indexed search and reaps the rest.
+ */
+const SEARCH_MESSAGE_TIMEOUT_MS = 3_000
+
+/**
+ * A single trigram needs three characters, so `%ab%` has none to look up and
+ * the planner falls back to a scan. Two-character queries are ordinary in CJK,
+ * so we still run them (bounded by the deadline above) — but a ONE-character
+ * pattern matches most of the corpus, meaning a full scan whose top-15 rows are
+ * effectively "the newest messages", which is not an answer to anything.
+ */
+const SEARCH_MESSAGE_MIN_LENGTH = 2
+
+/** Raised when the caller disconnects before the query is even issued. */
+class QueryAbandonedError extends Error {}
+
+/**
+ * Run the message-body search on its own connection under a bounded deadline,
+ * and actually cancel it when the caller walks away.
+ *
+ * The sidebar aborts its fetch on every keystroke after the debounce. Aborting
+ * the HTTP request does nothing to the query already executing in PostgreSQL —
+ * that backend keeps its pool slot until it finishes on its own. So we capture
+ * the backend pid up front and, if the response closes early, issue
+ * `pg_cancel_backend` from a *different* connection (the busy one cannot accept
+ * a command). A cancelled or timed-out search resolves to no rows rather than
+ * throwing: there is no longer anyone to show an error to, and a partial
+ * dropdown is a better failure than a 500.
+ */
+async function searchMessagesBounded(
+  res: Response,
+  params: unknown[],
+  sql: string,
+): Promise<{ rows: Array<{ body: string } & Record<string, unknown>> }> {
+  const client = await pool.connect()
+  let backendPid: number | null = null
+  let abandoned = false
+  const cancelIfRunning = (): void => {
+    // `close` also fires on a normal, fully-written response — only an early
+    // close means the caller is gone.
+    if (res.writableEnded) return
+    abandoned = true
+    if (backendPid == null) return
+    void pool.query('SELECT pg_cancel_backend($1)', [backendPid]).catch(() => { /* best effort */ })
+  }
+  res.on('close', cancelIfRunning)
+  try {
+    await client.query('BEGIN')
+    // SET LOCAL, not SET: the deadline dies with this transaction, so releasing
+    // the connection cannot leak a 3s timeout onto the next borrower.
+    await client.query(`SET LOCAL statement_timeout = ${SEARCH_MESSAGE_TIMEOUT_MS}`)
+    const pid = await client.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')
+    backendPid = pid.rows[0]?.pid ?? null
+    if (abandoned) throw new QueryAbandonedError()
+    const result = await client.query<{ body: string } & Record<string, unknown>>(sql, params)
+    await client.query('COMMIT')
+    return { rows: result.rows }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => { /* connection may be dead */ })
+    // 57014 = query_canceled, raised by both statement_timeout and our own
+    // pg_cancel_backend. Everything else is a real fault worth surfacing.
+    const code = (error as { code?: unknown } | null)?.code
+    if (code === '57014' || error instanceof QueryAbandonedError) {
+      if (!abandoned) {
+        console.warn(`[search] message bucket exceeded ${SEARCH_MESSAGE_TIMEOUT_MS}ms and was cancelled`)
+      }
+      return { rows: [] }
+    }
+    throw error
+  } finally {
+    res.off('close', cancelIfRunning)
+    client.release()
+  }
+}
+
+/**
  * Universal search across the workspace.
  *
  * Returns four ranked buckets in this order of importance:
@@ -5092,7 +5217,10 @@ api.get('/search', async (req, res) => {
 
   // Skip `tool` / `system` rows — those bodies are machine output, not
   // human-written content, and they'd flood the list with JSON snippets.
-  const messagesP = pool.query(
+  // (`idx_messages_body_trgm` is partial on exactly this predicate.)
+  const messagesP = raw.length < SEARCH_MESSAGE_MIN_LENGTH
+    ? Promise.resolve({ rows: [] as Array<{ body: string } & Record<string, unknown>> })
+    : searchMessagesBounded(res, [tenant, me, contains],
     `SELECT m.id,
             m.conversation_id AS "conversationId",
             CASE
@@ -5130,7 +5258,6 @@ api.get('/search', async (req, res) => {
         AND m.body ILIKE $3 ESCAPE '\\'
       ORDER BY m.created_at DESC
       LIMIT ${M_LIMIT}`,
-    [tenant, me, contains],
   )
 
   const [participants, rooms, groups, messages] = await Promise.all([
@@ -6933,10 +7060,19 @@ api.delete('/documents/:id', safe(async (req, res) => {
     const role = roleRows[0]?.role ?? 'member'
     if (!PRIVILEGED_ROLES.has(role)) throw new HttpError(403, 'only the creator or an owner can delete')
   }
+  let docKeys: string[] = []
   await withOutboxTransaction(async (client) => {
+    docKeys = await collectDocumentStorageKeys(id, client)
     await client.query(`DELETE FROM documents WHERE id = $1`, [id])
+    if (docKeys.length > 0) {
+      await enqueueWorkspaceCleanup(client, { companyId, agentIds: [], storageKeys: docKeys })
+    }
     await enqueueDocumentChanged(client, companyId, id, 'document.deleted', userId)
   })
+  evictDocumentRoom(id)
+  if (docKeys.length > 0) {
+    nudgeWorkspaceCleanupWorker()
+  }
   res.json({ ok: true })
 }))
 

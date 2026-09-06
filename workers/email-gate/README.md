@@ -10,9 +10,9 @@ The worker:
 
 1. Rejects mail (`550`) for any recipient outside `EMAIL_ROOT_DOMAINS`.
 2. Reads the raw RFC 5322 message and parses it with `postal-mime`.
-3. Builds a JSON payload (message-id, in-reply-to, references, from, to, cc, subject, text, html, raw size).
+3. Builds a JSON payload (message-id, in-reply-to, references, from, to, cc, subject, text, html, raw size, `autoSubmitted` per RFC 3834, and `attachments[]` as base64 — capped at 10 MB per attachment and 18 MB in total).
 4. HMAC-signs the payload with `EMAIL_INBOUND_HMAC_SECRET` and POSTs to `CUMORA_INBOUND_URL`.
-5. Translates the server's response into accept / bounce / tempfail.
+5. Translates the server's response into accept or reject. Every rejection is **permanent** (`message.setReject`) — including the 5xx branch, which arguably should tempfail so the sender's MTA retries. See the note in `src/index.ts`.
 
 Outbound mail goes through Resend on the server side, **not** this worker — Cloudflare Email Workers can't send mail.
 

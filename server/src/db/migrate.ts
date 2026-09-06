@@ -25,6 +25,18 @@ import {
   AGENT_RUNTIME_ASSIGNMENT_SQL,
   agentRuntimeAssignmentChecksum,
 } from './migrations/0004-agent-runtime-assignment.js'
+import {
+  SEARCH_TRIGRAM_EXTENSION_SQL,
+  SEARCH_TRIGRAM_INDEX_NAME,
+  SEARCH_TRIGRAM_INDEX_SQL,
+  searchTrigramIndexChecksum,
+} from './migrations/0005-search-trigram-index.js'
+import {
+  DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  emailMessagesCompanySmtpIdChecksum,
+} from './migrations/0006-email-messages-company-smtp-id.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2048,8 +2060,9 @@ export function computedBaselineMigrationChecksum(): string {
   return createHash('sha256').update(DDL).digest('hex')
 }
 
-interface VersionedMigration extends MigrationMetadata {
+export interface VersionedMigration extends MigrationMetadata {
   sourceChecksum: string
+  transactional?: boolean
   up(client: import('pg').PoolClient): Promise<void>
 }
 
@@ -2134,9 +2147,10 @@ export type BaselineStatementClient = { query(sql: string): Promise<unknown> }
  * AccessExclusiveLock and the transaction HOLDS all ~30 of them until commit.
  * Under sustained production traffic those waits close into a cycle and
  * Postgres aborts the whole batch with 40P01 — on every attempt. That is how
- * the first ADR 0003 adoption Job (v0.14.0, 2026-09-03) failed eight times in
- * a row without applying anything: the ledger was empty, so version 1 had to
- * run, and version 1 could never commit. Before ADR 0003 the same batch ran on
+ * the first versioned-migration adoption Job (v0.14.0, 2026-09-03) failed
+ * eight times in a row without applying anything: the ledger was empty, so
+ * version 1 had to run, and version 1 could never commit. Before versioned
+ * migrations the same batch ran on
  * every boot and only ever got through production because a sentinel probe let
  * a deadlocked no-op pass; that hatch is gone, and it would not have helped
  * here anyway because the baseline had real columns to add.
@@ -2145,7 +2159,8 @@ export type BaselineStatementClient = { query(sql: string): Promise<unknown> }
  * immediately, so a no-op cannot participate in a lock cycle, and a real
  * change waits at most `lock_timeout` (55P03) before this loop retries just
  * that statement. Every statement in the baseline is idempotent (it ran on
- * every application boot before ADR 0003), so a statement retry — or a rerun
+ * every application boot before the ledger existed), so a statement retry — or
+ * a rerun
  * of the Job after a mid-batch failure — resumes safely; ensureSchema records
  * version 1 only after the entire batch completed. Versioned migrations after
  * the baseline keep their single-transaction atomicity.
@@ -2345,13 +2360,153 @@ export async function checkConversationMembersResolvable(client: MigrationPreche
     nullCompanies > 0 ? `${nullCompanies} conversation(s) have no company_id` : null,
   ].filter(Boolean).join(' and ')
   throw Object.assign(
-    new Error(`migration 0002 precondition failed: ${detail} — repair the data, then rerun the migration Job (see the precheck lines above and ADR 0004)`),
+    new Error(`migration 0002 precondition failed: ${detail} — repair the data, then rerun the migration Job (see the precheck lines above)`),
     { code: '23503' },
   )
 }
 
+/** Where `archive-detach` parks the member ids it removes from
+ *  `conversations.members`, so the detach can be undone. */
+export const MIGRATION_0002_ARCHIVE_TABLE = 'conversation_members_detached_0002'
+
+export const MIGRATION_0002_ARCHIVE_DDL = `
+CREATE TABLE IF NOT EXISTS ${MIGRATION_0002_ARCHIVE_TABLE} (
+  conversation_id       TEXT NOT NULL,
+  company_id            TEXT NOT NULL,
+  member_id             TEXT NOT NULL,
+  ordinal               INTEGER NOT NULL,
+  original_members      JSONB NOT NULL,
+  authored_messages     BOOLEAN NOT NULL,
+  participant_elsewhere BOOLEAN NOT NULL,
+  archived_at           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, member_id)
+)`
+
+// Same predicate as UNRESOLVABLE_MEMBERS_CTE, plus everything needed to say
+// afterwards exactly what was removed: `ordinal` is where the id sat and
+// `original_members` is the whole pre-detach array, so the old state can be
+// reconstructed without re-deriving an interleaving. `authored_messages` /
+// `participant_elsewhere` record *why* the id was unresolvable.
+const MIGRATION_0002_ARCHIVE_ORPHANS = `
+INSERT INTO ${MIGRATION_0002_ARCHIVE_TABLE} (
+  conversation_id, company_id, member_id, ordinal, original_members,
+  authored_messages, participant_elsewhere
+)
+SELECT c.id, c.company_id, member.id, (member.ord - 1)::integer, c.members,
+       EXISTS (SELECT 1 FROM messages m
+                WHERE m.conversation_id = c.id AND m.author_id = member.id),
+       EXISTS (SELECT 1 FROM participants p WHERE p.id = member.id)
+  FROM conversations c
+  CROSS JOIN LATERAL jsonb_array_elements_text(c.members)
+         WITH ORDINALITY AS member(id, ord)
+  LEFT JOIN participants p
+    ON p.id = member.id AND p.company_id = c.company_id
+ WHERE c.company_id IS NOT NULL
+   AND p.id IS NULL
+   AND member.id NOT LIKE 'external:%'
+ON CONFLICT (conversation_id, member_id) DO NOTHING`
+
+// Rewrite only the affected conversations, preserving the relative order of
+// the members that stay. `external:` markers are kept on purpose — migration
+// 0002 strips them itself and they are not participants by design.
+const MIGRATION_0002_DETACH_ORPHANS = `
+WITH affected AS (
+  SELECT DISTINCT a.conversation_id FROM ${MIGRATION_0002_ARCHIVE_TABLE} a
+), kept AS (
+  SELECT c.id,
+         COALESCE(
+           jsonb_agg(member.id ORDER BY member.ord) FILTER (
+             WHERE member.id LIKE 'external:%'
+                OR EXISTS (SELECT 1 FROM participants p
+                            WHERE p.id = member.id AND p.company_id = c.company_id)
+           ),
+           '[]'::jsonb
+         ) AS members
+    FROM conversations c
+    JOIN affected a ON a.conversation_id = c.id
+    CROSS JOIN LATERAL jsonb_array_elements_text(c.members)
+           WITH ORDINALITY AS member(id, ord)
+   GROUP BY c.id
+)
+UPDATE conversations c
+   SET members = kept.members
+  FROM kept
+ WHERE c.id = kept.id
+   AND c.members IS DISTINCT FROM kept.members`
+
+export type Migration0002RepairMode = 'off' | 'archive-detach'
+
+/**
+ * Read `MIGRATION_0002_REPAIR`. Unset means `off` — a deploy that has not
+ * asked for a repair keeps failing closed, which is the whole point of the
+ * precheck. An unrecognized value is a hard error rather than a silent `off`,
+ * because a typo in the one flag that touches production rows must not read
+ * as "operator declined".
+ */
+export function migration0002RepairMode(raw = process.env.MIGRATION_0002_REPAIR): Migration0002RepairMode {
+  const value = (raw ?? '').trim().toLowerCase()
+  if (value === '' || value === 'off') return 'off'
+  if (value === 'archive-detach') return 'archive-detach'
+  throw new Error(`MIGRATION_0002_REPAIR must be unset, 'off', or 'archive-detach' (got '${raw}')`)
+}
+
+/**
+ * Opt-in repair for the 0002 precondition (ADR 0004).
+ *
+ * The unresolvable rows are legacy `conversations.members` entries naming an
+ * id with no participant in that conversation's tenant — most of them ids
+ * that do exist, under a *different* company. They predate the tenant guard
+ * in `startPulledGroup`, which now refuses to build a cross-tenant members
+ * array at all. Such an id grants nothing today: every read path is
+ * tenant-scoped, so a foreign member id is unreachable membership, and ADR
+ * 0004's composite FK has no way to represent it in the first place.
+ *
+ * So the repair detaches them — but archives each one first, along with the
+ * conversation's whole pre-detach members array, so nothing is destroyed
+ * silently. That archive is a record, not a one-click undo: once 0002 has
+ * applied, its projection trigger enforces ADR 0004 on every write, so
+ * putting a detached id back requires making it a real participant in that
+ * tenant first. `messages` is never touched: an archived member that authored
+ * in the conversation keeps its authorship, it just stops being listed as a
+ * member.
+ *
+ * Runs inside migration 0002's transaction, so a failure later in the
+ * migration rolls the detach back with it.
+ */
+export async function repairConversationMembers(
+  client: MigrationPrecheckClient,
+): Promise<{ archived: number; conversations: number }> {
+  await client.query(MIGRATION_0002_ARCHIVE_DDL)
+  await client.query(MIGRATION_0002_ARCHIVE_ORPHANS)
+  await client.query(MIGRATION_0002_DETACH_ORPHANS)
+  const { rows: [totals] } = await client.query(`
+    SELECT count(*) AS archived, count(DISTINCT conversation_id) AS conversations
+      FROM ${MIGRATION_0002_ARCHIVE_TABLE}`)
+  return {
+    archived: Number(totals?.archived ?? 0),
+    conversations: Number(totals?.conversations ?? 0),
+  }
+}
+
 async function applyNormalizedConversationMembers(client: import('pg').PoolClient): Promise<void> {
-  await checkConversationMembersResolvable(client)
+  const repair = migration0002RepairMode()
+  try {
+    await checkConversationMembersResolvable(client)
+  } catch (error) {
+    // The precheck only SELECTs; the 23503 it raises is constructed in JS
+    // after those reads succeeded, so the surrounding transaction is still
+    // live and the repair can run on this same connection.
+    if (repair !== 'archive-detach' || (error as { code?: string }).code !== '23503') throw error
+    const repaired = await repairConversationMembers(client)
+    console.warn(
+      `[db] migration 0002 repair(archive-detach): detached ${repaired.archived} member id(s) ` +
+      `from ${repaired.conversations} conversation(s) into ${MIGRATION_0002_ARCHIVE_TABLE}`,
+    )
+    // Re-run rather than assume. A conversation with no company_id, for
+    // instance, is not something detaching members can fix, and must still
+    // stop the deploy.
+    await checkConversationMembersResolvable(client)
+  }
   await client.query(NORMALIZED_CONVERSATION_MEMBERS_SQL)
 }
 
@@ -2363,28 +2518,101 @@ async function applyAgentRuntimeAssignment(client: import('pg').PoolClient): Pro
   await client.query(AGENT_RUNTIME_ASSIGNMENT_SQL)
 }
 
+/** Declared `transactional: false` below: PostgreSQL refuses CONCURRENTLY
+ * inside a transaction block. Both statements are idempotent, and
+ * `ensureConcurrentIndex` repairs an INVALID index left by an interrupted
+ * build, so an aborted run is safe to rerun. */
+async function applySearchTrigramIndex(client: import('pg').PoolClient): Promise<void> {
+  await client.query(SEARCH_TRIGRAM_EXTENSION_SQL)
+  await ensureConcurrentIndex(client, SEARCH_TRIGRAM_INDEX_NAME, SEARCH_TRIGRAM_INDEX_SQL)
+}
+
+/**
+ * Declared `transactional: false` below: PostgreSQL refuses CONCURRENTLY
+ * inside a transaction block. Both statements are idempotent:
+ * `ensureConcurrentIndex` repairs an INVALID index left by an interrupted
+ * build, and DROP INDEX CONCURRENTLY IF EXISTS is a safe no-op on retry.
+ */
+async function applyEmailMessagesCompanySmtpId(client: import('pg').PoolClient): Promise<void> {
+  await ensureConcurrentIndex(
+    client,
+    EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+    EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  )
+  await client.query(DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
     sourceChecksum: computedBaselineMigrationChecksum(),
+    transactional: false,
     up: applyLegacyBaseline,
   },
   {
     ...SCHEMA_MIGRATIONS[1],
     sourceChecksum: normalizedConversationMembersChecksum(),
+    transactional: true,
     up: applyNormalizedConversationMembers,
   },
   {
     ...SCHEMA_MIGRATIONS[2],
     sourceChecksum: workspaceCleanupJobsChecksum(),
+    transactional: true,
     up: applyWorkspaceCleanupJobs,
   },
   {
     ...SCHEMA_MIGRATIONS[3],
     sourceChecksum: agentRuntimeAssignmentChecksum(),
+    transactional: true,
     up: applyAgentRuntimeAssignment,
   },
+  {
+    ...SCHEMA_MIGRATIONS[4],
+    sourceChecksum: searchTrigramIndexChecksum(),
+    // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
+    transactional: false,
+    up: applySearchTrigramIndex,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[5],
+    sourceChecksum: emailMessagesCompanySmtpIdChecksum(),
+    // CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
+    transactional: false,
+    up: applyEmailMessagesCompanySmtpId,
+  },
 ]
+
+export async function applyPendingMigration(
+  client: import('pg').PoolClient,
+  migration: VersionedMigration,
+): Promise<void> {
+  const started = Date.now()
+  console.log(`[db] applying migration ${migration.version} ${migration.name}`)
+  if (migration.transactional !== false) {
+    await client.query('BEGIN')
+    try {
+      await migration.up(client)
+      await client.query(
+        `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+         VALUES ($1, $2, $3, $4)`,
+        [migration.version, migration.name, migration.checksum, Date.now() - started],
+      )
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => { /* swallow rollback err */ })
+      throw err
+    }
+  } else {
+    await migration.up(client)
+    await client.query(
+      `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+       VALUES ($1, $2, $3, $4)`,
+      [migration.version, migration.name, migration.checksum, Date.now() - started],
+    )
+  }
+  console.log(`[db] applied migration ${migration.version} in ${Date.now() - started}ms`)
+}
 
 function validateMigrationDefinitions(): void {
   if (VERSIONED_MIGRATIONS.length !== SCHEMA_MIGRATIONS.length) {
@@ -2443,15 +2671,7 @@ export async function ensureSchema(): Promise<void> {
         const migration = VERSIONED_MIGRATIONS.find((candidate) => candidate.version === metadata.version)
         if (!migration) throw new Error(`migration ${metadata.version} has metadata but no implementation`)
 
-        const started = Date.now()
-        console.log(`[db] applying migration ${migration.version} ${migration.name}`)
-        await migration.up(client)
-        await client.query(
-          `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
-           VALUES ($1, $2, $3, $4)`,
-          [migration.version, migration.name, migration.checksum, Date.now() - started],
-        )
-        console.log(`[db] applied migration ${migration.version} in ${Date.now() - started}ms`)
+        await applyPendingMigration(client, migration)
       }
 
       const finalHistory = validateMigrationHistory(await readHistory())
@@ -2534,13 +2754,49 @@ async function ensureMessageClientIdIndex(client: import('pg').PoolClient): Prom
  * stops promotion but cannot crash-loop application replicas because replicas
  * never run this code.
  */
+/**
+ * Build one `CREATE INDEX CONCURRENTLY` idempotently.
+ *
+ * `IF NOT EXISTS` alone is not enough: an interrupted concurrent build leaves an
+ * INVALID index behind that `IF NOT EXISTS` would then skip forever, so the
+ * table keeps paying for an index no planner will use. Check the catalog first
+ * and drop the dead entry before rebuilding.
+ *
+ * MUST run outside any transaction block — PostgreSQL forbids CONCURRENTLY
+ * inside one. Callers from the versioned ledger therefore declare
+ * `transactional: false`.
+ */
+export async function ensureConcurrentIndex(
+  client: import('pg').PoolClient,
+  name: string,
+  create: string,
+): Promise<void> {
+  const { rows } = await client.query<{ indisvalid: boolean; indisready: boolean; indislive: boolean }>(
+    `SELECT i.indisvalid, i.indisready, i.indislive FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = current_schema() AND c.relname = $1`,
+    [name],
+  )
+  if (rows[0] && (!rows[0].indisvalid || !rows[0].indisready || !rows[0].indislive)) {
+    console.warn(`[db] dropping invalid leftover index ${name} before rebuild`)
+    await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`)
+  } else if (rows[0]) {
+    return
+  }
+  await client.query(create)
+  console.log(`[db] concurrent index ready: ${name}`)
+}
+
 async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<void> {
   const indexes: Array<{ name: string; create: string }> = [
     {
       name: 'idx_conversations_members_gin',
-      // members @> [agentId] containment — the hottest read path (loadInbox /
-      // loadContext / inbox-triage, called per wake + poll). Without it each
-      // call seq-scans every conversation and saturates the pool.
+      // Retained for the expand-release rollback window only. `loadInbox` /
+      // `loadContext` / inbox-triage no longer read `members @> [agentId]` —
+      // they resolve membership through the normalized `conversation_members`
+      // participant index (see inproc-client.ts). Drop this index once the
+      // rollback window closes.
       create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conversations_members_gin
                  ON conversations USING gin (members jsonb_path_ops)`,
     },
@@ -2573,21 +2829,7 @@ async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<
     },
   ]
   for (const ix of indexes) {
-    const { rows } = await client.query<{ indisvalid: boolean; indisready: boolean; indislive: boolean }>(
-      `SELECT i.indisvalid, i.indisready, i.indislive FROM pg_class c
-         JOIN pg_index i ON i.indexrelid = c.oid
-         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = current_schema() AND c.relname = $1`,
-      [ix.name],
-    )
-    if (rows[0] && (!rows[0].indisvalid || !rows[0].indisready || !rows[0].indislive)) {
-      console.warn(`[db] dropping invalid leftover index ${ix.name} before rebuild`)
-      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${ix.name}`)
-    } else if (rows[0]) {
-      continue
-    }
-    await client.query(ix.create)
-    console.log(`[db] concurrent index ready: ${ix.name}`)
+    await ensureConcurrentIndex(client, ix.name, ix.create)
   }
 }
 
@@ -2608,6 +2850,8 @@ export const REQUIRED_SCHEMA_INDEXES = [
   ...BASELINE_REQUIRED_SCHEMA_INDEXES,
   'conversation_members_conversation_ordinal_key',
   'idx_conversation_members_participant',
+  SEARCH_TRIGRAM_INDEX_NAME,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
 ] as const
 
 /** Promotion gate: every required index must exist and be valid, ready, and

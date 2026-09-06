@@ -92,10 +92,15 @@ export const useCalendar = create<CalendarState>((set, get) => ({
 
   async create(input) {
     const retry = pendingCreateRequestId('calendar-event', input)
-    const { event } = await api.createCalendarEvent({ ...input, requestId: retry.requestId })
-    retry.complete()
-    set((s) => ({ events: replaceOrInsert(s.events, event) }))
-    return event
+    try {
+      const { event } = await api.createCalendarEvent({ ...input, requestId: retry.requestId })
+      retry.complete()
+      set((s) => ({ events: replaceOrInsert(s.events, event) }))
+      return event
+    } catch (err) {
+      retry.fail(err)
+      throw err
+    }
   },
 
   async update(id, patch) {

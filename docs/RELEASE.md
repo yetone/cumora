@@ -23,9 +23,11 @@ It does **not** deploy the API server. Backend production deploys are an
 explicit, separately approved action; a desktop tag must never silently mutate
 the backend.
 
-The auto-updater in the desktop app reads from `cumora-releases`, so
-once the release workflow finishes (~15–20 minutes), running clients
-will pick it up on their next periodic update check.
+The auto-updater in the desktop app reads from `https://updates.cumora.ai`
+(the R2-backed `generic` feed), with the `cumora-releases` GitHub Release as a
+fallback. Once the release workflow finishes (~15–20 minutes) and the R2 mirror
+step has run, running clients will pick it up on their next periodic update
+check.
 
 ## Backend release: build candidate, then ignite production
 
@@ -42,6 +44,8 @@ To deploy a candidate:
    is available; Deploy resolves either tag to a digest before touching GKE.
 3. Set `include_agent=Y` when the build changed `server/src/agents/**`, the
    bundled CLI/runtime, or the agent-computer image. Otherwise use `N`.
+   Leave `repair_0002=off` unless you are clearing the migration 0002
+   precondition — see below.
 4. Approve the protected `production` environment. The approver should not be
    the person who built the feature for high-risk changes.
 5. Verify the workflow summary contains the selected digest, previous server
@@ -56,6 +60,50 @@ Shipping overview/schema. A migration failure leaves the Deployment untouched;
 a failed post-deploy smoke automatically runs
 `kubectl rollout undo`, waits for the old revision to become ready, and fails
 the workflow.
+
+#### When migration 0002 refuses to apply
+
+Migration 0002 normalizes conversation membership (ADR 0004) and fails closed
+when a `conversations.members` entry names an id with no participant in that
+conversation's tenant. The Job log carries a precheck report first — counts by
+category plus a masked sample — so read that before doing anything.
+
+These entries predate the tenant guard in `startPulledGroup` and grant nothing
+today: every read path is tenant-scoped, so a foreign member id is unreachable
+membership, and ADR 0004's composite FK cannot represent it at all. Rerunning
+Deploy with `repair_0002=archive-detach` lets 0002 clear its own precondition:
+
+- every offending `(conversation, member)` pair is copied into
+  `conversation_members_detached_0002` — with its ordinal *and* the whole
+  pre-detach members array — before it is removed;
+- `messages` is never touched, so an archived member that posted in the
+  conversation keeps its authorship;
+- the precheck re-runs afterwards, so anything a detach cannot fix (a
+  conversation with no `company_id`, say) still stops the deploy;
+- all of it runs inside 0002's transaction, so any later failure rolls the
+  detach back with it.
+
+The archive is a complete record, not a one-click undo. Once 0002 has applied,
+its projection trigger enforces ADR 0004 on every write, so putting a detached
+id back into `conversations.members` fails until that id is a real participant
+in that tenant — which is the invariant the migration exists to establish. What
+the archive gives you is the ability to see exactly what was removed and from
+where:
+
+```sql
+SELECT conversation_id, member_id, ordinal, authored_messages,
+       participant_elsewhere, original_members
+  FROM conversation_members_detached_0002
+ ORDER BY conversation_id, ordinal;
+```
+
+A genuine restore means first making the id resolvable (recreate or move the
+participant into that tenant), then re-adding it through `addConversationMember`.
+`original_members` records the exact pre-detach array to restore against.
+
+`repair_0002` applies to that one run only — it is passed as an explicit
+container `env` entry that overrides the `cumora` Secret, and defaults to
+`off`, so an ordinary deploy keeps failing closed.
 
 Shipping features additionally track a production readback deadline, default
 24 hours after a successful release. The Ship workspace surfaces due items;
@@ -132,12 +180,40 @@ and still succeeds.
 
 ### One-time Cumora-side wiring
 
-- `build.publish` in `package.json` points at `yetone/cumora-releases`,
-  so the in-app auto-updater knows where to look.
-- `build.mac.notarize.teamId` reads `APPLE_TEAM_ID` from the workflow
+- `build.publish` in `package.json` is an **ordered array**: the first entry
+  is the `generic` feed at `https://updates.cumora.ai` (R2-backed) and is what
+  electron-updater actually polls; the `github` entry for
+  `yetone/cumora-releases` is the fallback feed. See `electron/autoUpdater.cjs`.
+- `build.mac.notarize` is `true`; electron-builder picks up `APPLE_TEAM_ID`
+  (alongside `APPLE_ID` and `APPLE_APP_SPECIFIC_PASSWORD`) from the workflow
   environment.
 - `build/entitlements.mac.plist` declares the hardened-runtime
   entitlements Electron needs (JIT, network access, dyld vars).
+
+## Releasing the `cumora` CLI to npm
+
+The BYOA daemon users install with `npx cumora@latest` is a **separate**
+artifact from the desktop app: the npm package `cumora`, built from
+`agent-cli/`. It has its own workflow and is not part of a `v*` tag release.
+
+`.github/workflows/publish.yml` publishes it on any push to `main` that
+touches `agent-cli/**` — typically the `chore(agent-cli): release cumora@X`
+version bump in `agent-cli/package.json`. To cut a CLI release:
+
+```bash
+# Bump agent-cli/package.json's own "version", then merge to main.
+# The workflow runs `node build.mjs` and `npm publish --access public`.
+```
+
+Notes:
+
+- It publishes only if that exact version isn't already on the registry, so
+  re-pushing `main` is a no-op rather than a failure.
+- It needs the repo secret `NPM_TOKEN` (an npm **automation** token, which
+  bypasses 2FA for writes). Until that secret exists the workflow no-ops
+  cleanly instead of failing.
+- `agent-cli/package.json`'s version is independent of the root
+  `package.json` version. Keep them in step by convention, not by tooling.
 
 ## Manual rebuild of a past release
 
@@ -163,6 +239,6 @@ etc.), use the `workflow_dispatch` form on `yetone/cumora-releases`:
 - **`latest-mac.yml` mentions only one architecture.** One of the two
   Mac runners failed before producing the yml. Look at the `Upload
   build artifacts` step on `build-mac-arm64` / `build-mac-x64`.
-- **The desktop app doesn't see the update.** The autoupdater polls
-  every 10 minutes (default for `electron-builder`). Force it from the
-  app menu or restart.
+- **The desktop app doesn't see the update.** The autoupdater checks 3
+  seconds after launch and then every **30 minutes** (`electron/autoUpdater.cjs`
+  sets that interval explicitly). Force it from the app menu or restart.

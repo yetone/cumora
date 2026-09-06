@@ -54,6 +54,8 @@ test('Claude custom-provider settings expose only core bootstrap values and mode
   try {
     const settings = readClaudeUserSettings(env)
     assert.deepEqual(settings, {
+      turnEnv: {},
+      turnSettings: {},
       coreEnv: {
         ANTHROPIC_AUTH_TOKEN: 'settings-token',
         ANTHROPIC_BASE_URL: 'https://provider.example.test',
@@ -79,6 +81,14 @@ test('Claude custom-provider settings expose only core bootstrap values and mode
       'provider/haiku-small',
     ])
     assert.doesNotMatch(JSON.stringify(catalog), /settings-token|provider\.example\.test/)
+
+    const modern = await discoverEngineModelCatalog('claude', '/fixture/claude', true, {
+      ...env, ANTHROPIC_DEFAULT_HAIKU_MODEL: 'provider/current-haiku',
+    })
+    assert.equal(modern.defaultFastModel, 'provider/current-haiku')
+    assert.equal(modern.models.some(model => model.id === 'provider/current-haiku'), true)
+    assert.equal('turnSettings' in modern, false)
+    assert.equal('turnEnv' in modern, false)
   } finally {
     clearModelCatalogCache()
     await rm(root, { recursive: true, force: true })
@@ -88,8 +98,26 @@ test('Claude custom-provider settings expose only core bootstrap values and mode
 test('Claude settings ignore a relative config-root override instead of reading from cwd', () => {
   assert.deepEqual(readClaudeUserSettings({ CLAUDE_CONFIG_DIR: 'relative/config' }), {
     coreEnv: {},
+    turnEnv: {},
+    turnSettings: {},
     defaultModel: null,
     defaultFastModel: null,
     prefersLocalDefault: false,
   })
+})
+
+test('Antigravity catalog parses tab-separated models, ignores fetching banner, and marks recommendations', () => {
+  const output = [
+    'Fetching available models...',
+    'gemini-3.8-flash-high\tGemini 3.8 Flash (High)',
+    'gemini-3.1-pro-high\tGemini 3.1 Pro (High)',
+    'claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)',
+  ].join('\n')
+
+  const out = parseListedModels(output, 'antigravity')
+  assert.deepEqual(out, [
+    { id: 'gemini-3.8-flash-high', label: 'Gemini 3.8 Flash (High)', description: null, recommendedFor: ['small'] },
+    { id: 'gemini-3.1-pro-high', label: 'Gemini 3.1 Pro (High)', description: null, recommendedFor: ['big'] },
+    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6 (Thinking)', description: null, recommendedFor: ['big'] },
+  ])
 })
