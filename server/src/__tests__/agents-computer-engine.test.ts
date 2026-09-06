@@ -357,6 +357,39 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   assert.match(logs[1] ?? '', /\[session\] engine process died .*exit 1/)
   })
 
+test('persistent Claude classifies a rejected resume from its result event', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-stale-resume-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir)
+  await mkdir(home)
+  await writeFakeCli(
+    binDir,
+    'claude',
+    "process.stdin.once('data', () => {\n" +
+    "  process.stdout.write(JSON.stringify({ type: 'result', subtype: 'error', is_error: true, session_id: 'claude-stale', result: 'No conversation found with session ID: claude-stale' }) + '\\n')\n" +
+    '})\n' +
+    'setInterval(() => {}, 1 << 30)\n',
+  )
+  useFakeCliPath(binDir)
+
+  const session = getAdapter('claude').startSession?.({
+    home,
+    env: secureClaudeEnv(root),
+    model: null,
+    fastModel: null,
+    resumeSessionId: 'claude-stale',
+    onLog: () => {},
+  })
+  assert.ok(session)
+  liveSessions.push(session)
+
+  const result = await session.send('wake')
+  assert.equal(result.failure?.kind, 'resume-not-found')
+  assert.match(result.failure?.diagnostic ?? '', /No conversation found/)
+})
+
 test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-engine-grok-'))
   tempDirs.push(root)
@@ -554,6 +587,46 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(probeCapture.stdin, 'Connectivity check. Reply with exactly: OK')
 })
 
+test('Claude and Codex one-shot adapters return structured engine failures', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-structured-engine-failures-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir)
+  await mkdir(home)
+  await writeFakeCli(binDir, 'claude', "process.stderr.write('No conversation found with session ID: claude-stale\\n')\nprocess.exit(1)\n")
+  await writeFakeCli(binDir, 'codex', "process.stderr.write('429 Too Many Requests: rate limit reached\\n')\nprocess.exit(1)\n")
+  useFakeCliPath(binDir)
+  process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
+
+  const signal = new AbortController().signal
+  const claude = await getAdapter('claude').run({
+    home,
+    prompt: 'wake',
+    env: secureClaudeEnv(root),
+    model: null,
+    fastModel: null,
+    resumeSessionId: 'claude-stale',
+    onLog: () => {},
+    signal,
+  })
+  const codex = await getAdapter('codex').run({
+    home,
+    prompt: 'wake',
+    env: secureClaudeEnv(root),
+    model: null,
+    fastModel: null,
+    resumeSessionId: 'codex-existing',
+    onLog: () => {},
+    signal,
+  })
+
+  assert.equal(claude.failure?.kind, 'resume-not-found')
+  assert.match(claude.failure?.diagnostic ?? '', /claude-stale/)
+  assert.equal(codex.failure?.kind, 'rate-limit')
+  assert.match(codex.failure?.diagnostic ?? '', /Too Many Requests/)
+})
+
 // ── Codex app-server handshake failures must kill the SESSION ────────────────
 // The handshake is one-shot: threadReq is consumed at the initialize ack, and
 // only a failed thread/resume re-issues a thread/start. So if the thread never
@@ -621,6 +694,7 @@ test('a Codex session whose thread never opens dies instead of wedging', { skip:
   const first = await session.send('first wake')
   assert.notEqual(first.exitCode, 0, 'the rejected handshake must fail the turn')
   assert.match(String(first.error), /unsupported model for this account/)
+  assert.equal(first.failure?.kind, 'unknown')
 
   // The session must NOT advertise itself as reusable: the daemon drops a
   // !alive session and spawns a clean one on the next wake.

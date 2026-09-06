@@ -608,6 +608,15 @@ export function engineFailureOf(result: EngineRunResult, hadResume = false): Eng
   }
 }
 
+/** Normalize a run at the adapter boundary. Keeping this next to the shared
+ * classifier gives every adapter the same vocabulary while still allowing a
+ * protocol-aware adapter to provide a more precise failure first. */
+function classifyEngineResult(result: EngineRunResult, hadResume = false): EngineRunResult {
+  const failure = engineFailureOf(result, hadResume)
+  if (failure && !result.failure) result.failure = failure
+  return result
+}
+
 export interface EngineRunResult {
   exitCode: number
   /** Concise operator-facing compatibility field. New control flow must use
@@ -1300,12 +1309,12 @@ class ClaudeSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) {
-      return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
+      return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid }, this.resumePending))
     }
     if (!this.alive) {
       const exitCode = this.exitCode || 1
       const detail = failurePreview({ exitCode, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail })
-      return Promise.resolve({ exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sid })
+      return Promise.resolve(classifyEngineResult({ exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sid }, this.resumePending))
     }
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve, stderr: [], stdout: [] }
@@ -1447,7 +1456,7 @@ class ClaudeSession implements EngineSession {
     if (this.pendingTimer) { clearTimeout(this.pendingTimer); this.pendingTimer = null }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(r)
+    if (p) p.resolve(classifyEngineResult(r, this.resumePending))
   }
 
   /** Process died (error/close). Mark dead and fail any in-flight turn. */
@@ -1740,6 +1749,7 @@ class ClaudeAdapter implements EngineAdapter {
     // it by default (MAX_THINKING_TOKENS=0); a user can re-enable by exporting their
     // own MAX_THINKING_TOKENS before launching the daemon.
     return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
+      .then((result) => classifyEngineResult(result, !!args.resumeSessionId))
   }
 
   startSession(args: EngineSessionArgs): EngineSession | null {
@@ -2002,8 +2012,8 @@ class CodexSession implements EngineSession {
   get sessionId(): string | null { return this.threadId }
 
   send(prompt: string): Promise<EngineRunResult> {
-    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId })
-    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId })
+    if (this.pending) return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId }, this.threadWasResume))
+    if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -2151,6 +2161,7 @@ class CodexSession implements EngineSession {
 
   private onThreadReady(threadId: string): void {
     this.threadId = threadId
+    this.threadWasResume = false
     this.ready = true
     if (this.queuedPrompt && this.pending) { const p = this.queuedPrompt; this.queuedPrompt = null; this.startTurn(p) }
   }
@@ -2178,7 +2189,7 @@ class CodexSession implements EngineSession {
   private settle(error?: string): void {
     const p = this.pending
     this.pending = null
-    if (p) p.resolve({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.model })
+    if (p) p.resolve(classifyEngineResult({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.model }, this.threadWasResume))
   }
   private failPending(error: string): void {
     if (this.pending) this.settle(error)
@@ -2207,7 +2218,7 @@ class CodexSession implements EngineSession {
     }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve({ exitCode: code, error: why, sessionId: this.threadId })
+    if (p) p.resolve(classifyEngineResult({ exitCode: code, error: why, sessionId: this.threadId }, this.threadWasResume))
   }
 }
 
@@ -2372,7 +2383,9 @@ class CodexAdapter implements EngineAdapter {
         // A rejected -c override aborts codex before it reads the prompt, so the
         // turn fails with a config error that never mentions Cumora. Say it once.
         noteCodexConfigRejection(res.error, args.onLog)
-        return res
+        // `codex exec` does not accept a thread id, so this one-shot fallback
+        // always starts fresh even if the daemon currently owns a saved id.
+        return classifyEngineResult(res, false)
       })
   }
 
