@@ -1,4 +1,5 @@
 import { Router, json, type Request, type Response, type NextFunction } from 'express'
+import { isProviderProfileId } from '../agents/computer/provider-profiles.js'
 import type { PoolClient } from 'pg'
 import {
   storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
@@ -1203,6 +1204,11 @@ api.delete('/computers/:id', safe(async (req, res) => {
   res.json({ ok: true })
 }))
 
+function readProviderProfile(value: unknown): string | null {
+  if (value == null) return null
+  if (!isProviderProfileId(value)) throw new HttpError(400, 'invalid provider profile id')
+  return value
+}
 // Assign an agent to a computer (move between Cumora Cloud and a paired
 // machine), choosing its engine (owner/admin).
 api.post('/agents/:id/computer', safe(async (req, res) => {
@@ -1219,8 +1225,9 @@ api.post('/agents/:id/computer', safe(async (req, res) => {
   const out = await assignAgentToComputer({
     agentId: String(req.params.id), companyId, computerId, engine, inherit: inherit || !engine,
     model: modelPins.model, fastModel: modelPins.fastModel,
+    providerProfile: readProviderProfile(req.body?.providerProfile),
   })
-  if (!out) throw new HttpError(400, 'invalid computer, agent, or engine for this company')
+  if (!out) throw new HttpError(400, 'invalid computer, agent, engine, or provider profile for this company')
   res.json({ ok: true, ...out })
 }))
 
@@ -1340,7 +1347,7 @@ api.get('/computers/me/control-stream', safe(async (req, res) => {
 // Agents assigned to the calling computer (daemon discovery on boot).
 api.get('/computers/me/agents', safe(async (req, res) => {
   const { computerId } = await requireDevice(req)
-  res.json(await listAgentsForComputer(computerId))
+  res.json(await listAgentsForComputer(computerId, req.query.providerProfiles === '1'))
 }))
 
 // Daemon liveness heartbeat — keeps the computer 'online' (an offline sweep
@@ -1361,7 +1368,7 @@ api.post('/computers/heartbeat', safe(async (req, res) => {
 // Mint a per-agent runtime JWT for the calling computer (daemon refresh loop).
 api.post('/agents/:id/runtime-token', safe(async (req, res) => {
   const { computerId } = await requireDevice(req)
-  const minted = await mintAgentRuntimeToken({ computerId, agentId: String(req.params.id) })
+  const minted = await mintAgentRuntimeToken({ computerId, agentId: String(req.params.id), providerProfile: readProviderProfile(req.body?.providerProfile) })
   if (!minted) throw new HttpError(403, 'agent not assigned to this computer')
   res.json(minted)
 }))
@@ -2421,14 +2428,14 @@ api.get('/participants', async (req, res) => {
     systemPrompt: string | null; model: string | null
     email: string | null; companySlug: string | null
     departedAt: string | null
-    computerId: string | null; engine: string | null; fastModel: string | null
+    computerId: string | null; engine: string | null; fastModel: string | null; providerProfile: string | null
     engineInherit: boolean | null
   }>(
     `SELECT p.id, p.kind, p.name, p.role, p.initial,
             p.avatar_bg AS "avatarBg", p.avatar_url AS "avatarUrl",
             p.status, p.status_updated_at AS "statusUpdatedAt",
             p.bio, p.tools, p.system_prompt AS "systemPrompt", p.model,
-            p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel",
+            p.computer_id AS "computerId", p.engine, p.fast_model AS "fastModel", p.provider_profile AS "providerProfile",
             p.engine_inherit AS "engineInherit",
             -- Email resolution differs by kind:
             --  - agents carry their own minted address on participants.email
@@ -2918,6 +2925,7 @@ api.post('/agents', async (req, res) => {
   const computerId = typeof req.body?.computerId === 'string' ? req.body.computerId.trim() || null : null
   const engine = typeof req.body?.engine === 'string' ? req.body.engine : undefined
   const inherit = req.body?.inherit === true
+  const providerProfile = readProviderProfile(req.body?.providerProfile)
   let creation: Awaited<ReturnType<typeof createAgentRecord>>
   try {
     creation = await createAgentRecord({
@@ -2933,6 +2941,7 @@ api.post('/agents', async (req, res) => {
       avatarBg: data.avatarBg,
       model: data.model,
       fastModel: data.fastModel,
+      providerProfile,
       tools: data.tools ?? undefined,
       computerId,
       engine,

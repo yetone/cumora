@@ -245,6 +245,6 @@ test('assignAgentToComputer persists model pins in the host assignment update', 
   assert.match(update?.sql ?? '', /model = \$4/)
   assert.match(update?.sql ?? '', /fast_model = \$5/)
   assert.deepEqual(update?.params, [
-    'comp-1', 'codex', false, 'gpt-5.6-sol', null, 'bram', 'co-1',
+    'comp-1', 'codex', false, 'gpt-5.6-sol', null, null, 'bram', 'co-1',
   ])
 })

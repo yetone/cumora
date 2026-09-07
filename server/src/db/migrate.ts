@@ -5,6 +5,7 @@
  * Application replicas use the read-only compatibility gate in
  * schema-version.ts and never execute DDL while starting.
  */
+import { AGENT_PROVIDER_PROFILE_SQL, agentProviderProfileChecksum } from './migrations/0007-agent-provider-profile.js'
 import { createHash } from 'node:crypto'
 import { pool } from './pool.js'
 import {
@@ -2580,6 +2581,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     // CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
     transactional: false,
     up: applyEmailMessagesCompanySmtpId,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[6],
+    sourceChecksum: agentProviderProfileChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(AGENT_PROVIDER_PROFILE_SQL) },
   },
 ]
 

@@ -32,6 +32,7 @@ export interface CreateAgentRecordInput {
   avatarBg?: string
   model?: string | null
   fastModel?: string | null
+  providerProfile?: string | null
   tools?: string[]
   computerId?: string | null
   engine?: string
@@ -93,6 +94,7 @@ function creationRequestHash(input: CreateAgentRecordInput): string {
     avatarBg: input.avatarBg ?? '',
     model: input.model ?? null,
     fastModel: input.fastModel ?? null,
+    ...(input.providerProfile ? { providerProfile: input.providerProfile } : {}),
     tools: input.tools ?? ['bash'],
     computerId: input.computerId ?? null,
     engine: input.engine ?? null,
@@ -187,12 +189,14 @@ export async function createAgentRecord(
         engine: input.engine,
         inherit: input.inherit,
         strictEngine: true,
+        providerProfile: input.providerProfile,
       }, client)
       if (!placement) {
         throw new AgentCreationError(400, 'invalid computer or engine for this company')
       }
     }
 
+    if (input.providerProfile && !placement) throw new AgentCreationError(400, 'provider profile requires a paired computer')
     const tools = input.tools ?? ['bash']
     for (const agentId of candidateAgentIds(input.name)) {
       const initial = input.initial || input.name.charAt(0).toUpperCase()
@@ -201,10 +205,10 @@ export async function createAgentRecord(
         `INSERT INTO participants
            (id, kind, name, role, initial, avatar_bg, status, bio, tools,
             system_prompt, model, fast_model, company_id, computer_id, engine,
-            engine_inherit, creation_request_id, creation_request_hash)
+            engine_inherit, creation_request_id, creation_request_hash, provider_profile)
          VALUES
            ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb,
-            $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
          ON CONFLICT DO NOTHING
          RETURNING id`,
         [
@@ -212,7 +216,7 @@ export async function createAgentRecord(
           JSON.stringify(tools), input.systemPrompt, input.model ?? null,
           input.fastModel ?? null, input.companyId, computerId,
           placement?.engine ?? null, placement?.inherit ?? true,
-          requestId, requestHash,
+          requestId, requestHash, input.providerProfile ?? null,
         ],
       )
       if (rows[0]) {

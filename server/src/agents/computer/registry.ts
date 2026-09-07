@@ -14,6 +14,7 @@
  *   - per-agent runtime JWTs minted for a paired device (reuses
  *     runtime/jwt.ts — the same token a pod gets)
  */
+import { type ProviderProfileMetadata, isProviderProfileId, sanitizeProviderProfiles } from './provider-profiles.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
 import { CH_STATUS, publish } from '../../redis.js'
@@ -117,6 +118,7 @@ const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
 export interface DetectedEngine {
+  providerProfiles?: ProviderProfileMetadata[]
   id: string
   bin: string
   path: string | null
@@ -247,6 +249,7 @@ export function sanitizeDetectedEngines(
     byId.set(id, {
       id, bin, path, ...sanitizeVersionFields(rec), blockedReason,
       ...(modelCatalog ? { modelCatalog } : {}),
+      ...(id === 'claude' && Array.isArray(rec.providerProfiles) ? { providerProfiles: sanitizeProviderProfiles(rec.providerProfiles) } : {}),
     })
   }
   // Every row carries the same keys, reported or not, so the app never has to
@@ -592,6 +595,7 @@ export async function resolveDevice(token: string): Promise<{ computerId: string
  *  This is the credential the daemon uses for the agent's wake-stream SSE and
  *  daemon-side runtime calls. It never enters the model process or agent home. */
 export async function mintAgentRuntimeToken(args: {
+  providerProfile?: string | null
   computerId: string
   agentId: string
 }): Promise<{ token: string; expiresInSeconds: number } | null> {
@@ -608,8 +612,9 @@ export async function mintAgentRuntimeToken(args: {
         AND c.revoked_at IS NULL
       WHERE p.id = $1 AND p.kind = 'agent' AND p.computer_id = $2
         AND p.departed_at IS NULL
+        AND p.provider_profile IS NOT DISTINCT FROM $3::text
       LIMIT 1`,
-    [args.agentId, args.computerId],
+    [args.agentId, args.computerId, args.providerProfile ?? null],
   )
   if (!rows[0]) return null
   const token = signAgentToken({
@@ -638,22 +643,24 @@ export async function mintAgentRuntimeToken(args: {
  *  agent behavior on every user's machine unless we pin here. A custom
  *  provider can explicitly make its unnamed local default authoritative so a
  *  vendor-specific deploy pin never crosses into the wrong namespace. */
-export async function listAgentsForComputer(computerId: string): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
+export async function listAgentsForComputer(computerId: string, supportsProviderProfiles = false): Promise<
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; providerProfile: string | null }>
 > {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
     engine: EngineId | null; model: string | null; fastModel: string | null
+    providerProfile: string | null
     availableEngines?: string[]; detectedEngines?: unknown
   }>(
     `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
-            p.fast_model AS "fastModel", c.available_engines AS "availableEngines",
+            p.fast_model AS "fastModel", p.provider_profile AS "providerProfile", c.available_engines AS "availableEngines",
             COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines"
        FROM participants p
        JOIN computers c ON c.id = p.computer_id
       WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
+        AND ($2::boolean OR p.provider_profile IS NULL)
       ORDER BY p.name ASC`,
-    [computerId],
+    [computerId, supportsProviderProfiles],
   )
   const claudeDefault = process.env.CUMORA_DEFAULT_CLAUDE_MODEL?.trim() || null
   const codexDefault = process.env.CUMORA_DEFAULT_CODEX_MODEL?.trim() || null
@@ -666,6 +673,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
     const { availableEngines, detectedEngines, ...agent } = r
+    if (agent.providerProfile) return agent // local profile owns its model namespace
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
       .find((entry) => entry.id === agent.engine)?.modelCatalog
     // A custom Claude endpoint owns its model namespace. Its reported defaults
@@ -927,6 +935,7 @@ export function isByoaKind(kind: ComputerKind | null): boolean {
  * `strictEngine` so an unavailable explicit pin fails instead of silently
  * selecting the Computer default. */
 export async function resolveComputerAssignment(args: {
+  providerProfile?: string | null
   companyId: string
   computerId: string
   engine?: string
@@ -934,8 +943,8 @@ export async function resolveComputerAssignment(args: {
   inherit?: boolean
   strictEngine?: boolean
 }, db: Queryable = pool): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
-  const { rows } = await db.query<{ kind: ComputerKind; available_engines: string[] }>(
-    `SELECT kind, available_engines FROM computers
+  const { rows } = await db.query<{ kind: ComputerKind; available_engines: string[]; detected_engines?: unknown }>(
+    `SELECT kind, available_engines, detected_engines FROM computers
       WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL
       LIMIT 1 FOR SHARE`,
     [args.computerId, args.companyId],
@@ -965,6 +974,12 @@ export async function resolveComputerAssignment(args: {
     inherit = wantInherit
   }
 
+  if (args.providerProfile != null) {
+    if (!isProviderProfileId(args.providerProfile) || engine !== 'claude' || inherit) return null
+    const profiles = sanitizeDetectedEngines(computer.detected_engines, computer.available_engines)
+      .find((entry) => entry.id === 'claude')?.providerProfiles ?? []
+    if (!profiles.some((p) => p.id === args.providerProfile)) return null
+  }
   return { kind: computer.kind, engine, inherit }
 }
 
@@ -974,6 +989,7 @@ export async function resolveComputerAssignment(args: {
  *  Returns the resolved { kind, engine } or null if the computer/agent is
  *  invalid for this company. */
 export async function assignAgentToComputer(args: {
+  providerProfile?: string | null
   agentId: string
   companyId: string
   computerId: string
@@ -998,6 +1014,8 @@ export async function assignAgentToComputer(args: {
     params.push(args.fastModel)
     sets.push(`fast_model = $${params.length}`)
   }
+  params.push(args.providerProfile ?? null)
+  sets.push(`provider_profile = $${params.length}`)
   params.push(args.agentId, args.companyId)
   const { rowCount } = await pool.query(
     `UPDATE participants SET ${sets.join(', ')}

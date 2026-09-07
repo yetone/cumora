@@ -27,6 +27,7 @@ export interface EngineModelCatalog {
 }
 
 export interface DetectedEngine {
+  providerProfiles?: Array<{ id: string; label: string; model: string; fastModel: string }>
   id: EngineId
   bin: string
   path: string | null
@@ -87,6 +88,7 @@ export interface Participant {
   /** big-brain (main) model override; null/undefined = use system default */
   model?: string | null
   /** small-brain (fast/auxiliary) model override */
+  providerProfile?: string | null
   fastModel?: string | null
   /** id of the Computer this agent runs on (null/undefined = Cumora Cloud) */
   computerId?: string | null

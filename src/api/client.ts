@@ -225,6 +225,7 @@ export interface ApiParticipant {
   computerId?: string | null
   engine?: string | null
   engineInherit?: boolean | null
+  providerProfile?: string | null
   fastModel?: string | null
 }
 
@@ -312,6 +313,7 @@ export interface AgentInput {
 }
 
 export interface AgentCreateInput extends AgentInput {
+  providerProfile?: string | null
   /** Stable for the lifetime of one create form so ambiguous retries replay. */
   requestId: string
   /** Initial host placement is committed atomically with the Agent row. */
@@ -999,10 +1001,11 @@ export const api = {
     inherit?: boolean,
     model?: string | null,
     fastModel?: string | null,
+    providerProfile?: string | null,
   ) =>
     http<{ ok: boolean; kind: ComputerKind; engine: EngineId; inherit?: boolean }>(
       `/agents/${encodeURIComponent(agentId)}/computer`,
-      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit, model, fastModel }) }),
+      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit, model, fastModel, providerProfile }) }),
   createAgent: (input: AgentCreateInput) =>
     http<{
       id: string

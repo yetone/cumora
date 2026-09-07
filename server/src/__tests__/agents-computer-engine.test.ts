@@ -10,6 +10,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
+import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
 import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
@@ -1057,4 +1058,84 @@ test('a Grok ACP turn still settles when no model is announced', { skip: IS_WIN 
   assert.equal(result.exitCode, 0)
   assert.equal(result.model, null, 'with nothing announced and nothing pinned there is no model to report')
   assert.equal(hops[0].model, 'grok', 'the hop keeps its last-resort label')
+})
+
+
+test('concurrent Claude profiles isolate one-shot, persistent, triage and doctor processes', { skip: IS_WIN }, async () => {
+  delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  const root = await mkdtemp(join(tmpdir(), 'cumora-profile-isolation-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const configDir = join(root, 'host-config')
+  await Promise.all([mkdir(binDir), mkdir(configDir)])
+  await writeFile(join(configDir, 'settings.json'), JSON.stringify({ env: {
+    ANTHROPIC_API_KEY: 'host-key-must-not-leak', ANTHROPIC_AUTH_TOKEN: 'host-token-must-not-leak',
+    ANTHROPIC_BASE_URL: 'https://host.example.test', ANTHROPIC_DEFAULT_OPUS_MODEL: 'host/opus',
+  } }))
+  await writeFakeCli(binDir, 'claude', `
+const argv = process.argv.slice(2)
+const capture = () => JSON.stringify({ argv, env: Object.fromEntries(
+  ${JSON.stringify([...CLAUDE_CORE_ENV_KEYS, 'ANTHROPIC_MODEL', 'CLAUDE_CODE_OAUTH_TOKEN'])}.map(k => [k, process.env[k]])
+) })
+if (argv.includes('--input-format')) {
+  require('node:readline').createInterface({ input: process.stdin }).on('line', () => {
+    process.stderr.write(capture() + '\\n')
+    process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK', session_id:'fixture'}) + '\\n')
+  })
+} else if (argv[argv.indexOf('--output-format') + 1] === 'json') {
+  process.stdout.write(JSON.stringify({result: capture()}))
+} else {
+  process.stderr.write(capture() + '\\n')
+  process.stdout.write((argv[argv.indexOf('--output-format') + 1] === 'text'
+    ? capture() : JSON.stringify({type:'result', subtype:'success', result:'OK'})) + '\\n')
+}
+`)
+  useFakeCliPath(binDir)
+  const adapter = getAdapter('claude')
+  const profiles: ProviderProfile[] = ['alpha', 'beta'].map((id, index) => ({
+    id, label: id, baseUrl: `https://${id}.example.test`, model: `${id}/big`, fastModel: `${id}/small`,
+    auth: index === 0 ? { apiKey: 'alpha-secret' } : { authToken: 'beta-secret' },
+  }))
+  await Promise.all(profiles.map(async (profile) => {
+    const home = join(root, profile.id)
+    await mkdir(home)
+    const env = providerProfileEnv(secureClaudeEnv(root, {
+      CLAUDE_CONFIG_DIR: configDir, CUMORA_ENGINE_MODEL: 'host-big', CUMORA_TRIAGE_MODEL: 'host-fast',
+      CLAUDE_CODE_OAUTH_TOKEN: 'host-oauth',
+    }), profile)
+    const captures: string[] = []
+    const args = { home, env, model: profile.model, fastModel: profile.fastModel, onLog: (line: string) => captures.push(line) }
+    await adapter.run({ ...args, prompt: 'wake', signal: new AbortController().signal })
+    const session = adapter.startSession?.(args)
+    assert.ok(session)
+    liveSessions.push(session)
+    assert.equal((await session.send('wake')).exitCode, 0)
+    await session.stop()
+    const triage = await adapter.classify({ cwd: home, env, prompt: 'triage', signal: new AbortController().signal })
+    captures.push(triage.text)
+    for (const tier of ['big', 'small'] as const) {
+      const probe = await adapter.probe({ cwd: home, env, tier, signal: new AbortController().signal })
+      captures.push(probe.text.trim())
+    }
+    const capturedProcesses = captures.filter((line) => line.startsWith('{"argv":'))
+    assert.equal(capturedProcesses.length, 5)
+    for (const text of capturedProcesses) {
+      const captured = JSON.parse(text) as { argv: string[]; env: Record<string, string> }
+      assert.equal(captured.env.ANTHROPIC_BASE_URL, profile.baseUrl)
+      assert.equal(captured.env.ANTHROPIC_MODEL, profile.model)
+      assert.equal(captured.env.ANTHROPIC_API_KEY, 'apiKey' in profile.auth ? profile.auth.apiKey : '')
+      assert.equal(captured.env.ANTHROPIC_AUTH_TOKEN, 'authToken' in profile.auth ? profile.auth.authToken : '')
+      assert.equal(captured.env.CLAUDE_CODE_OAUTH_TOKEN, '')
+      assert.ok(captured.argv.includes('--restricted'))
+      assert.doesNotMatch(text, /host-key-must-not-leak|host-token-must-not-leak|host\/opus|host-big|host-fast/)
+      if (captured.argv.includes('--settings')) {
+        const settings = JSON.parse(captured.argv[captured.argv.indexOf('--settings') + 1])
+        for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN']) {
+          assert.ok(settings.sandbox.credentials.envVars.some((entry: { name: string; mode: string }) => entry.name === name && entry.mode === 'deny'))
+        }
+      }
+    }
+    const triageArgv = JSON.parse(triage.text).argv as string[]
+    assert.equal(triageArgv[triageArgv.indexOf('--model') + 1], profile.fastModel)
+  }))
 })

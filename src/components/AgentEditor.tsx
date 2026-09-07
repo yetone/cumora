@@ -26,6 +26,7 @@ function newCreateRequestId(): string {
  *  the computer default means the user pinned it. */
 function initialEngineChoice(agent: Participant | null, computer: { kind: string; availableEngines: EngineId[] } | undefined): string {
   if (!agent || !computer || computer.kind === 'cloud') return INHERIT_ENGINE
+  if (agent.providerProfile) return 'claude'
   const advertised = computer.availableEngines
   const engine = agent.engine
   if (!engine || engine === 'managed' || !advertised.includes(engine)) return INHERIT_ENGINE
@@ -56,6 +57,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
   const [systemPrompt, setSystemPrompt] = useState(agent?.systemPrompt ?? '')
   const [bio, setBio] = useState(agent?.bio ?? '')
   const [avatarBg, setAvatarBg] = useState(agent?.avatarBg ?? PALETTE[0])
+  const [providerProfile, setProviderProfile] = useState(agent?.providerProfile ?? '')
   const [model, setModel] = useState(agent?.model ?? '')
   const [fastModel, setFastModel] = useState(agent?.fastModel ?? '')
   const [busy, setBusy] = useState(false)
@@ -94,9 +96,13 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       : (selectedComputer?.availableEngines[0] ?? 'claude')
   ) as EngineId
   const selectedComputerOffline = isByoa && selectedComputer.status !== 'online'
-  const modelCatalog = selectedComputer?.detectedEngines
-    ?.find((engine) => engine.id === selectedEngineId)
-    ?.modelCatalog
+  const detectedEngine = selectedComputer?.detectedEngines?.find((engine) => engine.id === selectedEngineId)
+  const profiles = detectedEngine?.providerProfiles ?? []
+  const selectedProfile = profiles.find((p) => p.id === providerProfile)
+  const modelCatalog = providerProfile ? {
+    models: [], defaultModel: selectedProfile?.model, defaultFastModel: selectedProfile?.fastModel,
+    supportsCustom: true, fastModelScope: 'agent',
+  } : detectedEngine?.modelCatalog
   const modelOptions: Array<ComboboxOption<string>> = [
     {
       value: '',
@@ -177,6 +183,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     if (id === computerId) return
     engineTouched.current = true
     setComputerId(id)
+    setProviderProfile('')
     setEngineChoice(INHERIT_ENGINE)
     clearModelPins()
   }
@@ -196,12 +203,12 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
       const current = agent?.computerId ?? cloud?.id
       const targetComputer = target ? computersById[target] : undefined
       const isByoaTarget = !!targetComputer && targetComputer.kind !== 'cloud'
-      const inherit = engineChoice === INHERIT_ENGINE
-      const pinned = inherit ? undefined : (engineChoice as EngineId)
+      const inherit = !providerProfile && engineChoice === INHERIT_ENGINE
+      const pinned = providerProfile ? 'claude' : inherit ? undefined : (engineChoice as EngineId)
       const savedChoice = initialEngineChoice(agent, targetComputer)
       const inheritChanged = isByoaTarget && inherit !== (savedChoice === INHERIT_ENGINE)
       const engineChanged = isByoaTarget && !inherit && pinned !== ((agent?.engine as EngineId) ?? null)
-      const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged))
+      const assignmentChanged = Boolean(target && (target !== current || inheritChanged || engineChanged || providerProfile !== (agent?.providerProfile ?? '')))
       const payload: AgentInput = {
         name, role, systemPrompt, bio, avatarBg,
         model: model.trim() || null,
@@ -224,6 +231,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           ...payload,
           requestId: createRequestId.current,
           computerId: target || null,
+          providerProfile: providerProfile || null,
           engine: isByoaTarget ? pinned : undefined,
           inherit: isByoaTarget ? inherit : false,
         })
@@ -244,6 +252,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
           isByoaTarget ? inherit : false,
           model.trim() || null,
           fastModel.trim() || null,
+          providerProfile || null,
         )
         if (isByoaTarget && pinned && out.engine !== pinned) {
           throw new Error(t('agent.enginePinRejected', { engine: engineLabel(pinned) }))
@@ -357,6 +366,26 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
             />
           </Field>
 
+          {isByoa && selectedEngineId === 'claude' && (profiles.length > 0 || providerProfile) && (
+            <Field label={t('agent.providerLabel')} hint={t('agent.providerHint')}>
+              <Select
+                ariaLabel={t('agent.providerLabel')}
+                value={providerProfile}
+                onValueChange={(value) => {
+                  setProviderProfile(value)
+                  if (value) { engineTouched.current = true; setEngineChoice('claude') }
+                  clearModelPins()
+                }}
+                options={[
+                  { value: '', label: t('agent.providerDefault') },
+                  ...profiles.map((p) => ({ value: p.id, label: p.label })),
+                  ...(providerProfile && !selectedProfile
+                    ? [{ value: providerProfile, label: t('agent.providerMissing', { id: providerProfile }), disabled: true }] : []),
+                ]}
+              />
+            </Field>
+          )}
+
           <Field
             label={isByoa ? t('agent.modelLabelByoa') : t('agent.modelLabel')}
             hint={isByoa ? t('agent.modelHintByoaCatalog') : t('agent.modelHintCloud')}
@@ -435,6 +464,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
                     if (value === engineChoice) return
                     engineTouched.current = true
                     setEngineChoice(value)
+                    setProviderProfile('')
                     clearModelPins()
                   }}
                   options={(() => {
