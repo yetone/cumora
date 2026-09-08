@@ -1333,8 +1333,9 @@ export const en = {
   'me.engineModelConfig': 'Default models for {engine}',
   'me.engineModelNotSet': 'Follow engine default',
   'me.engineModelConfigure': 'Configure models',
-  'me.engineDefaultModel': 'Main (big-brain) model — blank = follow CLI default',
-  'me.engineFastModel': 'Fast (small-brain) model — blank = follow CLI default',
+  'me.engineDefaultModel': 'Main model (leave blank to use default settings)',
+  'me.engineFastModel': 'Fast model (leave blank to use default settings)',
+  'me.engineModelHelp': 'Models selected for an individual agent take priority. Blank fields use the local engine configuration or server defaults.',
   'me.engineModelPlaceholder': 'e.g. claude-sonnet-4-20250514',
   'me.engineFastModelPlaceholder': 'e.g. claude-haiku-4-20250514',
 

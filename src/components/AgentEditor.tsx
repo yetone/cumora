@@ -106,7 +106,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     {
       value: '',
       label: t('agent.followEngineDefault'),
-      hint: modelCatalog?.defaultModel ?? engineDefaultModel,
+      hint: engineDefaultModel ?? modelCatalog?.defaultModel ?? undefined,
     },
     ...(modelCatalog?.models ?? []).map((option) => ({
       value: option.id,
@@ -121,7 +121,7 @@ export function AgentEditor({ agent, onClose, onSaved }: Props) {
     {
       value: '',
       label: t('agent.followSmallBrainDefault'),
-      hint: modelCatalog?.defaultFastModel ?? engineDefaultFastModel,
+      hint: engineDefaultFastModel ?? modelCatalog?.defaultFastModel ?? undefined,
     },
     ...(modelCatalog?.models ?? []).map((option) => ({
       value: option.id,

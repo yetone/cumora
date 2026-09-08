@@ -865,6 +865,7 @@ function ComputersTab() {
   const [savingModel, setSavingModel] = useState(false)
 
   const saveEngineDefaults = async (computerId: string, engineId: string) => {
+    const savedEditor = editingModel
     setSavingModel(true)
     setErr(null)
     try {
@@ -876,7 +877,8 @@ function ComputersTab() {
       }
       await api.updateEngineDefaults(computerId, defaults)
       await useComputers.getState().refresh()
-      setEditingModel(null)
+      // A late response must not close a different editing session.
+      setEditingModel((current) => current === savedEditor ? null : current)
     } catch (e) {
       console.warn('[engine-defaults] save failed', e)
       setErr(e instanceof Error ? e.message : String(e))
@@ -1198,6 +1200,7 @@ function ComputersTab() {
                                       <input
                                         type="text"
                                         value={modelInput}
+                                        disabled={savingModel}
                                         onChange={(e) => setModelInput(e.target.value)}
                                         placeholder={t('me.engineModelPlaceholder')}
                                         className="w-full px-2 py-1.5 text-[12px] rounded-[8px] font-mono"
@@ -1209,12 +1212,14 @@ function ComputersTab() {
                                       <input
                                         type="text"
                                         value={fastModelInput}
+                                        disabled={savingModel}
                                         onChange={(e) => setFastModelInput(e.target.value)}
                                         placeholder={t('me.engineFastModelPlaceholder')}
                                         className="w-full px-2 py-1.5 text-[12px] rounded-[8px] font-mono"
                                         style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
                                       />
                                     </div>
+                                    <p className="text-[11px] text-ink-500">{t('me.engineModelHelp')}</p>
                                     <div className="flex gap-2">
                                       <button
                                         type="button"

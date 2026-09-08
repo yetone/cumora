@@ -1113,36 +1113,50 @@ export async function updateEngineDefaults(args: {
   companyId: string
   defaults: EngineDefaultsMap
 }): Promise<EngineDefaultsMap | null> {
-  const { rows } = await pool.query<{ engine_defaults: unknown }>(
-    `SELECT engine_defaults FROM computers
-      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
-    [args.computerId, args.companyId],
-  )
-  if (!rows[0]) return null
-  const existing = sanitizeEngineDefaults(rows[0].engine_defaults)
-  const merged = sanitizeEngineDefaults(args.defaults)
-  // Deep merge: for each engine, merge model and fastModel
-  for (const [engineId, defaults] of Object.entries(merged)) {
-    if (defaults.model === null && defaults.fastModel === null) {
-      // Both null means remove this engine's defaults entirely
-      delete existing[engineId]
-    } else {
-      existing[engineId] = {
-        ...(existing[engineId] ?? {}),
-        ...(defaults.model !== undefined ? { model: defaults.model } : {}),
-        ...(defaults.fastModel !== undefined ? { fastModel: defaults.fastModel } : {}),
-      }
-      // Clean up nulls
-      if (existing[engineId].model === null) delete existing[engineId].model
-      if (existing[engineId].fastModel === null) delete existing[engineId].fastModel
-      if (!existing[engineId].model && !existing[engineId].fastModel) delete existing[engineId]
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    // Lock before reading so concurrent partial updates merge into the latest state.
+    const { rows } = await client.query<{ engine_defaults: unknown }>(
+      `SELECT engine_defaults FROM computers
+        WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1 FOR UPDATE`,
+      [args.computerId, args.companyId],
+    )
+    if (!rows[0]) {
+      await client.query('COMMIT')
+      return null
     }
+    const existing = sanitizeEngineDefaults(rows[0].engine_defaults)
+    const merged = sanitizeEngineDefaults(args.defaults)
+    // Deep merge: for each engine, merge model and fastModel
+    for (const [engineId, defaults] of Object.entries(merged)) {
+      if (defaults.model === null && defaults.fastModel === null) {
+        // Both null means remove this engine's defaults entirely
+        delete existing[engineId]
+      } else {
+        existing[engineId] = {
+          ...(existing[engineId] ?? {}),
+          ...(defaults.model !== undefined ? { model: defaults.model } : {}),
+          ...(defaults.fastModel !== undefined ? { fastModel: defaults.fastModel } : {}),
+        }
+        // Clean up nulls
+        if (existing[engineId].model === null) delete existing[engineId].model
+        if (existing[engineId].fastModel === null) delete existing[engineId].fastModel
+        if (!existing[engineId].model && !existing[engineId].fastModel) delete existing[engineId]
+      }
+    }
+    await client.query(
+      `UPDATE computers SET engine_defaults = $2::jsonb WHERE id = $1`,
+      [args.computerId, JSON.stringify(existing)],
+    )
+    await client.query('COMMIT')
+    return existing
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
   }
-  await pool.query(
-    `UPDATE computers SET engine_defaults = $2::jsonb WHERE id = $1`,
-    [args.computerId, JSON.stringify(existing)],
-  )
-  return existing
 }
 
 /** Get the per-engine default model settings for a computer. */
