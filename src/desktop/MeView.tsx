@@ -784,6 +784,7 @@ type AgentRow = {
   latest?: string | null
   outdated?: boolean
   updateCommand?: string | null
+  blockedReason?: string | null
 }
 
 const CLI_ORDER = [
@@ -1080,10 +1081,25 @@ function ComputersTab() {
                                       {t('me.agentsCliUpdateAvailable')}
                                     </span>
                                   )}
-                                  {!engineId && (
+                                  {/* Two different things, deliberately not one
+                                      label: "not runnable" means Cumora has no
+                                      adapter for this CLI and the operator can
+                                      do nothing about it, while "blocked" means
+                                      it is supported but was refused here for a
+                                      reason they can act on. */}
+                                  {row.blockedReason ? (
+                                    <span className="text-[12px] font-semibold px-2 py-0.5 rounded-full shrink-0 bg-coral-soft text-coral-deep">
+                                      {t('me.agentsCliBlocked')}
+                                    </span>
+                                  ) : !engineId && (
                                     <span className="text-[12px] text-ink-400 truncate">{t('me.agentsNotRunnable')}</span>
                                   )}
                                 </div>
+                                {row.blockedReason && (
+                                  <div className="mt-1 text-[12px] leading-[1.55] text-coral-deep">
+                                    {t('me.agentsCliBlockedReason', { reason: row.blockedReason })}
+                                  </div>
+                                )}
                                 <div className="mt-1 flex items-center min-w-0 font-mono text-[12px] text-ink-400">
                                   <span className="shrink-0">{row.bin}</span>
                                   {row.path && (
@@ -1173,20 +1189,24 @@ function ComputersTab() {
             </div>
             {/* biome-ignore lint/security/noDangerouslySetInnerHtml: static copy from the locale bundle, not user input */}
             <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display" dangerouslySetInnerHTML={{ __html: t('me.engineRequired') }} />
-            <div className="flex items-center gap-2.5 mb-2.5">
-              <span className="text-[12px] text-ink-500">{t('me.engineLabel')}</span>
-              <div className="inline-flex rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
-                {RUNNABLE_ENGINES.map((id) => (
-                  <button key={id} type="button" onClick={() => setEngine(id)}
-                    className="px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
-                    style={engine === id
-                      ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
-                      : { color: 'var(--ink-500)' }}>
-                    {engineLabel(id)}
-                  </button>
-                ))}
+            <div className="mb-2.5">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="text-[12px] text-ink-500 shrink-0">{t('me.engineLabel')}</span>
+                <div className="flex-1 min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+                  <div className="inline-flex min-w-max rounded-[9px] p-0.5" style={{ background: 'var(--ink-100)' }}>
+                    {RUNNABLE_ENGINES.map((id) => (
+                      <button key={id} type="button" onClick={() => setEngine(id)}
+                        className="shrink-0 whitespace-nowrap px-3 py-1 rounded-[7px] text-[12px] font-semibold transition-colors duration-150"
+                        style={engine === id
+                          ? { background: 'var(--paper)', color: 'var(--ink-900)', boxShadow: '0 1px 2px rgba(0,0,0,0.08)' }
+                          : { color: 'var(--ink-500)' }}>
+                        {engineLabel(id)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
-              <span className="text-[11px] text-ink-400">{t('me.engineDefaultHint')}</span>
+              <div className="mt-1.5 text-[11px] leading-relaxed text-ink-400">{t('me.engineDefaultHint')}</div>
             </div>
             <label className="flex items-start gap-2 mb-2.5 cursor-pointer select-none">
               <input type="checkbox" checked={asService} onChange={(e) => setAsService(e.target.checked)} className="mt-[3px]" />

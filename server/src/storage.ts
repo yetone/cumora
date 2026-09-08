@@ -146,7 +146,12 @@ class LocalStorage implements Storage {
   async deleteObject(key: string): Promise<boolean> {
     const path = join(UPLOAD_DIR, key)
     try { await unlink(path); return true }
-    catch { return false }
+    catch (error) {
+      // Deletion is idempotent: a prior successful attempt may have removed
+      // the file before the durable cleanup job could be marked complete.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true
+      return false
+    }
   }
 }
 

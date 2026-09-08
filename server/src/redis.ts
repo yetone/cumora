@@ -61,6 +61,10 @@ export const CH_CALENDAR_REMINDER = 'cumora:calendar.reminder'
  *  update / delete / cancel / run-now / dispatcher auto-done so every
  *  client in the company can patch their Calendar view in real time. */
 export const CH_CALENDAR_EVENTS = 'cumora:calendar.events'
+/** Workspace membership/role invalidation. Unlike ordinary tenant broadcasts,
+ * removal/deletion events must still reach users whose company_members row has
+ * already gone, so the WS bridge routes this channel by recipientUserIds. */
+export const CH_WORKSPACES = 'cumora:workspaces'
 
 /* === Event types ===
  *
@@ -69,7 +73,11 @@ export const CH_CALENDAR_EVENTS = 'cumora:calendar.events'
  * memberships. Events without `companyId` are treated as conservatively
  * routable (skipped) — keep the field populated at every publish site.
  */
-interface TenantTagged { companyId?: string }
+interface TenantTagged {
+  companyId?: string
+  /** Stable transactional-outbox delivery id. Redis delivery is at-least-once. */
+  deliveryId?: string
+}
 
 export interface MessageNewEvent extends TenantTagged {
   type: 'message.new'
@@ -375,6 +383,15 @@ export interface CalendarEventChangedEvent extends TenantTagged {
   actorId: string | null
 }
 
+export interface WorkspaceMembershipEvent extends TenantTagged {
+  type: 'workspace.membership'
+  kind: 'role_changed' | 'removed' | 'workspace_deleted'
+  recipientUserIds: string[]
+  actorId: string
+  userId?: string
+  role?: 'admin' | 'member'
+}
+
 /** Poll state changed — a new vote was cast, an existing vote was changed,
  *  or the poll was closed (manually or by the expiration sweeper). Carries
  *  the full denormalized poll snapshot so renderers can patch in place
@@ -412,6 +429,7 @@ export type BroadcastEvent = MessageNewEvent | MessageDeltaEvent | TypingEvent
   | CalendarEventChangedEvent
   | PollUpdatedEvent
   | ComputerStatusEvent
+  | WorkspaceMembershipEvent
 
 export async function publish(channel: string, event: BroadcastEvent): Promise<void> {
   await redis.publish(channel, JSON.stringify(event))

@@ -21,6 +21,8 @@ import { randomUUID } from 'node:crypto'
 import { env } from '../env.js'
 import { getTrackedLlmClient } from './llm-ledger.js'
 import { pool } from '../db/pool.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
+import { CH_REACTIONS } from '../redis.js'
 import { tReadFile, tWriteFile, tEditFile } from './runtime/native-tools.js'
 import type { FsNamespace } from './runtime/fs-namespace.js'
 import {
@@ -202,7 +204,12 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
          FROM participants requester
          JOIN conversations c
            ON c.company_id = requester.company_id
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND cm.participant_id = $2
+          )
          JOIN messages m
            ON m.conversation_id = c.id
           AND m.company_id = c.company_id
@@ -259,7 +266,15 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
       [messageId],
     )
     agg = aggregate.rows
+    await enqueueBroadcast(client, CH_REACTIONS, {
+      type: 'message.reactions',
+      conversationId,
+      companyId,
+      messageId,
+      reactions: agg,
+    })
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -271,17 +286,6 @@ async function tReact(args: Record<string, unknown>, agentId: string): Promise<T
   // acknowledgement for long work, and marking the request read before the
   // turn completes can erase unfinished tasks from the agent's inbox. The turn
   // runtime advances reads only after semantic completion is accepted.
-  const { CH_REACTIONS, publish } = await import('../redis.js')
-  await publish(CH_REACTIONS, {
-    type: 'message.reactions',
-    conversationId,
-    companyId,
-    messageId,
-    reactions: agg,
-  }).catch((error) => {
-    console.warn(`[react] durable reaction on ${messageId} committed but publish failed`, error)
-  })
-
   return {
     ok: true,
     output: { messageId, emoji, action, reactions: agg },

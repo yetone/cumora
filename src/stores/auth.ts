@@ -44,12 +44,23 @@ interface AuthState {
   setServerCapabilities: (caps: ServerCapabilities) => void
   setActiveCompany: (id: string) => void
   addCompany: (c: AuthCompany) => void
+  removeCompany: (id: string, nextCompanyId: string | null) => boolean
   clear: () => void
   markReady: () => void
 }
 
 const TOKEN_KEY = 'cumora.auth.token'
 const COMPANY_KEY = 'cumora.auth.company'
+
+function resetWorkspaceStores(): void {
+  void Promise.all([
+    import('./documents').then(({ useDocuments }) => useDocuments.getState().reset()),
+    import('./boards').then(({ useBoards }) => useBoards.getState().reset()),
+    import('./calendar').then(({ useCalendar }) => useCalendar.getState().reset()),
+    import('./shipping').then(({ useShipping }) => useShipping.getState().reset()),
+    import('./app').then(({ useApp }) => useApp.getState().selectConversation(null)),
+  ])
+}
 
 export const useAuth = create<AuthState>((set) => ({
   token: localStorage.getItem(TOKEN_KEY),
@@ -77,6 +88,8 @@ export const useAuth = create<AuthState>((set) => ({
       ? stored
       : (activeCompanyId && memberIds.has(activeCompanyId) ? activeCompanyId : (companies[0]?.id ?? null))
     if (resolved) localStorage.setItem(COMPANY_KEY, resolved)
+    else localStorage.removeItem(COMPANY_KEY)
+    const previous = useAuth.getState().activeCompanyId
     set((s) => ({
       user,
       companies,
@@ -85,6 +98,7 @@ export const useAuth = create<AuthState>((set) => ({
         ? s.contextEpoch + 1
         : s.contextEpoch,
     }))
+    if (previous !== resolved) resetWorkspaceStores()
   },
   setServerCapabilities(caps) {
     set({ serverCapabilities: caps })
@@ -103,12 +117,7 @@ export const useAuth = create<AuthState>((set) => ({
     // next listXXX() lands. These stores are global singletons that
     // outlive the AuthedApp remount, so a key-change alone doesn't
     // clear them.
-    void Promise.all([
-      import('./documents').then(({ useDocuments }) => useDocuments.getState().reset()),
-      import('./boards').then(({ useBoards }) => useBoards.getState().reset()),
-      import('./calendar').then(({ useCalendar }) => useCalendar.getState().reset()),
-      import('./shipping').then(({ useShipping }) => useShipping.getState().reset()),
-    ])
+    resetWorkspaceStores()
   },
   /** Append a freshly-created company to the user's set and switch to it. */
   addCompany(c) {
@@ -123,13 +132,29 @@ export const useAuth = create<AuthState>((set) => ({
     // stores too so the new workspace doesn't render the previous
     // one's data while the first listXXX() is in flight.
     if (prevId && prevId !== c.id) {
-      void Promise.all([
-        import('./documents').then(({ useDocuments }) => useDocuments.getState().reset()),
-        import('./boards').then(({ useBoards }) => useBoards.getState().reset()),
-        import('./calendar').then(({ useCalendar }) => useCalendar.getState().reset()),
-        import('./shipping').then(({ useShipping }) => useShipping.getState().reset()),
-      ])
+      resetWorkspaceStores()
     }
+  },
+  /** Apply the authoritative result of deleting a workspace immediately.
+   * The realtime bridge still reconciles with /auth/me, but no longer needs
+   * to duplicate the modal's fetch or socket reconnect. */
+  removeCompany(id, nextCompanyId) {
+    const current = useAuth.getState()
+    if (!current.companies.some((company) => company.id === id)) return false
+    const companies = current.companies.filter((company) => company.id !== id)
+    const memberIds = new Set(companies.map((company) => company.id))
+    const resolved = nextCompanyId && memberIds.has(nextCompanyId)
+      ? nextCompanyId
+      : (companies[0]?.id ?? null)
+    if (resolved) localStorage.setItem(COMPANY_KEY, resolved)
+    else localStorage.removeItem(COMPANY_KEY)
+    set((state) => ({
+      companies,
+      activeCompanyId: resolved,
+      contextEpoch: state.contextEpoch + 1,
+    }))
+    resetWorkspaceStores()
+    return true
   },
   clear() {
     localStorage.removeItem(TOKEN_KEY)
@@ -154,12 +179,7 @@ export const useAuth = create<AuthState>((set) => ({
     // waiting for whoever signs in next on a shared machine.
     void import('./app').then(({ useApp }) => useApp.getState().clearComposerDrafts())
     // Library stores survive logout otherwise (they're global singletons).
-    void Promise.all([
-      import('./documents').then(({ useDocuments }) => useDocuments.getState().reset()),
-      import('./boards').then(({ useBoards }) => useBoards.getState().reset()),
-      import('./calendar').then(({ useCalendar }) => useCalendar.getState().reset()),
-      import('./shipping').then(({ useShipping }) => useShipping.getState().reset()),
-    ])
+    resetWorkspaceStores()
   },
   markReady() {
     set({ ready: true })

@@ -9,6 +9,7 @@ export const BYOA_SOURCES = [
   'byoa-pi',
   'byoa-gemini',
   'byoa-qwen',
+  'byoa-antigravity',
 ] as const
 
 export type ByoaSource = typeof BYOA_SOURCES[number]

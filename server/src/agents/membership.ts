@@ -9,9 +9,7 @@
  *   1. Post a `kind='system'` message into the conversation describing
  *      what happened (joined / left / kicked), so the audit trail is
  *      visible to remaining members.
- *   2. Publish CH_MESSAGE_NEW after a real membership change. The database
- *      mutation must happen first: otherwise a concurrently revoked actor can
- *      emit a false audit row and then fail the protected write. Departure
+ *   2. Enqueue CH_MESSAGE_NEW in the same PostgreSQL transaction. Departure
  *      notices carry a durable delivery recipient so the removed agent still
  *      sees the one row that explains why the conversation disappeared.
  *
@@ -20,7 +18,8 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, publish, type MessageNewEvent } from '../redis.js'
+import { CH_MESSAGE_NEW, type MessageNewEvent } from '../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
 
 export type MembershipKind = 'joined' | 'left' | 'kicked'
 
@@ -31,17 +30,10 @@ export interface MembershipMutationResult {
   systemMessageId: string
 }
 
-interface CommittedMembershipChange {
-  result: MembershipMutationResult
-  event: MessageNewEvent
-}
-
 /** Serialize membership authorization against offboarding / tenant moves.
- * The UPDATE below still repeats every predicate; these row locks close the
- * narrower race where a participant row changes after a statement snapshot is
- * taken while the conversation UPDATE is waiting on another writer. IDs are
- * sorted so cross-kicks cannot deadlock by locking actor/target in opposite
- * orders. */
+ * Normalized membership writes then lock the conversation row, giving every
+ * invite/leave/kick one participant -> conversation lock order. IDs are sorted
+ * so cross-kicks cannot deadlock by locking actor/target in opposite orders. */
 async function withActiveParticipantLocks<T>(args: {
   participantIds: string[]
   companyId: string
@@ -67,6 +59,7 @@ async function withActiveParticipantLocks<T>(args: {
     }
     const result = await args.run(client)
     await client.query('COMMIT')
+    if (result !== null) nudgeRealtimeOutbox()
     return result
   } catch (err) {
     await client.query('ROLLBACK').catch(() => { /* preserve original error */ })
@@ -84,7 +77,7 @@ async function insertMembershipSystemMessage(args: {
   kind: MembershipKind
   participantId: string
   members: string[]
-}): Promise<CommittedMembershipChange> {
+}): Promise<MembershipMutationResult> {
   const messageId = `m-${randomUUID()}`
   const sequence = await nextConversationSequenceWithClient(args.client, args.conversationId)
   const body = JSON.stringify({
@@ -103,64 +96,69 @@ async function insertMembershipSystemMessage(args: {
       args.companyId, deliveryRecipientId,
     ],
   )
-  return {
-    result: { members: args.members, systemMessageId: messageId },
-    event: {
-      type: 'message.new',
+  const event: MessageNewEvent = {
+    type: 'message.new',
+    conversationId: args.conversationId,
+    companyId: args.companyId,
+    message: {
+      id: messageId,
       conversationId: args.conversationId,
-      companyId: args.companyId,
-      message: {
-        id: messageId,
-        conversationId: args.conversationId,
-        authorId: args.actorId,
-        kind: 'system',
-        body,
-        sequence,
-        at: new Date().toISOString(),
-        ...(deliveryRecipientId ? { deliveryRecipientId } : {}),
-      },
+      authorId: args.actorId,
+      kind: 'system',
+      body,
+      sequence,
+      at: new Date().toISOString(),
+      ...(deliveryRecipientId ? { deliveryRecipientId } : {}),
     },
   }
+  await enqueueBroadcast(args.client, CH_MESSAGE_NEW, event)
+  return { members: args.members, systemMessageId: messageId }
 }
 
-/** Redis is the wake accelerator; the committed message is the source of
- * truth. Do not turn a transient publish failure into an apparent mutation
- * failure that callers retry after the database already changed. */
-async function publishCommittedMembershipChange(
-  committed: CommittedMembershipChange | null,
-): Promise<MembershipMutationResult | null> {
-  if (!committed) return null
-  await publish(CH_MESSAGE_NEW, committed.event).catch((err) => {
-    console.warn(
-      `[membership] publish ${committed.result.systemMessageId} failed; row remains durable`,
-      err instanceof Error ? err.message : err,
-    )
-  })
-  return committed.result
+async function lockConversationForMembership(args: {
+  client: PoolClient
+  conversationId: string
+  companyId: string
+  actorId: string
+}): Promise<boolean> {
+  const locked = await args.client.query(
+    `SELECT c.id
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2
+      FOR UPDATE OF c`,
+    [args.conversationId, args.companyId],
+  )
+  if (locked.rowCount !== 1) return false
+
+  // This must be a separate statement after the row lock is acquired. If the
+  // membership predicate is part of the blocking SELECT, its statement
+  // snapshot can still see a membership deleted by the transaction we waited
+  // behind even though EvalPlanQual refreshed the conversation tuple.
+  const authorized = await args.client.query(
+    `SELECT 1 FROM conversation_members
+      WHERE conversation_id = $1
+        AND company_id = $2
+        AND participant_id = $3`,
+    [args.conversationId, args.companyId, args.actorId],
+  )
+  return authorized.rowCount === 1
+}
+
+async function refreshMembersProjection(
+  client: PoolClient,
+  conversationId: string,
+): Promise<string[]> {
+  const { rows } = await client.query<{ members: string[] }>(
+    `SELECT refresh_conversation_members_projection($1) AS members`,
+    [conversationId],
+  )
+  return rows[0]?.members ?? []
 }
 
 /**
- * Add `memberId` to a conversation's member list and return the list as it
- * stands AFTER the write.
- *
- * The array is edited by Postgres, not by us. Every caller used to SELECT
- * `members`, splice it in JavaScript and write the whole array back, which
- * makes two overlapping membership changes a last-write-wins race: the second
- * write is computed from a snapshot taken before the first, so the first one
- * is erased with no error anywhere.
- *
- * That is not a rare interleaving here. The scheduler wakes several agents for
- * the same message, and `invite` / `leave` / `kick` are what those agents do
- * next. And the damage is silent in the worst way: the `joined` system row is
- * posted regardless, so the transcript records a join that did not happen,
- * while the agent's mailbox query (`members @> [agentId]`) never matches, so
- * they are simply never woken for that conversation again.
- *
- * Authorization is deliberately repeated in this single UPDATE. Route-level
- * SELECTs are only for friendly error messages; they are stale the moment a
- * concurrent kick, offboarding, or tenant move commits. Both the actor and the
- * target therefore have to be active participants in the conversation's
- * current tenant at the exact write boundary.
+ * Add one normalized membership row and return the derived JSON projection as
+ * it stands after the write. Route-level SELECTs remain friendly preflights;
+ * actor authorization is repeated while the conversation row is locked.
  *
  * Returns null when the write was not authorized or no longer necessary. The
  * helper intentionally performs no fallback SELECT: a second statement would
@@ -179,27 +177,31 @@ export async function addConversationMember(args: {
     participantIds: [args.actorId, args.memberId],
     companyId: args.companyId,
     run: async (client) => {
-      const { rows } = await client.query<{ members: string[] }>(
-        `UPDATE conversations c
-        SET members = members || to_jsonb(ARRAY[$2::text]), updated_at = NOW()
-      WHERE c.id = $1
-        AND c.company_id = $4
-        AND c.members @> to_jsonb(ARRAY[$3::text])
-        AND NOT (c.members @> to_jsonb(ARRAY[$2::text]))
-        AND EXISTS (
-          SELECT 1 FROM participants actor
-           WHERE actor.id = $3 AND actor.company_id = c.company_id
-             AND actor.departed_at IS NULL
-        )
-        AND EXISTS (
-          SELECT 1 FROM participants target
-           WHERE target.id = $2 AND target.company_id = c.company_id
-             AND target.departed_at IS NULL
-        )
-      RETURNING members`,
-        [args.conversationId, args.memberId, args.actorId, args.companyId],
+      if (!(await lockConversationForMembership({
+        client,
+        conversationId: args.conversationId,
+        companyId: args.companyId,
+        actorId: args.actorId,
+      }))) return null
+
+      const inserted = await client.query(
+        `INSERT INTO conversation_members (
+           conversation_id, company_id, participant_id, ordinal
+         )
+         SELECT c.id, c.company_id, $2,
+                COALESCE(MAX(existing.ordinal) + 1, 0)::integer
+           FROM conversations c
+           LEFT JOIN conversation_members existing
+             ON existing.conversation_id = c.id
+            AND existing.company_id = c.company_id
+          WHERE c.id = $1 AND c.company_id = $3
+          GROUP BY c.id, c.company_id
+         ON CONFLICT (conversation_id, participant_id) DO NOTHING
+         RETURNING participant_id`,
+        [args.conversationId, args.memberId, args.companyId],
       )
-      if (!rows[0]) return null
+      if (!inserted.rowCount) return null
+      const members = await refreshMembersProjection(client, args.conversationId)
       return insertMembershipSystemMessage({
         client,
         conversationId: args.conversationId,
@@ -207,19 +209,15 @@ export async function addConversationMember(args: {
         actorId: args.actorId,
         kind: 'joined',
         participantId: args.memberId,
-        members: rows[0].members,
+        members,
       })
     },
   })
-  return publishCommittedMembershipChange(committed)
+  return committed
 }
 
 /**
- * Remove `memberId` from a conversation's member list, returning the list as
- * it stands after the write. Same reasoning as addConversationMember.
- *
- * `jsonb - text` deletes every matching element, so this is idempotent and
- * also cleans up a duplicate left behind by the old racy path.
+ * Delete one normalized membership row and return the rebuilt projection.
  */
 export async function removeConversationMember(args: {
   conversationId: string
@@ -239,28 +237,33 @@ export async function removeConversationMember(args: {
     participantIds: [args.actorId, args.memberId],
     companyId: args.companyId,
     run: async (client) => {
-      const { rows } = await client.query<{ members: string[] }>(
-        `UPDATE conversations c
-        SET members = members - $2::text, updated_at = NOW()
-      WHERE c.id = $1
-        AND c.company_id = $4
-        AND c.members @> to_jsonb(ARRAY[$2::text])
-        AND c.members @> to_jsonb(ARRAY[$3::text])
-        AND ($5::boolean OR jsonb_array_length(c.members - $2::text) <> 1)
-        AND EXISTS (
-          SELECT 1 FROM participants actor
-           WHERE actor.id = $3 AND actor.company_id = c.company_id
-             AND actor.departed_at IS NULL
-        )
-        AND EXISTS (
-          SELECT 1 FROM participants target
-           WHERE target.id = $2 AND target.company_id = c.company_id
-             AND target.departed_at IS NULL
-        )
-      RETURNING members`,
-        [args.conversationId, args.memberId, args.actorId, args.companyId, Boolean(args.allowSoleMember)],
+      if (!(await lockConversationForMembership({
+        client,
+        conversationId: args.conversationId,
+        companyId: args.companyId,
+        actorId: args.actorId,
+      }))) return null
+
+      const removed = await client.query(
+        `DELETE FROM conversation_members target
+          WHERE target.conversation_id = $1
+            AND target.company_id = $3
+            AND target.participant_id = $2
+            AND (
+              $4::boolean
+              OR (
+                SELECT COUNT(*)::integer
+                  FROM conversation_members remaining
+                 WHERE remaining.conversation_id = target.conversation_id
+                   AND remaining.company_id = target.company_id
+                   AND remaining.participant_id <> target.participant_id
+              ) <> 1
+            )
+         RETURNING participant_id`,
+        [args.conversationId, args.memberId, args.companyId, Boolean(args.allowSoleMember)],
       )
-      if (!rows[0]) return null
+      if (!removed.rowCount) return null
+      const members = await refreshMembersProjection(client, args.conversationId)
       return insertMembershipSystemMessage({
         client,
         conversationId: args.conversationId,
@@ -268,11 +271,11 @@ export async function removeConversationMember(args: {
         actorId: args.actorId,
         kind: args.kind,
         participantId: args.memberId,
-        members: rows[0].members,
+        members,
       })
     },
   })
-  return publishCommittedMembershipChange(committed)
+  return committed
 }
 
 /** Atomically claim the next sequence number for a conversation.

@@ -877,6 +877,67 @@ function WakeEconomicsPanel(props: {
               </table>
               <div className="mt-2.5 text-[11px] leading-[1.6] text-ink-500">{t('obs.wakesFootnote')}</div>
             </div>
+
+            {/* Fan-out width — the other half of the #70 ledger. Where the
+                silent rate says "of the turns that fired, how many said
+                nothing", this says how many turns fired per message in the
+                first place. Room-wide by construction, so when an agent
+                filter is active, say so instead of silently mixing scopes. */}
+            {(data.turnsPerMessage?.length ?? 0) > 0 && (
+              <div className="rounded-[10px] border border-ink-100 bg-paper px-3.5 py-3">
+                <div className="flex items-baseline justify-between gap-2">
+                  <div className="text-[9.5px] font-bold uppercase tracking-[0.12em] text-ink-300">{t('obs.fanoutTitle')}</div>
+                  {props.agentId !== 'all' && <div className="text-[9.5px] text-ink-400">{t('obs.fanoutRoomWide')}</div>}
+                </div>
+                <table className="mt-2 w-full text-[11.5px]">
+                  <thead className="text-[9px] font-bold uppercase tracking-[0.1em] text-ink-400">
+                    <tr>
+                      <th className="py-1 text-left">{t('obs.colKind')}</th>
+                      <th className="py-1 text-right">{t('obs.colMessages')}</th>
+                      <th className="py-1 text-right">{t('obs.colTurns')}</th>
+                      <th className="py-1 text-right">{t('obs.colAvg')}</th>
+                      <th className="py-1 text-right">{t('obs.colMedian')}</th>
+                      <th className="py-1 text-right">{t('obs.colDist')}</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-ink-100">
+                    {data.turnsPerMessage.map((b) => (
+                      <tr key={b.conversationKind}>
+                        <td className="py-1">
+                          <span className={cn(
+                            'rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase',
+                            b.conversationKind === 'group' ? 'bg-sky2-50 text-skype-deep' : 'bg-ink-100 text-ink-600',
+                          )}>
+                            {b.conversationKind === 'group' ? t('obs.kindGroup') : t('obs.kindDirect')}
+                          </span>
+                        </td>
+                        <td className="py-1 text-right tabular-nums text-ink-600">{b.messages}</td>
+                        <td className="py-1 text-right tabular-nums text-ink-600">{b.turns}</td>
+                        <td className="py-1 text-right tabular-nums text-ink-700">{b.avgTurns.toFixed(1)}</td>
+                        <td className="py-1 text-right tabular-nums text-ink-700">{b.medianTurns.toFixed(1)}</td>
+                        <td className="py-1">
+                          <div className="flex h-2 w-40 overflow-hidden rounded-full bg-ink-100">
+                            {b.hist.map((h, i) => (
+                              <div
+                                key={h.turns}
+                                title={`${h.turns} turns: ${h.messages}`}
+                                className="h-full"
+                                style={{
+                                  width: `${(h.messages / Math.max(1, b.messages)) * 100}%`,
+                                  background: 'var(--skype)',
+                                  opacity: 0.18 + i * 0.2,
+                                }}
+                              />
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div className="mt-2.5 text-[11px] leading-[1.6] text-ink-500">{t('obs.fanoutFootnote')}</div>
+              </div>
+            )}
           </div>
         )}
       </div>

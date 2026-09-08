@@ -3,7 +3,7 @@ import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso'
 import { useApp } from '@/stores/app'
 import { EMPTY_DRAFT, type ComposerDraft } from '@/stores/composerDrafts'
 import { useMe } from '@/stores/auth'
-import { useConversations } from '@/stores/conversations'
+import { isMuted, useConversations } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
 import type { MessagesState } from '@/stores/messages'
@@ -1401,8 +1401,13 @@ function EmptyConversationState() {
   // italic counter pattern in WhispersView's sidebar header.
   const list = useConversations((s) => s.list)
   const total = list.length
+  // isMuted, not the raw flag: a "muted for 15 min" row keeps `muted: true`
+  // locally until something reloads the list, so the raw read keeps silencing
+  // the count after the mute has lapsed. Every other unread total already goes
+  // through the helper — Rail, MobileTabBar, ConversationsPane, App — and this
+  // one sits on the same screen as the Rail badge, disagreeing with it.
   const unread = useMemo(
-    () => list.reduce((n, c) => n + (c.muted ? 0 : (c.unread ?? 0)), 0),
+    () => list.reduce((n, c) => n + (isMuted(c) ? 0 : (c.unread ?? 0)), 0),
     [list],
   )
 

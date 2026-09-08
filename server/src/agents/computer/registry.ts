@@ -17,10 +17,12 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
 import { CH_STATUS, publish } from '../../redis.js'
+import { normalizeTier, type Tier } from '../../tier.js'
 import { signAgentToken } from '../runtime/jwt.js'
+import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -59,8 +61,16 @@ export async function announceComputerOnline(computerId: string, companyId: stri
 const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
   qwen: true,
+  antigravity: true,
 }
-const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
+export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
+
+type Queryable = {
+  query<T extends object = Record<string, unknown>>(
+    text: string,
+    params?: readonly unknown[],
+  ): Promise<{ rows: T[]; rowCount?: number | null }>
+}
 
 /** Merge a fresh PATH detection into a computer's advertised engine list.
  *
@@ -93,7 +103,7 @@ export function mergeDetectedEngines(current: string[], detected: string[]): str
   return same ? null : next
 }
 
-const ENGINE_BINS: Record<string, string> = {
+const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   claude: 'claude',
   codex: 'codex',
   grok: 'grok',
@@ -101,6 +111,8 @@ const ENGINE_BINS: Record<string, string> = {
   opencode: 'opencode',
   pi: 'pi',
   gemini: 'gemini',
+  qwen: 'qwen',
+  antigravity: 'agy',
 }
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
@@ -116,6 +128,17 @@ export interface DetectedEngine {
   latest?: string | null
   outdated?: boolean
   updateCommand?: string | null
+  /** Why Cumora will not drive this engine even though it is installed here —
+   *  "version 2.0.9 is older than the secure minimum 2.1.248", "missing sandbox
+   *  dependency: bubblewrap (bwrap)". Absent when the engine is runnable.
+   *
+   *  This travels because the person reading the card is usually not sitting at
+   *  the machine it describes — the same reason the version fields do. The
+   *  daemon knew the reason all along and only wrote it to its own stdout, so
+   *  an engine could vanish from a computer with no explanation anywhere the
+   *  operator was looking. */
+  blockedReason?: string | null
+  modelCatalog?: EngineModelCatalog
 }
 
 /** Trim a daemon-reported display string, or drop it. Control characters are
@@ -141,16 +164,73 @@ function sanitizeVersionFields(rec: Record<string, unknown>): Partial<DetectedEn
   }
 }
 
-/** An engine we know is advertised but have no PATH/version report for. */
-function unreportedEngine(id: string): DetectedEngine {
+function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
+  if (!raw || typeof raw !== 'object') return undefined
+  const rec = raw as Record<string, unknown>
+  const source: ModelCatalogSource = rec.source === 'protocol' || rec.source === 'cli' || rec.source === 'presets'
+    ? rec.source
+    : 'presets'
+  const fastModelScope: FastModelScope = rec.fastModelScope === 'computer' || rec.fastModelScope === 'unsupported'
+    ? rec.fastModelScope
+    : 'agent'
+  const models: EngineModelOption[] = []
+  const seen = new Set<string>()
+  if (Array.isArray(rec.models)) {
+    for (const rawModel of rec.models.slice(0, 128)) {
+      if (!rawModel || typeof rawModel !== 'object') continue
+      const model = rawModel as Record<string, unknown>
+      const id = displayString(model.id, 160)
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      const recommendedFor = Array.isArray(model.recommendedFor)
+        ? model.recommendedFor.filter((tier): tier is 'big' | 'small' => tier === 'big' || tier === 'small').slice(0, 2)
+        : undefined
+      models.push({
+        id,
+        label: displayString(model.label, 160) ?? id,
+        description: displayString(model.description, 320),
+        ...(recommendedFor?.length ? { recommendedFor } : {}),
+      })
+    }
+  }
   return {
-    id, bin: ENGINE_BINS[id] ?? id, path: null,
-    version: null, latest: null, outdated: false, updateCommand: null,
+    models,
+    defaultModel: displayString(rec.defaultModel, 160),
+    defaultFastModel: displayString(rec.defaultFastModel, 160),
+    ...(rec.prefersLocalDefault === true ? { prefersLocalDefault: true } : {}),
+    supportsCustom: rec.supportsCustom !== false,
+    fastModelScope,
+    source,
   }
 }
 
-export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): DetectedEngine[] {
-  const allowed = engineIds.filter((id) => PAIRABLE_ENGINES.has(id))
+/** An engine we know is advertised but have no PATH/version report for. */
+function unreportedEngine(id: string): DetectedEngine {
+  return {
+    id, bin: ENGINE_BINS[id as keyof typeof ENGINE_BINS] ?? id, path: null,
+    version: null, latest: null, outdated: false, updateCommand: null, blockedReason: null,
+  }
+}
+
+/**
+ * Shape the daemon's PATH report for storage and display.
+ *
+ * `runnableIds` are the engines the daemon will actually wake; `blockedIds` are
+ * installed but refused, and appear ONLY here. That separation is the safety
+ * property of this function: `available_engines` is what picks an agent's
+ * adapter, so a blocked engine reaching it would run the very thing the
+ * sandbox gate declined. Blocked ids are therefore never returned to the
+ * caller as runnable and never influence `ordered` — they ride along as extra
+ * display rows carrying the reason they were refused.
+ */
+export function sanitizeDetectedEngines(
+  raw: unknown,
+  engineIds: string[],
+  blockedIds: string[] = [],
+): DetectedEngine[] {
+  const runnable = engineIds.filter((id) => PAIRABLE_ENGINES.has(id))
+  const blocked = blockedIds.filter((id) => PAIRABLE_ENGINES.has(id) && !runnable.includes(id))
+  const allowed = [...runnable, ...blocked]
   if (!Array.isArray(raw)) return allowed.map(unreportedEngine)
   const byId = new Map<string, DetectedEngine>()
   for (const item of raw) {
@@ -158,9 +238,16 @@ export function sanitizeDetectedEngines(raw: unknown, engineIds: string[]): Dete
     const rec = item as Record<string, unknown>
     const id = typeof rec.id === 'string' ? rec.id : ''
     if (!PAIRABLE_ENGINES.has(id) || !allowed.includes(id)) continue
-    const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id] ?? id)
+    const bin = typeof rec.bin === 'string' && rec.bin.trim() ? rec.bin.trim() : (ENGINE_BINS[id as keyof typeof ENGINE_BINS] ?? id)
     const path = typeof rec.path === 'string' && rec.path.trim() ? rec.path.trim() : null
-    byId.set(id, { id, bin, path, ...sanitizeVersionFields(rec) })
+    // A reason is only meaningful on an engine we actually refused. Accepting
+    // one on a runnable engine would let a daemon mark a working engine broken.
+    const blockedReason = blocked.includes(id) ? displayString(rec.blockedReason, 200) : null
+    const modelCatalog = sanitizeModelCatalog(rec.modelCatalog)
+    byId.set(id, {
+      id, bin, path, ...sanitizeVersionFields(rec), blockedReason,
+      ...(modelCatalog ? { modelCatalog } : {}),
+    })
   }
   // Every row carries the same keys, reported or not, so the app never has to
   // distinguish "field absent" from "nothing installed to report".
@@ -315,6 +402,11 @@ export async function pairComputer(args: {
   engines?: string[]
   /** Optional PATH snapshot from the daemon (bin + resolved path). */
   detected?: unknown
+  /** Installed engines the daemon refused to run, so the card can say why from
+   *  the very first pairing rather than only after the next PATH rescan — which
+   *  is minutes later, and right after pairing is exactly when "why is only
+   *  codex here?" gets asked. Display-only; never joins available_engines. */
+  blocked?: string[]
   /** The daemon's running version, stored so the app can flag outdated daemons. */
   version?: string
   /** Whether the daemon runs supervised (service) vs. as a foreground command. */
@@ -326,7 +418,8 @@ export async function pairComputer(args: {
   deferBroadcast?: boolean
 }): Promise<{ computerId: string; companyId: string; deviceToken: string } | null> {
   const engines = (args.engines ?? []).filter((e) => PAIRABLE_ENGINES.has(e))
-  const detected = sanitizeDetectedEngines(args.detected, engines)
+  const blocked = args.blocked ?? []
+  const detected = sanitizeDetectedEngines(args.detected, engines, blocked)
   const detectedJson = JSON.stringify(detected)
   const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 32) : null
   const supervised = typeof args.supervised === 'boolean' ? args.supervised : null
@@ -346,7 +439,7 @@ export async function pairComputer(args: {
     // the existing default first while it is still installed; if it vanished,
     // mergeDetectedEngines naturally falls back to the daemon's scan order.
     const orderedEngines = mergeDetectedEngines(currentEngines ?? [], engines) ?? (currentEngines ?? [])
-    const reconnectDetectedJson = JSON.stringify(sanitizeDetectedEngines(args.detected, orderedEngines))
+    const reconnectDetectedJson = JSON.stringify(sanitizeDetectedEngines(args.detected, orderedEngines, blocked))
     await pool.query(
       `UPDATE computers
           SET credential_hash = $1, available_engines = $2::jsonb,
@@ -502,15 +595,28 @@ export async function mintAgentRuntimeToken(args: {
   computerId: string
   agentId: string
 }): Promise<{ token: string; expiresInSeconds: number } | null> {
-  const { rows } = await pool.query<{ company_id: string | null }>(
-    `SELECT company_id FROM participants
-      WHERE id = $1 AND kind = 'agent' AND computer_id = $2 LIMIT 1`,
+  const { rows } = await pool.query<{
+    company_id: string
+    computer_id: string
+    runtime_assignment_id: string
+  }>(
+    `SELECT p.company_id, p.computer_id, p.runtime_assignment_id
+       FROM participants p
+       JOIN computers c
+         ON c.id = p.computer_id
+        AND c.company_id = p.company_id
+        AND c.revoked_at IS NULL
+      WHERE p.id = $1 AND p.kind = 'agent' AND p.computer_id = $2
+        AND p.departed_at IS NULL
+      LIMIT 1`,
     [args.agentId, args.computerId],
   )
   if (!rows[0]) return null
   const token = signAgentToken({
     agentId: args.agentId,
     companyId: rows[0].company_id,
+    computerId: rows[0].computer_id,
+    assignmentId: rows[0].runtime_assignment_id,
     ttlSeconds: AGENT_TOKEN_TTL_SECONDS,
   })
   return { token, expiresInSeconds: AGENT_TOKEN_TTL_SECONDS }
@@ -520,21 +626,33 @@ export async function mintAgentRuntimeToken(args: {
  *  Includes the per-agent big-brain (`model`) + small-brain (`fastModel`)
  *  overrides so the daemon can pass them to the engine.
  *
- *  When a row has no explicit model, fall back to the deploy-level default
+ *  When a row has no explicit model, a reported custom-Claude provider default
+ *  takes precedence; otherwise fall back to the deploy-level default
  *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
  *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
- *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL) so every BYOA
- *  daemon gets a consistent pin — independent of whatever model the local
- *  engine CLI happens to default to today. Critical: a model
+ *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL /
+ *  CUMORA_DEFAULT_GEMINI_MODEL / CUMORA_DEFAULT_QWEN_MODEL /
+ *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL) so every BYOA
+ *  daemon without a custom provider gets a consistent pin. Critical: a model
  *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
- *  agent behavior on every user's machine unless we pin here. */
+ *  agent behavior on every user's machine unless we pin here. A custom
+ *  provider can explicitly make its unnamed local default authoritative so a
+ *  vendor-specific deploy pin never crosses into the wrong namespace. */
 export async function listAgentsForComputer(computerId: string): Promise<
   Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>
 > {
-  const { rows } = await pool.query<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null }>(
-    `SELECT id, name, role, system_prompt AS "systemPrompt", engine, model, fast_model AS "fastModel" FROM participants
-      WHERE computer_id = $1 AND kind = 'agent' AND departed_at IS NULL
-      ORDER BY name ASC`,
+  const { rows } = await pool.query<{
+    id: string; name: string; role: string | null; systemPrompt: string | null
+    engine: EngineId | null; model: string | null; fastModel: string | null
+    availableEngines?: string[]; detectedEngines?: unknown
+  }>(
+    `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
+            p.fast_model AS "fastModel", c.available_engines AS "availableEngines",
+            COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines"
+       FROM participants p
+       JOIN computers c ON c.id = p.computer_id
+      WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
+      ORDER BY p.name ASC`,
     [computerId],
   )
   const claudeDefault = process.env.CUMORA_DEFAULT_CLAUDE_MODEL?.trim() || null
@@ -543,8 +661,25 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const cursorDefault = process.env.CUMORA_DEFAULT_CURSOR_MODEL?.trim() || null
   const openCodeDefault = process.env.CUMORA_DEFAULT_OPENCODE_MODEL?.trim() || null
   const piDefault = process.env.CUMORA_DEFAULT_PI_MODEL?.trim() || null
+  const geminiDefault = process.env.CUMORA_DEFAULT_GEMINI_MODEL?.trim() || null
+  const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
+  const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
-    if (r.model) return r
+    const { availableEngines, detectedEngines, ...agent } = r
+    const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
+      .find((entry) => entry.id === agent.engine)?.modelCatalog
+    // A custom Claude endpoint owns its model namespace. Its reported defaults
+    // fill only unpinned fields; explicit per-Agent choices still win. When it
+    // cannot name a main/fast default, leave that field null so the CLI chooses
+    // instead of crossing an Anthropic deployment pin into the provider.
+    if (r.engine === 'claude' && localCatalog?.prefersLocalDefault) {
+      return {
+        ...agent,
+        model: agent.model ?? localCatalog.defaultModel,
+        fastModel: agent.fastModel ?? localCatalog.defaultFastModel,
+      }
+    }
+    if (agent.model) return agent
     const dflt = r.engine === 'codex'
       ? codexDefault
       : r.engine === 'claude'
@@ -557,8 +692,14 @@ export async function listAgentsForComputer(computerId: string): Promise<
               ? openCodeDefault
               : r.engine === 'pi'
                 ? piDefault
-                : null
-    return dflt ? { ...r, model: dflt } : r
+                : r.engine === 'gemini'
+                  ? geminiDefault
+                  : r.engine === 'qwen'
+                    ? qwenDefault
+                    : r.engine === 'antigravity'
+                      ? antigravityDefault
+                    : null
+    return dflt ? { ...agent, model: dflt } : agent
   })
 }
 
@@ -589,28 +730,188 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
   }))
 }
 
-export interface AgentHost {
-  /** kind of computer the agent runs on, or null if unassigned (treat as cloud). */
+export interface ResolvedAgentHost {
+  status: 'found'
+  /** kind of computer the agent runs on, or null only when truly unassigned. */
   kind: ComputerKind | null
-  /** the agent's company — lets the scheduler check the company's tier. */
-  companyId: string | null
+  /** Exact assigned computer. Null is the explicit unassigned state. */
+  computerId: string | null
+  /** Active agent tenant. A found result never carries an empty tenant. */
+  companyId: string
+  /** Opaque placement generation bound into every runtime token. */
+  runtimeAssignmentId: string
+  /** Tenant tier read in the same database snapshot as the host assignment. */
+  tier: Tier
+}
+
+export interface MissingAgentHost {
+  status: 'missing'
+}
+
+export interface FailedAgentHostResolution {
+  status: 'error'
+  code: 'lookup_failed' | 'invalid_assignment'
+  reason: string
+  cause?: unknown
+}
+
+/** A database failure is deliberately different from a valid unassigned Agent. */
+export type AgentHostResolution =
+  | ResolvedAgentHost
+  | MissingAgentHost
+  | FailedAgentHostResolution
+
+export type ManagedPodPlacement =
+  | { status: 'allowed'; companyId: string; computerId: string | null; runtimeAssignmentId: string }
+  | {
+      status: 'denied'
+      code: 'agent_not_found' | 'placement_lookup_failed' | 'placement_denied'
+      reason: string
+    }
+
+function isComputerKind(value: unknown): value is ComputerKind {
+  return value === 'cloud' || value === 'local' || value === 'vps'
 }
 
 /** Resolve where an agent runs + its company. Not cached: this sits on the
  *  scheduler's cold path (wakeOne only calls it for a resting agent with no
  *  live subscriber), and it's a single indexed lookup — a PK probe on
- *  participants + a PK LEFT JOIN on computers. An in-process cache here would
+ *  participants + PK joins on computers/company ownership. An in-process cache here would
  *  be both pointless (cold path) and unsafe (each replica caches independently,
  *  so reassignments/tier changes go stale per-pod). LEFT JOIN so an unassigned
- *  agent (computer_id NULL) still returns its companyId with a null kind. */
-export async function resolveAgentHost(agentId: string): Promise<AgentHost> {
-  const { rows } = await pool.query<{ kind: ComputerKind | null; company_id: string | null }>(
-    `SELECT c.kind, p.company_id FROM participants p
-       LEFT JOIN computers c ON c.id = p.computer_id
-      WHERE p.id = $1 AND p.kind = 'agent' LIMIT 1`,
-    [agentId],
-  )
-  return { kind: rows[0]?.kind ?? null, companyId: rows[0]?.company_id ?? null }
+ *  agent (computer_id NULL) still returns its companyId with a null kind.
+ *
+ *  Do not throw lookup failures into the same shape as "missing": callers route
+ *  execution from this result, so every state is explicit and exhaustively
+ *  handled. Soft-reference corruption (missing/cross-tenant Computer) is also
+ *  an error, never an implicit cloud assignment. */
+export async function resolveAgentHost(
+  agentId: string,
+  db: Queryable = pool,
+): Promise<AgentHostResolution> {
+  try {
+    const { rows } = await db.query<{
+      company_id: string | null
+      computer_id: string | null
+      runtime_assignment_id: string | null
+      resolved_computer_id: string | null
+      computer_company_id: string | null
+      kind: string | null
+      revoked_at: Date | null
+      resolved_company_id: string | null
+      tier: string | null
+    }>(
+      `SELECT p.company_id,
+              p.computer_id,
+              p.runtime_assignment_id,
+              c.id AS resolved_computer_id,
+              c.company_id AS computer_company_id,
+              c.kind,
+              c.revoked_at,
+              company.id AS resolved_company_id,
+              COALESCE(owner_user.tier, owner_member.tier, 'free') AS tier
+         FROM participants p
+         LEFT JOIN computers c ON c.id = p.computer_id
+         LEFT JOIN companies company ON company.id = p.company_id
+         LEFT JOIN users owner_user ON owner_user.id = company.owner_user_id
+         LEFT JOIN LATERAL (
+           SELECT u.tier
+             FROM company_members cm
+             JOIN users u ON u.id = cm.user_id
+            WHERE cm.company_id = company.id AND cm.role = 'owner'
+            ORDER BY cm.joined_at ASC
+            LIMIT 1
+         ) owner_member ON TRUE
+        WHERE p.id = $1
+          AND p.kind = 'agent'
+          AND p.departed_at IS NULL
+        LIMIT 1`,
+      [agentId],
+    )
+    const row = rows[0]
+    if (!row) return { status: 'missing' }
+    if (!row.company_id || !row.resolved_company_id || !row.runtime_assignment_id) {
+      return {
+        status: 'error',
+        code: 'invalid_assignment',
+        reason: `agent ${agentId} has no valid company assignment`,
+      }
+    }
+    if (row.computer_id !== null) {
+      if (!row.resolved_computer_id || !isComputerKind(row.kind)) {
+        return {
+          status: 'error',
+          code: 'invalid_assignment',
+          reason: `agent ${agentId} references an unavailable computer`,
+        }
+      }
+      if (row.computer_company_id !== row.company_id) {
+        return {
+          status: 'error',
+          code: 'invalid_assignment',
+          reason: `agent ${agentId} computer assignment crosses company boundaries`,
+        }
+      }
+      if (row.revoked_at !== null) {
+        return {
+          status: 'error',
+          code: 'invalid_assignment',
+          reason: `agent ${agentId} is assigned to a revoked computer`,
+        }
+      }
+    }
+    return {
+      status: 'found',
+      kind: row.computer_id === null ? null : row.kind as ComputerKind,
+      computerId: row.computer_id,
+      companyId: row.company_id,
+      runtimeAssignmentId: row.runtime_assignment_id,
+      tier: normalizeTier(row.tier),
+    }
+  } catch (cause) {
+    return {
+      status: 'error',
+      code: 'lookup_failed',
+      reason: `host lookup failed for agent ${agentId}`,
+      cause,
+    }
+  }
+}
+
+/** Final managed-runtime policy used at the `ensurePod` boundary. */
+export function managedPodPlacement(
+  resolution: AgentHostResolution,
+): ManagedPodPlacement {
+  if (resolution.status === 'missing') {
+    return { status: 'denied', code: 'agent_not_found', reason: 'no such agent' }
+  }
+  if (resolution.status === 'error') {
+    return {
+      status: 'denied',
+      code: resolution.code === 'lookup_failed' ? 'placement_lookup_failed' : 'placement_denied',
+      reason: resolution.reason,
+    }
+  }
+  if (isByoaKind(resolution.kind)) {
+    return {
+      status: 'denied',
+      code: 'placement_denied',
+      reason: `managed pod denied: agent is assigned to a ${resolution.kind} computer`,
+    }
+  }
+  if (resolution.tier === 'free') {
+    return {
+      status: 'denied',
+      code: 'placement_denied',
+      reason: 'managed pod denied: free tier is BYOA-only',
+    }
+  }
+  return {
+    status: 'allowed',
+    companyId: resolution.companyId,
+    computerId: resolution.computerId,
+    runtimeAssignmentId: resolution.runtimeAssignmentId,
+  }
 }
 
 /** A BYOA host (user-paired) runs a daemon, not a server-managed pod. */
@@ -618,22 +919,25 @@ export function isByoaKind(kind: ComputerKind | null): boolean {
   return kind === 'local' || kind === 'vps'
 }
 
-/** Assign an agent to a computer (move it between Cumora Cloud and a paired
- *  machine). Resolves the engine: 'managed' for cloud, else the requested
- *  engine if the computer advertises it, else the computer's first engine.
- *  Returns the resolved { kind, engine } or null if the computer/agent is
- *  invalid for this company. */
-export async function assignAgentToComputer(args: {
-  agentId: string
+/** Resolve and lock a valid Computer placement without mutating an Agent.
+ *
+ * Creation uses this inside the participant INSERT transaction so a rejected
+ * or revoked Computer can never leave behind an unassigned Agent. Existing
+ * assignment callers retain their historical fallback behavior; creation sets
+ * `strictEngine` so an unavailable explicit pin fails instead of silently
+ * selecting the Computer default. */
+export async function resolveComputerAssignment(args: {
   companyId: string
   computerId: string
   engine?: string
   /** When true (or when no engine is named), follow the computer default. */
   inherit?: boolean
-}): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
-  const { rows } = await pool.query<{ kind: ComputerKind; available_engines: string[] }>(
+  strictEngine?: boolean
+}, db: Queryable = pool): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
+  const { rows } = await db.query<{ kind: ComputerKind; available_engines: string[] }>(
     `SELECT kind, available_engines FROM computers
-      WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL LIMIT 1`,
+      WHERE id = $1 AND company_id = $2 AND revoked_at IS NULL
+      LIMIT 1 FOR SHARE`,
     [args.computerId, args.companyId],
   )
   const computer = rows[0]
@@ -648,6 +952,9 @@ export async function assignAgentToComputer(args: {
     const advertised = computer.available_engines ?? []
     const wantInherit = args.inherit === true || !args.engine
     const requested = args.engine && PAIRABLE_ENGINES.has(args.engine) ? (args.engine as EngineId) : null
+    if (!wantInherit && args.strictEngine && (!requested || !advertised.includes(requested))) {
+      return null
+    }
     const pick = (
       wantInherit
         ? advertised[0]
@@ -658,13 +965,47 @@ export async function assignAgentToComputer(args: {
     inherit = wantInherit
   }
 
+  return { kind: computer.kind, engine, inherit }
+}
+
+/** Assign an agent to a computer (move it between Cumora Cloud and a paired
+ *  machine). Resolves the engine: 'managed' for cloud, else the requested
+ *  engine if the computer advertises it, else the computer's first engine.
+ *  Returns the resolved { kind, engine } or null if the computer/agent is
+ *  invalid for this company. */
+export async function assignAgentToComputer(args: {
+  agentId: string
+  companyId: string
+  computerId: string
+  engine?: string
+  /** When true (or when no engine is named), follow the computer default. */
+  inherit?: boolean
+  /** Optional model pins to persist in the same participant UPDATE as the
+   *  host/engine assignment. undefined leaves the value untouched; null clears it. */
+  model?: string | null
+  fastModel?: string | null
+}): Promise<{ kind: ComputerKind; engine: EngineId; inherit: boolean } | null> {
+  const placement = await resolveComputerAssignment({ ...args, strictEngine: true })
+  if (!placement) return null
+
+  const sets = ['computer_id = $1', 'engine = $2', 'engine_inherit = $3']
+  const params: unknown[] = [args.computerId, placement.engine, placement.inherit]
+  if (args.model !== undefined) {
+    params.push(args.model)
+    sets.push(`model = $${params.length}`)
+  }
+  if (args.fastModel !== undefined) {
+    params.push(args.fastModel)
+    sets.push(`fast_model = $${params.length}`)
+  }
+  params.push(args.agentId, args.companyId)
   const { rowCount } = await pool.query(
-    `UPDATE participants SET computer_id = $1, engine = $2, engine_inherit = $3
-      WHERE id = $4 AND company_id = $5 AND kind = 'agent'`,
-    [args.computerId, engine, inherit, args.agentId, args.companyId],
+    `UPDATE participants SET ${sets.join(', ')}
+      WHERE id = $${params.length - 1} AND company_id = $${params.length} AND kind = 'agent'`,
+    params,
   )
   if (!rowCount) return null
-  return { kind: computer.kind, engine, inherit }
+  return placement
 }
 
 /** Ask the online daemon to re-probe PATH on its next heartbeat. */
@@ -686,6 +1027,9 @@ export async function reportDetectedEngines(args: {
   computerId: string
   engines?: string[]
   detected?: unknown
+  /** Installed engines the daemon refused to run. Display-only — they are
+   *  deliberately kept out of `available_engines`, which chooses adapters. */
+  blocked?: string[]
 }): Promise<boolean> {
   const { rows } = await pool.query<{ available_engines: string[]; company_id: string }>(
     `SELECT available_engines, company_id FROM computers
@@ -699,7 +1043,7 @@ export async function reportDetectedEngines(args: {
   const ordered = prevDefault && incoming.includes(prevDefault)
     ? [prevDefault, ...incoming.filter((e) => e !== prevDefault)]
     : incoming
-  const detected = sanitizeDetectedEngines(args.detected, ordered)
+  const detected = sanitizeDetectedEngines(args.detected, ordered, args.blocked ?? [])
   await pool.query(
     `UPDATE computers
         SET available_engines = $2::jsonb,

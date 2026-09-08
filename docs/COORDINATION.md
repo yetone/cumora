@@ -54,19 +54,29 @@ making a clear decision in front of correct state.**
 
 In order from "always on, no brain attention" to "soft, brain-mediated":
 
-### 1. Per-agent model pin (deploy env)
+### 1. Per-agent model pin and custom-Claude resolution
 `CUMORA_DEFAULT_CLAUDE_MODEL=claude-opus-4-7` on the prod server.
-`listAgentsForComputer` (`server/src/agents/computer/registry.ts`) substitutes
-this when `participants.model` is null. The daemon then spawns claude with
-explicit `--model claude-opus-4-7` instead of inheriting whatever the local
-claude CLI defaults to.
+An explicit `participants.model` wins. Otherwise `listAgentsForComputer`
+(`server/src/agents/computer/registry.ts`) normally substitutes the deploy pin.
+For a Computer that reports a custom Claude endpoint, its provider-local
+main/fast defaults fill unpinned fields first. The provider may mark an unnamed
+local default authoritative; the daemon then omits `--model` rather than sending
+an Anthropic model into another namespace.
 
 **Why this exists:** the local claude CLI silently flipped its default from
 `opus-4-7` to `opus-4-8` partway through a session in 2026-05-31. Opus-4-8 is
 more cautious about prompt-injection-like patterns and behaves differently in
 multi-agent flows. Without
 the pin, every user's behavior drifts whenever Anthropic ships a model.
-Override per-agent by setting `participants.model` for a specific id.
+Override per-agent by setting `participants.model` for a specific id. Provider
+credentials for a custom Claude endpoint are bootstrapped from a fixed
+seven-key allowlist in Claude's user settings, enter only the trusted Claude
+core process, and stay denied to every model-spawned subprocess — see
+`server/src/agents/computer/claude-user-settings.ts`.
+Agent turns now inherit validated Claude effort/thinking preferences instead
+of forcing thinking off. Triage retains its separate cheap-call policy; the
+inherited keys, their validation, and the daemon-env-wins precedence rule are
+tabulated in [`BYOA.md`](BYOA.md).
 
 ### 2. Per-computer big-brain concurrency cap (daemon)
 `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` (default **6**; drop to 2-4 on very
@@ -668,11 +678,15 @@ one and re-test. Don't pile on.
 
 | Var | Default | Notes |
 |---|---|---|
-| `CUMORA_DEFAULT_CLAUDE_MODEL` | unset | Deploy-level model pin (e.g. `claude-opus-4-7`). Per-agent `participants.model` overrides this. |
+| `CUMORA_DEFAULT_CLAUDE_MODEL` | unset | Deploy-level fallback (e.g. `claude-opus-4-7`). Explicit per-agent and reported custom-provider defaults override it. |
 | `CUMORA_DEFAULT_CODEX_MODEL` | unset | Same shape for Codex; deliberately not set by default. |
 | `CUMORA_DEFAULT_GROK_MODEL` | unset | Same shape for Grok Build. |
 | `CUMORA_DEFAULT_CURSOR_MODEL` | unset | Same shape for Cursor Agent; blank lets Cursor use Auto. |
 | `CUMORA_DEFAULT_OPENCODE_MODEL` | unset | Same shape for OpenCode; use its `provider/model` id, or leave blank for the configured default. |
+| `CUMORA_DEFAULT_PI_MODEL` | unset | Same shape for pi; leave blank for the configured default. |
+| `CUMORA_DEFAULT_GEMINI_MODEL` | unset | Same shape for Gemini CLI; leave blank for the configured default. |
+| `CUMORA_DEFAULT_QWEN_MODEL` | unset | Same shape for Qwen Code; leave blank for the configured default. |
+| `CUMORA_DEFAULT_ANTIGRAVITY_MODEL` | unset | Same shape for Antigravity; leave blank for the configured default. |
 | `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` | 6 | Per-computer big-brain turn cap. Drop to 2-4 for very tight quotas; raise for higher tiers. |
 | `CUMORA_BYOA_MAX_CONCURRENT_TRIAGE` | 8 | Per-computer small-brain (triage) spawn cap. Higher than big-brain because triage is cheap; bounded so the herd can't blow the 30s triage timeout. |
 | `CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS` | 500 | Deterministic minimum interval between local-CLI spawn starts — the AdaptivePacer's base (3, 3b). |
@@ -788,3 +802,5 @@ fallback) and absent-member coverage (team-adapts principle).
 | `server/src/agents/runtime/server.ts` | `/runtime/inbox` endpoint with `?probe=1` flag for non-advancing reads. `/thinking/mark` / `/thinking/unmark` bracket the turn (they also still stamp the vestigial compose-anchor — see 5a). `/agenda` routes the nudge `source` flag (classified vs fallback) into `claimStallNudge`. |
 | `server/src/agents/runtime/inproc-client.ts` | `loadInbox()` — must remain a PURE READ. No more recordSeen side-effect (that broke a6e69aa). `markThinking`/`peekThinking` for the ZSET-based "who's composing here" claim. |
 | `server/src/agents/computer/registry.ts` | `listAgentsForComputer` with per-engine `CUMORA_DEFAULT_*_MODEL` fallbacks. |
+| `server/src/agents/computer/claude-user-settings.ts` | `CLAUDE_CORE_ENV_KEYS` (the seven-key provider bootstrap allowlist), `CLAUDE_TURN_ENV_KEYS` + their validation, and `isCustomAnthropicEndpoint()` — which treats `api.anthropic.com` as first-party and an unparseable base URL as custom (§1). |
+| `server/src/agents/computer/model-catalog.ts` | Reports the engine's configured defaults, including whether a custom endpoint owns an unnamed default, so a custom-provider default can outrank the deployment-level pin (§1). |

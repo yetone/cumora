@@ -18,6 +18,7 @@ lerna-debug.log*
 *.sln
 *.sw?
 .claude/
+.codex/
 
 # Dependencies
 node_modules

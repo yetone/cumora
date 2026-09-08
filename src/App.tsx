@@ -26,6 +26,8 @@ import { UpdateBanner, UpdaterDialog } from '@/components/UpdaterDialog'
 import { AdminApp } from '@/admin/AdminApp'
 import { WaitlistConfirmedScreen, consumeWaitlistFragment } from '@/admin/WaitlistConfirmedScreen'
 import { SuspendedScreen, consumeSuspendedFragment } from '@/admin/SuspendedScreen'
+import { NoWorkspaceScreen } from '@/components/NoWorkspaceScreen'
+import { WorkspaceSessionBridge } from '@/components/WorkspaceSessionBridge'
 import '@/admin/admin.css'
 
 /** True iff this browser tab is for the admin panel. On prod the
@@ -133,10 +135,11 @@ function AuthedApp() {
   useEffect(() => {
     if (!convoId || !selectedConvoExists) return
     void useMessages.getState().loadConversation(convoId)
-    void api.markRead(convoId).then(() => {
-      // refresh list so the badge clears
-      void useConversations.getState().reload()
-    }).catch(() => { /* swallow */ })
+    // Clear the badge locally, then persist. The server response tells us
+    // nothing the client doesn't already know, so refetching the whole list
+    // to learn that one count went to zero is pure waste.
+    useConversations.getState().markLocallyRead(convoId)
+    void api.markRead(convoId).catch(() => { /* swallow */ })
   }, [convoId, selectedConvoExists])
 
   // Lazy-refresh whisper list when entering whispers view
@@ -262,7 +265,10 @@ export function App() {
   return (
     <AuthGate>
       <ErrorBoundary>
-        <AuthedApp key={`${userId ?? 'anon'}::${companyId ?? 'none'}`} />
+        <WorkspaceSessionBridge />
+        {userId && !companyId
+          ? <NoWorkspaceScreen />
+          : <AuthedApp key={`${userId ?? 'anon'}::${companyId ?? 'none'}`} />}
       </ErrorBoundary>
     </AuthGate>
   )

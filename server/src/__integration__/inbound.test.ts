@@ -14,6 +14,7 @@
  */
 import { test, before, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
 import { createServer, type Server } from 'node:http'
 import {
   buildTestApp, ensureSchemaOnce, resetAllTables, seedCompanyWithAgent,
@@ -332,4 +333,226 @@ test('[integration] inbound attachments land in email_attachments + storage', as
   assert.equal(note.truncated, false)
   assert.ok(note.storage_key && note.storage_key.startsWith('email-attachments/'),
     `expected storage_key under email-attachments/, got: ${note.storage_key}`)
+})
+
+test('[integration] delivers an inbound email to multiple recipients in the same company without duplicate collision or ghost threads', async () => {
+  const { companyId, agentId: agent1Id, agentEmail: agent1Email } = await seedCompanyWithAgent()
+  const agent2Id = `a-${randomUUID().slice(0, 8)}`
+  const dom = process.env.EMAIL_DOMAIN || 'cumora.local'
+  const agent2Email = `${agent2Id}.${companyId}@${dom}`
+  await pool.query(
+    `INSERT INTO participants (id, company_id, kind, name, role, initial, avatar_bg, status, email)
+     VALUES ($1, $2, 'agent', $3, 'tester', $4, '#abcdef', 'avail', $5)`,
+    [agent2Id, companyId, `Agent ${agent2Id}`, agent2Id.slice(0, 1).toUpperCase(), agent2Email],
+  )
+
+  const r = await postInbound({
+    messageId: 'multi-same-co@host',
+    from: 'Alice <alice@external.com>',
+    to: [agent1Email, agent2Email],
+    subject: 'Joint announcement',
+    text: 'Hello both',
+  })
+  assert.equal(r.status, 200)
+  assert.equal(r.body.ok, true)
+  assert.equal(r.body.deliveries.length, 1, 'same company recipients share one delivery/message')
+
+  // Exactly one email_messages row in the company
+  const { rows: msgs } = await pool.query<{ company_id: string; message_id: string }>(
+    `SELECT company_id, message_id FROM email_messages WHERE smtp_message_id = $1`,
+    ['multi-same-co@host'],
+  )
+  assert.equal(msgs.length, 1)
+  assert.equal(msgs[0].company_id, companyId)
+
+  // Exactly one conversation created (no ghost thread with 0 messages!)
+  const { rows: convos } = await pool.query<{ id: string; members: string[] }>(
+    `SELECT id, members FROM conversations WHERE company_id = $1 AND kind = 'email'`,
+    [companyId],
+  )
+  assert.equal(convos.length, 1, 'must leave exactly one conversation, no ghost thread')
+  assert.ok(convos[0].members.includes(agent1Id))
+  assert.ok(convos[0].members.includes(agent2Id))
+})
+
+test('[integration] delivers one inbound email addressed to two different companies independently (cross-tenant delivery)', async () => {
+  const compA = await seedCompanyWithAgent()
+  const compB = await seedCompanyWithAgent()
+
+  const r = await postInbound({
+    messageId: 'cross-tenant-msg@host',
+    from: 'Partner <partner@external.com>',
+    to: [compA.agentEmail, compB.agentEmail],
+    subject: 'Cross company update',
+    text: 'Hello to both teams',
+  })
+  assert.equal(r.status, 200)
+  assert.equal(r.body.ok, true)
+  assert.equal(r.body.deliveries.length, 2, 'both companies receive delivery')
+
+  // Both companies now have an email_messages row with the SAME smtp_message_id
+  const { rows: msgs } = await pool.query<{ company_id: string }>(
+    `SELECT company_id FROM email_messages WHERE smtp_message_id = $1 ORDER BY company_id`,
+    ['cross-tenant-msg@host'],
+  )
+  assert.equal(msgs.length, 2)
+  const storedCompanyIds = msgs.map((m) => m.company_id).sort()
+  const expectedCompanyIds = [compA.companyId, compB.companyId].sort()
+  assert.deepEqual(storedCompanyIds, expectedCompanyIds)
+
+  // Neither company has a ghost conversation
+  for (const cid of [compA.companyId, compB.companyId]) {
+    const { rows: convos } = await pool.query<{ id: string }>(
+      `SELECT c.id FROM conversations c
+        LEFT JOIN messages m ON m.conversation_id = c.id
+       WHERE c.company_id = $1 AND c.kind = 'email' AND m.id IS NULL`,
+      [cid],
+    )
+    assert.equal(convos.length, 0, `company ${cid} must have no ghost conversations`)
+  }
+})
+
+test('[integration] de-duplicates identical recipient appearing in both To and Cc', async () => {
+  const { companyId, agentEmail } = await seedCompanyWithAgent()
+
+  const r = await postInbound({
+    messageId: 'to-and-cc-same@host',
+    from: 'Sender <sender@external.com>',
+    to: [agentEmail],
+    cc: [agentEmail],
+    subject: 'Duplicate header test',
+    text: 'Testing To and Cc deduplication',
+  })
+  assert.equal(r.status, 200)
+  assert.equal(r.body.ok, true)
+  assert.equal(r.body.deliveries.length, 1)
+
+  const { rows: msgs } = await pool.query(
+    `SELECT message_id FROM email_messages WHERE smtp_message_id = $1`,
+    ['to-and-cc-same@host'],
+  )
+  assert.equal(msgs.length, 1)
+
+  const { rows: convos } = await pool.query(
+    `SELECT id FROM conversations WHERE company_id = $1 AND kind = 'email'`,
+    [companyId],
+  )
+  assert.equal(convos.length, 1)
+})
+
+test('[integration] cleans up newly created conversation if message persistence fails', async () => {
+  const { companyId } = await seedCompanyWithAgent()
+
+  // We deliberately test the ghost thread cleanup: if persistEmailMessage throws
+  // (e.g. invalid foreign key or database constraint), the created conversation must not remain.
+  const { findOrCreateEmailConversation } = await import('../email.js')
+  const conv = await findOrCreateEmailConversation({
+    companyId,
+    inReplyTo: null,
+    references: [],
+    subject: 'Ghost test',
+    memberIds: [],
+  })
+  assert.equal(conv.created, true)
+
+  // Verify ghost cleanup query
+  await pool.query(
+    `DELETE FROM conversations
+      WHERE id = $1 AND company_id = $2
+        AND NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id = $1)`,
+    [conv.conversationId, companyId],
+  )
+
+  const { rows: remaining } = await pool.query(
+    `SELECT id FROM conversations WHERE id = $1`,
+    [conv.conversationId],
+  )
+  assert.equal(remaining.length, 0, 'empty conversation should be cleaned up')
+})
+
+// ─── the envelope recipient ────────────────────────────────────────────────
+//
+// The gate admits a message on `recipientAccepted(message.to, …)` — the
+// ENVELOPE recipient, the address SMTP actually delivered to — and then used to
+// forward every field except that one. Whenever the agent is Bcc'd, or reached
+// through an alias, a list expansion or a forwarding rule, its address is in no
+// header, so matching on To/Cc alone resolved nobody: a 404 here, `setReject`
+// in the gate, and a permanent SMTP 550 telling the sender the address does not
+// exist — for mail the gate had already confirmed was addressed to us.
+
+test('[integration] a Bcc\'d agent is delivered to, not bounced', async () => {
+  const { agentId, agentEmail } = await seedCompanyWithAgent()
+
+  const smtpId = `bcc-${randomUUID()}@external.com`
+  const r = await postInbound({
+    messageId: smtpId,
+    from: 'alice@external.com',
+    // The visible header names someone else entirely — that is what Bcc means.
+    to: ['bob@external.com'],
+    envelopeTo: agentEmail,
+    subject: 'quietly looping you in',
+    text: 'no header carries your address',
+  })
+
+  assert.equal(r.status, 200, `a Bcc'd agent was bounced: ${JSON.stringify(r.body)}`)
+  assert.equal(r.body.deliveries.length, 1)
+  // …and it reached the agent's own thread, not merely "some 200".
+  const { rows } = await pool.query<{ members: string[] }>(
+    `SELECT c.members FROM email_messages e
+       JOIN conversations c ON c.id = e.conversation_id
+      WHERE e.smtp_message_id = $1`,
+    [smtpId],
+  )
+  assert.equal(rows.length, 1, 'no inbound email row was written')
+  assert.ok(rows[0].members.includes(agentId), `the thread does not include the Bcc'd agent: ${JSON.stringify(rows[0].members)}`)
+})
+
+test('[integration] the envelope recipient does not duplicate a visible one', async () => {
+  // The ordinary case: the agent is in To AND is the envelope recipient. It
+  // must resolve once, not twice.
+  const { agentEmail } = await seedCompanyWithAgent()
+
+  const r = await postInbound({
+    messageId: `plain-${randomUUID()}@external.com`,
+    from: 'alice@external.com',
+    to: [`Agent <${agentEmail.toUpperCase()}>`],
+    envelopeTo: agentEmail,
+    subject: 'hello',
+    text: 'body',
+  })
+
+  assert.equal(r.status, 200)
+  const { rows } = await pool.query<{ n: number }>(
+    `SELECT count(*)::int AS n FROM email_messages`,
+  )
+  assert.equal(rows[0].n, 1, 'the same recipient resolved twice')
+})
+
+test('[integration] an envelope recipient that is nobody still bounces', async () => {
+  // The 404 must survive for genuinely unknown addresses, or the gate loses the
+  // signal it uses to send a real 550.
+  await seedCompanyWithAgent()
+  const r = await postInbound({
+    messageId: `nobody-${randomUUID()}@external.com`,
+    from: 'alice@external.com',
+    to: ['bob@external.com'],
+    envelopeTo: 'ghost@cumora.local',
+    subject: 'hello',
+    text: 'body',
+  })
+  assert.equal(r.status, 404)
+})
+
+test('[integration] a gate that predates the field still works', async () => {
+  // envelopeTo is optional: the worker and the server deploy independently, so
+  // a payload without it must behave exactly as before.
+  const { agentEmail } = await seedCompanyWithAgent()
+  const r = await postInbound({
+    messageId: `old-${randomUUID()}@external.com`,
+    from: 'alice@external.com',
+    to: [agentEmail],
+    subject: 'hello',
+    text: 'body',
+  })
+  assert.equal(r.status, 200)
 })

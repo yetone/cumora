@@ -1,4 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
+import { initialActiveIndex } from '@/lib/combobox-highlight'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
 
@@ -31,6 +32,10 @@ interface ComboboxProps<T extends string = string> {
   ariaLabel?: string
   className?: string
   emptyText?: string
+  /** Allow committing a value that is not present in options. Useful for model
+   * ids whose provider/account catalog cannot be enumerated reliably. */
+  allowCustom?: boolean
+  customLabel?: (value: string) => string
 }
 
 export function Combobox<T extends string = string>({
@@ -42,6 +47,8 @@ export function Combobox<T extends string = string>({
   ariaLabel,
   className,
   emptyText: emptyTextProp,
+  allowCustom = false,
+  customLabel = (customValue) => customValue,
 }: ComboboxProps<T>) {
   const t = useT()
   // Defaults resolve through t() so they follow the active locale;
@@ -65,13 +72,19 @@ export function Combobox<T extends string = string>({
       o.label.toLowerCase().includes(needle) || (o.hint?.toLowerCase().includes(needle) ?? false),
     )
   }, [options, query])
+  const customValue = allowCustom && query.trim()
+    && !options.some((option) => option.value.toLowerCase() === query.trim().toLowerCase())
+    ? query.trim()
+    : ''
+  const resultCount = filtered.length + (customValue ? 1 : 0)
 
-  // Keep the highlight on the current value when the menu (re)opens, else top.
+  // Keep the highlight on the current value when the menu (re)opens, else top —
+  // except when the query names one option exactly, which wins. See
+  // combobox-highlight.ts for the case that made the exception necessary.
   useEffect(() => {
     if (!open) return
-    const idx = filtered.findIndex((o) => o.value === value)
-    setActiveIndex(idx >= 0 ? idx : 0)
-  }, [open, filtered, value])
+    setActiveIndex(initialActiveIndex(filtered, value, query))
+  }, [open, filtered, value, query, customValue])
 
   // Close on outside click.
   useEffect(() => {
@@ -91,9 +104,14 @@ export function Combobox<T extends string = string>({
     onValueChange(o.value)
     setOpen(false); setQuery(''); inputRef.current?.blur()
   }
+  const commitCustom = () => {
+    if (!customValue) return
+    onValueChange(customValue as T)
+    setOpen(false); setQuery(''); inputRef.current?.blur()
+  }
 
   // Closed: show the selected label (or placeholder). Open: show the live query.
-  const displayValue = open ? query : (selected?.label ?? placeholder)
+  const displayValue = open ? query : (selected?.label ?? value ?? placeholder)
 
   return (
     <div ref={rootRef} className={cn('relative', className)}>
@@ -114,7 +132,7 @@ export function Combobox<T extends string = string>({
           aria-autocomplete="list"
           aria-expanded={open}
           aria-controls={`${id}-listbox`}
-          aria-activedescendant={open && filtered[activeIndex] ? `${id}-option-${activeIndex}` : undefined}
+          aria-activedescendant={open && activeIndex >= 0 && activeIndex < resultCount ? `${id}-option-${activeIndex}` : undefined}
           value={displayValue}
           placeholder={open ? searchPlaceholder : placeholder}
           onFocus={openMenu}
@@ -122,9 +140,9 @@ export function Combobox<T extends string = string>({
           onChange={(e) => { if (!open) setOpen(true); setQuery(e.target.value) }}
           onKeyDown={(e) => {
             if (e.nativeEvent.isComposing) return
-            if (e.key === 'ArrowDown') { e.preventDefault(); if (!open) { openMenu(); return } setActiveIndex((i) => Math.min(filtered.length - 1, i + 1)); return }
+            if (e.key === 'ArrowDown') { e.preventDefault(); if (!open) { openMenu(); return } setActiveIndex((i) => Math.min(resultCount - 1, i + 1)); return }
             if (e.key === 'ArrowUp')   { e.preventDefault(); if (!open) { openMenu(); return } setActiveIndex((i) => Math.max(0, i - 1)); return }
-            if (e.key === 'Enter')     { e.preventDefault(); commit(filtered[activeIndex]); return }
+            if (e.key === 'Enter')     { e.preventDefault(); if (activeIndex < filtered.length) commit(filtered[activeIndex]); else commitCustom(); return }
             if (e.key === 'Escape')    { e.preventDefault(); setOpen(false); setQuery('') }
           }}
           className="h-full min-w-0 flex-1 rounded-[14px] bg-transparent px-3.5 pr-10 text-[13px] font-semibold text-ink-900 outline-none placeholder:text-ink-300"
@@ -189,7 +207,26 @@ export function Combobox<T extends string = string>({
               </button>
             )
           })}
-          {filtered.length === 0 && (
+          {customValue && (
+            <button
+              id={`${id}-option-${filtered.length}`}
+              type="button"
+              role="option"
+              aria-selected={false}
+              onMouseDown={(e) => e.preventDefault()}
+              onMouseEnter={() => setActiveIndex(filtered.length)}
+              onClick={commitCustom}
+              className={cn(
+                'flex h-9 w-full items-center gap-2.5 rounded-[10px] px-3 text-left text-[12.5px] font-semibold transition',
+                activeIndex === filtered.length
+                  ? 'bg-sky2-50 text-skype-deep'
+                  : 'text-ink-700 hover:bg-sky2-50 hover:text-skype-deep',
+              )}
+            >
+              <span className="min-w-0 flex-1 truncate">{customLabel(customValue)}</span>
+            </button>
+          )}
+          {filtered.length === 0 && !customValue && (
             <div className="px-3 py-3 text-[12.5px] font-semibold text-ink-400">{emptyText}</div>
           )}
         </div>

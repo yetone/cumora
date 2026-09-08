@@ -10,10 +10,11 @@
 import type React from 'react'
 import { useEffect, useRef, useState } from 'react'
 import { api } from '@/api/client'
+import { useT } from '@/lib/i18n'
 import { useApp } from '@/stores/app'
 import { useAuth } from '@/stores/auth'
-import { useT } from '@/lib/i18n'
 import { InvitePeopleModal } from './InvitePeopleModal'
+import { WorkspaceSettingsModal } from './WorkspaceSettingsModal'
 
 export function CompanySwitcher() {
   const t = useT()
@@ -28,6 +29,7 @@ export function CompanySwitcher() {
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
   const [inviteOpen, setInviteOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
   const popRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
@@ -122,17 +124,27 @@ export function CompanySwitcher() {
           <div className="my-1 mx-2 h-px bg-ink-100" />
 
           {active && (active.role === 'owner' || active.role === 'admin') && (
-            <button
-              type="button"
-              onClick={() => { setInviteOpen(true); setOpen(false) }}
-              className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
-            >
-              <span
-                className="w-5 h-5 rounded grid place-items-center shrink-0 text-[11px]"
-                style={{ background: 'var(--sky-50)', color: 'var(--skype)' }}
-              >+</span>
-              <span className="flex-1">{t('company.invitePeoplePrefix')}<b className="font-semibold">{active.name}</b></span>
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => { setSettingsOpen(true); setOpen(false) }}
+                className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
+              >
+                <span className="w-5 h-5 rounded grid place-items-center shrink-0 text-[11px]" style={{ background: 'var(--sky-50)', color: 'var(--skype)' }}>⚙</span>
+                <span className="flex-1">{t('company.workspaceSettings')}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => { setInviteOpen(true); setOpen(false) }}
+                className="w-full px-3 py-1.5 flex items-center gap-2 text-left hover:bg-cloud transition text-[12px] text-ink-700"
+              >
+                <span
+                  className="w-5 h-5 rounded grid place-items-center shrink-0 text-[11px]"
+                  style={{ background: 'var(--sky-50)', color: 'var(--skype)' }}
+                >+</span>
+                <span className="flex-1">{t('company.invitePeoplePrefix')}<b className="font-semibold">{active.name}</b></span>
+              </button>
+            </>
           )}
 
           {creating ? (
@@ -178,7 +190,16 @@ export function CompanySwitcher() {
         <InvitePeopleModal
           companyId={active.id}
           companyName={active.name}
+          actorRole={active.role}
           onClose={() => setInviteOpen(false)}
+        />
+      )}
+      {settingsOpen && active && (
+        <WorkspaceSettingsModal
+          company={active}
+          companyCount={companies.length}
+          onInvite={() => { setSettingsOpen(false); setInviteOpen(true) }}
+          onClose={() => setSettingsOpen(false)}
         />
       )}
     </div>

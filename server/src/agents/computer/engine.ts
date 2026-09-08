@@ -3,7 +3,7 @@
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
  * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent,
- * OpenCode, or pi. The daemon (daemon.ts) hands
+ * OpenCode, pi, Gemini CLI, Qwen Code, or Antigravity. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * dedicated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -30,7 +30,9 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
+import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersion } from './cli-version.js'
+import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
 
 const IS_WIN = process.platform === 'win32'
 
@@ -349,10 +351,10 @@ function resolveCodexSpawn(): CodexSpawn {
   return { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -525,13 +527,12 @@ export interface EngineClassifyResult {
   model?: string | null
 }
 
-/** A `doctor` liveness probe for ONE brain tier of an engine: spawn it on the
- *  big (default reasoning) model or the small (cheap fast) model with a one-token
- *  prompt. Verifies the binary runs AND its auth/quota is good for that tier,
- *  without doing any real work. Reuses the same one-shot spawn path as triage. */
+/** A `doctor` liveness probe for ONE brain tier of an engine. Doctor has no
+ *  agent/DB context, so its small tier checks only the computer-level fallback,
+ *  not a member-specific fastModel pin. */
 export interface EngineProbeArgs {
-  /** 'big' → engine default model (main brain); 'small' → cheap fast model (the
-   *  cerebellum, e.g. Claude haiku) — the SAME model triage runs on. */
+  /** 'big' → engine default model; 'small' → computer-level cheap/fast
+   *  fallback. Member-specific pins are validated only during real triage. */
   tier: 'big' | 'small'
   /** Neutral temp cwd (no persona). */
   cwd: string
@@ -812,7 +813,9 @@ function countAssistantContent(content: unknown): { toolUses: number; textChars:
   return { toolUses, textChars }
 }
 
-function failurePreview(args: {
+/** Exported for tests: pure, and the only way to pin what an operator actually
+ *  reads after every cap downstream has taken its bite. */
+export function failurePreview(args: {
   exitCode: number
   signalName: NodeJS.Signals | null
   stderr: string[]
@@ -825,7 +828,21 @@ function failurePreview(args: {
   const prefix = args.signalName
     ? `process terminated by ${args.signalName}`
     : `process exited with code ${args.exitCode}`
-  return detail ? `${prefix}\n${detail}`.slice(0, MAX_FAILURE_CHARS) : prefix
+  if (!detail) return prefix
+  // Everything downstream cuts from the END — this cap, then the daemon's own
+  // 900-character one — and two of the engines put the reason on the LAST line.
+  // Measured on the installed binaries, each given one flag it does not know:
+  // gemini 0.1.15 prints 2,819 characters of help with the cause at offset
+  // 2,765; qwen 0.0.14, 3,798 with the cause at 3,744. Both dump their entire
+  // --help to stderr. So the operator's notice was 900 characters of option
+  // documentation, truncated mid-word, with no reason anywhere in it.
+  //
+  // salientError() already leads with this line, for exactly this reason, but
+  // only the probe and handshake paths go through it — an ordinary turn lands
+  // here instead. Lead with the cause and keep the full output behind it.
+  const rejected = argvRejection(detail)
+  const body = rejected ? `${rejected}\n${detail}` : detail
+  return `${prefix}\n${body}`.slice(0, MAX_FAILURE_CHARS)
 }
 
 /** Write to an engine's stdin without letting a dead pipe crash the process.
@@ -1033,9 +1050,7 @@ function spawnCapture(
   })
 }
 
-/** The small/fast model the triage path actually runs on. `probe` must use the
- *  SAME one or `doctor` reports a red small-brain for an operator whose custom
- *  provider has no `haiku` — even though their triage is configured correctly. */
+/** The computer-level small/fast model used by standalone probes. */
 function triageModel(fallback: string): string {
   return process.env.CUMORA_TRIAGE_MODEL?.trim() || fallback
 }
@@ -1340,6 +1355,7 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv): string
   pathDirs.push(dirname(process.execPath))
   const allowRead = [...new Set([agentHome, ...pathDirs])]
   return JSON.stringify({
+    ...readClaudeUserSettings(env).turnSettings,
     permissions: {
       defaultMode: 'dontAsk',
       // Restricted mode confines file tools to the working directory. Keep the
@@ -1393,13 +1409,58 @@ function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv): string[] 
   ]
 }
 
+/** Restricted Claude ignores ~/.claude/settings.json wholesale. Recover only
+ * the provider bootstrap variables its trusted core needs; claudeSecureSettings
+ * denies those names to every model-spawned subprocess. Compatibility mode
+ * keeps Claude's native settings loading and its already-explicit host risk. */
+function claudeCoreEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return allowUnsandboxedByoa(env) ? { ...env } : withClaudeUserSettingsEnv(env)
+}
+
+/** Pick the small brain inside the local provider namespace. An explicit
+ * per-agent/computer pin wins; next use the provider's configured fast model.
+ * If a custom endpoint names no fast model, omit --model and let that endpoint
+ * choose instead of injecting Anthropic's `haiku` alias. Anthropic's OWN base
+ * URL is not a custom endpoint — Claude Code exports it into every child
+ * process, so keying on "the variable is set" dropped Haiku for first-party
+ * accounts. */
+function claudeFastModelArgs(env: NodeJS.ProcessEnv, requested?: string | null): string[] {
+  const model = requested?.trim()
+    || env.CUMORA_TRIAGE_MODEL?.trim()
+    || env.ANTHROPIC_DEFAULT_HAIKU_MODEL?.trim()
+    || env.ANTHROPIC_SMALL_FAST_MODEL?.trim()
+  if (model) return ['--model', model]
+  return isCustomAnthropicEndpoint(env.ANTHROPIC_BASE_URL) ? [] : ['--model', 'haiku']
+}
+
+function claudeTurnEnv(env: NodeJS.ProcessEnv, fastModel?: string | null): NodeJS.ProcessEnv {
+  const core = claudeCoreEnv(env)
+  if (!allowUnsandboxedByoa(core)) {
+    for (const [key, value] of Object.entries(readClaudeUserSettings(env).turnEnv)) {
+      if (core[key] === undefined) core[key] = value
+    }
+  }
+  const turnEnv: NodeJS.ProcessEnv = {
+    ...core,
+    CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa(core)
+      ? core.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
+      : '1',
+  }
+  if (fastModel) {
+    turnEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = fastModel
+    turnEnv.ANTHROPIC_SMALL_FAST_MODEL = fastModel
+  }
+  return turnEnv
+}
+
 class ClaudeAdapter implements EngineAdapter {
   readonly id = 'claude' as const
   readonly bin = 'claude'
 
   async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
-    // Plain headless completion on Claude Code's own cheap fast model (Haiku) —
-    // exactly what Claude Code uses for its OWN quick judgments. NO tools, NO
+    // Plain headless completion on Claude Code's cheap fast model (Haiku for a
+    // first-party account, or the custom provider's configured/default model).
+    // NO tools, NO
     // MCP (--strict-mcp-config, no --mcp-config = zero MCP init, the slowest
     // part of a cold `claude` spawn), NO session, thinking off, neutral cwd (no
     // persona CLAUDE.md). Just text in → JSON out, locally. Never the cloud.
@@ -1407,7 +1468,8 @@ class ClaudeAdapter implements EngineAdapter {
     // token usage (incl. cache_read/cache_creation) → we unwrap `.result` as the
     // text and pass `.usage` up for the triage cost ledger.
     const flags = unsafeEngineArgs('CUMORA_TRIAGE_ARGS')
-    const model = ['--model', args.model || 'haiku']
+    const env = claudeCoreEnv(args.env)
+    const model = claudeFastModelArgs(env, args.model)
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
     const usingJson = flags.length === 0
     // On Windows the .cmd shim runs via the shell, which can't carry the big
@@ -1416,13 +1478,13 @@ class ClaudeAdapter implements EngineAdapter {
     // before (unchanged).
     const base = flags.length
       ? [...flags, '-p']
-      : allowUnsandboxedByoa()
+      : allowUnsandboxedByoa(env)
         ? ['-p', ...model, '--output-format', 'json', '--dangerously-skip-permissions', '--strict-mcp-config']
         : ['-p', ...model, '--output-format', 'json', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
     const res = await spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...args.env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0' },
       signal: args.signal,
       onLog: args.onLog,
       shell,
@@ -1442,18 +1504,19 @@ class ClaudeAdapter implements EngineAdapter {
 
   probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
     // Mirror classify's clean one-shot spawn, but pick the tier's model: 'small'
-    // → haiku (the cerebellum); 'big' → omit --model so Claude uses its DEFAULT
-    // (the main reasoning brain). One token in, "OK" out — proves the binary runs
+    // → the resolved provider-local cerebellum; 'big' → omit --model so Claude
+    // uses its default main reasoning brain. One token in, "OK" out — proves the binary runs
     // and that tier is authed/has quota, with NO tools/MCP/persona.
-    const model = args.tier === 'small' ? ['--model', triageModel('haiku')] : []
+    const env = claudeCoreEnv(args.env)
+    const model = args.tier === 'small' ? claudeFastModelArgs(env) : []
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = allowUnsandboxedByoa()
+    const base = allowUnsandboxedByoa(env)
       ? ['-p', ...model, '--output-format', 'text', '--dangerously-skip-permissions', '--strict-mcp-config']
       : ['-p', ...model, '--output-format', 'text', '--restricted', '--tools', '', '--strict-mcp-config']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...args.env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0' },
       signal: args.signal,
       shell,
       stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
@@ -1477,8 +1540,9 @@ class ClaudeAdapter implements EngineAdapter {
     const promptFile = join(args.cwd, '.cumora-doctor-standing.md')
     try { await writeFile(promptFile, '', 'utf8') }
     catch (err) { return { ok: false, detail: `could not write standing-prompt probe file: ${err instanceof Error ? err.message : String(err)}` } }
+    const env = claudeCoreEnv(args.env)
     const { command, shell, wantsStdinPrompt } = resolveSpawn(this.bin)
-    const base = allowUnsandboxedByoa()
+    const base = allowUnsandboxedByoa(env)
       ? ['-p', '--output-format', 'text', '--append-system-prompt-file', promptFile, '--dangerously-skip-permissions']
       : [
           '-p', '--output-format', 'text', '--append-system-prompt-file', promptFile,
@@ -1487,7 +1551,7 @@ class ClaudeAdapter implements EngineAdapter {
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     const r = await spawnCapture(command, argv, {
       cwd: args.cwd,
-      env: { ...args.env, MAX_THINKING_TOKENS: '0' },
+      env: { ...env, MAX_THINKING_TOKENS: '0' },
       signal: args.signal,
       shell,
       stdinText: wantsStdinPrompt ? DOCTOR_PROMPT : undefined,
@@ -1524,6 +1588,7 @@ class ClaudeAdapter implements EngineAdapter {
     // Big-brain model → --model; small-brain → ANTHROPIC_SMALL_FAST_MODEL env.
     const flags = unsafeEngineArgs('CUMORA_CLAUDE_ARGS')
     const model = args.model ? ['--model', args.model] : []
+    const env = claudeTurnEnv(args.env, args.fastModel)
     // Continuous context across wakes: resume the agent's prior session so it
     // remembers the running task (its place in a counting relay, what it already
     // said) instead of re-deriving from a frozen inbox snapshot each time.
@@ -1533,23 +1598,12 @@ class ClaudeAdapter implements EngineAdapter {
     // unchanged (prompt in argv).
     const base = flags.length
       ? [...flags, ...resume, '-p']
-      : allowUnsandboxedByoa()
+      : allowUnsandboxedByoa(env)
         ? ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions']
-        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, args.env)]
+        : ['-p', ...resume, ...model, '--output-format', 'stream-json', '--verbose', ...claudeSecureFlags(args.home, env)]
     const argv = wantsStdinPrompt ? base : (flags.length ? [...base, args.prompt] : ['-p', args.prompt, ...base.slice(1)])
-    // BYOA turns are short reactive cycles (read inbox, maybe reply). Extended
-    // thinking just adds latency + cost here, and in a group @all it makes the
-    // slowest agent finish last and bow out on the "don't duplicate" rule. Disable
-    // it by default (MAX_THINKING_TOKENS=0); a user can re-enable by exporting their
-    // own MAX_THINKING_TOKENS before launching the daemon.
-    const env: NodeJS.ProcessEnv = {
-      ...args.env,
-      MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa()
-        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
-        : '1',
-    }
-    if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
+    // Agent turns can be substantial engineering/design work. Preserve the
+    // operator's reasoning preferences; only triage/doctor force thinking off.
     return spawnEngine(command, argv, { ...args, env }, { shell, stdinText: wantsStdinPrompt ? args.prompt : undefined })
   }
 
@@ -1558,6 +1612,7 @@ class ClaudeAdapter implements EngineAdapter {
     // persistent path — those flags are tuned for the one-shot run; fall back to run().
     if (unsafeEngineArgs('CUMORA_CLAUDE_ARGS').length) return null
     const model = args.model ? ['--model', args.model] : []
+    const env = claudeTurnEnv(args.env, args.fastModel)
     // --resume only on the FIRST spawn / after a restart, to continue a prior
     // session; inside a live process the session continues on its own.
     const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
@@ -1571,23 +1626,15 @@ class ClaudeAdapter implements EngineAdapter {
       try { atomicAgentWriteSync(file, args.standingPrompt); sys = ['--append-system-prompt-file', file]; carriesStanding = true }
       catch { /* couldn't write → leave it; the daemon inlines the standing prompt instead */ }
     }
-    const argv = allowUnsandboxedByoa()
+    const argv = allowUnsandboxedByoa(env)
       ? [
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
           ...resume, ...sys, ...model, '--dangerously-skip-permissions',
         ]
       : [
           '-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose',
-          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, args.env),
+          ...resume, ...sys, ...model, ...claudeSecureFlags(args.home, env),
         ]
-    const env: NodeJS.ProcessEnv = {
-      ...args.env,
-      MAX_THINKING_TOKENS: args.env.MAX_THINKING_TOKENS ?? '0',
-      CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: allowUnsandboxedByoa()
-        ? args.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB
-        : '1',
-    }
-    if (args.fastModel) env.ANTHROPIC_SMALL_FAST_MODEL = args.fastModel
     return new ClaudeSession(this.bin, argv, { ...args, env }, carriesStanding)
   }
 }
@@ -1615,6 +1662,9 @@ type CodexRpcMsg = {
 
 const CODEX_SECURE_CONFIG_ARGS = [
   '--strict-config',
+  // The unelevated restricted-token sandbox cannot enforce Cumora's split
+  // filesystem profile. Native Windows uses Codex's elevated sandbox instead.
+  ...(IS_WIN ? ['-c', 'windows.sandbox="elevated"'] : []),
   '-c', 'default_permissions="cumora"',
   '-c', 'permissions.cumora.network.enabled=false',
   '-c', 'shell_environment_policy.inherit="none"',
@@ -1680,6 +1730,17 @@ export function noteCodexConfigRejection(err: string | undefined, onLog?: (line:
   onLog?.(hint)
   console.warn(hint)
   return true
+}
+
+/** The `-c` sandbox profile without the `exec`-only tail, so the persistent
+ *  app-server path is confined by exactly the same profile as the one-shot path.
+ *  This is the set production has since run clean: zero config rejections across
+ *  every turn on 0.11.1 daemons. */
+function codexSecureConfigOverrides(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
+  const full = codexSecureExecArgs(args, readOnly)
+  const exec = full.indexOf('exec')
+  // Everything before `-a never exec …` is the config profile.
+  return exec === -1 ? full : full.slice(0, Math.max(0, exec - 2))
 }
 
 function codexSecureExecArgs(args: { home: string; env: NodeJS.ProcessEnv }, readOnly = false): string[] {
@@ -2184,10 +2245,20 @@ class CodexAdapter implements EngineAdapter {
     // Escape hatches → fall back to one-shot `codex exec` (run()): a custom-args
     // override, an explicit opt-out, or Windows (JSON-RPC over a .cmd shell is
     // fragile; exec is the safe path there).
-    // app-server currently has no equivalent to exec --ignore-user-config, so
-    // user MCP/hook/config layers cannot be excluded. Keep the secure default
-    // on the one-shot path; persistent compatibility is an explicit opt-in.
-    if (!allowUnsandboxedByoa()) return null
+    //
+    // This used to `return null` unless BYOA was explicitly unsandboxed, because
+    // app-server has no equivalent to `exec --ignore-user-config`. The cost of
+    // that was invisible in the code: with no persistent process every codex
+    // turn is a fresh session, so agents answered each message with no memory of
+    // the one before — what users reported as the agent not remembering the
+    // previous exchange.
+    //
+    // `-c` are global flags and DO apply to app-server, so the filesystem,
+    // network, environment and feature profile below is identical on both paths.
+    // What app-server cannot exclude is a user's own ~/.codex adding EXTRA
+    // mcp_servers — a narrower gap than losing every agent's continuity, on the
+    // operator's own machine, with their own config. CUMORA_CODEX_NO_APP_SERVER=1
+    // still opts out, and a failing session degrades to one-shot (see daemon.ts).
     if (unsafeEngineArgs('CUMORA_CODEX_ARGS').length) return null
     if (process.env.CUMORA_CODEX_NO_APP_SERVER === '1') return null
     if (IS_WIN) return null
@@ -2196,7 +2267,13 @@ class CodexAdapter implements EngineAdapter {
     // Standing prompt rides the thread's developerInstructions (see CodexSession),
     // approval/sandbox are set per-thread, so no global bypass flags are needed.
     const { command, argsPrefix } = resolveCodexSpawn()
-    return new CodexSession(command, [...argsPrefix, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
+    // Confine the persistent process with the same profile the one-shot path
+    // uses. `-c` are global flags and apply to app-server too, so filesystem,
+    // network, environment and features are identical on both paths.
+    const secure = allowUnsandboxedByoa()
+      ? []
+      : codexSecureConfigOverrides({ home: args.home, env: args.env })
+    return new CodexSession(command, [...argsPrefix, ...secure, 'app-server', '--listen', 'stdio://'], args.home, args.env, args)
   }
 }
 
@@ -4620,6 +4697,410 @@ class QwenAdapter implements EngineAdapter {
   // fresh one, which is what the one-shot path already does.
 }
 
+// ─── Antigravity CLI ──────────────────────────────────────────────────────────────────
+//
+// `agy --input-format stream-json --output-format stream-json` is a real
+// long-lived protocol: one NDJSON user event goes in per turn and exactly one
+// terminal result event comes back. Result usage is CUMULATIVE for the whole
+// process, so the tracker must subtract the previous total before handing a
+// turn to Cumora's ledger. Treating the result as per-turn silently bills the
+// first turn again on every later wake.
+
+interface AntigravityNativeUsage {
+  input_tokens?: number
+  output_tokens?: number
+  thinking_tokens?: number
+  cache_read_tokens?: number
+  total_tokens?: number
+}
+
+interface AntigravityEvent {
+  event?: string
+  conversation_id?: string
+  init?: { conversation_id?: string; model?: string }
+  step_update?: {
+    conversation_id?: string
+    step_index?: number
+    state?: string
+    step_type?: string
+    text_delta?: string
+    tool_info?: unknown
+  }
+  result?: {
+    conversation_id?: string
+    status?: string
+    response?: string
+    error?: string
+    duration_seconds?: number
+    num_turns?: number
+    model?: string
+    usage?: AntigravityNativeUsage
+  }
+}
+
+function antigravityCounter(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0
+}
+
+/** Convert Antigravity's counters without charging cache reads twice.
+ *
+ * `input_tokens` is the complete prompt, including cache reads (the documented
+ * examples satisfy total = input + output). Cumora's common shape wants fresh
+ * input and cache reads in disjoint fields. `thinking_tokens` is a subset of
+ * output_tokens, not an extra token class, so it is intentionally not added
+ * again. */
+function antigravityUsage(raw: AntigravityNativeUsage | undefined): EngineUsage | undefined {
+  if (!raw) return undefined
+  const cached = antigravityCounter(raw.cache_read_tokens)
+  const input = Math.max(0, antigravityCounter(raw.input_tokens) - cached)
+  const output = antigravityCounter(raw.output_tokens)
+  if (!input && !output && !cached) return undefined
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    cache_read_input_tokens: cached,
+  }
+}
+
+function antigravityUsageDelta(
+  current: AntigravityNativeUsage | undefined,
+  previous: AntigravityNativeUsage | undefined,
+): AntigravityNativeUsage | undefined {
+  if (!current) return undefined
+  const delta = (key: keyof AntigravityNativeUsage): number => {
+    const now = antigravityCounter(current[key])
+    const before = antigravityCounter(previous?.[key])
+    // A CLI-side session reset makes the cumulative total smaller. That new
+    // value is the whole current turn, not a negative delta.
+    return now >= before ? now - before : now
+  }
+  return {
+    input_tokens: delta('input_tokens'),
+    output_tokens: delta('output_tokens'),
+    thinking_tokens: delta('thinking_tokens'),
+    cache_read_tokens: delta('cache_read_tokens'),
+    total_tokens: delta('total_tokens'),
+  }
+}
+
+function parseAntigravityLine(line: string): AntigravityEvent | null {
+  if (!line.startsWith('{')) return null
+  try { return JSON.parse(line) as AntigravityEvent } catch { return null }
+}
+
+class AntigravityTurnTracker {
+  sessionId: string | null = null
+  model: string | null
+  text = ''
+  error: string | null = null
+  usage: EngineUsage | undefined
+  private previousUsage: AntigravityNativeUsage | undefined
+  private startedAt: number | null = null
+  private toolUses = 0
+  private readonly seenToolSteps = new Set<number>()
+  private hopIndex = 0
+
+  constructor(
+    pin: string | null,
+    private readonly onHopUsage?: (report: EngineHopReport) => void,
+  ) {
+    this.model = pin
+  }
+
+  beginTurn(): void {
+    this.text = ''
+    this.error = null
+    this.usage = undefined
+    this.startedAt = Date.now()
+    this.toolUses = 0
+    this.seenToolSteps.clear()
+  }
+
+  /** Feed one event. True means the current turn reached its terminal result. */
+  observe(event: AntigravityEvent): boolean {
+    const id = event.conversation_id ?? event.init?.conversation_id ?? event.result?.conversation_id
+    if (typeof id === 'string' && id) this.sessionId = id
+    const namedModel = event.init?.model ?? event.result?.model
+    if (typeof namedModel === 'string' && namedModel) this.model = namedModel
+
+    if (event.event === 'step_update') {
+      const step = event.step_update
+      if (step?.tool_info != null && step.state === 'DONE' && typeof step.step_index === 'number' && !this.seenToolSteps.has(step.step_index)) {
+        this.seenToolSteps.add(step.step_index)
+        this.toolUses += 1
+      }
+      return false
+    }
+    if (event.event !== 'result' || !event.result) return false
+
+    const result = event.result
+    if (typeof result.response === 'string') this.text = result.response
+    if (result.status !== 'SUCCESS') {
+      this.error = typeof result.error === 'string' && result.error
+        ? result.error
+        : `antigravity turn ended with status ${result.status || 'UNKNOWN'}`
+    }
+    const delta = antigravityUsageDelta(result.usage, this.previousUsage)
+    this.previousUsage = result.usage
+    this.usage = antigravityUsage(delta)
+    if (this.usage && this.onHopUsage) {
+      this.hopIndex += 1
+      try {
+        this.onHopUsage({
+          model: this.model ?? 'antigravity',
+          usage: this.usage,
+          latencyMs: this.startedAt == null ? undefined : Date.now() - this.startedAt,
+          hopIndex: this.hopIndex,
+          toolUses: this.toolUses,
+          textChars: this.text.length,
+        })
+      } catch { /* ledger reporting is best-effort */ }
+    }
+    return true
+  }
+}
+
+class AntigravitySession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly tracker: AntigravityTurnTracker
+  private readonly decoder = new StringDecoder('utf8')
+  private outBuf = ''
+  private exited = false
+  private exitCode = 0
+  private stderrTail: string[] = []
+  private stdoutTail: string[] = []
+  private pending: { resolve: (result: EngineRunResult) => void } | null = null
+  private stopPromise: Promise<void> | null = null
+  readonly carriesStandingPrompt = false
+
+  constructor(
+    command: string,
+    argv: string[],
+    shell: boolean,
+    private readonly opts: EngineSessionArgs,
+    pin: string | null,
+  ) {
+    this.tracker = new AntigravityTurnTracker(pin, opts.onHopUsage)
+    this.child = spawnEngineChild(command, argv, {
+      cwd: opts.home,
+      env: opts.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell,
+    })
+    this.child.stdout?.on('data', (buf: Buffer) => this.onStdout(buf))
+    this.child.stderr?.on('data', (buf: Buffer) => this.onStderr(buf))
+    this.child.on('error', (err) => this.die(1, err.message))
+    this.child.on('close', (code, signalName) => {
+      this.flushStdout()
+      this.die(code ?? (signalName ? 128 : 1), signalName ? `terminated by ${signalName}` : `exited with code ${code}`)
+    })
+  }
+
+  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.tracker.sessionId }
+  get text(): string { return this.tracker.text }
+
+  send(prompt: string): Promise<EngineRunResult> {
+    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sessionId })
+    if (!this.alive) {
+      return Promise.resolve({
+        exitCode: this.exitCode || 1,
+        error: failurePreview({ exitCode: this.exitCode || 1, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail }),
+        sessionId: this.sessionId,
+      })
+    }
+    this.tracker.beginTurn()
+    return new Promise((resolve) => {
+      this.pending = { resolve }
+      const message = JSON.stringify({ event: 'user', message: { content: stripLoneSurrogates(prompt) } })
+      if (!writeStdin(this.child, `${message}\n`)) {
+        this.settle({ exitCode: 1, error: 'failed to write turn to antigravity', sessionId: this.sessionId })
+      }
+    })
+  }
+
+  steer(_text: string): void {
+    // The documented protocol requires waiting for a result before the next
+    // user event. Queueing mid-turn would be an undocumented race; the daemon's
+    // normal coalesced wake delivers the ping after this turn instead.
+    if (this.pending) this.opts.onLog('[antigravity] same-turn steer is not supported; the ping rides the next wake')
+  }
+
+  stop(options: { force?: boolean } = {}): Promise<void> {
+    this.exited = true
+    try { this.child.stdin?.end() } catch { /* ignore */ }
+    if (options.force) return terminateEngineTree(this.child, true)
+    if (!this.stopPromise) {
+      this.stopPromise = (async () => {
+        if (await waitForChildExit(this.child, 2_000)) return
+        await terminateEngineTree(this.child)
+      })()
+    }
+    return this.stopPromise
+  }
+
+  private onStdout(buf: Buffer): void {
+    this.outBuf += this.decoder.write(buf)
+    let newline: number
+    while ((newline = this.outBuf.indexOf('\n')) >= 0) {
+      const raw = this.outBuf.slice(0, newline)
+      this.outBuf = this.outBuf.slice(newline + 1)
+      this.takeLine(raw)
+    }
+  }
+
+  private flushStdout(): void {
+    this.outBuf += this.decoder.end()
+    if (this.outBuf) this.takeLine(this.outBuf)
+    this.outBuf = ''
+  }
+
+  private takeLine(raw: string): void {
+    const line = cleanLine(raw)
+    if (!line) return
+    pushTail(this.stdoutTail, line)
+    this.opts.onLog(line)
+    const event = parseAntigravityLine(line)
+    if (event && this.tracker.observe(event)) {
+      const eventError = this.tracker.error
+      this.settle({
+        exitCode: eventError ? 1 : 0,
+        error: eventError ? `engine turn error: ${eventError.slice(0, MAX_FAILURE_CHARS)}` : undefined,
+        sessionId: this.tracker.sessionId,
+        usage: this.tracker.usage,
+        model: this.tracker.model,
+      })
+    }
+  }
+
+  private onStderr(buf: Buffer): void {
+    for (const raw of buf.toString('utf8').split('\n')) {
+      const line = cleanLine(raw)
+      if (!line) continue
+      pushTail(this.stderrTail, line)
+      this.opts.onLog(line)
+    }
+  }
+
+  private settle(result: EngineRunResult): void {
+    const pending = this.pending
+    if (!pending) return
+    this.pending = null
+    pending.resolve(result)
+  }
+
+  private die(code: number, detail: string): void {
+    if (this.exited && !this.pending) return
+    this.exited = true
+    this.exitCode = code
+    if (this.pending) {
+      this.settle({
+        exitCode: code || 1,
+        error: failurePreview({ exitCode: code || 1, signalName: null, stderr: this.stderrTail, stdout: this.stdoutTail }) || detail,
+        sessionId: this.sessionId,
+        usage: this.tracker.usage,
+        model: this.tracker.model,
+      })
+    }
+  }
+}
+
+class AntigravityAdapter implements EngineAdapter {
+  readonly id = 'antigravity' as const
+  readonly bin = 'agy'
+
+  private sessionArgs(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): string[] {
+    const model = args.model ? ['--model', args.model] : []
+    return [
+      '--input-format', 'stream-json',
+      '--output-format', 'stream-json',
+      '--sandbox',
+      '--mode', mode,
+      '--dangerously-skip-permissions',
+      '--disable-slash-commands',
+      ...model,
+    ]
+  }
+
+  private start(args: EngineSessionArgs, mode: 'accept-edits' | 'plan'): AntigravitySession {
+    const { command, shell } = resolveSpawn(this.bin)
+    // Do not pass --conversation across daemon restarts yet. Its result usage is
+    // cumulative over the historical conversation, while Cumora persists only
+    // the id, not the prior counters; resuming would overbill that history as
+    // the first new turn. The per-agent home + memory remains durable.
+    return new AntigravitySession(command, this.sessionArgs(args, mode), shell, args, args.model ?? null)
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return this.start(args, 'accept-edits')
+  }
+
+  async run(args: EngineRunArgs): Promise<EngineRunResult> {
+    if (args.signal.aborted) return { exitCode: 130, error: 'engine turn aborted before start', sessionId: null }
+    const sessionArgs: EngineSessionArgs = {
+      home: args.home,
+      env: args.env,
+      model: args.model,
+      fastModel: args.fastModel,
+      resumeSessionId: args.resumeSessionId,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    }
+    const session = this.start(sessionArgs, 'accept-edits')
+    const onAbort = (): void => { void session.stop({ force: true }) }
+    args.signal.addEventListener('abort', onAbort, { once: true })
+    if (args.signal.aborted) onAbort()
+    try {
+      if (args.signal.aborted) return { exitCode: 130, error: 'engine turn aborted before start', sessionId: null }
+      return await session.send(args.prompt)
+    } finally {
+      args.signal.removeEventListener('abort', onAbort)
+      await session.stop()
+    }
+  }
+
+  async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    const session = this.start({
+      home: args.cwd,
+      env: args.env,
+      model: args.model ?? process.env.CUMORA_TRIAGE_MODEL ?? null,
+      onLog: args.onLog ?? (() => {}),
+    }, 'plan')
+    const onAbort = (): void => { void session.stop({ force: true }) }
+    args.signal.addEventListener('abort', onAbort, { once: true })
+    if (args.signal.aborted) onAbort()
+    try {
+      if (args.signal.aborted) return { text: '', error: 'engine turn aborted before start' }
+      const result = await session.send(args.prompt)
+      return { text: session.text, error: result.error, usage: result.usage, model: result.model }
+    } finally {
+      args.signal.removeEventListener('abort', onAbort)
+      await session.stop()
+    }
+  }
+
+  async probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    const model = args.tier === 'small' ? (process.env.CUMORA_TRIAGE_MODEL ?? null) : null
+    return this.classify({ cwd: args.cwd, prompt: DOCTOR_PROMPT, env: args.env, model, signal: args.signal })
+  }
+
+  probeWake(_args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // classify()/probe() use the same bidirectional stream-json protocol as a
+    // real wake, only in plan mode, so the brain probes already cover it.
+    return Promise.resolve({ ok: true, detail: '', skipped: true })
+  }
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
+    await writeFile(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
+      'utf8',
+    )
+  }
+}
+
 
 const ADAPTERS: Record<EngineId, EngineAdapter> = {
   claude: new ClaudeAdapter(),
@@ -4630,6 +5111,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   pi: new PiAdapter(),
   gemini: new GeminiAdapter(),
   qwen: new QwenAdapter(),
+  antigravity: new AntigravityAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -4676,6 +5158,12 @@ export interface DetectedEngineSnapshot {
   latest?: string | null
   outdated?: boolean
   updateCommand?: string | null
+  /** Why this installed engine will NOT be driven — the reason
+   *  evaluateRunnableEngines() produced. Absent on runnable engines. */
+  blockedReason?: string
+  /** Account/config-specific model choices discovered by the daemon that owns
+   * this CLI login. Absent on the cheap pairing snapshot and older daemons. */
+  modelCatalog?: EngineModelCatalog
 }
 
 /** Snapshot the installed engines, optionally in a caller-supplied order
@@ -4697,11 +5185,15 @@ export async function snapshotDetectedEngines(ids?: EngineId[]): Promise<Detecte
  *  sitting and waiting on. */
 export async function enrichDetectedEngines(
   snapshot: DetectedEngineSnapshot[],
+  refreshModelCatalog = false,
 ): Promise<DetectedEngineSnapshot[]> {
-  return Promise.all(snapshot.map(async (entry) => ({
-    ...entry,
-    ...await probeEngineVersion(entry.id, entry.path),
-  })))
+  return Promise.all(snapshot.map(async (entry) => {
+    const [version, modelCatalog] = await Promise.all([
+      probeEngineVersion(entry.id, entry.path),
+      discoverEngineModelCatalog(entry.id, entry.path, refreshModelCatalog),
+    ])
+    return { ...entry, ...version, modelCatalog }
+  }))
 }
 
 /** Resolve a bin's absolute path on PATH (the first hit), or null if absent. */

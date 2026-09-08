@@ -24,6 +24,7 @@ import { pool } from '../db/pool.js'
 import { readDocumentText, subscribe } from '../documents/rooms.js'
 import { env } from '../env.js'
 import { CH_DOCS, redis } from '../redis.js'
+import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from '../realtime-outbox.js'
 import {
   ensureSchemaOnce, resetAllTables, seedCompanyWithAgent, teardownAll,
 } from './_helpers.js'
@@ -81,10 +82,25 @@ async function seedAgent(companyId?: string, agentId?: string): Promise<{
   token: string
 }> {
   const seeded = await seedCompanyWithAgent({ companyId, agentId })
+  const { rows } = await pool.query<{
+    computer_id: string | null
+    runtime_assignment_id: string
+  }>(
+    `SELECT computer_id, runtime_assignment_id
+       FROM participants
+      WHERE id = $1 AND company_id = $2 AND kind = 'agent'`,
+    [seeded.agentId, seeded.companyId],
+  )
+  assert.ok(rows[0], 'runtime token fixture requires a live Agent placement')
   return {
     companyId: seeded.companyId,
     agentId: seeded.agentId,
-    token: signAgentToken({ agentId: seeded.agentId, companyId: seeded.companyId }),
+    token: signAgentToken({
+      agentId: seeded.agentId,
+      companyId: seeded.companyId,
+      computerId: rows[0].computer_id,
+      assignmentId: rows[0].runtime_assignment_id,
+    }),
   }
 }
 
@@ -196,7 +212,7 @@ test('[integration] runtime notices: a queued kick wins before notice authorizat
     // Queue the real membership mutation first. It holds both participant rows
     // while waiting for our conversation lock.
     kickPromise = runCli(['--as', actor.agentId, 'kick', conversationId, target.agentId])
-    await waitForBlockedQuery('%UPDATE conversations c%SET members = members -%')
+    await waitForBlockedQuery('%SELECT c.id%FROM conversations c%FOR UPDATE OF c%')
 
     // The notice request passes JWT validation, then blocks on the target's
     // participant row behind the already-queued kick transaction.
@@ -411,6 +427,7 @@ test('[integration] CLI document change events are published only after commit',
   const subscriber = redis.duplicate({ enableOfflineQueue: true, maxRetriesPerRequest: null })
   await observer.connect()
   await subscriber.subscribe(CH_DOCS)
+  startRealtimeOutboxWorker()
 
   type ChangedEvent = {
     type: 'doc.changed'
@@ -479,6 +496,7 @@ test('[integration] CLI document change events are published only after commit',
     assert.equal(deleted.ok, true, deleted.text)
     await deleteObserved
   } finally {
+    stopRealtimeOutboxWorker()
     await subscriber.unsubscribe(CH_DOCS).catch(() => {})
     await subscriber.quit().catch(() => {})
     await observer.end().catch(() => {})

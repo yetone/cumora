@@ -14,7 +14,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolveEngineModel, resolveEngineFastModel } from '../agents/computer/daemon.js'
+import { resolveEngineModel, resolveEngineFastModel, resolveTriageModel } from '../agents/computer/daemon.js'
 
 test('with no override, the model Cumora pinned is used', () => {
   assert.equal(resolveEngineModel('claude-opus-4-7', undefined), 'claude-opus-4-7')
@@ -57,4 +57,17 @@ test('an empty or whitespace-only override is ignored, not treated as `local`', 
   // An exported-but-empty env var must not silently unpin the model.
   assert.equal(resolveEngineModel('claude-opus-4-7', ''), 'claude-opus-4-7')
   assert.equal(resolveEngineModel('claude-opus-4-7', '   '), 'claude-opus-4-7')
+})
+
+test('per-agent small brain wins over the computer-wide triage model', () => {
+  assert.equal(resolveTriageModel('gpt-5.4-mini', 'gpt-5.6-luna', undefined), 'gpt-5.4-mini')
+})
+
+test('computer-wide triage model remains the fallback for an unpinned agent', () => {
+  assert.equal(resolveTriageModel(null, 'gpt-5.6-luna', undefined), 'gpt-5.6-luna')
+  assert.equal(resolveTriageModel(null, undefined, undefined), undefined)
+})
+
+test('local engine override suppresses the agent fast pin but keeps the explicit triage fallback', () => {
+  assert.equal(resolveTriageModel('claude-haiku-4-5', 'local-provider/fast', 'local'), 'local-provider/fast')
 })

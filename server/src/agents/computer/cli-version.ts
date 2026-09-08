@@ -115,6 +115,10 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     versionArgs: ['--version'],
     npm: '@qwen-code/qwen-code',
   },
+  antigravity: {
+    versionArgs: ['--version'],
+    selfUpdate: 'agy update',
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',
@@ -137,10 +141,50 @@ export function clearLatestCache(): void {
 
 /** Pull the first version-looking token out of CLI output. Accepts both semver
  *  and the CalVer some vendors print (`2026.08.30`). */
+/** Lines that carry a version number but never the CLI's OWN version.
+ *
+ *  `npm warn EBADENGINE Unsupported engine { required: { node: '>=20.19.0' } }`
+ *  and `(node:1234) [DEP0040] DeprecationWarning: …` both routinely precede a
+ *  CLI's real output, and both contain something that looks exactly like a
+ *  version. Taking the first match in the combined stream then reads the
+ *  warning's number as the engine's version — which is how a Claude Code 2.0.9
+ *  came back as "20.19.0" and satisfied the 2.1.248 secure floor. The gate that
+ *  exists to refuse an un-sandboxable CLI failed OPEN on unrelated noise. */
+const VERSION_NOISE_LINE =
+  /^\s*(?:npm\s+(?:warn|WARN|notice|err)|\(node:\d+\)|warning:|warn\b|deprecat|debugger\s|\[dep\d)/i
+
+const VERSION_TOKEN = /v?(\d{4}\.\d{2}\.\d{2}(?:-[\w.]+)?|\d+\.\d+\.\d+(?:[-+][\w.]+)?)/i
+
+/** The version a command reported. stdout is what a CLI prints its own version
+ *  on, so it is asked first; stderr is only a fallback for the engines that
+ *  report there, and can no longer outrank the real answer. */
+export function versionFromOutput(out: CommandOutput): string | null {
+  return parseCliVersion(out.stdout) ?? parseCliVersion(out.stderr)
+}
+
+/** The version a CLI reported, ignoring lines that are someone else's version.
+ *
+ *  Scans line by line rather than the blob so a warning cannot win merely by
+ *  arriving first. */
 export function parseCliVersion(text: string | null | undefined): string | null {
   if (!text) return null
-  const m = text.match(/v?(\d{4}\.\d{2}\.\d{2}(?:-[\w.]+)?|\d+\.\d+\.\d+(?:[-+][\w.]+)?)/i)
-  return m ? m[1] : null
+  // Warnings are frequently multi-line, and only the FIRST line carries the
+  // marker — npm's EBADENGINE puts the version on an indented continuation:
+  //   npm warn EBADENGINE Unsupported engine {
+  //     required: { node: '>=20.19.0' }
+  //   }
+  // So a line is noise if it announces itself as one, or if it is a
+  // continuation of one: indented, or a bare closing brace. Suppression only
+  // ever begins after a marker line, so output with no warnings is untouched.
+  let inNoise = false
+  for (const line of String(text).split(/\r?\n/)) {
+    if (VERSION_NOISE_LINE.test(line)) { inNoise = true; continue }
+    if (inNoise && (/^\s+\S/.test(line) || /^\s*[)}\]]+[,;]?\s*$/.test(line) || line.trim() === '')) continue
+    inNoise = false
+    const m = line.match(VERSION_TOKEN)
+    if (m) return m[1]
+  }
+  return null
 }
 
 function versionParts(v: string): number[] {
@@ -230,9 +274,21 @@ export function parseGrokCheck(text: string): string | null {
   }
 }
 
-/** Run a command and return its combined output, or '' on any failure. Never
- *  rejects: a missing or wedged CLI must not take down the rescan. */
-function spawnText(cmd: string, args: string[], timeoutMs: number): Promise<string> {
+export interface CommandOutput {
+  stdout: string
+  stderr: string
+  /** stdout first — the order every combined-text caller wants. */
+  combined: string
+}
+
+/** Run a command and return its output, or empty strings on any failure. Never
+ *  rejects: a missing or wedged CLI must not take down the rescan.
+ *
+ *  The streams are returned APART because they mean different things: a CLI
+ *  prints its version on stdout and its warnings on stderr, and merging them
+ *  let an `npm warn EBADENGINE … node: '>=20.19.0'` line stand in for an
+ *  engine's version at the secure floor. */
+function spawnCommand(cmd: string, args: string[], timeoutMs: number): Promise<CommandOutput> {
   return new Promise((resolve) => {
     let settled = false
     let child: ReturnType<typeof spawn>
@@ -244,14 +300,24 @@ function spawnText(cmd: string, args: string[], timeoutMs: number): Promise<stri
         windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
       })
     } catch {
-      resolve('')
+      resolve({ stdout: '', stderr: '', combined: '' })
       return
     }
-    let out = ''
-    const onChunk = (buf: Buffer) => { out += buf.toString('utf8') }
-    child.stdout?.on('data', onChunk)
-    child.stderr?.on('data', onChunk)
-    const finish = (value: string) => {
+    // Kept apart, then joined stdout-first. A CLI prints its version on stdout
+    // and its warnings on stderr, so scanning stdout first means a warning
+    // cannot win by arriving earlier — which is what let an npm EBADENGINE
+    // line stand in for an engine's version at the secure floor. Some engines
+    // do report the version on stderr, so it stays in the text, just after.
+    let stdout = ''
+    let stderr = ''
+    child.stdout?.on('data', (buf: Buffer) => { stdout += buf.toString('utf8') })
+    child.stderr?.on('data', (buf: Buffer) => { stderr += buf.toString('utf8') })
+    const captured = (): CommandOutput => ({
+      stdout: stdout.trim(),
+      stderr: stderr.trim(),
+      combined: `${stdout}\n${stderr}`.trim(),
+    })
+    const finish = (value: CommandOutput) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
@@ -259,10 +325,10 @@ function spawnText(cmd: string, args: string[], timeoutMs: number): Promise<stri
     }
     const timer = setTimeout(() => {
       try { child.kill() } catch { /* already gone */ }
-      finish(out.trim())
+      finish(captured())
     }, timeoutMs)
-    child.on('error', () => finish(''))
-    child.on('close', () => finish(out.trim()))
+    child.on('error', () => finish({ stdout: '', stderr: '', combined: '' }))
+    child.on('close', () => finish(captured()))
   })
 }
 
@@ -287,10 +353,10 @@ async function probeLatest(id: string, spec: EngineVersionSpec, binPath: string 
   let version: string | null = null
   try {
     if (spec.latestVia === 'cursor-about' && binPath) {
-      const about = await spawnText(binPath, ['about'], 10_000)
+      const about = (await spawnCommand(binPath, ['about'], 10_000)).combined
       version = parseCursorAbout(about) || parseCliVersion(about)
     } else if (spec.latestVia === 'grok-check' && binPath) {
-      const check = await spawnText(binPath, ['update', '--check', '--json'], 12_000)
+      const check = (await spawnCommand(binPath, ['update', '--check', '--json'], 12_000)).combined
       version = parseGrokCheck(check)
     }
     if (!version && spec.npm) version = await npmLatest(spec.npm)
@@ -316,7 +382,7 @@ export async function probeEngineVersion(id: string, binPath: string | null): Pr
   const empty: EngineVersionInfo = { version: null, latest: null, outdated: false, updateCommand: null }
   if (!spec || !binPath) return empty
 
-  const version = parseCliVersion(await spawnText(binPath, spec.versionArgs, 6000))
+  const version = versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
   const latest = await probeLatest(id, spec, binPath)
   const outdated = isCliOutdated(version, latest)
   return {
@@ -332,5 +398,5 @@ export async function probeEngineVersion(id: string, binPath: string | null): Pr
 export async function probeLocalEngineVersion(id: string, binPath: string | null): Promise<string | null> {
   const spec = ENGINE_VERSION_SPECS[id]
   if (!spec || !binPath) return null
-  return parseCliVersion(await spawnText(binPath, spec.versionArgs, 6000))
+  return versionFromOutput(await spawnCommand(binPath, spec.versionArgs, 6000))
 }

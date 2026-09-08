@@ -96,6 +96,10 @@ test('inferUpdateCommand prefers the vendor updater, then brew, then npm', () =>
   // pi needs the vendor's documented flag when it falls through to npm.
   assert.equal(inferUpdateCommand({ versionArgs: ['--version'], npm: '@earendil-works/pi-coding-agent', npmFlags: '--ignore-scripts' }, '/usr/local/bin/pi'),
     'npm install -g --ignore-scripts @earendil-works/pi-coding-agent@latest')
+  assert.equal(
+    inferUpdateCommand(ENGINE_VERSION_SPECS.antigravity, '/Users/test/.local/bin/agy'),
+    'agy update',
+  )
 })
 
 test('parseCursorAbout / parseGrokCheck read their vendor formats', () => {
@@ -118,6 +122,7 @@ test('sanitizeDetectedEngines carries version fields through', () => {
     id: 'codex', bin: 'codex', path: '/usr/local/bin/codex',
     version: '0.5.0', latest: '0.6.0', outdated: true,
     updateCommand: 'npm install -g @openai/codex@latest',
+    blockedReason: null,
   }])
 })
 
@@ -168,4 +173,26 @@ test('sanitizeDetectedEngines tolerates a daemon too old to report versions', ()
   assert.equal(row?.latest, null)
   assert.equal(row?.outdated, false)
   assert.equal(row?.updateCommand, null)
+})
+
+test('sanitizeDetectedEngines bounds and cleans account-specific model catalogs', () => {
+  const [row] = sanitizeDetectedEngines([{
+    id: 'codex', bin: 'codex', path: '/usr/local/bin/codex',
+    modelCatalog: {
+      source: 'protocol', supportsCustom: true, fastModelScope: 'agent',
+      defaultModel: 'gpt-5.6-sol', defaultFastModel: 'gpt-5.4-mini',
+      models: [
+        { id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol\nspoof', recommendedFor: ['big', 'bogus'] },
+        { id: 'gpt-5.6-sol', label: 'duplicate' },
+        { id: '', label: 'empty' },
+      ],
+    },
+  }], ['codex'])
+  assert.deepEqual(row?.modelCatalog, {
+    source: 'protocol', supportsCustom: true, fastModelScope: 'agent',
+    defaultModel: 'gpt-5.6-sol', defaultFastModel: 'gpt-5.4-mini',
+    models: [{
+      id: 'gpt-5.6-sol', label: 'GPT-5.6-Sol spoof', description: null, recommendedFor: ['big'],
+    }],
+  })
 })

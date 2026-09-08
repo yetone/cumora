@@ -48,23 +48,25 @@ export async function bumpClimate(args: BumpArgs): Promise<void> {
   try {
     // Guard: only insert/update climate WHEN agent_id refers to an agent.
     // (Reaction events fire for human authors too; skip those.)
-    const { rows: kind } = await pool.query<{ kind: string }>(
-      `SELECT kind FROM participants WHERE id = $1 LIMIT 1`, [agentId],
+    const { rows: part } = await pool.query<{ kind: string; company_id: string | null }>(
+      `SELECT kind, company_id FROM participants WHERE id = $1 LIMIT 1`, [agentId],
     )
-    if (!kind[0] || kind[0].kind !== 'agent') return
+    if (!part[0] || part[0].kind !== 'agent') return
+    const tenant = part[0].company_id ?? 'personal'
 
     await pool.query(
-      `INSERT INTO agent_climate (agent_id, about_id, affinity, trust, last_note, updated_at)
-       VALUES ($1, $2,
-               GREATEST(-1, LEAST(1, $3::real)),
+      `INSERT INTO agent_climate (agent_id, about_id, company_id, affinity, trust, last_note, updated_at)
+       VALUES ($1, $2, $3,
                GREATEST(-1, LEAST(1, $4::real)),
-               $5, NOW())
+               GREATEST(-1, LEAST(1, $5::real)),
+               $6, NOW())
        ON CONFLICT (agent_id, about_id) DO UPDATE
-          SET affinity = GREATEST(-1, LEAST(1, agent_climate.affinity + $3::real)),
-              trust    = GREATEST(-1, LEAST(1, agent_climate.trust    + $4::real)),
-              last_note = COALESCE($5, agent_climate.last_note),
+          SET company_id = EXCLUDED.company_id,
+              affinity = GREATEST(-1, LEAST(1, agent_climate.affinity + $4::real)),
+              trust    = GREATEST(-1, LEAST(1, agent_climate.trust    + $5::real)),
+              last_note = COALESCE($6, agent_climate.last_note),
               updated_at = NOW()`,
-      [agentId, aboutId, clamp(affinity), clamp(trust), note ?? null],
+      [agentId, aboutId, tenant, clamp(affinity), clamp(trust), note ?? null],
     )
   } catch (e) {
     console.warn('[climate] bump failed', e)

@@ -17,7 +17,8 @@ import { ICalendar, IClock, IRepeat } from '@/components/icons'
 import { tapHaptic } from '@/lib/native'
 import { useT } from '@/lib/i18n'
 import { cn } from '@/lib/utils'
-import type { CalendarEvent, RecurrenceRule } from '@/types'
+import { nextOccurrenceOnOrAfter } from '@/lib/recurrence'
+import type { CalendarEvent } from '@/types'
 
 const DAY_MS = 86_400_000
 const WEEK = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
@@ -42,47 +43,9 @@ function formatTime(d: Date): string {
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-function stepRule(from: Date, rule: RecurrenceRule): Date {
-  const interval = Math.max(1, Math.floor(rule.interval || 1))
-  switch (rule.freq) {
-    case 'daily':
-      return new Date(from.getTime() + interval * DAY_MS)
-    case 'weekly': {
-      const days = rule.byweekday && rule.byweekday.length ? [...rule.byweekday].sort((a, b) => a - b) : null
-      if (!days) return new Date(from.getTime() + interval * 7 * DAY_MS)
-      let cand = new Date(from.getTime() + ((interval - 1) * 7 + 1) * DAY_MS)
-      for (let i = 0; i < 14; i++) {
-        if (days.includes(cand.getDay())) return cand
-        cand = new Date(cand.getTime() + DAY_MS)
-      }
-      return cand
-    }
-    case 'monthly': {
-      const out = new Date(from); out.setMonth(out.getMonth() + interval); return out
-    }
-    case 'yearly': {
-      const out = new Date(from); out.setFullYear(out.getFullYear() + interval); return out
-    }
-  }
-}
-
 function nextOccurrence(event: CalendarEvent, from: Date): Date | null {
-  const startAt = new Date(event.startAt)
   if (event.status !== 'active') return null
-  if (!event.recurrence) return startAt.getTime() >= from.getTime() ? startAt : null
-  const rule = event.recurrence
-  const untilTs = rule.until ? new Date(rule.until).getTime() : Infinity
-  const maxCount = rule.count ?? Infinity
-  let current = new Date(startAt)
-  let fired = 1
-  for (let i = 0; i < 5000; i++) {
-    if (current.getTime() > untilTs) return null
-    if (fired > maxCount) return null
-    if (current.getTime() >= from.getTime()) return current
-    current = stepRule(current, rule)
-    fired += 1
-  }
-  return null
+  return nextOccurrenceOnOrAfter(new Date(event.startAt), event.recurrence ?? null, from)
 }
 
 function expandToRange(events: CalendarEvent[], start: Date, end: Date): AgendaItem[] {

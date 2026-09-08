@@ -5,7 +5,7 @@ import { mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { env } from './env.js'
-import { ensureSchemaWithBootRetry } from './db/migrate.js'
+import { verifySchemaWithBootRetry } from './db/schema-version.js'
 import { seedIfEmpty } from './seed.js'
 import { api } from './api/router.js'
 import { storage, UPLOAD_DIR } from './storage.js'
@@ -34,9 +34,12 @@ import { startTrialSweepWorker } from './trial-sweep.js'
 import { seedAdmins } from './admin.js'
 import { notifyAlert } from './alerting.js'
 import { startShippingMaintenance } from './shipping-maintenance.js'
+import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from './realtime-outbox.js'
+import { startWorkspaceCleanupWorker, stopWorkspaceCleanupWorker } from './workspace-cleanup.js'
 
 async function main() {
-  await ensureSchemaWithBootRetry()
+  const schemaVersion = await verifySchemaWithBootRetry()
+  console.log(`[boot] schema version ${schemaVersion} is compatible`)
   await seedIfEmpty()
   // Promote CUMORA_ADMIN_EMAILS members to is_admin on every boot —
   // idempotent, only flips FALSE→TRUE. Demotion goes through the panel.
@@ -252,8 +255,10 @@ async function main() {
 
   // Start generic background scans for agents that explicitly have
   // the background.scan capability.
-  // In a multi-instance deploy you'd elect a leader (or use a job queue) so
-  // only one instance runs the scan; for single-instance dev this is fine.
+  // Safe across replicas: each tick takes an advisory lock, so exactly one
+  // instance runs the pass, and wakes are claimed in Redis with a 24h TTL so
+  // the lock moving elsewhere doesn't re-wake agents for activity already
+  // scanned. See agents/scanner.ts.
   if (process.env.ENABLE_SCANNER !== 'false') {
     const handle = startScanner(env.SCANNER_INTERVAL_MS)
     console.log(`[boot] background scanner running every ${env.SCANNER_INTERVAL_MS}ms`)
@@ -310,6 +315,11 @@ async function main() {
   // readbacks to visible overdue friction and mines repeated agent completion
   // failures into deduplicated improvement signals.
   startShippingMaintenance()
+
+  // PostgreSQL owns command completion; Redis delivery is retried here after
+  // commit. Start after the schema ensure so the outbox table is guaranteed.
+  startRealtimeOutboxWorker()
+  startWorkspaceCleanupWorker()
 
   // Agent-pod garbage collection — sweep Succeeded/Failed/Unknown
   // agent pods older than 5min. Plain Pods don't have TTL-after-
@@ -369,6 +379,8 @@ async function main() {
   const shutdown = async (sig: string) => {
     console.log(`[shutdown] ${sig}`)
     server.close()
+    stopRealtimeOutboxWorker()
+    stopWorkspaceCleanupWorker()
     try { await pool.end() } catch { /* ignore */ }
     try { redis.disconnect() } catch { /* ignore */ }
     process.exit(0)

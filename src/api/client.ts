@@ -1,10 +1,10 @@
+import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
 import type {
-  Message, Status,
-  BoardSummary, BoardSnapshot, BoardCardComment, BoardCardLookup,
-  CalendarEvent, CalendarEventKind, CalendarEventStatus, CalendarDispatch, RecurrenceRule,
-  CalendarReminderChannel,ComputerStatus, ComputerKind, EngineId,
+  BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
+  CalendarDispatch, CalendarEvent, CalendarEventKind, CalendarEventStatus,
+  CalendarReminderChannel, ComputerKind, ComputerStatus, DetectedEngine, EngineId,
+  Message, RecurrenceRule, Status,
 } from '@/types'
-import { getAuthToken, getActiveCompanyId, useAuth } from '@/stores/auth'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
 const SERVER_URL_KEY = 'cumora.serverUrl'
@@ -236,7 +236,7 @@ export interface ApiComputer {
   name: string
   kind: ComputerKind
   available_engines: EngineId[]
-  detected_engines?: Array<{ id: EngineId; bin: string; path: string | null }>
+  detected_engines?: DetectedEngine[]
   engines_detected_at?: string | null
   status: ComputerStatus
   last_seen_at: string | null
@@ -309,6 +309,15 @@ export interface AgentInput {
   /** per-agent small-brain (fast) model override; null clears it */
   fastModel?: string | null
   tools?: string[]
+}
+
+export interface AgentCreateInput extends AgentInput {
+  /** Stable for the lifetime of one create form so ambiguous retries replay. */
+  requestId: string
+  /** Initial host placement is committed atomically with the Agent row. */
+  computerId?: string | null
+  engine?: EngineId
+  inherit?: boolean
 }
 
 export interface ApiAttachment {
@@ -404,7 +413,7 @@ export interface ApiAgentRun {
 }
 
 // ── Triage cost-effectiveness ledger ──
-export type ApiTriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen'
+export type ApiTriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity'
 
 export interface ApiTriageAgentRow {
   agentId: string
@@ -467,11 +476,23 @@ export interface ApiSilentWakeBucket {
   silentSpendUsd: number
 }
 
+export interface ApiTurnsPerMessageBucket {
+  conversationKind: string
+  messages: number
+  turns: number
+  avgTurns: number
+  medianTurns: number
+  hist: { turns: string; messages: number }[]
+}
+
 export interface ApiWakeEconomics {
   sinceHours: number
   buckets: ApiSilentWakeBucket[]
   /** The RATIOS are measured either way; only the dollar column is modelled. */
   costEstimated: boolean
+  /** Fan-out width per human message. Room-wide: not scoped by the agentId
+   *  filter, because width is a property of the room, not of one agent. */
+  turnsPerMessage: ApiTurnsPerMessageBucket[]
 }
 
 export interface ApiTriageEconomics {
@@ -617,6 +638,17 @@ export interface ApiInvitationEmailDelivery {
    *  'no_email_config' (EMAIL_DOMAIN unset). Distinct from `error` so
    *  the UI can show a different message. */
   skipped: 'no_email_config' | null
+}
+
+export type WorkspaceRole = 'owner' | 'admin' | 'member'
+
+export interface ApiWorkspaceMember {
+  id: string
+  name: string
+  email: string
+  avatarUrl: string | null
+  role: WorkspaceRole
+  joinedAt: string
 }
 
 export type ApiInvitationPreviewStatus =
@@ -879,6 +911,22 @@ export const api = {
     http<{ id: string; name: string; slug: string; role: string }>('/companies', {
       method: 'POST', body: JSON.stringify({ name }),
     }),
+  listWorkspaceMembers: (companyId: string) =>
+    http<ApiWorkspaceMember[]>(`/companies/${encodeURIComponent(companyId)}/members`),
+  updateWorkspaceMemberRole: (companyId: string, userId: string, role: 'member' | 'admin') =>
+    http<{ ok: true; member: ApiWorkspaceMember }>(
+      `/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'PATCH', body: JSON.stringify({ role }) },
+    ),
+  removeWorkspaceMember: (companyId: string, userId: string) =>
+    http<{ ok: true }>(
+      `/companies/${encodeURIComponent(companyId)}/members/${encodeURIComponent(userId)}`,
+      { method: 'DELETE' },
+    ),
+  deleteCompany: (companyId: string, confirmation: string) =>
+    http<{ ok: true; nextCompanyId: string }>(`/companies/${encodeURIComponent(companyId)}`, {
+      method: 'DELETE', body: JSON.stringify({ confirmation }),
+    }),
   /** Owner/admin-only: list every invitation (active + historical) for a
    *  company so the management UI can show recent activity. */
   listInvitations: (companyId: string) =>
@@ -944,12 +992,25 @@ export const api = {
     http<{ ok: boolean }>(
       `/computers/${encodeURIComponent(id)}/detect`, { method: 'POST', body: '{}' }),
   /** Move an agent to a computer, choosing its engine (Cumora Cloud = managed). */
-  assignAgentComputer: (agentId: string, computerId: string, engine?: EngineId, inherit?: boolean) =>
+  assignAgentComputer: (
+    agentId: string,
+    computerId: string,
+    engine?: EngineId,
+    inherit?: boolean,
+    model?: string | null,
+    fastModel?: string | null,
+  ) =>
     http<{ ok: boolean; kind: ComputerKind; engine: EngineId; inherit?: boolean }>(
       `/agents/${encodeURIComponent(agentId)}/computer`,
-      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit }) }),
-  createAgent: (input: AgentInput) =>
-    http<{ id: string }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
+      { method: 'POST', body: JSON.stringify({ computerId, engine, inherit, model, fastModel }) }),
+  createAgent: (input: AgentCreateInput) =>
+    http<{
+      id: string
+      replayed: boolean
+      kind?: ComputerKind
+      engine?: EngineId
+      inherit?: boolean
+    }>('/agents', { method: 'POST', body: JSON.stringify(input) }),
   updateAgent: (id: string, input: AgentInput) =>
     http<{ ok: boolean }>(`/agents/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(input) }),
   /** Soft-delete: marks the agent as off-boarded. Memory + log preserved. */
@@ -1308,8 +1369,8 @@ export const api = {
   listBoards: () => http<BoardSummary[]>('/boards'),
   getBoard: (id: string) => http<BoardSnapshot>(`/boards/${encodeURIComponent(id)}`),
   getBoardCard: (id: string) => http<BoardCardLookup>(`/cards/${encodeURIComponent(id)}`),
-  createBoard: (input: { title: string; description?: string }) =>
-    http<{ id: string }>('/boards', { method: 'POST', body: JSON.stringify(input) }),
+  createBoard: (input: { title: string; description?: string; requestId?: string }) =>
+    http<{ id: string; replayed: boolean }>('/boards', { method: 'POST', body: JSON.stringify(input) }),
   updateBoard: (id: string, input: { title?: string; description?: string }) =>
     http<{ ok: boolean }>(`/boards/${encodeURIComponent(id)}`, {
       method: 'PATCH', body: JSON.stringify(input),
@@ -1381,7 +1442,7 @@ export const api = {
   getCalendarEvent: (id: string) =>
     http<{ event: CalendarEvent }>(`/calendar/events/${encodeURIComponent(id)}`),
   createCalendarEvent: (input: CalendarEventInput) =>
-    http<{ event: CalendarEvent }>('/calendar/events', {
+    http<{ event: CalendarEvent; replayed: boolean }>('/calendar/events', {
       method: 'POST',
       body: JSON.stringify(input),
     }),
@@ -1404,7 +1465,7 @@ export const api = {
   /* ============== Collaborative documents (CRDT) ============== */
   listDocuments: () =>
     http<{ documents: ApiDocument[] }>('/documents'),
-  createDocument: (input: { title?: string; conversationId?: string | null } = {}) =>
+  createDocument: (input: { title?: string; conversationId?: string | null; requestId?: string } = {}) =>
     http<ApiDocument>('/documents', { method: 'POST', body: JSON.stringify(input) }),
   getDocument: (id: string) =>
     http<ApiDocument>(`/documents/${encodeURIComponent(id)}`),
@@ -1445,6 +1506,8 @@ export interface CalendarEventInput {
    *  (and the workspace owner, if the row involves an agent). Default
    *  false = same shared-workspace behavior as before. */
   isPrivate?: boolean
+  /** Stable across retries after an ambiguous network failure. */
+  requestId?: string
 }
 
 /* ============== WebSocket bridge ============== */
@@ -1457,7 +1520,7 @@ export type WsEvent =
   | { type: 'participants.status'; participantId: string; status: Status; statusUpdatedAt?: string }
   | { type: 'participants.avatar'; participantId: string; avatarUrl: string }
   | { type: 'computers.status'; computerId: string; status: ComputerStatus }
-  | { type: 'participants.added'; conversationId?: string; participant: {
+  | { type: 'participants.added'; companyId?: string; conversationId?: string; participant: {
       id: string; kind: 'human' | 'agent'; name: string; role: string | null;
       initial: string; avatarBg: string; avatarUrl: string | null;
       status: Status; statusUpdatedAt: string | null;
@@ -1508,6 +1571,15 @@ export type WsEvent =
       poll: import('../types.js').PollPayload
       tallies: import('../types.js').PollTally[]
       actorId: string | null
+    }
+  | {
+      type: 'workspace.membership'
+      kind: 'role_changed' | 'removed' | 'workspace_deleted'
+      companyId: string
+      recipientUserIds: string[]
+      actorId: string
+      userId?: string
+      role?: 'admin' | 'member'
     }
 
 type Listener = (e: WsEvent) => void

@@ -7,9 +7,10 @@
  * JSON shape declared in `client.ts`.
  *
  * Auth: every request carries `Authorization: Bearer <agent-runtime
- * JWT>`. The JWT pins `{ agentId, companyId }`. Endpoints take the
- * agentId from the *token* (not the request body) so a compromised pod
- * can't operate as someone else's agent.
+ * JWT>`. The JWT pins `{ agentId, companyId, computerId, assignmentId }`.
+ * Endpoints take identity and placement from the *token* (not the request
+ * body) and compare them with the live database row, so a compromised or
+ * replaced runtime can't operate as another Agent placement.
  *
  * Mount at `/runtime` from `server/src/index.ts`. Not nested under
  * `/api` because the cookie-auth middleware on /api would reject these
@@ -93,15 +94,15 @@ async function authMiddleware(req: RuntimeRequest, res: Response, next: NextFunc
 
   try {
     // A valid signature only proves what was true when the token was minted.
-    // Re-check the globally unique agent row on every request so tenant moves
-    // and offboarding revoke an old daemon token immediately, across the whole
-    // runtime surface rather than only on selected data-reading endpoints.
-    if (!(await isRuntimeAgentAuthorized(claims.sub, claims.companyId))) {
-      res.status(403).json({ error: 'agent does not belong to token tenant' })
+    // Re-check tenant, Computer, and opaque placement generation on every
+    // request so moves, offboarding, and Computer revocation invalidate an old
+    // runtime immediately across the whole surface.
+    if (!(await isRuntimeAgentAuthorized(claims))) {
+      res.status(403).json({ error: 'agent runtime assignment changed or was revoked' })
       return
     }
   } catch (err) {
-    console.error('[runtime] token tenant validation failed', err instanceof Error ? err.message : err)
+    console.error('[runtime] token assignment validation failed', err instanceof Error ? err.message : err)
     res.status(503).json({ error: 'runtime authorization unavailable' })
     return
   }
@@ -129,7 +130,7 @@ function withAgent(
 
 export const runtimeRouter: Router = Router()
 runtimeRouter.use(authMiddleware as never)
-// JWT signature, tenant claim, and current agent assignment are all checked
+// JWT signature, tenant claim, and exact current Agent placement are checked
 // before any body parser reads JSON. Most runtime calls are small; the FUSE
 // whole-file write endpoint installs its compatibility parser at the route.
 const runtimeJsonParser = json({ limit: '4mb' })
@@ -147,7 +148,7 @@ runtimeRouter.get('/wake-stream', withAgent(async (c, _req, res) => {
   await attachWakeStream(c.sub, res, {
     // The HTTP middleware validates at connection time. Re-check before every
     // event as well because this response can remain open across a tenant move.
-    authorize: () => isRuntimeAgentAuthorized(c.sub, c.companyId),
+    authorize: () => isRuntimeAgentAuthorized(c),
   })
   // Don't end — attachWakeStream keeps the response open until the
   // client disconnects.

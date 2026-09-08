@@ -6,6 +6,7 @@ import {
   CH_STATUS, CH_REACTIONS, CH_POLLS,
   CH_GROUP_PULLED, CH_CONVO_UPDATED, CH_CONVENE,
   CH_BOARDS, CH_DOCS, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, CH_DOC_MENTION,
+  CH_WORKSPACES,
   publish,
   type DocMentionEvent,
 } from './redis.js'
@@ -13,6 +14,7 @@ import type { MessageNewEvent } from './redis.js'
 import { env } from './env.js'
 import { consumeWsTicket } from './auth.js'
 import { pool } from './db/pool.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from './realtime-outbox.js'
 import { setStatus } from './status.js'
 import {
   subscribe as docSubscribe,
@@ -161,6 +163,19 @@ export async function resolveWsEventRecipientUserIds(
 ): Promise<Set<string>> {
   const companyId = typeof event.companyId === 'string' ? event.companyId : ''
   if (!companyId) return new Set()
+  // Membership invalidations are terminal, user-targeted frames. Looking the
+  // recipients up through company_members would drop the exact event that tells
+  // a removed user to evict the workspace from their client. The publisher is a
+  // server-only mutation path and users are still checked for account liveness.
+  if (event.type === 'workspace.membership') {
+    const requested = [...new Set((event.recipientUserIds ?? []).filter((id) => typeof id === 'string'))]
+    if (requested.length === 0) return new Set()
+    const { rows } = await pool.query<{ id: string }>(
+      `SELECT id FROM users WHERE id = ANY($1::text[]) AND deleted_at IS NULL`,
+      [requested],
+    )
+    return new Set(rows.map((row) => row.id))
+  }
   const targetedUserIds = event.type === 'doc.mention'
     ? event.mentionedIds
     : event.type === 'calendar.reminder'
@@ -205,21 +220,23 @@ export async function resolveWsEventRecipientUserIds(
     : null
   const { rows } = await pool.query<{ user_id: string }>(
     `WITH scoped_conversation AS (
-       SELECT id, company_id, members
+       SELECT id, company_id
          FROM conversations
         WHERE id = $1 AND company_id = $2
      ), current_members AS (
-       SELECT cm.user_id
+       SELECT company_member.user_id
          FROM scoped_conversation c
-         CROSS JOIN LATERAL jsonb_array_elements_text(c.members) member(id)
+         JOIN conversation_members room_member
+           ON room_member.conversation_id = c.id
+          AND room_member.company_id = c.company_id
          JOIN participants p
-           ON p.id = member.id
+           ON p.id = room_member.participant_id
           AND p.company_id = c.company_id
           AND p.kind = 'human'
           AND p.departed_at IS NULL
-         JOIN company_members cm
-           ON cm.user_id = p.id
-          AND cm.company_id = c.company_id
+         JOIN company_members company_member
+           ON company_member.user_id = p.id
+          AND company_member.company_id = c.company_id
      ), durable_recipient AS (
        SELECT cm.user_id
          FROM scoped_conversation c
@@ -506,8 +523,12 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
  *  most recent mention-row for the same (doc, mentioner, mentioned)
  *  tuple — we don't want a noisily editing user spamming the
  *  recipient. For mentioned AGENTS, also writes an `agent_log` row so
- *  the agent's history surfaces the mention. */
-async function processDocMention(args: {
+ *  the agent's history surfaces the mention.
+ *
+ *  Exported for the integration suite: the only production caller is the
+ *  `doc.mention.notify` WS frame above, and standing up a socket just to
+ *  assert the durable/outbox contract would test the transport instead. */
+export async function processDocMention(args: {
   documentId: string
   companyId: string
   mentionerId: string
@@ -592,7 +613,26 @@ async function processDocMention(args: {
       }
       freshRows.push(row)
     }
+    // The toast rides the transactional outbox rather than a post-COMMIT
+    // publish. `document_mentions` is the dedup ledger: once these rows
+    // commit, the 60s window above swallows every retry, so a Redis outage
+    // that threw here used to lose the notice permanently while the caller
+    // saw a failure for work that had actually succeeded. Enqueued in-band,
+    // a degraded Redis only delays it. See realtime-outbox.ts.
+    if (freshRows.length > 0) {
+      const event: DocMentionEvent = {
+        type: 'doc.mention',
+        companyId,
+        documentId,
+        documentTitle,
+        mentionerId,
+        mentionerName,
+        mentionedIds: freshRows.map((row) => row.id),
+      }
+      await enqueueBroadcast(client, CH_DOC_MENTION, event)
+    }
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -614,18 +654,6 @@ async function processDocMention(args: {
       console.warn(`[doc.mention] wake post for ${row.id} failed`, e)
     }
   }
-  const freshIds = freshRows.map((row) => row.id)
-
-  const event: DocMentionEvent = {
-    type: 'doc.mention',
-    companyId,
-    documentId,
-    documentTitle,
-    mentionerId,
-    mentionerName,
-    mentionedIds: freshIds,
-  }
-  await publish(CH_DOC_MENTION, event)
 }
 
 /** Post a synthetic chat message that wakes the mentioned agent with
@@ -701,24 +729,41 @@ async function postDocMentionWake(args: {
     // participants still belong to it. 2) Otherwise reuse/create one DM.
     if (document[0].conversation_id) {
       const { rows } = await client.query<{ id: string }>(
-        `SELECT id FROM conversations
-          WHERE id = $1 AND company_id = $2
-            AND members @> to_jsonb(ARRAY[$3::text])
-            AND members @> to_jsonb(ARRAY[$4::text])
-          FOR UPDATE`,
+        `SELECT c.id FROM conversations c
+          WHERE c.id = $1 AND c.company_id = $2
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            )
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $4
+            )
+          FOR UPDATE OF c`,
         [document[0].conversation_id, companyId, mentionerId, agentId],
       )
       conversationId = rows[0]?.id ?? ''
     }
     if (!conversationId) {
       const { rows } = await client.query<{ id: string }>(
-        `SELECT id FROM conversations
-          WHERE kind = 'direct' AND company_id = $3
-            AND members @> to_jsonb(ARRAY[$1::text])
-            AND members @> to_jsonb(ARRAY[$2::text])
-            AND jsonb_array_length(members) = 2
-          ORDER BY updated_at DESC LIMIT 1
-          FOR UPDATE`,
+        `SELECT c.id FROM conversations c
+          WHERE c.kind = 'direct' AND c.company_id = $3
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $1
+            )
+            AND EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $2
+            )
+            AND (SELECT COUNT(*) FROM conversation_members cm
+                  WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+          ORDER BY c.updated_at DESC LIMIT 1
+          FOR UPDATE OF c`,
         [mentionerId, agentId, companyId],
       )
       conversationId = rows[0]?.id ?? ''
@@ -872,7 +917,7 @@ export function attachWebSocket(httpServer: Server) {
     CH_MESSAGE_NEW, CH_MESSAGE_DELTA, CH_TYPING,
     CH_STATUS, CH_REACTIONS, CH_POLLS,
     CH_GROUP_PULLED, CH_CONVO_UPDATED, CH_CONVENE,
-    CH_BOARDS, CH_DOCS, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, CH_DOC_MENTION,
+    CH_BOARDS, CH_DOCS, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, CH_DOC_MENTION, CH_WORKSPACES,
   ).then((count) => {
     console.log(`[ws] subscribed to ${count} redis channels`)
   })

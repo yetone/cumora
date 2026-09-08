@@ -5,7 +5,8 @@
  *   1. Reject (550) if the recipient domain isn't in EMAIL_ROOT_DOMAINS.
  *   2. Stream the raw MIME, parse with postal-mime.
  *   3. Build a JSON payload (message-id, in-reply-to, references, from,
- *      to, cc, subject, text, html, raw size).
+ *      to, cc, subject, text, html, raw size, autoSubmitted, and
+ *      attachments[] as base64 — see MAX_ATTACHMENT_BYTES / the total cap).
  *   4. Sign with HMAC-SHA256(EMAIL_INBOUND_HMAC_SECRET, body) and POST
  *      to CUMORA_INBOUND_URL.
  *   5. Reject (550) if the server says "no recipient resolved" so the
@@ -41,6 +42,7 @@ interface InboundAttachment {
 
 interface InboundPayload {
   messageId: string
+  envelopeTo: string
   inReplyTo: string | null
   references: string[]
   from: string
@@ -126,6 +128,49 @@ export function getHeader(headers: { key: string; value: string }[] | undefined,
   return undefined
 }
 
+/** Fallback time bucket for a message that carries no `Date:` of its own.
+ *  Wide enough to cover an MTA's first retries, which is when a tempfail is
+ *  most likely to be retried at all. */
+export const SYNTH_ID_BUCKET_MS = 60 * 60 * 1000
+
+/** A Message-Id for a message that arrived without one. The server's dedup
+ *  index requires a non-null id.
+ *
+ *  It has to be DERIVED, not random. This worker throws on an upstream 5xx or a
+ *  network failure precisely so the sending MTA tempfails and retries — and
+ *  that retry runs this worker again on the same physical message. The server
+ *  dedups on `smtp_message_id`, so a fresh random id per attempt is a fresh
+ *  delivery per attempt: the recipient sees the same email once per retry. The
+ *  comment here always claimed the id included "the recipient + a coarse
+ *  timestamp"; the string it built included neither.
+ *
+ *  The raw bytes are not a safe input. A retry is a new SMTP transaction and
+ *  arrives with its own `Received:` headers, so identical mail hashes
+ *  differently. These five fields survive that, and still tell two genuinely
+ *  different messages apart.
+ *
+ *  `Date:` is what separates two otherwise identical sends. RFC 5322 requires
+ *  it and nearly every MTA adds it, but a sender that omitted Message-Id may
+ *  have omitted this too — then fall back to a coarse bucket, which is the
+ *  original intent and the best available when the message carries no time of
+ *  its own. A retry that straddles a bucket boundary still duplicates. That
+ *  residue is deliberate: merging two genuinely distinct alerts would lose
+ *  mail, and losing mail is worse than showing it twice. */
+export async function synthesizeMessageId(parts: {
+  envelopeFrom: string
+  envelopeTo: string
+  date: string | undefined
+  subject: string
+  body: string
+}): Promise<string> {
+  const stamp = parts.date?.trim() || `bucket:${Math.floor(Date.now() / SYNTH_ID_BUCKET_MS)}`
+  // NUL-joined so a field boundary cannot be forged by content.
+  const material = [parts.envelopeFrom, parts.envelopeTo, stamp, parts.subject, parts.body].join('\u0000')
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(material))
+  const hex = Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('')
+  return `synth-${hex}@cumora-email-gate`
+}
+
 export default {
   async email(message: ForwardableEmailMessage, env: Env, ctx: ExecutionContext): Promise<void> {
     if (!recipientAccepted(message.to, env)) {
@@ -195,6 +240,12 @@ export default {
       // To / Cc — postal-mime returns Address[]. Fall back to the envelope
       // recipient if the header is missing (rare but happens).
       to: (parsed.to ?? []).map(fmtAddress).filter(Boolean),
+      // The address SMTP actually delivered to, and the one this worker
+      // admitted the message on two dozen lines up. It is absent from the
+      // headers whenever the agent was Bcc'd or reached through an alias or a
+      // forwarding rule, and then it is the ONLY thing identifying the
+      // recipient — so send it always, not just when To: happens to be empty.
+      envelopeTo: message.to,
       cc: (parsed.cc ?? []).map(fmtAddress).filter(Boolean),
       subject: parsed.subject ?? '',
       text: (parsed.text ?? '').trim(),
@@ -205,10 +256,13 @@ export default {
     }
     if (payload.to.length === 0) payload.to = [message.to]
     if (!payload.messageId) {
-      // Fabricate one — server's dedup index requires a non-null id.
-      // Including the recipient + a coarse timestamp keeps re-deliveries
-      // of the same physical message from creating duplicates per agent.
-      payload.messageId = `synth-${Date.now().toString(36)}.${crypto.randomUUID()}@cumora-email-gate`
+      payload.messageId = await synthesizeMessageId({
+        envelopeFrom: message.from,
+        envelopeTo: message.to,
+        date: getHeader(parsed.headers, 'Date'),
+        subject: payload.subject,
+        body: payload.text,
+      })
     }
 
     const body = JSON.stringify(payload)
@@ -225,19 +279,27 @@ export default {
         body,
       })
     } catch (e) {
-      message.setReject('Upstream unreachable')
       console.error('[email-gate] POST failed:', e instanceof Error ? e.message : String(e))
-      return
+      // Transient network or connection error — throw to signal a temporary failure
+      // (SMTP 4xx tempfail) in Cloudflare Email Routing so the sending MTA retries delivery later.
+      throw new Error(`Upstream unreachable: ${e instanceof Error ? e.message : String(e)}`)
     }
     if (res.status === 404) {
-      // Server says no agent matches this recipient — bounce.
+      // Server says no agent matches this recipient — permanent rejection (SMTP 550 bounce).
       message.setReject('No such recipient')
       return
     }
+    if (res.status >= 500) {
+      // 5xx upstream failure (server restarting, deploy in progress, database blip).
+      // Cloudflare Email Routing signals a temporary SMTP failure (4xx tempfail) when the
+      // handler throws, allowing sending MTAs (Gmail, Outlook, etc.) to retry delivery later.
+      const errorText = await res.text().catch(() => '')
+      console.error(`[email-gate] upstream ${res.status}: ${errorText.slice(0, 400)}`)
+      throw new Error(`Upstream temporary failure (${res.status}): ${errorText.slice(0, 200)}`)
+    }
     if (!res.ok) {
-      // 4xx other than 404, or 5xx → tempfail so the sender's MTA retries.
-      // Reading the body keeps the response from leaking; ctx.waitUntil so
-      // we don't block the email return.
+      // 4xx other than 404 (e.g. 400 bad request, 401 unauthorized HMAC, 413 payload too large).
+      // Permanent client rejection — retrying will not change the outcome.
       ctx.waitUntil(res.text().then((t) => console.error(`[email-gate] upstream ${res.status}: ${t.slice(0, 400)}`)))
       message.setReject(`Upstream ${res.status}`)
       return

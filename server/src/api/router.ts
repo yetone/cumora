@@ -5,7 +5,10 @@ import {
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
 } from '../storage.js'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, publish } from '../redis.js'
+import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox, withOutboxTransaction } from '../realtime-outbox.js'
+import { enqueueWorkspaceCleanup, nudgeWorkspaceCleanupWorker } from '../workspace-cleanup.js'
+import { collectDocumentStorageKeys, evictDocumentRoom } from '../documents/rooms.js'
 import { createPoll, castVote, closePoll, PollError } from '../polls.js'
 import { env } from '../env.js'
 import { publicBodyParserError } from '../body-parser-errors.js'
@@ -14,8 +17,9 @@ import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
+import { AgentCreationError, createAgentRecord } from '../agents/create.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
-import { notifyMessage, computeMessageRecipients } from '../push.js'
+import { dispatchMessagePush } from '../push.js'
 import { randomUUID, randomBytes, createHash, timingSafeEqual } from 'node:crypto'
 import {
   deleteSession, authMiddleware, type AuthedRequest,
@@ -37,9 +41,15 @@ import {
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
   setComputerDefaultEngine,
+  PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
+import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
+import {
+  findIdempotentCreate, IdempotencyConflictError,
+  parseRequestId, requestHash,
+} from '../idempotent-create.js'
 
 /** Re-export so older imports (server/index.ts, agents/cli.ts) keep working
  *  after the storage abstraction moved this constant. */
@@ -130,6 +140,28 @@ class HttpError extends Error {
   constructor(public status: number, message: string) { super(message) }
 }
 
+function createRequestId(value: unknown): string | null {
+  try {
+    return parseRequestId(value)
+  } catch (error) {
+    throw new HttpError(400, error instanceof Error ? error.message : 'invalid requestId')
+  }
+}
+
+async function createReplay(
+  client: PoolClient,
+  args: Parameters<typeof findIdempotentCreate>[1],
+): Promise<{ id: string } | null> {
+  try {
+    return await findIdempotentCreate(client, args)
+  } catch (error) {
+    if (error instanceof IdempotencyConflictError) {
+      throw new HttpError(error.status, error.message)
+    }
+    throw error
+  }
+}
+
 /** Throw 401 if the request has no valid session. Returns the user_id. */
 function requireAuth(req: Request & AuthedRequest): string {
   const id = req.authUserId
@@ -156,13 +188,16 @@ function userId(req: Request & AuthedRequest): string {
   return requireAuth(req)
 }
 
+function deviceBearerToken(req: Request): string {
+  const auth = req.headers.authorization
+  return typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
+}
+
 /** Resolve the calling Computer daemon from its device-token Bearer header,
  *  or throw 401. Used by daemon-facing endpoints that carry no user session —
  *  the device token (issued at pairing) is the credential. */
 async function requireDevice(req: Request & AuthedRequest): Promise<{ computerId: string; companyId: string }> {
-  const auth = req.headers.authorization
-  const token = typeof auth === 'string' && auth.startsWith('Bearer ') ? auth.slice(7).trim() : ''
-  const dev = await resolveDevice(token)
+  const dev = await resolveDevice(deviceBearerToken(req))
   if (!dev) throw new HttpError(401, 'invalid or revoked device token')
   return dev
 }
@@ -336,8 +371,8 @@ async function requireCompanyRole(
  * Tenant + conversation membership gate in one round-trip.
  *
  * Verifies (a) the caller belongs to the active tenant and (b) the
- * conversation lives in that tenant AND (c) the caller is in the
- * conversation's `members` array. This is the missing check that used to
+ * conversation lives in that tenant AND (c) the caller has a normalized
+ * conversation-membership row. This is the missing check that used to
  * allow any tenant member to read or react in conversations they weren't
  * part of (private DMs etc.).
  *
@@ -354,15 +389,19 @@ async function requireConversationMember(
 ): Promise<{ userId: string; companyId: string; members: string[]; kind: string }> {
   const { userId, companyId } = await requireCompany(req)
   const { rows } = await pool.query<{ members: string[]; kind: string }>(
-    `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2 LIMIT 1`,
-    [conversationId, companyId],
+    `SELECT c.members, c.kind
+       FROM conversations c
+       JOIN conversation_members cm
+         ON cm.conversation_id = c.id
+        AND cm.company_id = c.company_id
+        AND cm.participant_id = $3
+      WHERE c.id = $1 AND c.company_id = $2
+      LIMIT 1`,
+    [conversationId, companyId, userId],
   )
+  // Stay opaque: same 404 a non-existent / cross-tenant convo returns,
+  // so a probing client can't tell "doesn't exist" from "I'm not in it".
   if (!rows[0]) throw new HttpError(404, 'not found')
-  if (!rows[0].members.includes(userId)) {
-    // Stay opaque: same 404 a non-existent / cross-tenant convo returns,
-    // so a probing client can't tell "doesn't exist" from "I'm not in it".
-    throw new HttpError(404, 'not found')
-  }
   return { userId, companyId, members: rows[0].members, kind: rows[0].kind }
 }
 
@@ -391,13 +430,20 @@ async function withLockedConversationMember<T>(args: {
     )
     if (!actor.rowCount) throw new HttpError(404, 'not found')
     const { rows } = await client.query<{ members: string[]; kind: string; pinned: boolean }>(
-      `SELECT members, kind, pinned FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR UPDATE`,
-      [args.conversationId, args.companyId, args.userId],
+      `SELECT c.members, c.kind, c.pinned FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        FOR UPDATE OF c`,
+      [args.conversationId, args.companyId],
     )
     if (!rows[0]) throw new HttpError(404, 'not found')
+    const membership = await client.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1
+          AND company_id = $2
+          AND participant_id = $3`,
+      [args.conversationId, args.companyId, args.userId],
+    )
+    if (!membership.rowCount) throw new HttpError(404, 'not found')
     const result = await args.work(client, rows[0])
     await client.query('COMMIT')
     return result
@@ -1169,8 +1215,10 @@ api.post('/agents/:id/computer', safe(async (req, res) => {
   }
   const engine = typeof req.body?.engine === 'string' ? req.body.engine : undefined
   const inherit = req.body?.inherit === true
+  const modelPins = readAgentBody(req.body ?? {})
   const out = await assignAgentToComputer({
     agentId: String(req.params.id), companyId, computerId, engine, inherit: inherit || !engine,
+    model: modelPins.model, fastModel: modelPins.fastModel,
   })
   if (!out) throw new HttpError(400, 'invalid computer, agent, or engine for this company')
   res.json({ ok: true, ...out })
@@ -1186,6 +1234,11 @@ api.post('/computers/pair', safe(async (req, res) => {
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
   const detected = req.body?.detected
+  // Same separation as /computers/me/engines: display-only, never merged into
+  // the engines list that picks an adapter.
+  const blockedAtPair = Array.isArray(req.body?.blocked)
+    ? (req.body.blocked as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
   const hostName = typeof req.body?.hostName === 'string' ? req.body.hostName : undefined
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
@@ -1193,7 +1246,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // its onboarding gate on that event and immediately reloads its roster, so the
   // starter team + "Everyone" group must already exist when it fires — otherwise
   // the user lands on an empty Conversations list that fills in a beat later.
-  const paired = await pairComputer({ code, hostName, engines, detected, version, supervised, deferBroadcast: true })
+  const paired = await pairComputer({ code, hostName, engines, detected, blocked: blockedAtPair, version, supervised, deferBroadcast: true })
   if (!paired) throw new HttpError(400, 'invalid pairing token')
   // Free-tier BYOA onboarding on pair. The daemon sends the engines list with
   // the user's CHOSEN engine first (`cumora agent computer --pair … --engine X`),
@@ -1201,11 +1254,7 @@ api.post('/computers/pair', safe(async (req, res) => {
   // and any adopted agent are created with. Fall back to Claude if unreported.
   try {
     if ((await companyTier(paired.companyId)) === 'free') {
-      const engine = (
-        engines[0] === 'claude' || engines[0] === 'codex' || engines[0] === 'grok' ||
-        engines[0] === 'cursor' || engines[0] === 'opencode' || engines[0] === 'pi' ||
-        engines[0] === 'gemini' || engines[0] === 'qwen'
-      ) ? engines[0] : 'claude'
+      const engine: EngineId = PAIRABLE_ENGINES.has(engines[0]) ? (engines[0] as EngineId) : 'claude'
       // Adopt only agents that are stranded on the managed Cumora Cloud (or
       // unassigned) onto the just-paired machine — earlier builds' boot backfill
       // wrongly seeded free starters on cloud, where free can't run them. Agents
@@ -1240,9 +1289,18 @@ api.post('/computers/pair', safe(async (req, res) => {
 
 api.post('/computers/:id/detect', safe(async (req, res) => {
   const { companyId } = await requireCompanyRole(req)
-  const ok = await requestEngineDetect({ computerId: String(req.params.id), companyId })
+  const computerId = String(req.params.id)
+  // Persist first: Redis/SSE is the fast path, while the existing heartbeat flag
+  // guarantees eventual delivery across deploys, disconnects and Redis outages.
+  const ok = await requestEngineDetect({ computerId, companyId })
   if (!ok) throw new HttpError(404, 'computer not found')
-  res.json({ ok: true })
+  let delivered = false
+  try {
+    delivered = (await deliverEngineDetect(computerId)) > 0
+  } catch (error) {
+    console.warn('[computers] immediate engine detection signal failed:', error instanceof Error ? error.message : String(error))
+  }
+  res.json({ ok: true, delivered })
 }))
 
 api.post('/computers/:id/default-engine', safe(async (req, res) => {
@@ -1258,9 +1316,25 @@ api.post('/computers/me/engines', safe(async (req, res) => {
   const engines = Array.isArray(req.body?.engines)
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : []
-  const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected })
+  // Installed-but-refused engines. Kept apart from `engines` on purpose: that
+  // list becomes available_engines and picks an agent's adapter, so a blocked
+  // id arriving there would run what the sandbox gate declined.
+  const blocked = Array.isArray(req.body?.blocked)
+    ? (req.body.blocked as unknown[]).filter((e): e is string => typeof e === 'string')
+    : []
+  const ok = await reportDetectedEngines({ computerId, engines, detected: req.body?.detected, blocked })
   if (!ok) throw new HttpError(404, 'computer not found')
   res.json({ ok: true })
+}))
+
+// One device-level control stream per daemon. Unlike per-agent wake streams,
+// this also works when the computer currently hosts zero agents.
+api.get('/computers/me/control-stream', safe(async (req, res) => {
+  const token = deviceBearerToken(req)
+  const { computerId } = await requireDevice(req)
+  await attachComputerControlStream(computerId, res, {
+    authorize: async () => (await resolveDevice(token))?.computerId === computerId,
+  })
 }))
 
 // Agents assigned to the calling computer (daemon discovery on boot).
@@ -1398,10 +1472,411 @@ async function requireCompanyAdmin(req: Request & AuthedRequest, companyId: stri
   )
   if (rows.length === 0) throw new HttpError(403, 'not a member of this company')
   if (!DEVTOOLS_ROLES.has(rows[0].role)) {
-    throw new HttpError(403, 'only owners and admins can manage invitations')
+    throw new HttpError(403, 'only workspace owners and admins can perform this action')
   }
   return { userId: me, role: rows[0].role }
 }
+
+type WorkspaceMemberRole = 'owner' | 'admin' | 'member'
+const MUTABLE_WORKSPACE_ROLES = new Set<WorkspaceMemberRole>(['admin', 'member'])
+
+interface WorkspaceMemberRow {
+  id: string
+  name: string
+  email: string
+  avatar_url: string | null
+  role: WorkspaceMemberRole
+  joined_at: string
+}
+
+function serializeWorkspaceMember(row: WorkspaceMemberRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    email: row.email,
+    avatarUrl: row.avatar_url,
+    role: row.role,
+    joinedAt: new Date(row.joined_at).toISOString(),
+  }
+}
+
+async function enqueueWorkspaceMembership(client: PoolClient, event: {
+  companyId: string
+  kind: 'role_changed' | 'removed' | 'workspace_deleted'
+  recipientUserIds: string[]
+  actorId: string
+  userId?: string
+  role?: 'admin' | 'member'
+}): Promise<void> {
+  await enqueueBroadcast(client, CH_WORKSPACES, { type: 'workspace.membership', ...event })
+}
+
+/** List the human membership roster and its actual company_members role.
+ * `/participants` deliberately exposes an agent's job role instead, so it is
+ * not a safe source for workspace authorization UI. */
+api.get('/companies/:id/members', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  await requireCompanyAdmin(req, companyId)
+  const { rows } = await pool.query<WorkspaceMemberRow>(
+    `SELECT cm.user_id AS id,
+            u.display_name AS name,
+            u.email,
+            u.avatar_url,
+            cm.role,
+            cm.joined_at
+       FROM company_members cm
+       JOIN users u ON u.id = cm.user_id
+      WHERE cm.company_id = $1
+      ORDER BY CASE cm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END,
+               LOWER(u.display_name), cm.joined_at`,
+    [companyId],
+  )
+  res.json(rows.map(serializeWorkspaceMember))
+}))
+
+/** Change an existing member between member/admin. Ownership is immutable here
+ * and only the owner may change roles; ownership transfer needs its own flow. */
+api.patch('/companies/:id/members/:userId', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  const targetUserId = String(req.params.userId)
+  const requestedRole = String(req.body?.role ?? '') as WorkspaceMemberRole
+  if (!MUTABLE_WORKSPACE_ROLES.has(requestedRole)) {
+    throw new HttpError(400, 'role must be member or admin')
+  }
+  const nextRole = requestedRole as 'admin' | 'member'
+  const me = requireAuth(req)
+  const client = await pool.connect()
+  let previousRole: WorkspaceMemberRole
+  let updatedMember: WorkspaceMemberRow
+  try {
+    await client.query('BEGIN')
+    const { rows: actors } = await client.query<{ role: WorkspaceMemberRole; owner_user_id: string | null }>(
+      `SELECT actor.role, c.owner_user_id
+         FROM companies c
+         JOIN company_members actor
+           ON actor.company_id = c.id AND actor.user_id = $2
+        WHERE c.id = $1
+        FOR UPDATE OF c, actor`,
+      [companyId, me],
+    )
+    if (!actors[0]) throw new HttpError(403, 'not a member of this company')
+    if (actors[0].role !== 'owner') throw new HttpError(403, 'only the workspace owner can change member roles')
+
+    const { rows: targets } = await client.query<{ role: WorkspaceMemberRole }>(
+      `SELECT role FROM company_members
+        WHERE company_id = $1 AND user_id = $2
+        FOR UPDATE`,
+      [companyId, targetUserId],
+    )
+    if (!targets[0]) throw new HttpError(404, 'workspace member not found')
+    previousRole = targets[0].role
+    if (previousRole === 'owner' || actors[0].owner_user_id === targetUserId) {
+      throw new HttpError(409, 'workspace ownership cannot be changed here')
+    }
+    await client.query(
+      `UPDATE company_members SET role = $3
+        WHERE company_id = $1 AND user_id = $2`,
+      [companyId, targetUserId, nextRole],
+    )
+    const { rows: updatedMembers } = await client.query<WorkspaceMemberRow>(
+      `SELECT cm.user_id AS id, u.display_name AS name, u.email, u.avatar_url,
+              cm.role, cm.joined_at
+         FROM company_members cm JOIN users u ON u.id = cm.user_id
+        WHERE cm.company_id = $1 AND cm.user_id = $2`,
+      [companyId, targetUserId],
+    )
+    updatedMember = updatedMembers[0]
+    const { rows: managers } = await client.query<{ user_id: string }>(
+      `SELECT user_id FROM company_members
+        WHERE company_id = $1 AND role IN ('owner', 'admin')`,
+      [companyId],
+    )
+    await enqueueWorkspaceMembership(client, {
+      companyId, kind: 'role_changed',
+      recipientUserIds: [...new Set([targetUserId, ...managers.map((row) => row.user_id)])],
+      actorId: me, userId: targetUserId, role: nextRole,
+    })
+    await client.query('COMMIT')
+    nudgeRealtimeOutbox()
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+
+  const ip = req.socket.remoteAddress ?? null
+  const ua = (req.headers['user-agent'] as string | undefined) ?? null
+  await audit({
+    kind: 'workspace_member_role_changed', userId: me, companyId, ip, userAgent: ua,
+    detail: { targetUserId, previousRole, role: nextRole },
+  })
+  res.json({ ok: true, member: serializeWorkspaceMember(updatedMember) })
+}))
+
+/** Remove a human from a workspace while preserving authored history. The
+ * authorization rows, active participant state, and every conversation roster
+ * change in one transaction so there is no partial-access window. */
+api.delete('/companies/:id/members/:userId', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  const targetUserId = String(req.params.userId)
+  const me = requireAuth(req)
+  if (targetUserId === me) throw new HttpError(409, 'use a dedicated leave-workspace flow to remove yourself')
+
+  const client = await pool.connect()
+  let targetRole: WorkspaceMemberRole
+  let recipientUserIds: string[] = []
+  try {
+    await client.query('BEGIN')
+    const { rows: actors } = await client.query<{ role: WorkspaceMemberRole; owner_user_id: string | null }>(
+      `SELECT actor.role, c.owner_user_id
+         FROM companies c
+         JOIN company_members actor
+           ON actor.company_id = c.id AND actor.user_id = $2
+        WHERE c.id = $1
+        FOR UPDATE OF c, actor`,
+      [companyId, me],
+    )
+    const actor = actors[0]
+    if (!actor) throw new HttpError(403, 'not a member of this company')
+    if (actor.role !== 'owner' && actor.role !== 'admin') {
+      throw new HttpError(403, 'only owners and admins can remove workspace members')
+    }
+
+    const { rows: targets } = await client.query<{ role: WorkspaceMemberRole }>(
+      `SELECT role FROM company_members
+        WHERE company_id = $1 AND user_id = $2
+        FOR UPDATE`,
+      [companyId, targetUserId],
+    )
+    if (!targets[0]) throw new HttpError(404, 'workspace member not found')
+    targetRole = targets[0].role
+    if (targetRole === 'owner' || actor.owner_user_id === targetUserId) {
+      throw new HttpError(409, 'the workspace owner cannot be removed')
+    }
+    if (actor.role === 'admin' && targetRole !== 'member') {
+      throw new HttpError(403, 'admins can remove regular members only')
+    }
+
+    // Membership mutations lock participants first and conversations second,
+    // matching the normalized-membership helpers' global lock order.
+    const participantIds = [me, targetUserId].sort()
+    await client.query(
+      `SELECT id FROM participants
+        WHERE company_id = $1 AND id = ANY($2::text[])
+        ORDER BY id FOR UPDATE`,
+      [companyId, participantIds],
+    )
+    const { rows: conversations } = await client.query<{ id: string }>(
+      `SELECT c.id
+         FROM conversations c
+         JOIN conversation_members cm
+           ON cm.conversation_id = c.id AND cm.company_id = c.company_id
+        WHERE c.company_id = $1
+          AND cm.participant_id = $2
+          AND c.kind <> 'direct'
+        ORDER BY c.id
+        FOR UPDATE OF c`,
+      [companyId, targetUserId],
+    )
+    const conversationIds = conversations.map((row) => row.id)
+    if (conversationIds.length > 0) {
+      await client.query(
+        `DELETE FROM conversation_members
+          WHERE company_id = $1 AND participant_id = $2
+            AND conversation_id = ANY($3::text[])`,
+        [companyId, targetUserId, conversationIds],
+      )
+      await client.query(
+        `SELECT refresh_conversation_members_projection(id)
+           FROM unnest($1::text[]) affected(id)`,
+        [conversationIds],
+      )
+    }
+    await client.query(
+      `UPDATE participants
+          SET departed_at = NOW(), status = 'resting', status_updated_at = NOW()
+        WHERE company_id = $1 AND id = $2 AND kind = 'human'`,
+      [companyId, targetUserId],
+    )
+    await client.query(`DELETE FROM conversation_reads WHERE company_id = $1 AND user_id = $2`, [companyId, targetUserId])
+    await client.query(
+      `DELETE FROM conversation_mutes
+        WHERE user_id = $2
+          AND conversation_id IN (SELECT id FROM conversations WHERE company_id = $1)`,
+      [companyId, targetUserId],
+    )
+    const { rows: recipients } = await client.query<{ user_id: string }>(
+      `SELECT user_id FROM company_members WHERE company_id = $1`, [companyId],
+    )
+    recipientUserIds = recipients.map((row) => row.user_id)
+    await client.query(
+      `DELETE FROM company_members WHERE company_id = $1 AND user_id = $2`,
+      [companyId, targetUserId],
+    )
+    await enqueueWorkspaceMembership(client, {
+      companyId, kind: 'removed', recipientUserIds,
+      actorId: me, userId: targetUserId,
+    })
+    await client.query('COMMIT')
+    nudgeRealtimeOutbox()
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+
+  const ip = req.socket.remoteAddress ?? null
+  const ua = (req.headers['user-agent'] as string | undefined) ?? null
+  await audit({
+    kind: 'workspace_member_removed', userId: me, companyId, ip, userAgent: ua,
+    detail: { targetUserId, previousRole: targetRole },
+  })
+  res.json({ ok: true })
+}))
+
+/** Hard-delete a workspace's tenant data. The schema contains both modern
+ * company FKs and legacy soft company_id columns, so the explicit deletes are
+ * intentional; relying on DELETE companies CASCADE alone would leave orphans. */
+api.delete('/companies/:id', safe(async (req, res) => {
+  const companyId = String(req.params.id)
+  const confirmation = String(req.body?.confirmation ?? '').trim()
+  const me = requireAuth(req)
+  const client = await pool.connect()
+  let companyName = ''
+  let memberIds: string[] = []
+  let agentIds: string[] = []
+  const storageKeys = new Set<string>()
+  let nextCompanyId: string | null = null
+  try {
+    await client.query('BEGIN')
+    const { rows: companies } = await client.query<{
+      name: string; owner_user_id: string | null; role: WorkspaceMemberRole
+    }>(
+      `SELECT c.name, c.owner_user_id, cm.role
+         FROM companies c
+         JOIN company_members cm ON cm.company_id = c.id AND cm.user_id = $2
+        WHERE c.id = $1
+        FOR UPDATE OF c, cm`,
+      [companyId, me],
+    )
+    const company = companies[0]
+    if (!company) throw new HttpError(404, 'workspace not found')
+    if (company.role !== 'owner' || (company.owner_user_id && company.owner_user_id !== me)) {
+      throw new HttpError(403, 'only the workspace owner can delete it')
+    }
+    companyName = company.name
+    if (!confirmation || confirmation !== companyName) {
+      throw new HttpError(400, 'type the workspace name exactly to confirm deletion')
+    }
+    const { rows: alternatives } = await client.query<{ company_id: string }>(
+      `SELECT company_id FROM company_members
+        WHERE user_id = $1 AND company_id <> $2
+        ORDER BY joined_at ASC LIMIT 1`,
+      [me, companyId],
+    )
+    nextCompanyId = alternatives[0]?.company_id ?? null
+    if (!nextCompanyId) throw new HttpError(409, 'you cannot delete your only workspace')
+
+    const { rows: members } = await client.query<{ user_id: string }>(
+      `SELECT user_id FROM company_members WHERE company_id = $1`, [companyId],
+    )
+    memberIds = members.map((row) => row.user_id)
+    const { rows: agents } = await client.query<{ id: string; avatar_url: string | null }>(
+      `SELECT id, avatar_url FROM participants WHERE company_id = $1 AND kind = 'agent'`, [companyId],
+    )
+    agentIds = agents.map((row) => row.id)
+    for (const row of agents) {
+      if (!row.avatar_url) continue
+      const key = storageKeyFromPublicUrl(row.avatar_url)
+      if (key) storageKeys.add(key)
+    }
+    const { rows: emailFiles } = await client.query<{ storage_key: string | null }>(
+      `SELECT storage_key FROM email_attachments WHERE company_id = $1`, [companyId],
+    )
+    for (const row of emailFiles) {
+      const key = row.storage_key ? normalizeStorageKey(row.storage_key) : null
+      if (key) storageKeys.add(key)
+    }
+    const { rows: messageFiles } = await client.query<{ attachment: unknown }>(
+      `SELECT attachment FROM messages WHERE company_id = $1 AND attachment IS NOT NULL`, [companyId],
+    )
+    for (const row of messageFiles) {
+      const candidates = Array.isArray(row.attachment) ? row.attachment : [row.attachment]
+      for (const candidate of candidates) {
+        if (!candidate || typeof candidate !== 'object') continue
+        const key = messageAttachmentStorageKey(candidate as { key?: unknown; url?: unknown })
+        if (key) storageKeys.add(key)
+      }
+    }
+    const { rows: docRows } = await client.query<{ id: string }>(
+      `SELECT id FROM documents WHERE company_id = $1`, [companyId],
+    )
+    for (const docRow of docRows) {
+      const docKeys = await collectDocumentStorageKeys(docRow.id, client)
+      for (const key of docKeys) storageKeys.add(key)
+      evictDocumentRoom(docRow.id)
+    }
+
+    // Child/root rows with soft company_id references. FK-backed trees such as
+    // boards, calendar, projects, invitations, and shipping cascade from the
+    // final companies delete below.
+    const softScopedTables = [
+      'document_mentions', 'email_attachments', 'email_messages', 'email_contacts',
+      'poll_votes', 'message_reactions', 'tool_calls', 'conversation_reads',
+      'agent_events', 'agent_runs', 'agent_triages',
+      'agent_workspace', 'agent_memory', 'agent_log', 'agent_tasks',
+      'agent_climate', 'computers',
+    ] as const
+    for (const table of softScopedTables) {
+      await client.query(`DELETE FROM ${table} WHERE company_id = $1`, [companyId])
+    }
+    if (agentIds.length > 0) {
+      await client.query(`DELETE FROM board_mention_reads WHERE user_id = ANY($1::text[])`, [agentIds])
+      // Sweep by owner as well as by tenant. #207 added the five tables whose
+      // writers were dropping company_id; these three are here so the sweep does
+      // not depend on writer discipline at all. Their writers do pass a tenant
+      // today — the point is that the other five did too, until they didn't, and
+      // these are the tables that carry per-run history and cost, so a row that
+      // slips through resurfaces on a billing report rather than in a UI.
+      const agentScopedTables = [
+        'agent_workspace', 'agent_memory', 'agent_log', 'agent_tasks', 'agent_climate',
+        'agent_events', 'agent_runs', 'agent_triages',
+      ] as const
+      for (const table of agentScopedTables) {
+        await client.query(`DELETE FROM ${table} WHERE agent_id = ANY($1::text[])`, [agentIds])
+      }
+    }
+    await client.query(`DELETE FROM documents WHERE company_id = $1`, [companyId])
+    await client.query(`DELETE FROM conversations WHERE company_id = $1`, [companyId])
+    await client.query(`DELETE FROM participants WHERE company_id = $1`, [companyId])
+    // Keep the billing/usage ledger (llm_calls + llm_calls_rollup) and global
+    // user settings. They are intentionally not tenant-owned data.
+    await enqueueWorkspaceCleanup(client, { companyId, agentIds, storageKeys: [...storageKeys] })
+    await enqueueWorkspaceMembership(client, {
+      companyId, kind: 'workspace_deleted', recipientUserIds: memberIds,
+      actorId: me,
+    })
+    await client.query(`DELETE FROM companies WHERE id = $1`, [companyId])
+    await client.query('COMMIT')
+    nudgeRealtimeOutbox()
+    nudgeWorkspaceCleanupWorker()
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+
+  const ip = req.socket.remoteAddress ?? null
+  const ua = (req.headers['user-agent'] as string | undefined) ?? null
+  await audit({
+    kind: 'workspace_deleted', userId: me, companyId, ip, userAgent: ua,
+    detail: { name: companyName, memberCount: memberIds.length, agentCount: agentIds.length },
+  })
+  res.json({ ok: true, nextCompanyId })
+}))
 
 /** Build the public-facing accept URL for an invite — always an https web
  *  origin (e.g. https://app.cumora.ai/invite/<token>). The web bundle hosted
@@ -1480,7 +1955,7 @@ api.get('/companies/:id/invitations', safe(async (req, res) => {
  *  hash, so this is the only chance to copy the link. */
 api.post('/companies/:id/invitations', safe(async (req, res) => {
   const companyId = String(req.params.id)
-  const { userId: me } = await requireCompanyAdmin(req, companyId)
+  const { userId: me, role: actorRole } = await requireCompanyAdmin(req, companyId)
   const body = req.body ?? {}
   const rawEmail = typeof body.email === 'string' ? body.email.trim() : ''
   const email = rawEmail ? rawEmail.toLowerCase() : null
@@ -1489,6 +1964,9 @@ api.post('/companies/:id/invitations', safe(async (req, res) => {
   }
   const role = typeof body.role === 'string' && INVITE_ALLOWED_ROLES.has(body.role)
     ? body.role : 'member'
+  if (actorRole === 'admin' && role === 'admin') {
+    throw new HttpError(403, 'only the workspace owner can invite another admin')
+  }
   const note = typeof body.note === 'string' ? body.note.trim().slice(0, 280) || null : null
   const multiUse = body.multiUse === true || (!email && body.maxUses !== 1)
   const requestedMaxUses = Number(body.maxUses ?? (email ? 1 : INVITE_MAX_LINK_USES))
@@ -1750,7 +2228,13 @@ api.post('/invitations/:token/accept', safe(async (req, res) => {
     await client.query(
       `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, avatar_url, status, company_id)
        VALUES ($1, 'human', $2, NULL, $3, '#FF8870', $4, 'avail', $5)
-       ON CONFLICT (id, company_id) DO NOTHING`,
+       ON CONFLICT (id, company_id) DO UPDATE
+         SET name = EXCLUDED.name,
+             initial = EXCLUDED.initial,
+             avatar_url = EXCLUDED.avatar_url,
+             status = 'avail',
+             status_updated_at = NOW(),
+             departed_at = NULL`,
       [me, displayName, displayName.charAt(0).toUpperCase(),
        userAvatar, inv.company_id],
     )
@@ -1991,17 +2475,6 @@ api.get('/participants', async (req, res) => {
 })
 
 /* ============== Agent CRUD ============== */
-
-const AVATAR_PALETTE = [
-  '#FFB088', '#FFD9D2', '#FFB7AF', '#F4B740',
-  '#7C5CFF', '#A593FF', '#4FC2F4', '#41B5DC',
-  '#4FC2A1', '#6EC56A', '#E9A0E9', '#FF7AB6',
-]
-function defaultAvatarBg(id: string): string {
-  let h = 0
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0
-  return AVATAR_PALETTE[h % AVATAR_PALETTE.length]
-}
 
 /* ============== Deterministic visual signature per agent ============== */
 
@@ -2424,48 +2897,6 @@ function readAgentBody(b: AgentBody): {
   return out as ReturnType<typeof readAgentBody>
 }
 
-/** Slugify a display name into a candidate agent id: lowercase ASCII
- *  letters/digits/hyphens, starts with a letter, capped at 24 chars.
- *  Falls back to `'agent'` when the name has no usable ASCII tail
- *  (e.g. an all-CJK / emoji name). Used by /agents POST to derive
- *  the agent id from the user-supplied name — users no longer enter
- *  an id directly, so we get to enforce shape AND global uniqueness
- *  invisibly. */
-function slugifyAgentName(name: string): string {
-  const lowered = name.toLowerCase().normalize('NFKD').replace(/[̀-ͯ]/g, '')
-  let slug = lowered
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-{2,}/g, '-')
-    .slice(0, 24)
-  if (!/^[a-z]/.test(slug)) slug = `a-${slug}`.slice(0, 24)
-  if (slug.length === 0) slug = 'agent'
-  return slug
-}
-
-/** Pick a globally-unique agent id, preferring the slug of `name` and
- *  falling back to `${slug}-${random4}` if (and as many times as)
- *  needed. The participants table enforces global uniqueness on
- *  `id WHERE kind='agent'` via a partial unique index, so this loop
- *  + the INSERT race together can still 409 if a peer wins; the
- *  caller catches that and retries with a fresh suffix. */
-async function pickUniqueAgentId(baseName: string): Promise<string> {
-  const base = slugifyAgentName(baseName)
-  const tryIds: string[] = [base]
-  for (let i = 0; i < 8; i++) {
-    tryIds.push(`${base}-${Math.random().toString(36).slice(2, 6)}`)
-  }
-  for (const candidate of tryIds) {
-    const { rows } = await pool.query<{ exists: boolean }>(
-      `SELECT EXISTS(SELECT 1 FROM participants WHERE id = $1) AS exists`,
-      [candidate],
-    )
-    if (!rows[0].exists) return candidate
-  }
-  // Wildly unlikely with 8 random suffixes.
-  throw new HttpError(500, 'could not pick a unique agent id — please retry')
-}
-
 api.post('/agents', async (req, res) => {
   // Agents are shared workspace identities — they speak on behalf of the
   // company, hold their own LLM budget, and can email out. Restricting
@@ -2477,33 +2908,43 @@ api.post('/agents', async (req, res) => {
   if (!data.systemPrompt || data.systemPrompt.trim().length < 10) {
     res.status(400).json({ error: 'systemPrompt required (at least 10 chars — describe the agent\'s style)' }); return
   }
-  await assertCompanyAgentLimit(tenant)
-  // The id is now SERVER-generated from the name (slugified) rather
-  // than user-supplied — users can't accidentally cause cross-tenant
-  // id collisions, and the same display name landing in two
-  // workspaces still produces two distinct ids (the second one gets
-  // a random suffix).
-  const agentId = await pickUniqueAgentId(data.name)
-  const initial = data.initial || data.name.charAt(0).toUpperCase()
-  const avatarBg = data.avatarBg || defaultAvatarBg(agentId)
+  if (req.body?.requestId !== undefined && typeof req.body.requestId !== 'string') {
+    res.status(400).json({ error: 'requestId must be a string' }); return
+  }
+  if (req.body?.computerId !== undefined && typeof req.body.computerId !== 'string') {
+    res.status(400).json({ error: 'computerId must be a string' }); return
+  }
+  const tier = await companyPlanTier(tenant)
+  const computerId = typeof req.body?.computerId === 'string' ? req.body.computerId.trim() || null : null
+  const engine = typeof req.body?.engine === 'string' ? req.body.engine : undefined
+  const inherit = req.body?.inherit === true
+  let creation: Awaited<ReturnType<typeof createAgentRecord>>
   try {
-    await pool.query(
-      `INSERT INTO participants (id, kind, name, role, initial, avatar_bg, status, bio, tools, system_prompt, model, fast_model, company_id)
-       VALUES ($1, 'agent', $2, $3, $4, $5, 'avail', $6, $7::jsonb, $8, $9, $10, $11)`,
-      [agentId, data.name, data.role ?? '', initial, avatarBg, data.bio ?? '',
-       JSON.stringify(data.tools ?? ['bash']), data.systemPrompt, data.model ?? null, data.fastModel ?? null, tenant],
-    )
+    creation = await createAgentRecord({
+      companyId: tenant,
+      tier,
+      maxActiveAgents: TIER_LIMITS[tier].agentsPerCompany,
+      requestId: typeof req.body?.requestId === 'string' ? req.body.requestId : null,
+      name: data.name,
+      role: data.role,
+      systemPrompt: data.systemPrompt,
+      bio: data.bio,
+      initial: data.initial,
+      avatarBg: data.avatarBg,
+      model: data.model,
+      fastModel: data.fastModel,
+      tools: data.tools ?? undefined,
+      computerId,
+      engine,
+      inherit,
+    })
   } catch (e) {
+    const status = e instanceof AgentCreationError ? e.status : 500
     const msg = e instanceof Error ? e.message : String(e)
-    if (/duplicate key|participants_agent_id_unique/.test(msg)) {
-      // Race window between pickUniqueAgentId's SELECT and the INSERT
-      // — another POST squatted on this id. Client can retry.
-      res.status(409).json({ error: 'agent id collision — please retry' })
-    } else {
-      res.status(500).json({ error: msg })
-    }
+    res.status(status).json({ error: msg })
     return
   }
+  const agentId = creation.id
   // Re-bind data.id for the rest of the handler so subsequent code
   // (workspace seeding, all-hands join, response payload) sees it.
   data.id = agentId
@@ -2566,12 +3007,18 @@ api.post('/agents', async (req, res) => {
   // with their initial-letter avatar; the real portrait shows up on the
   // next /participants poll once the image is ready. We deliberately
   // don't block the 201 response since image gen can take several seconds.
-  const newAgentId = data.id
-  void generateAndPersistAvatar({ agentId: newAgentId, tenant })
-    .then(() => console.log(`[agents] auto-portrait ready for ${newAgentId}`))
-    .catch((e) => console.warn(`[agents] auto-portrait failed for ${newAgentId}`, e))
+  if (creation.created) {
+    const newAgentId = data.id
+    void generateAndPersistAvatar({ agentId: newAgentId, tenant })
+      .then(() => console.log(`[agents] auto-portrait ready for ${newAgentId}`))
+      .catch((e) => console.warn(`[agents] auto-portrait failed for ${newAgentId}`, e))
+  }
 
-  res.status(201).json({ id: data.id })
+  res.status(creation.created ? 201 : 200).json({
+    id: data.id,
+    replayed: !creation.created,
+    ...(creation.placement ?? {}),
+  })
 })
 
 api.put('/agents/:id', async (req, res) => {
@@ -2767,21 +3214,20 @@ export async function generateAndPersistAvatar(args: {
 
   const key = `avatars/avatar-${id}-${randomUUID().slice(0, 8)}.png`
   const url = await storage.put(key, imageBuf, 'image/png')
-  await pool.query(
-    `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
-    [id, url, tenant],
-  )
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE participants SET avatar_url = $2 WHERE id = $1 AND company_id = $3`,
+      [id, url, tenant],
+    )
+    await enqueueBroadcast(client, CH_STATUS, {
+      type: 'participants.avatar',
+      participantId: id,
+      avatarUrl: url,
+      companyId: tenant,
+    })
+  })
   const { invalidatePersonaCache } = await import('../agents/personas.js')
   invalidatePersonaCache(id)
-  // Notify connected clients that this agent's avatar changed so they
-  // can pick it up without waiting for the 60s periodic refresh.
-  const { CH_STATUS, publish } = await import('../redis.js')
-  await publish(CH_STATUS, {
-    type: 'participants.avatar',
-    participantId: id,
-    avatarUrl: url,
-    companyId: tenant,
-  })
   return { url }
 }
 
@@ -2825,6 +3271,18 @@ api.post('/agents/:id/rehire', async (req, res) => {
   res.json({ ok: true })
 })
 
+/**
+ * Ceiling on one sidebar page.
+ *
+ * The route has no cursor, so this is a backstop rather than pagination: it
+ * bounds the pathological workspace the performance review described (10,000
+ * conversations returned in one response) without changing the contract for
+ * the real ones, which are nowhere near it. If a workspace ever trips the log
+ * line below, that is the signal that real cursor paging has become worth its
+ * cost across the ~80 call sites that read this list.
+ */
+const CONVERSATION_LIST_LIMIT = 500
+
 api.get('/conversations', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { rows } = await pool.query(
@@ -2841,67 +3299,81 @@ api.get('/conversations', async (req, res) => {
         -- "until tomorrow" silence wears off without needing a sweeper job.
         (mu.user_id IS NOT NULL AND (mu.muted_until IS NULL OR mu.muted_until > NOW())) AS muted,
         mu.muted_until AS "mutedUntil",
-        (
-          SELECT json_build_object(
-            'id', m.id,
-            'authorId', m.author_id,
-            'kind', m.kind,
-            'body', m.body,
-            'tool', m.tool,
-            'attachment', m.attachment,
-            'createdAt', m.created_at,
-            -- For email messages, surface the subject + direction so the
-            -- sidebar preview can show "Re: contract draft" instead of a
-            -- raw body excerpt. NULL for non-email messages — the client
-            -- branches on last.kind === 'email'.
-            'email', (
-              SELECT jsonb_build_object(
-                'subject', em.subject,
-                'direction', em.direction,
-                'from', em.from_addr
-              )
-                FROM email_messages em
-               WHERE em.message_id = m.id
-            )
-          )
-          FROM messages m
-          WHERE m.conversation_id = c.id
-          ORDER BY m.sequence DESC
-          LIMIT 1
-        ) AS "lastMessage",
-        COALESCE((
-          SELECT COUNT(*)::int
-            FROM messages m
-           WHERE m.conversation_id = c.id
-             AND m.author_id <> $1
-             AND m.created_at > COALESCE(
-               (SELECT last_read_at FROM conversation_reads WHERE user_id = $1 AND conversation_id = c.id),
-               '1970-01-01T00:00:00Z'::timestamptz
-             )
-        ), 0) AS "unreadCount"
+        last_message.payload AS "lastMessage",
+        COALESCE(unread.n, 0) AS "unreadCount"
       FROM conversations c
       LEFT JOIN projects p ON p.id = c.project_id
       LEFT JOIN conversation_mutes mu ON mu.conversation_id = c.id AND mu.user_id = $1
+      -- Hoisted out of the unread subquery. As a correlated scalar it was
+      -- probed once per conversation, nested inside a COUNT that was itself
+      -- probed once per conversation.
+      LEFT JOIN conversation_reads cr ON cr.user_id = $1 AND cr.conversation_id = c.id
       LEFT JOIN LATERAL (
         SELECT p_other.name
-          FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+          FROM conversation_members member
           JOIN participants p_other
-            ON p_other.id = member.id
-           AND p_other.company_id = c.company_id
-         WHERE member.id <> $1
-         ORDER BY member.ord
+            ON p_other.id = member.participant_id
+           AND p_other.company_id = member.company_id
+         WHERE member.conversation_id = c.id
+           AND member.company_id = c.company_id
+           AND member.participant_id <> $1
+         ORDER BY member.ordinal
          LIMIT 1
       ) other_participant ON c.kind = 'direct'
+      LEFT JOIN LATERAL (
+        SELECT json_build_object(
+          'id', m.id,
+          'authorId', m.author_id,
+          'kind', m.kind,
+          'body', m.body,
+          'tool', m.tool,
+          'attachment', m.attachment,
+          'createdAt', m.created_at,
+          -- For email messages, surface the subject + direction so the
+          -- sidebar preview can show "Re: contract draft" instead of a
+          -- raw body excerpt. NULL for non-email messages — the client
+          -- branches on last.kind === 'email'.
+          'email', (
+            SELECT jsonb_build_object(
+              'subject', em.subject,
+              'direction', em.direction,
+              'from', em.from_addr
+            )
+              FROM email_messages em
+             WHERE em.message_id = m.id
+          )
+        ) AS payload
+          FROM messages m
+         WHERE m.conversation_id = c.id
+         ORDER BY m.sequence DESC
+         LIMIT 1
+      ) last_message ON true
+      LEFT JOIN LATERAL (
+        SELECT COUNT(*)::int AS n
+          FROM messages m
+         WHERE m.conversation_id = c.id
+           AND m.author_id <> $1
+           AND m.created_at > COALESCE(cr.last_read_at, '1970-01-01T00:00:00Z'::timestamptz)
+      ) unread ON true
       WHERE c.company_id = $2
         -- Only conversations the caller is actually in. Without this,
         -- agent-to-agent direct chats (members=[agentA, agentB]) leak
         -- into the user's list even though they're not a participant
         -- — those are private to the agents and surfaced only via the
         -- "Whispers" peek tab.
-        AND c.members @> to_jsonb(ARRAY[$1::text])
-      ORDER BY c.pinned DESC, c.updated_at DESC`,
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id
+             AND cm.company_id = c.company_id
+             AND cm.participant_id = $1
+        )
+      ORDER BY c.pinned DESC, c.updated_at DESC
+      LIMIT ${CONVERSATION_LIST_LIMIT}`,
     [me, tenant],
   )
+  if (rows.length === CONVERSATION_LIST_LIMIT) {
+    console.warn(`[conversations] ${tenant} hit the ${CONVERSATION_LIST_LIMIT}-row sidebar ceiling; older rows are being withheld`)
+  }
   res.json(rows)
 })
 
@@ -2979,13 +3451,13 @@ api.post('/conversations/:id/topic', async (req, res) => {
           WHERE id = $1 AND company_id = $3`,
         [id, topic, tenant],
       )
+      await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+        type: 'conversation.updated',
+        conversationId: id,
+        companyId: tenant,
+        patch: { topic },
+      })
     },
-  })
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: id,
-    companyId: tenant,
-    patch: { topic },
   })
   res.json({ ok: true, topic })
 })
@@ -3008,13 +3480,13 @@ api.post('/conversations/:id/title', async (req, res) => {
           WHERE id = $1 AND company_id = $3`,
         [id, title, tenant],
       )
+      await enqueueBroadcast(client, CH_CONVO_UPDATED, {
+        type: 'conversation.updated',
+        conversationId: id,
+        companyId: tenant,
+        patch: { title },
+      })
     },
-  })
-  await publish(CH_CONVO_UPDATED, {
-    type: 'conversation.updated',
-    conversationId: id,
-    companyId: tenant,
-    patch: { title },
   })
   res.json({ ok: true, title })
 })
@@ -3048,12 +3520,22 @@ api.post('/conversations/direct', async (req, res) => {
       [tenant, pairKey],
     )
     const { rows: existing } = await client.query<{ id: string }>(
-      `SELECT id FROM conversations
-        WHERE kind = 'direct' AND company_id = $3
-          AND members @> to_jsonb(ARRAY[$1::text]) AND members @> to_jsonb(ARRAY[$2::text])
-          AND jsonb_array_length(members) = 2
-        ORDER BY updated_at DESC LIMIT 1
-        FOR UPDATE`,
+      `SELECT c.id FROM conversations c
+        WHERE c.kind = 'direct' AND c.company_id = $3
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $1
+          )
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $2
+          )
+          AND (SELECT COUNT(*) FROM conversation_members cm
+                WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+        ORDER BY c.updated_at DESC LIMIT 1
+        FOR UPDATE OF c`,
       [me, otherId, tenant],
     )
     if (existing[0]) {
@@ -3180,14 +3662,29 @@ api.post('/conversations/:id/members', async (req, res) => {
   const { id } = req.params
   const newMember = String(req.body?.id ?? '').trim()
   if (!newMember) { res.status(400).json({ error: 'id required' }); return }
-  const { rows } = await pool.query<{ kind: string; members: string[] }>(
-    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
+  const { rows } = await pool.query<{
+    kind: string; members: string[]; actor_is_member: boolean; target_is_member: boolean
+  }>(
+    `SELECT c.kind, c.members,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            ) AS actor_is_member,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $4
+            ) AS target_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [id, tenant, me, newMember],
   )
   const c = rows[0]
   if (!c) { res.status(404).json({ error: 'not found' }); return }
   if (c.kind !== 'group') { res.status(400).json({ error: `cannot add to a ${c.kind} conversation` }); return }
-  if (!c.members.includes(me)) { res.status(403).json({ error: 'only members can add others' }); return }
-  if (c.members.includes(newMember)) { res.json({ ok: true, members: c.members, alreadyIn: true }); return }
+  if (!c.actor_is_member) { res.status(403).json({ error: 'only members can add others' }); return }
+  if (c.target_is_member) { res.json({ ok: true, members: c.members, alreadyIn: true }); return }
   // Validate participant exists in this tenant.
   const { rows: existing } = await pool.query<{ id: string }>(
     `SELECT id FROM participants WHERE id = $1 AND company_id = $2`, [newMember, tenant],
@@ -3211,15 +3708,23 @@ api.post('/conversations/:id/members', async (req, res) => {
 api.post('/conversations/:id/leave', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
-  const { rows } = await pool.query<{ kind: string; members: string[] }>(
-    `SELECT kind, members FROM conversations WHERE id = $1 AND company_id = $2`, [id, tenant],
+  const { rows } = await pool.query<{ kind: string; members: string[]; actor_is_member: boolean }>(
+    `SELECT c.kind, c.members,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            ) AS actor_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [id, tenant, me],
   )
   const c = rows[0]
   if (!c) { res.status(404).json({ error: 'not found' }); return }
   if (c.kind === 'direct') {
     res.status(400).json({ error: 'cannot leave a direct conversation' }); return
   }
-  if (!c.members.includes(me)) { res.status(409).json({ error: 'not a member' }); return }
+  if (!c.actor_is_member) { res.status(409).json({ error: 'not a member' }); return }
   const { removeConversationMember } = await import('../agents/membership.js')
   const mutation = await removeConversationMember({
     conversationId: id, memberId: me, actorId: me, companyId: tenant,
@@ -3244,13 +3749,22 @@ api.post('/conversations/:id/typing', async (req, res) => {
     // field name is a legacy from when only agents emitted typing — the
     // client treats it as an opaque participant id and doesn't care
     // whether the typer is human or agent.
+    //
+    // Fail-open on a Redis outage. A typing indicator is pure ephemera
+    // that the renderer expires on its own; surfacing the outage as a 500
+    // would only teach a composer that fires one of these every few
+    // seconds to spam the error path. Matches how the agent-side emitters
+    // treat the same channel (inproc-client.ts, scheduler.ts).
     await publish(CH_TYPING, {
       type: 'typing',
       conversationId: id,
       agentId: me,
       done,
       companyId,
-    })
+    }).catch((err) =>
+      console.warn(`[typing] publish for ${id} failed — dropping`,
+        err instanceof Error ? err.message : err),
+    )
     res.json({ ok: true })
   } catch (e) {
     const status = e instanceof HttpError ? e.status : 500
@@ -3548,16 +4062,23 @@ api.post('/conversations/:id/messages', async (req, res) => {
     }
   })
 
-  const { rows: convoRows } = await pool.query<{ members: string[]; kind: string }>(
-    `SELECT members, kind FROM conversations WHERE id = $1 AND company_id = $2`,
-    [id, tenant],
+  const { rows: convoRows } = await pool.query<{ kind: string; actor_is_member: boolean }>(
+    `SELECT c.kind,
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+                 AND cm.participant_id = $3
+            ) AS actor_is_member
+       FROM conversations c
+      WHERE c.id = $1 AND c.company_id = $2`,
+    [id, tenant, me],
   )
   const convo = convoRows[0]
   if (!convo) {
     res.status(404).json({ error: 'conversation not found' })
     return
   }
-  if (!convo.members.includes(me)) {
+  if (!convo.actor_is_member) {
     res.status(403).json({ error: 'not a member of this conversation' })
     return
   }
@@ -3617,13 +4138,18 @@ api.post('/conversations/:id/messages', async (req, res) => {
     )
     if (!actor.rowCount) throw new HttpError(403, 'participant is no longer active in this workspace')
     const currentConversation = await client.query<{ kind: string }>(
-      `SELECT kind FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR UPDATE`,
-      [id, tenant, me],
+      `SELECT c.kind FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        FOR UPDATE OF c`,
+      [id, tenant],
     )
     if (!currentConversation.rowCount) throw new HttpError(403, 'not a member of this conversation')
+    const currentMembership = await client.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1 AND company_id = $2 AND participant_id = $3`,
+      [id, tenant, me],
+    )
+    if (!currentMembership.rowCount) throw new HttpError(403, 'not a member of this conversation')
     if (currentConversation.rows[0].kind === 'email') {
       throw new HttpError(409, 'conversation changed; retry the email reply')
     }
@@ -3690,8 +4216,22 @@ api.post('/conversations/:id/messages', async (req, res) => {
         `UPDATE conversations SET updated_at = NOW() WHERE id = $1 AND company_id = $2`,
         [id, tenant],
       )
+      await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+        type: 'message.new',
+        conversationId: id,
+        companyId: tenant,
+        message: {
+          id: persisted.id, conversationId: id, authorId: me,
+          kind: 'text', body, sequence: persisted.sequence, at: new Date().toISOString(),
+          attachment: attachment ?? undefined,
+          quotedMessageId: resolvedQuotedId ?? undefined,
+          quoted: quotedSummary ?? undefined,
+          clientId: clientId ?? undefined,
+        },
+      })
     }
     await client.query('COMMIT')
+    if (insertedNew) nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -3721,51 +4261,22 @@ api.post('/conversations/:id/messages', async (req, res) => {
     return
   }
 
-  // Drop the message into the bus. The mailbox scheduler (subscribed to
-  // CH_MESSAGE_NEW) wakes every agent member and lets each decide for itself
-  // whether to reply, react, dm, or stay silent. The companyId tag lets
-  // the WS bridge filter who sees it.
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId: id,
-    companyId: tenant,
-    message: {
-      id: messageId, conversationId: id, authorId: me,
-      kind: 'text', body, sequence: persistedSequence, at: new Date().toISOString(),
-      attachment: attachment ?? undefined,
-      quotedMessageId: resolvedQuotedId ?? undefined,
-      quoted: quotedSummary ?? undefined,
-      clientId: clientId ?? undefined,
-    },
-  })
-  logDelivery('ws.published')
+  // Redis delivery is handled by the transactional outbox worker. The mailbox
+  // scheduler and WS bridge receive the same payload without participating in
+  // HTTP command completion.
+  logDelivery('ws.enqueued')
 
   // Fan out APNs to recipients who aren't currently looking at the app
   // (NotificationToasts handles those). Fire-and-forget — push delivery
   // must never block the HTTP response. The push module soft-disables
   // when APNs creds aren't configured, so this is safe even in dev.
-  void (async () => {
-    try {
-      const [recipients, convoRow, authorRow] = await Promise.all([
-        computeMessageRecipients({ conversationId: id, authorId: me }),
-        pool.query<{ title: string }>(`SELECT title FROM conversations WHERE id = $1`, [id]).then((r) => r.rows[0]),
-        pool.query<{ display_name: string }>(`SELECT display_name FROM users WHERE id = $1`, [me]).then((r) => r.rows[0]),
-      ])
-      if (recipients.length === 0) return
-      await notifyMessage({
-        conversationId: id,
-        conversationTitle: convoRow?.title ?? null,
-        authorId: me,
-        authorName: authorRow?.display_name ?? me,
-        messageId,
-        body,
-        companyId: tenant,
-        recipientUserIds: recipients,
-      })
-    } catch (e) {
-      console.warn('[push] notifyMessage post-/messages failed', e)
-    }
-  })()
+  void dispatchMessagePush({
+    conversationId: id,
+    authorId: me,
+    messageId,
+    body,
+    companyId: tenant,
+  })
 
   // Climate signal: @-mentioned agents feel mildly more affinity / trust
   // toward the speaker (engagement is positive). Fire-and-forget so we
@@ -4107,10 +4618,12 @@ api.get('/email/:messageId/html', async (req, res) => {
     const row = rows[0]
     if (!row) { res.status(404).json({ error: 'unknown email message' }); return }
     if (!row.html) { res.status(204).end(); return }
-    const { rows: cv } = await pool.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1`, [row.conversation_id],
+    const { rows: cv } = await pool.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1 AND company_id = $2 AND participant_id = $3`,
+      [row.conversation_id, tenant, me],
     )
-    if (!cv[0] || !cv[0].members.includes(me)) {
+    if (!cv[0]) {
       res.status(403).json({ error: 'not a member of this thread' }); return
     }
     const { sanitizeEmailHtml } = await import('../email.js')
@@ -4157,10 +4670,12 @@ api.post('/email/reply/:messageId', async (req, res) => {
     )
     const o = orig[0]
     if (!o) { res.status(404).json({ error: 'unknown email message' }); return }
-    const { rows: cv } = await pool.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1`, [o.conversation_id],
+    const { rows: cv } = await pool.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1 AND company_id = $2 AND participant_id = $3`,
+      [o.conversation_id, tenant, me],
     )
-    if (!cv[0] || !cv[0].members.includes(me)) {
+    if (!cv[0]) {
       res.status(403).json({ error: 'not a member of this thread' }); return
     }
 
@@ -4438,6 +4953,13 @@ api.post('/messages/:id/reactions', async (req, res) => {
            GROUP BY emoji ORDER BY count DESC, emoji ASC`,
         [id],
       )
+      await enqueueBroadcast(client, CH_REACTIONS, {
+        type: 'message.reactions',
+        conversationId,
+        companyId: tenant,
+        messageId: id,
+        reactions,
+      })
       return { wasRemoval, messageAuthorId: message[0].author_id, reactions }
     },
   })
@@ -4453,20 +4975,6 @@ api.post('/messages/:id/reactions', async (req, res) => {
       note: `received ${emoji} from ${me}`,
     })
   }
-
-  // Aggregate. No server-side `mine` flag: the same row is broadcast over
-  // WS to every client in the tenant, and "is this mine" is per-recipient.
-  // Renderer derives mine = users.includes(meId) — see fromApi /
-  // applyEvent in src/stores/messages.ts.
-  await publish(CH_REACTIONS, {
-    type: 'message.reactions',
-    conversationId,
-    companyId: tenant,
-    messageId: id,
-    reactions: mutation.reactions,
-  }).catch((error) => {
-    console.warn(`[reactions] durable reaction on ${id} committed but publish failed`, error)
-  })
 
   res.json({ reactions: mutation.reactions })
 })
@@ -4485,6 +4993,115 @@ api.post('/messages/:id/reactions', async (req, res) => {
  */
 
 /**
+ * Hard deadline for the message-body bucket of global search.
+ *
+ * `idx_messages_body_trgm` (migration 0005) answers most `%term%` patterns from
+ * the index, but a pattern shorter than three characters produces no complete
+ * trigram and still plans as a scan — two-character CJK queries are the common
+ * case. The pool's global 60s `statement_timeout` is far too generous for
+ * something the sidebar re-issues on every typing pause: a handful of those in
+ * flight is enough to hold every slot. Three seconds is well past a healthy
+ * indexed search and reaps the rest.
+ */
+const SEARCH_MESSAGE_TIMEOUT_MS = 3_000
+
+/**
+ * A single trigram needs three characters, so `%ab%` has none to look up and
+ * the planner falls back to a scan. Two-character queries are ordinary in CJK,
+ * so we still run them (bounded by the deadline above) — but a ONE-character
+ * pattern matches most of the corpus, meaning a full scan whose top-15 rows are
+ * effectively "the newest messages", which is not an answer to anything.
+ */
+const SEARCH_MESSAGE_MIN_LENGTH = 2
+
+/** Raised when the caller disconnects before the query is even issued. */
+class QueryAbandonedError extends Error {}
+
+/**
+ * Run the message-body search on its own connection under a bounded deadline,
+ * and actually cancel it when the caller walks away.
+ *
+ * The sidebar aborts its fetch on every keystroke after the debounce. Aborting
+ * the HTTP request does nothing to the query already executing in PostgreSQL —
+ * that backend keeps its pool slot until it finishes on its own. So we capture
+ * the backend pid up front and, if the response closes early, issue
+ * `pg_cancel_backend` from a *different* connection (the busy one cannot accept
+ * a command). A cancelled or timed-out search resolves to no rows rather than
+ * throwing: there is no longer anyone to show an error to, and a partial
+ * dropdown is a better failure than a 500.
+ *
+ * A pid alone is not a safe thing to cancel. Nothing waits for that cancel — it
+ * is fired with `void` — so it can still be in flight when the abandoned search
+ * finishes on its own and `finally` hands the connection back. The idle pool is
+ * a LIFO stack, so the very next borrower gets that same backend, and the
+ * cancel lands on THEIR query. Measured against Postgres 16: it kills them with
+ * 57014, which for another search means silently empty results and for anything
+ * else a 500 — on a request that did nothing wrong.
+ *
+ * So the cancel names the search, not just the backend. Each search publishes a
+ * unique token as its `application_name` for the life of its transaction
+ * (`set_config(…, is_local => true)`, so it reverts at COMMIT/ROLLBACK exactly
+ * like the timeout above), and the cancel only fires on a backend still
+ * carrying that token. A cancel that arrives late now matches nothing.
+ */
+export const CANCEL_ABANDONED_SEARCH_SQL = `SELECT pg_cancel_backend(pid) FROM pg_stat_activity
+   WHERE pid = $1 AND application_name = $2 AND state = 'active'`
+
+async function searchMessagesBounded(
+  res: Response,
+  params: unknown[],
+  sql: string,
+): Promise<{ rows: Array<{ body: string } & Record<string, unknown>> }> {
+  const client = await pool.connect()
+  let backendPid: number | null = null
+  let abandoned = false
+  // Identifies THIS search on THIS backend, for exactly as long as it runs.
+  const searchToken = `cumora-search:${randomUUID()}`
+  const cancelIfRunning = (): void => {
+    // `close` also fires on a normal, fully-written response — only an early
+    // close means the caller is gone.
+    if (res.writableEnded) return
+    abandoned = true
+    if (backendPid == null) return
+    void pool.query(CANCEL_ABANDONED_SEARCH_SQL, [backendPid, searchToken])
+      .catch(() => { /* best effort */ })
+  }
+  res.on('close', cancelIfRunning)
+  try {
+    await client.query('BEGIN')
+    // SET LOCAL, not SET: the deadline dies with this transaction, so releasing
+    // the connection cannot leak a 3s timeout onto the next borrower.
+    await client.query(`SET LOCAL statement_timeout = ${SEARCH_MESSAGE_TIMEOUT_MS}`)
+    // Both in one round trip — the token has to be published before we hand the
+    // pid to a canceller, and SET takes no bind parameter, so set_config it is.
+    const pid = await client.query<{ pid: number }>(
+      'SELECT pg_backend_pid() AS pid, set_config($1, $2, true)',
+      ['application_name', searchToken],
+    )
+    backendPid = pid.rows[0]?.pid ?? null
+    if (abandoned) throw new QueryAbandonedError()
+    const result = await client.query<{ body: string } & Record<string, unknown>>(sql, params)
+    await client.query('COMMIT')
+    return { rows: result.rows }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => { /* connection may be dead */ })
+    // 57014 = query_canceled, raised by both statement_timeout and our own
+    // pg_cancel_backend. Everything else is a real fault worth surfacing.
+    const code = (error as { code?: unknown } | null)?.code
+    if (code === '57014' || error instanceof QueryAbandonedError) {
+      if (!abandoned) {
+        console.warn(`[search] message bucket exceeded ${SEARCH_MESSAGE_TIMEOUT_MS}ms and was cancelled`)
+      }
+      return { rows: [] }
+    }
+    throw error
+  } finally {
+    res.off('close', cancelIfRunning)
+    client.release()
+  }
+}
+
+/**
  * Universal search across the workspace.
  *
  * Returns four ranked buckets in this order of importance:
@@ -4498,7 +5115,7 @@ api.post('/messages/:id/reactions', async (req, res) => {
  * if you don't see what you want.
  *
  * Scoping: requireCompany() pins to the active company. Conversation/message
- * results additionally filter on `members @> [userId]` so we never leak
+ * results additionally join the normalized membership truth so we never leak
  * rooms the caller isn't actually in (same guard `/conversations` uses).
  */
 api.get('/search', async (req, res) => {
@@ -4560,17 +5177,23 @@ api.get('/search', async (req, res) => {
          LEFT JOIN projects p ON p.id = c.project_id
          LEFT JOIN LATERAL (
            SELECT p_other.name
-             FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+             FROM conversation_members member
              JOIN participants p_other
-               ON p_other.id = member.id
-              AND p_other.company_id = c.company_id
-            WHERE member.id <> $2
-            ORDER BY member.ord
+               ON p_other.id = member.participant_id
+              AND p_other.company_id = member.company_id
+            WHERE member.conversation_id = c.id
+              AND member.company_id = c.company_id
+              AND member.participant_id <> $2
+            ORDER BY member.ordinal
             LIMIT 1
          ) other_participant ON c.kind = 'direct'
         WHERE c.company_id = $1
           AND c.kind IN ('direct', 'whisper')
-          AND c.members @> to_jsonb(ARRAY[$2::text])
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $2
+          )
      )
      SELECT r.id, r.kind, r.title, r.members, r."projectName"
        FROM my_rooms r
@@ -4580,7 +5203,12 @@ api.get('/search', async (req, res) => {
                WHERE p.company_id = $1
                  AND p.name ILIKE $3 ESCAPE '\\'
                  AND p.id <> $2
-                 AND r.members @> to_jsonb(ARRAY[p.id::text])
+                 AND EXISTS (
+                   SELECT 1 FROM conversation_members cm
+                    WHERE cm.conversation_id = r.id
+                      AND cm.company_id = $1
+                      AND cm.participant_id = p.id
+                 )
             )
       ORDER BY
         CASE WHEN lower(r.title) = lower($4) THEN 0
@@ -4597,7 +5225,11 @@ api.get('/search', async (req, res) => {
        LEFT JOIN projects p ON p.id = c.project_id
       WHERE c.company_id = $1
         AND c.kind = 'group'
-        AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+             AND cm.participant_id = $2
+        )
         AND (c.title ILIKE $3 ESCAPE '\\' OR (c.topic IS NOT NULL AND c.topic ILIKE $3 ESCAPE '\\'))
       ORDER BY
         CASE WHEN lower(c.title) = lower($4) THEN 0
@@ -4610,7 +5242,10 @@ api.get('/search', async (req, res) => {
 
   // Skip `tool` / `system` rows — those bodies are machine output, not
   // human-written content, and they'd flood the list with JSON snippets.
-  const messagesP = pool.query(
+  // (`idx_messages_body_trgm` is partial on exactly this predicate.)
+  const messagesP = raw.length < SEARCH_MESSAGE_MIN_LENGTH
+    ? Promise.resolve({ rows: [] as Array<{ body: string } & Record<string, unknown>> })
+    : searchMessagesBounded(res, [tenant, me, contains],
     `SELECT m.id,
             m.conversation_id AS "conversationId",
             CASE
@@ -4628,21 +5263,26 @@ api.get('/search', async (req, res) => {
          ON p.id = m.author_id AND p.company_id = c.company_id
        LEFT JOIN LATERAL (
          SELECT p_other.name
-           FROM jsonb_array_elements_text(c.members) WITH ORDINALITY AS member(id, ord)
+           FROM conversation_members member
            JOIN participants p_other
-             ON p_other.id = member.id
-            AND p_other.company_id = c.company_id
-          WHERE member.id <> $2
-          ORDER BY member.ord
+             ON p_other.id = member.participant_id
+            AND p_other.company_id = member.company_id
+          WHERE member.conversation_id = c.id
+            AND member.company_id = c.company_id
+            AND member.participant_id <> $2
+          ORDER BY member.ordinal
           LIMIT 1
        ) other_participant ON c.kind = 'direct'
       WHERE c.company_id = $1
-        AND c.members @> to_jsonb(ARRAY[$2::text])
+        AND EXISTS (
+          SELECT 1 FROM conversation_members cm
+           WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+             AND cm.participant_id = $2
+        )
         AND m.kind = 'text'
         AND m.body ILIKE $3 ESCAPE '\\'
       ORDER BY m.created_at DESC
       LIMIT ${M_LIMIT}`,
-    [tenant, me, contains],
   )
 
   const [participants, rooms, groups, messages] = await Promise.all([
@@ -4684,19 +5324,32 @@ api.get('/peek/agent-chats', async (req, res) => {
             c.kind,
             c.title,
             c.members,
-            (c.members->>0) AS "agentA",
-            (c.members->>1) AS "agentB",
+            (SELECT member.participant_id
+               FROM conversation_members member
+              WHERE member.conversation_id = c.id
+              ORDER BY member.ordinal
+              LIMIT 1) AS "agentA",
+            (SELECT member.participant_id
+               FROM conversation_members member
+              WHERE member.conversation_id = c.id
+              ORDER BY member.ordinal
+              OFFSET 1 LIMIT 1) AS "agentB",
             c.topic AS about,
             c.created_at AS "createdAt",
             c.updated_at AS "updatedAt",
             (SELECT COUNT(*)::int FROM messages WHERE conversation_id = c.id) AS "msgCount"
        FROM conversations c
        WHERE c.company_id = $1
-         AND jsonb_array_length(c.members) >= 2
+         AND (SELECT COUNT(*) FROM conversation_members member
+               WHERE member.conversation_id = c.id) >= 2
          AND NOT EXISTS (
-           SELECT 1 FROM jsonb_array_elements_text(c.members) m
-             LEFT JOIN participants p ON p.id = m AND p.company_id = c.company_id
-            WHERE p.kind IS DISTINCT FROM 'agent'
+           SELECT 1
+             FROM conversation_members member
+             LEFT JOIN participants p
+               ON p.id = member.participant_id
+              AND p.company_id = member.company_id
+            WHERE member.conversation_id = c.id
+              AND p.kind IS DISTINCT FROM 'agent'
          )
        ORDER BY c.updated_at DESC
        LIMIT 50`,
@@ -4717,11 +5370,16 @@ api.get('/peek/agent-chats/:id/messages', async (req, res) => {
   // of kind='agent' in this company.
   const { rows: w } = await pool.query<{ ok: boolean }>(
     `SELECT (
-        jsonb_array_length(c.members) >= 1
+        (SELECT COUNT(*) FROM conversation_members member
+          WHERE member.conversation_id = c.id) >= 1
         AND NOT EXISTS (
-          SELECT 1 FROM jsonb_array_elements_text(c.members) m
-            LEFT JOIN participants p ON p.id = m AND p.company_id = c.company_id
-           WHERE p.kind IS DISTINCT FROM 'agent'
+          SELECT 1
+            FROM conversation_members member
+            LEFT JOIN participants p
+              ON p.id = member.participant_id
+             AND p.company_id = member.company_id
+           WHERE member.conversation_id = c.id
+             AND p.kind IS DISTINCT FROM 'agent'
         )
      ) AS ok
        FROM conversations c
@@ -5169,7 +5827,7 @@ async function requireBoardAccess(req: Request & AuthedRequest, boardId: string)
   return { userId, companyId }
 }
 
-async function publishBoardEvent(args: {
+async function enqueueBoardEvent(db: PoolClient, args: {
   companyId: string
   kind: import('../redis.js').BoardEvent['kind']
   boardId: string
@@ -5179,8 +5837,7 @@ async function publishBoardEvent(args: {
   mentions?: string[]
   actorId?: string
 }): Promise<void> {
-  const { CH_BOARDS, publish } = await import('../redis.js')
-  await publish(CH_BOARDS, {
+  await enqueueBroadcast(db, CH_BOARDS, {
     type: 'board.changed',
     companyId: args.companyId,
     kind: args.kind,
@@ -5299,13 +5956,19 @@ api.post('/boards', async (req, res) => {
   const title = String(req.body?.title ?? '').trim().slice(0, 200)
   const description = String(req.body?.description ?? '').trim().slice(0, 4000) || null
   if (!title) throw new HttpError(400, 'title required')
-  const id = `board-${randomUUID().slice(0, 12)}`
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
+  const requestId = createRequestId(req.body?.requestId)
+  const hash = requestHash({ title, description })
+  const created = await withOutboxTransaction(async (client) => {
+    const replay = await createReplay(client, {
+      domain: 'board', companyId, actorId: me, requestId, requestHash: hash,
+    })
+    if (replay) return { id: replay.id, replayed: true }
+    const id = `board-${randomUUID().slice(0, 12)}`
     await client.query(
-      `INSERT INTO boards (id, company_id, title, description, created_by) VALUES ($1, $2, $3, $4, $5)`,
-      [id, companyId, title, description, me],
+      `INSERT INTO boards
+         (id, company_id, title, description, created_by, creation_request_id, creation_request_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [id, companyId, title, description, me, requestId, requestId ? hash : null],
     )
     // Seed the MEANING alongside the title — see board-columns.ts. Without it an
     // agent asked to advance a card has to infer which column is "Doing" from
@@ -5317,15 +5980,10 @@ api.post('/boards', async (req, res) => {
         [`col-${randomUUID().slice(0, 12)}`, id, seeds[i][0], (i + 1) * 1000, seeds[i][1]],
       )
     }
-    await client.query('COMMIT')
-  } catch (e) {
-    await client.query('ROLLBACK').catch(() => { /* swallow */ })
-    throw e
-  } finally {
-    client.release()
-  }
-  await publishBoardEvent({ companyId, kind: 'board.created', boardId: id, actorId: me })
-  res.json({ id })
+    await enqueueBoardEvent(client, { companyId, kind: 'board.created', boardId: id, actorId: me })
+    return { id, replayed: false }
+  })
+  res.status(created.replayed ? 200 : 201).json(created)
 })
 
 /** GET /boards/:id — full snapshot: board + columns (ordered) + cards
@@ -5409,11 +6067,13 @@ api.patch('/boards/:id', async (req, res) => {
     params.push(v); sets.push(`${k} = $${params.length}`)
   }
   params.push(boardId)
-  await pool.query(
-    `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
-    params,
-  )
-  await publishBoardEvent({ companyId, kind: 'board.updated', boardId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE boards SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${params.length}`,
+      params,
+    )
+    await enqueueBoardEvent(client, { companyId, kind: 'board.updated', boardId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5421,8 +6081,10 @@ api.patch('/boards/:id', async (req, res) => {
 api.delete('/boards/:id', async (req, res) => {
   const boardId = req.params.id
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  await pool.query(`DELETE FROM boards WHERE id = $1`, [boardId])
-  await publishBoardEvent({ companyId, kind: 'board.deleted', boardId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    await client.query(`DELETE FROM boards WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, { companyId, kind: 'board.deleted', boardId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5437,11 +6099,13 @@ api.post('/boards/:id/columns', async (req, res) => {
   )
   const position = (Number(posRows[0]?.max ?? 0)) + 1000
   const id = `col-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-    [id, boardId, title, position],
-  )
-  await publishBoardEvent({ companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
+      [id, boardId, title, position],
+    )
+    await enqueueBoardEvent(client, { companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
+  })
   res.json({ id, position })
 })
 
@@ -5460,12 +6124,14 @@ api.patch('/boards/:bid/columns/:cid', async (req, res) => {
   }
   if (sets.length === 0) { res.json({ ok: true }); return }
   params.push(columnId); params.push(boardId)
-  const r = await pool.query(
-    `UPDATE board_columns SET ${sets.join(', ')} WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
-    params,
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({ companyId, kind: 'column.updated', boardId, columnId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `UPDATE board_columns SET ${sets.join(', ')} WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
+      params,
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, { companyId, kind: 'column.updated', boardId, columnId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5474,12 +6140,14 @@ api.delete('/boards/:bid/columns/:cid', async (req, res) => {
   const boardId = req.params.bid
   const columnId = req.params.cid
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  const r = await pool.query(
-    `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
-    [columnId, boardId],
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({ companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM board_columns WHERE id = $1 AND board_id = $2`,
+      [columnId, boardId],
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, { companyId, kind: 'column.deleted', boardId, columnId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5507,15 +6175,17 @@ api.post('/boards/:id/cards', async (req, res) => {
   const position = (Number(posRows[0]?.max ?? 0)) + 1000
   const mentions = await parseMentions(companyId, `${title}\n${description ?? ''}`)
   const id = `card-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO board_cards
-       (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
-    [id, boardId, columnId, title, description, position, assigneeId, JSON.stringify(mentions), me],
-  )
-  await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-  await publishBoardEvent({
-    companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO board_cards
+         (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
+      [id, boardId, columnId, title, description, position, assigneeId, JSON.stringify(mentions), me],
+    )
+    await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, {
+      companyId, kind: 'card.created', boardId, cardId: id, columnId, mentions, actorId: me,
+    })
   })
   void wakeKanbanAgents({
     companyId, mentions, actorId: me,
@@ -5592,16 +6262,18 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
   }
   if (sets.length === 0) { res.json({ ok: true }); return }
   params.push(cardId); params.push(boardId)
-  await pool.query(
-    `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW()
-      WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
-    params,
-  )
-  await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-  await publishBoardEvent({
-    companyId,
-    kind: columnChanged ? 'card.moved' : 'card.updated',
-    boardId, cardId, mentions, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `UPDATE board_cards SET ${sets.join(', ')}, updated_at = NOW()
+        WHERE id = $${params.length - 1} AND board_id = $${params.length}`,
+      params,
+    )
+    await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, {
+      companyId,
+      kind: columnChanged ? 'card.moved' : 'card.updated',
+      boardId, cardId, mentions, actorId: me,
+    })
   })
   void wakeKanbanAgents({
     companyId, mentions, actorId: me,
@@ -5631,12 +6303,14 @@ api.delete('/boards/:bid/cards/:cid', async (req, res) => {
   const boardId = req.params.bid
   const cardId = req.params.cid
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  const r = await pool.query(
-    `DELETE FROM board_cards WHERE id = $1 AND board_id = $2`,
-    [cardId, boardId],
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({ companyId, kind: 'card.deleted', boardId, cardId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM board_cards WHERE id = $1 AND board_id = $2`,
+      [cardId, boardId],
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, { companyId, kind: 'card.deleted', boardId, cardId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -5681,15 +6355,17 @@ api.post('/boards/:bid/cards/:cid/comments', async (req, res) => {
   if (card.rows.length === 0) throw new HttpError(404, 'not found')
   const mentions = await parseMentions(companyId, body)
   const id = `cmt-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
-     VALUES ($1, $2, $3, $4, $5::jsonb)`,
-    [id, cardId, me, body, JSON.stringify(mentions)],
-  )
-  await pool.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
-  await pool.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
-  await publishBoardEvent({
-    companyId, kind: 'comment.created', boardId, cardId, commentId: id, mentions, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    await client.query(
+      `INSERT INTO board_card_comments (id, card_id, author_id, body, mentions)
+       VALUES ($1, $2, $3, $4, $5::jsonb)`,
+      [id, cardId, me, body, JSON.stringify(mentions)],
+    )
+    await client.query(`UPDATE board_cards SET updated_at = NOW() WHERE id = $1`, [cardId])
+    await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
+    await enqueueBoardEvent(client, {
+      companyId, kind: 'comment.created', boardId, cardId, commentId: id, mentions, actorId: me,
+    })
   })
   void wakeKanbanAgents({
     companyId, mentions, actorId: me,
@@ -5708,14 +6384,16 @@ api.delete('/boards/:bid/cards/:cid/comments/:mid', async (req, res) => {
   const cardId = req.params.cid
   const mid = req.params.mid
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
-  const r = await pool.query(
-    `DELETE FROM board_card_comments
-       WHERE id = $1 AND card_id = $2 AND author_id = $3`,
-    [mid, cardId, me],
-  )
-  if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
-  await publishBoardEvent({
-    companyId, kind: 'comment.deleted', boardId, cardId, commentId: mid, actorId: me,
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM board_card_comments
+         WHERE id = $1 AND card_id = $2 AND author_id = $3`,
+      [mid, cardId, me],
+    )
+    if ((r.rowCount ?? 0) === 0) throw new HttpError(404, 'not found')
+    await enqueueBoardEvent(client, {
+      companyId, kind: 'comment.deleted', boardId, cardId, commentId: mid, actorId: me,
+    })
   })
   res.json({ ok: true })
 })
@@ -5884,23 +6562,19 @@ function calendarVisibilityClause(meIdx: number, companyIdx: number): string {
   )`
 }
 
-/** Fire-and-forget WS broadcast for a calendar row change. Thin payload —
- *  the client refetches the affected row (or the whole list on delete)
- *  rather than receiving inline diffs. Mirrors the doc.changed shape. */
-function publishCalendarChange(args: {
+/** Queue a thin calendar invalidation in the mutation transaction. */
+async function enqueueCalendarChange(db: PoolClient, args: {
   kind: 'event.created' | 'event.updated' | 'event.deleted' | 'event.dispatched'
   eventId: string
   companyId: string
   actorId: string | null
-}): void {
-  void publish(CH_CALENDAR_EVENTS, {
+}): Promise<void> {
+  await enqueueBroadcast(db, CH_CALENDAR_EVENTS, {
     type: 'calendar.changed',
     kind: args.kind,
     eventId: args.eventId,
     companyId: args.companyId,
     actorId: args.actorId,
-  }).catch((e) => {
-    console.warn('[calendar] publish failed', e instanceof Error ? e.message : e)
   })
 }
 
@@ -6004,25 +6678,47 @@ api.post('/calendar/events', async (req, res) => {
     if (!c[0]) throw new HttpError(400, 'targetConversationId not found in this workspace')
   }
 
-  const id = `ce-${randomUUID()}`
-  const { rows } = await pool.query(
-    `INSERT INTO calendar_events
-       (id, company_id, created_by, kind, title, description, assignee_id,
-        target_conversation_id, agent_prompt, start_at, end_at, all_day,
-        recurrence, status, reminder_minutes_before, reminder_channel,
-        is_private)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17)
-     RETURNING ${CALENDAR_SELECT}`,
-    [
-      id, companyId, me, kind, title, description, assigneeId,
-      targetConversationId, agentPrompt, startAt, endAt, allDay,
-      recurrence ? JSON.stringify(recurrence) : null, status,
-      reminderMinutesBefore, reminderChannel,
-      isPrivate,
-    ],
-  )
-  publishCalendarChange({ kind: 'event.created', eventId: id, companyId, actorId: me })
-  res.status(201).json({ event: rowToCalendarEvent(rows[0]) })
+  const requestId = createRequestId(body.requestId)
+  const hash = requestHash({
+    title, kind, description, assigneeId, targetConversationId, agentPrompt,
+    startAt: startAt.toISOString(), endAt: endAt?.toISOString() ?? null,
+    allDay, recurrence, status, reminderMinutesBefore, reminderChannel, isPrivate,
+  })
+  const created = await withOutboxTransaction(async (client) => {
+    const replay = await createReplay(client, {
+      domain: 'calendar-event', companyId, actorId: me, requestId, requestHash: hash,
+    })
+    if (replay) {
+      const existing = await client.query(
+        `SELECT ${CALENDAR_SELECT} FROM calendar_events WHERE id = $1`,
+        [replay.id],
+      )
+      return { rows: existing.rows, replayed: true }
+    }
+    const id = `ce-${randomUUID()}`
+    const inserted = await client.query(
+      `INSERT INTO calendar_events
+         (id, company_id, created_by, kind, title, description, assignee_id,
+          target_conversation_id, agent_prompt, start_at, end_at, all_day,
+          recurrence, status, reminder_minutes_before, reminder_channel,
+          is_private, creation_request_id, creation_request_hash)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14,$15,$16,$17,$18,$19)
+       RETURNING ${CALENDAR_SELECT}`,
+      [
+        id, companyId, me, kind, title, description, assigneeId,
+        targetConversationId, agentPrompt, startAt, endAt, allDay,
+        recurrence ? JSON.stringify(recurrence) : null, status,
+        reminderMinutesBefore, reminderChannel,
+        isPrivate, requestId, requestId ? hash : null,
+      ],
+    )
+    await enqueueCalendarChange(client, { kind: 'event.created', eventId: id, companyId, actorId: me })
+    return { rows: inserted.rows, replayed: false }
+  })
+  res.status(created.replayed ? 200 : 201).json({
+    event: rowToCalendarEvent(created.rows[0]),
+    replayed: created.replayed,
+  })
 })
 
 api.get('/calendar/events/:id', async (req, res) => {
@@ -6140,9 +6836,12 @@ api.patch('/calendar/events/:id', async (req, res) => {
   const sql = `UPDATE calendar_events SET ${sets.join(', ')}
                 WHERE id = $${params.length - 1} AND company_id = $${params.length}
             RETURNING ${CALENDAR_SELECT}`
-  const { rows } = await pool.query(sql, params)
-  if (!rows[0]) throw new HttpError(404, 'event not found')
-  publishCalendarChange({ kind: 'event.updated', eventId: id, companyId, actorId: me })
+  const rows = await withOutboxTransaction(async (client) => {
+    const updated = await client.query(sql, params)
+    if (!updated.rows[0]) throw new HttpError(404, 'event not found')
+    await enqueueCalendarChange(client, { kind: 'event.updated', eventId: id, companyId, actorId: me })
+    return updated.rows
+  })
   res.json({ event: rowToCalendarEvent(rows[0]) })
 })
 
@@ -6152,13 +6851,15 @@ api.delete('/calendar/events/:id', async (req, res) => {
   // The visibility clause is folded into the DELETE so the same caller
   // who can't read the row can't delete it either. rowCount === 0 covers
   // both "no such id" and "privacy filtered" — same 404 on the wire.
-  const r = await pool.query(
-    `DELETE FROM calendar_events
-      WHERE id = $1 AND company_id = $2 AND ${calendarVisibilityClause(3, 2)}`,
-    [id, companyId, me],
-  )
-  if (r.rowCount === 0) throw new HttpError(404, 'event not found')
-  publishCalendarChange({ kind: 'event.deleted', eventId: id, companyId, actorId: me })
+  await withOutboxTransaction(async (client) => {
+    const r = await client.query(
+      `DELETE FROM calendar_events
+        WHERE id = $1 AND company_id = $2 AND ${calendarVisibilityClause(3, 2)}`,
+      [id, companyId, me],
+    )
+    if (r.rowCount === 0) throw new HttpError(404, 'event not found')
+    await enqueueCalendarChange(client, { kind: 'event.deleted', eventId: id, companyId, actorId: me })
+  })
   res.json({ ok: true })
 })
 
@@ -6176,7 +6877,13 @@ api.post('/calendar/events/:id/run-now', async (req, res) => {
   // wide enough to absorb concurrent button-mashing within the same minute.
   const result = await dispatchEvent(rows[0] as import('../calendar.js').CalendarEventRow, new Date())
   // last_fired_at moved + dispatch happened → renderers want to refetch.
-  publishCalendarChange({ kind: 'event.dispatched', eventId: id, companyId, actorId: me })
+  // dispatchEvent owns the durable dispatch transaction. This thin UI
+  // invalidation is queued independently only after dispatch succeeds; the
+  // dispatcher itself also reconciles from PostgreSQL on every tick.
+  await withOutboxTransaction((client) => enqueueCalendarChange(
+    client,
+    { kind: 'event.dispatched', eventId: id, companyId, actorId: me },
+  ))
   res.json(result)
 })
 
@@ -6253,13 +6960,14 @@ function toDocPayload(row: DocumentRow): DocumentPayload {
   }
 }
 
-async function publishDocumentChanged(
+async function enqueueDocumentChanged(
+  db: PoolClient,
   companyId: string,
   documentId: string,
   kind: 'document.created' | 'document.updated' | 'document.deleted',
   actorId: string,
 ): Promise<void> {
-  await publish(CH_DOCS, {
+  await enqueueBroadcast(db, CH_DOCS, {
     type: 'doc.changed',
     kind,
     companyId,
@@ -6283,7 +6991,11 @@ api.get('/documents', safe(async (req, res) => {
 
 api.post('/documents', safe(async (req, res) => {
   const { userId, companyId } = await requireCompany(req)
-  const body = (req.body ?? {}) as { title?: unknown; conversationId?: unknown }
+  const body = (req.body ?? {}) as {
+    title?: unknown
+    conversationId?: unknown
+    requestId?: unknown
+  }
   const title = typeof body.title === 'string' && body.title.trim()
     ? body.title.trim().slice(0, 200)
     : 'Untitled'
@@ -6297,19 +7009,30 @@ api.post('/documents', safe(async (req, res) => {
     if (convRows.length === 0) throw new HttpError(404, 'conversation not found')
     conversationId = body.conversationId
   }
-  const id = `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`
-  await pool.query(
-    `INSERT INTO documents (id, company_id, title, created_by, conversation_id)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [id, companyId, title, userId, conversationId],
-  )
-  const { rows } = await pool.query<DocumentRow>(
-    `SELECT id, company_id, title, created_by, conversation_id, created_at, updated_at
-       FROM documents WHERE id = $1`, [id],
-  )
-  const doc = toDocPayload(rows[0])
-  await publishDocumentChanged(companyId, id, 'document.created', userId)
-  res.status(201).json(doc)
+  const requestId = createRequestId(body.requestId)
+  const hash = requestHash({ title, conversationId })
+  const created = await withOutboxTransaction(async (client) => {
+    const replay = await createReplay(client, {
+      domain: 'document', companyId, actorId: userId, requestId, requestHash: hash,
+    })
+    const id = replay?.id ?? `doc_${randomUUID().replace(/-/g, '').slice(0, 16)}`
+    if (!replay) {
+      await client.query(
+        `INSERT INTO documents
+           (id, company_id, title, created_by, conversation_id, creation_request_id, creation_request_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [id, companyId, title, userId, conversationId, requestId, requestId ? hash : null],
+      )
+    }
+    const selected = await client.query<DocumentRow>(
+      `SELECT id, company_id, title, created_by, conversation_id, created_at, updated_at
+         FROM documents WHERE id = $1`, [id],
+    )
+    if (!replay) await enqueueDocumentChanged(client, companyId, id, 'document.created', userId)
+    return { rows: selected.rows, replayed: Boolean(replay) }
+  })
+  const doc = toDocPayload(created.rows[0])
+  res.status(created.replayed ? 200 : 201).json({ ...doc, replayed: created.replayed })
 }))
 
 api.get('/documents/:id', safe(async (req, res) => {
@@ -6332,13 +7055,15 @@ api.put('/documents/:id', safe(async (req, res) => {
     throw new HttpError(400, 'title required')
   }
   const title = body.title.trim().slice(0, 200)
-  const { rowCount } = await pool.query(
-    `UPDATE documents SET title = $1, updated_at = NOW()
-      WHERE id = $2 AND company_id = $3`,
-    [title, id, companyId],
-  )
-  if (!rowCount) throw new HttpError(404, 'not found')
-  await publishDocumentChanged(companyId, id, 'document.updated', userId)
+  await withOutboxTransaction(async (client) => {
+    const { rowCount } = await client.query(
+      `UPDATE documents SET title = $1, updated_at = NOW()
+        WHERE id = $2 AND company_id = $3`,
+      [title, id, companyId],
+    )
+    if (!rowCount) throw new HttpError(404, 'not found')
+    await enqueueDocumentChanged(client, companyId, id, 'document.updated', userId)
+  })
   res.json({ ok: true, title })
 }))
 
@@ -6360,8 +7085,19 @@ api.delete('/documents/:id', safe(async (req, res) => {
     const role = roleRows[0]?.role ?? 'member'
     if (!PRIVILEGED_ROLES.has(role)) throw new HttpError(403, 'only the creator or an owner can delete')
   }
-  await pool.query(`DELETE FROM documents WHERE id = $1`, [id])
-  await publishDocumentChanged(companyId, id, 'document.deleted', userId)
+  let docKeys: string[] = []
+  await withOutboxTransaction(async (client) => {
+    docKeys = await collectDocumentStorageKeys(id, client)
+    await client.query(`DELETE FROM documents WHERE id = $1`, [id])
+    if (docKeys.length > 0) {
+      await enqueueWorkspaceCleanup(client, { companyId, agentIds: [], storageKeys: docKeys })
+    }
+    await enqueueDocumentChanged(client, companyId, id, 'document.deleted', userId)
+  })
+  evictDocumentRoom(id)
+  if (docKeys.length > 0) {
+    nudgeWorkspaceCleanupWorker()
+  }
   res.json({ ok: true })
 }))
 

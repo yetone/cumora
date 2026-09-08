@@ -3,6 +3,7 @@ import { api, ws } from '@/api/client'
 import type {
   BoardSummary, BoardSnapshot, BoardCard, BoardCardComment, BoardCardLookup,
 } from '@/types'
+import { pendingCreateRequestId } from '@/lib/create-idempotency'
 
 interface BoardsState {
   /** Workspace-wide list of board summaries. Loaded once on view mount;
@@ -184,11 +185,18 @@ export const useBoards = create<BoardsState>((set, get) => ({
   },
 
   createBoard: async (title, description) => {
-    const r = await api.createBoard({ title, description })
-    await get().loadList()
-    set({ selectedId: r.id })
-    await get().loadBoard(r.id)
-    return r.id
+    const retry = pendingCreateRequestId('board', { title, description: description ?? null })
+    try {
+      const r = await api.createBoard({ title, description, requestId: retry.requestId })
+      retry.complete()
+      await get().loadList()
+      set({ selectedId: r.id })
+      await get().loadBoard(r.id)
+      return r.id
+    } catch (err) {
+      retry.fail(err)
+      throw err
+    }
   },
 
   renameBoard: async (id, title) => {

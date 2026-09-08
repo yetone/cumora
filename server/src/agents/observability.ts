@@ -4,7 +4,7 @@ import { pool } from '../db/pool.js'
 import { EMPTY_USAGE, effectiveCostUsd, modelPriceTable, priceFor, type TokenUsage } from './cost.js'
 
 export type AgentRunStatus = 'running' | 'completed' | 'failed' | 'skipped'
-export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen'
+export type TriageSource = 'cloud' | 'byoa-claude' | 'byoa-codex' | 'byoa-grok' | 'byoa-cursor' | 'byoa-opencode' | 'byoa-pi' | 'byoa-gemini' | 'byoa-qwen' | 'byoa-antigravity'
 export type AgentEventLevel = 'debug' | 'info' | 'warn' | 'error'
 
 type Queryable = Pick<PoolClient, 'query'>
@@ -682,6 +682,9 @@ export interface WakeEconomics {
   /** Any price used was a seed/fallback rather than an operator-supplied rate.
    *  The RATIOS are measured either way; only the dollars are modelled. */
   costEstimated: boolean
+  /** Fan-out width: how many big-brain turns a human message causes. Room-wide
+   *  — the agentId filter above does not apply to it. See getTurnsPerMessage. */
+  turnsPerMessage: TurnsPerMessageBucket[]
 }
 
 /** How often a wake produced nothing.
@@ -805,5 +808,129 @@ export async function getWakeEconomics(args: {
       silentRate: v.runs > 0 ? v.silent / v.runs : 0,
       silentSpendUsd: v.usd,
     })).sort((a, b) => b.runs - a.runs),
+    turnsPerMessage: await getTurnsPerMessage({ companyId: args.companyId, sinceHours }),
   }
+}
+
+/** One row of the fan-out-width distribution. */
+export interface TurnsPerMessageBucket {
+  conversationKind: string
+  /** Denominator: human-authored messages in rooms with at least one agent. */
+  messages: number
+  /** Numerator: (message, run) pairs — runs whose drained inbox included the
+   *  message. A run draining a burst counts toward each message it read. */
+  turns: number
+  avgTurns: number
+  medianTurns: number
+  hist: { turns: string; messages: number }[]
+}
+
+/** How many big-brain turns does one human message cause?
+ *
+ *  The silent-rate panel above answers "of the turns that fired, how many said
+ *  nothing". This is the other half of #70's ledger: how MANY turns a message
+ *  fires in the first place. The scheduler picks recipients purely by
+ *  membership, so the width of that fan-out is the number any routing change
+ *  (#92's `me`, a future `one-of-us`) claims to shrink — measured here instead
+ *  of argued, per the ordering agreed in the #70 review.
+ *
+ *  Attribution: `agent_runs.input_message_ids` is the inbox a run actually
+ *  drained, so a message's turn count is the number of token-bearing runs that
+ *  read it. A run draining a burst of k messages counts toward each of them —
+ *  that is deliberate (the message genuinely participated in that turn) and it
+ *  is why this panel reports counts, not dollars: dollars per message would
+ *      need fractional run attribution, which is a different, denser metric.
+ *
+ *  Denominator: human-authored, non-system messages in group/direct rooms with
+ *  at least one agent member — so a message nobody's inbox ever reached shows
+ *  up as 0 turns rather than vanishing. Room-wide by design: the agent filter
+ *  above does not apply, because fan-out width is a property of the room. */
+export async function getTurnsPerMessage(args: {
+  companyId: string
+  sinceHours?: number
+}): Promise<TurnsPerMessageBucket[]> {
+  const sinceHours = Math.min(720, Math.max(1, args.sinceHours ?? 24))
+  const ms = sinceHours * 3_600_000
+
+  const { rows } = await pool.query<{
+    conversation_kind: string
+    messages: number
+    turns: number
+    avg_turns: string
+    median_turns: string
+    w0: number
+    w1: number
+    w2: number
+    w3_5: number
+    w6: number
+  }>(
+    `WITH scope AS (
+       SELECT m.id AS mid, c.kind AS conversation_kind
+         FROM messages m
+         JOIN conversations c ON c.id = m.conversation_id
+         JOIN participants a ON a.id = m.author_id AND a.company_id = c.company_id
+        WHERE c.company_id = $1
+          AND c.kind IN ('group', 'direct')
+          AND m.kind <> 'system'
+          AND m.created_at > NOW() - ($2::double precision * INTERVAL '1 millisecond')
+          AND a.kind = 'human'
+          AND a.departed_at IS NULL
+          AND EXISTS (
+            SELECT 1
+              FROM conversation_members cm
+              JOIN participants ap
+                ON ap.id = cm.participant_id
+               AND ap.company_id = cm.company_id
+             WHERE cm.conversation_id = c.id
+               AND cm.company_id = c.company_id
+               AND ap.kind = 'agent' AND ap.departed_at IS NULL
+          )
+     ),
+     turns AS (
+       SELECT j.mid, count(DISTINCT r.id)::int AS turns
+         FROM agent_runs r
+         CROSS JOIN LATERAL jsonb_array_elements_text(r.input_message_ids) AS j(mid)
+        WHERE r.company_id = $1
+          AND r.started_at > NOW() - ($2::double precision * INTERVAL '1 millisecond')
+          AND (r.input_tokens + r.cached_input_tokens + r.output_tokens) > 0
+        GROUP BY j.mid
+     )
+     SELECT s.conversation_kind,
+            count(*)::int AS messages,
+            COALESCE(sum(t.turns), 0)::int AS turns,
+            -- COALESCE INSIDE the aggregate, not around it. A message no
+            -- inbox reached has t.turns = NULL after the LEFT JOIN, and SQL
+            -- aggregates skip NULLs — so avg and median silently dropped the
+            -- zero-turn messages while the histogram (which already coalesces)
+            -- counted them. On 4 messages, 2 of them unwoken, that reported a
+            -- fan-out of 3.0 where the real width was 1.5, next to a rendered
+            -- turns/messages pair that divides to 1.5. The whole point of
+            -- this panel is that number.
+            COALESCE(avg(COALESCE(t.turns, 0)), 0) AS avg_turns,
+            COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY COALESCE(t.turns, 0)), 0) AS median_turns,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) = 0)::int AS w0,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) = 1)::int AS w1,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) = 2)::int AS w2,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) BETWEEN 3 AND 5)::int AS w3_5,
+            count(*) FILTER (WHERE COALESCE(t.turns, 0) >= 6)::int AS w6
+       FROM scope s
+       LEFT JOIN turns t ON t.mid = s.mid
+      GROUP BY s.conversation_kind`,
+    [args.companyId, ms],
+  )
+
+  return rows.map((r) => ({
+    conversationKind: r.conversation_kind,
+    messages: r.messages,
+    turns: r.turns,
+    avgTurns: Number(r.avg_turns),
+    medianTurns: Number(r.median_turns),
+    hist: [
+      { turns: '0', messages: r.w0 },
+      { turns: '1', messages: r.w1 },
+      { turns: '2', messages: r.w2 },
+      { turns: '3–5', messages: r.w3_5 },
+      { turns: '6+', messages: r.w6 },
+    ],
+  }))
 }

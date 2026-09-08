@@ -1,9 +1,51 @@
 /**
- * Idempotent boot-time schema initializer.
- * For production we'd use drizzle-kit migrations; for now we ensure the
- * schema exists via plain DDL so a fresh DATABASE_URL becomes a working app.
+ * Versioned schema migrator.
+ *
+ * Only the standalone migration command calls this module in production.
+ * Application replicas use the read-only compatibility gate in
+ * schema-version.ts and never execute DDL while starting.
  */
+import { createHash } from 'node:crypto'
 import { pool } from './pool.js'
+import {
+  type AppliedMigration,
+  type MigrationMetadata,
+  SCHEMA_MIGRATIONS,
+  validateMigrationHistory,
+} from './migrations/manifest.js'
+import {
+  NORMALIZED_CONVERSATION_MEMBERS_SQL,
+  normalizedConversationMembersChecksum,
+} from './migrations/0002-normalized-conversation-members.js'
+import {
+  WORKSPACE_CLEANUP_JOBS_SQL,
+  workspaceCleanupJobsChecksum,
+} from './migrations/0003-workspace-cleanup-jobs.js'
+import {
+  AGENT_RUNTIME_ASSIGNMENT_SQL,
+  agentRuntimeAssignmentChecksum,
+} from './migrations/0004-agent-runtime-assignment.js'
+import {
+  SEARCH_TRIGRAM_EXTENSION_SQL,
+  SEARCH_TRIGRAM_INDEX_NAME,
+  SEARCH_TRIGRAM_INDEX_SQL,
+  searchTrigramIndexChecksum,
+} from './migrations/0005-search-trigram-index.js'
+import {
+  DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  emailMessagesCompanySmtpIdChecksum,
+} from './migrations/0006-email-messages-company-smtp-id.js'
+
+/** Frozen data backfill embedded in migration 0001. Exported so its behavior
+ * can be exercised against PostgreSQL without replaying the whole migration. */
+export const BASELINE_BOARD_COLUMN_KIND_BACKFILL_SQL = `UPDATE board_columns SET kind = 'todo'
+ WHERE kind IS NULL AND lower(btrim(title)) IN ('todo', 'to do');
+UPDATE board_columns SET kind = 'doing'
+ WHERE kind IS NULL AND lower(btrim(title)) = 'doing';
+UPDATE board_columns SET kind = 'done'
+ WHERE kind IS NULL AND lower(btrim(title)) = 'done';`
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS conversations (
@@ -38,6 +80,30 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_convo_seq ON messages(conversation_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_messages_convo_created ON messages(conversation_id, created_at);
+
+-- Transactional realtime outbox. Durable mutations write their invalidation
+-- here in the SAME PostgreSQL transaction; a bounded worker publishes to Redis
+-- after commit. Redis is therefore never part of command completion.
+CREATE TABLE IF NOT EXISTS realtime_outbox (
+  id            TEXT PRIMARY KEY,
+  channel       TEXT NOT NULL,
+  payload       JSONB NOT NULL,
+  attempts      INTEGER NOT NULL DEFAULT 0,
+  available_at  TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  locked_by     TEXT,
+  locked_until  TIMESTAMP WITH TIME ZONE,
+  published_at  TIMESTAMP WITH TIME ZONE,
+  discarded_at  TIMESTAMP WITH TIME ZONE,
+  last_error    TEXT,
+  created_at    TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  CONSTRAINT realtime_outbox_payload_object CHECK (jsonb_typeof(payload) = 'object')
+);
+CREATE INDEX IF NOT EXISTS idx_realtime_outbox_pending
+  ON realtime_outbox(available_at, created_at)
+  WHERE published_at IS NULL AND discarded_at IS NULL;
+CREATE INDEX IF NOT EXISTS idx_realtime_outbox_published
+  ON realtime_outbox(published_at)
+  WHERE published_at IS NOT NULL;
 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_recipient_id TEXT;
@@ -656,8 +722,9 @@ CREATE INDEX IF NOT EXISTS idx_conversations_company ON conversations(company_id
 -- NOT built here. A plain CREATE INDEX on this hot table holds a build-long lock
 -- that blocks live member-writes and deadlocks (40P01) under traffic — and since
 -- the build then never commits, every pod retried it forever and none could
--- boot. It's built CONCURRENTLY + best-effort in buildConcurrentIndexes() below,
--- outside this transaction. See idx_conversations_members_gin there.
+-- boot. The dedicated migration owner builds it CONCURRENTLY outside this
+-- transaction and treats readiness as a promotion requirement. See
+-- buildConcurrentIndexes() below.
 CREATE INDEX IF NOT EXISTS idx_messages_company      ON messages(company_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_agent_memory_company  ON agent_memory(company_id, agent_id);
 CREATE INDEX IF NOT EXISTS idx_agent_log_company     ON agent_log(company_id, agent_id);
@@ -1217,6 +1284,11 @@ CREATE INDEX IF NOT EXISTS idx_calendar_events_status
 CREATE INDEX IF NOT EXISTS idx_calendar_events_assignee
   ON calendar_events(assignee_id, start_at)
   WHERE assignee_id IS NOT NULL;
+ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE calendar_events ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_calendar_event_creation_request
+  ON calendar_events(company_id, created_by, creation_request_id)
+  WHERE creation_request_id IS NOT NULL;
 
 -- One row per actual firing of a calendar event. Lets the scheduler dedup
 -- on (event_id, scheduled_for) so a tick that runs twice (replica race or
@@ -1298,6 +1370,11 @@ CREATE TABLE IF NOT EXISTS boards (
   updated_at      TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_boards_company ON boards(company_id, updated_at DESC);
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE boards ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_board_creation_request
+  ON boards(company_id, created_by, creation_request_id)
+  WHERE creation_request_id IS NOT NULL;
 
 -- Columns within a board. position is a DOUBLE so reorders can insert
 -- between two cards without renumbering every sibling.
@@ -1326,12 +1403,7 @@ ALTER TABLE board_columns ADD COLUMN IF NOT EXISTS kind TEXT;
 -- flight / Shipped" is better left NULL (nothing moves automatically) than
 -- guessed at, and a wrong guess would silently move a user's cards. Runs once;
 -- already-classified columns are left alone so a later manual choice sticks.
-UPDATE board_columns SET kind = 'todo'
- WHERE kind IS NULL AND lower(btrim(title)) IN ('todo', 'to do');
-UPDATE board_columns SET kind = 'doing'
- WHERE kind IS NULL AND lower(btrim(title)) = 'doing';
-UPDATE board_columns SET kind = 'done'
- WHERE kind IS NULL AND lower(btrim(title)) = 'done';
+${BASELINE_BOARD_COLUMN_KIND_BACKFILL_SQL}
 
 -- Cards live in a column. The "mentions" column is the deduped list of
 -- @-targets parsed from title+description on every write — clients can
@@ -1399,6 +1471,11 @@ CREATE INDEX IF NOT EXISTS idx_documents_company_updated
   ON documents(company_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_documents_conversation
   ON documents(conversation_id) WHERE conversation_id IS NOT NULL;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS uniq_document_creation_request
+  ON documents(company_id, created_by, creation_request_id)
+  WHERE creation_request_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS document_updates (
   id            BIGSERIAL PRIMARY KEY,
@@ -1554,6 +1631,11 @@ ALTER TABLE computers ADD COLUMN IF NOT EXISTS engines_detected_at TIMESTAMP WIT
 ALTER TABLE computers ADD COLUMN IF NOT EXISTS detect_requested_at TIMESTAMP WITH TIME ZONE;
 -- true = follow computers.available_engines[0]; false = pin participants.engine.
 ALTER TABLE participants ADD COLUMN IF NOT EXISTS engine_inherit BOOLEAN NOT NULL DEFAULT TRUE;
+-- Stable browser-generated key for idempotent Agent creation. The hash binds
+-- the key to the sanitized create payload so accidental key reuse cannot
+-- silently return a differently configured Agent.
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS creation_request_id TEXT;
+ALTER TABLE participants ADD COLUMN IF NOT EXISTS creation_request_hash TEXT;
 
 -- ============== Evidence-backed feature shipping =======================
 -- A shipping feature is deliberately distinct from a generic board card.
@@ -1790,60 +1872,6 @@ UPDATE participants p
  *  pg_advisory_lock the same database. */
 const SCHEMA_LOCK_KEY = 7_643_178_926_104n
 
-/**
- * Boot-time wrapper around `ensureSchema` that retries with exponential
- * backoff when the DB is briefly unreachable. Without this, a single
- * pg-pool acquire timeout at startup crashes the process; k8s restarts
- * it; the next attempt hits the same hiccup; pod crashloops until the
- * blip clears — even though `ensureSchema` itself is idempotent and a
- * 1–2s delay would have recovered.
- *
- * Retries on two retryable classes, fails fast on everything else
- * (DDL / permission / syntax errors need a human, not a retry):
- *   - transport-shaped errors (connection timeout, EOF, terminated,
- *     ECONNREFUSED/RESET) — a DB blip during boot.
- *   - lock-contention errors (40P01 deadlock_detected, 55P03
- *     lock_not_available, 40001 serialization_failure) — the migration
- *     is idempotent + lock_timeout-bounded, so a blocked/deadlocked DDL
- *     just needs a short backoff and another try. NOT retrying these is
- *     what crashlooped the pod; with two replicas down at once the LB
- *     served 502.
- *
- * Total max wait: 1+2+4+8+16+30·4 = 151s across 9 attempts.
- *
- * `opts.schemaFn` and `opts.sleep` exist only for tests — production
- * callers pass nothing.
- */
-export async function ensureSchemaWithBootRetry(opts: {
-  schemaFn?: () => Promise<void>
-  sleep?: (ms: number) => Promise<void>
-  maxAttempts?: number
-} = {}): Promise<void> {
-  const schemaFn = opts.schemaFn ?? ensureSchema
-  const sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)))
-  const maxAttempts = opts.maxAttempts ?? 9
-  let delayMs = 1_000
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      await schemaFn()
-      if (attempt > 1) {
-        console.log(`[boot] ensureSchema recovered on attempt ${attempt}/${maxAttempts}`)
-      }
-      return
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e)
-      const code = (e && typeof e === 'object' && 'code' in e) ? String((e as { code?: unknown }).code) : ''
-      const transportShaped = /timeout|terminated|ECONNREFUSED|ECONNRESET|EOF/i.test(msg)
-      const lockContention = code === '40P01' || code === '55P03' || code === '40001'
-      if ((!transportShaped && !lockContention) || attempt === maxAttempts) throw e
-      const kind = lockContention ? `lock-contention (${code})` : 'transient'
-      console.warn(`[boot] ensureSchema attempt ${attempt}/${maxAttempts} ${kind} failure: ${msg} — retrying in ${delayMs}ms`)
-      await sleep(delayMs)
-      delayMs = Math.min(delayMs * 2, 30_000)
-    }
-  }
-}
-
 /** Tables that store an agent id by value. Each entry carries a SQL
  *  fragment (`scopeSql`) bound to `$2` = loser company_id, used as
  *  the WHERE condition that limits the rename to that one tenant's
@@ -2028,123 +2056,630 @@ async function renameAgentIdCollisions(client: import('pg').PoolClient): Promise
   }
 }
 
+export function computedBaselineMigrationChecksum(): string {
+  return createHash('sha256').update(DDL).digest('hex')
+}
+
+export interface VersionedMigration extends MigrationMetadata {
+  sourceChecksum: string
+  transactional?: boolean
+  up(client: import('pg').PoolClient): Promise<void>
+}
+
+/**
+ * Split a SQL batch into its top-level statements.
+ *
+ * Honors single-quoted strings (with `''` escapes), dollar-quoted bodies
+ * (`$$ … $$` and `$tag$ … $tag$`), `--` line comments and block comments, so a
+ * `;` inside a DO block, a string, or a comment never ends a statement.
+ * Comment-only chunks are dropped. Exported for the unit test.
+ */
+export function splitSqlStatements(sql: string): string[] {
+  const statements: string[] = []
+  const push = (chunk: string) => {
+    const trimmed = chunk.trim()
+    if (trimmed === '') return
+    const withoutComments = trimmed.replace(/--[^\n]*/g, '').replace(/\/\*[\s\S]*?\*\//g, '').trim()
+    if (withoutComments === '') return
+    statements.push(trimmed)
+  }
+  const n = sql.length
+  let start = 0
+  let i = 0
+  while (i < n) {
+    const ch = sql[i]
+    const next = sql[i + 1]
+    if (ch === '-' && next === '-') {
+      const end = sql.indexOf('\n', i)
+      i = end === -1 ? n : end + 1
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      const end = sql.indexOf('*/', i + 2)
+      i = end === -1 ? n : end + 2
+      continue
+    }
+    if (ch === "'") {
+      let j = i + 1
+      while (j < n) {
+        if (sql[j] === "'") {
+          if (sql[j + 1] === "'") { j += 2; continue }
+          break
+        }
+        j++
+      }
+      i = j + 1
+      continue
+    }
+    if (ch === '$') {
+      const tag = /^\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$/.exec(sql.slice(i, i + 64))?.[0]
+      if (tag) {
+        const end = sql.indexOf(tag, i + tag.length)
+        i = end === -1 ? n : end + tag.length
+        continue
+      }
+    }
+    if (ch === ';') {
+      push(sql.slice(start, i))
+      start = i + 1
+    }
+    i++
+  }
+  push(sql.slice(start))
+  return statements
+}
+
+// Postgres SQLSTATE codes for transient lock contention on one statement:
+// 40P01 deadlock_detected, 55P03 lock_not_available (lock_timeout), 40001
+// serialization_failure. Anything else is a real error and propagates.
+const BASELINE_STATEMENT_LOCK_CODES = new Set(['40P01', '55P03', '40001'])
+const BASELINE_STATEMENT_ATTEMPTS = 6
+
+/** Structural so the unit test can drive the runner with a fake client. */
+export type BaselineStatementClient = { query(sql: string): Promise<unknown> }
+
+/**
+ * Run the frozen baseline one statement at a time, retrying a statement that
+ * loses a lock race.
+ *
+ * Sent as a single simple-protocol query, the batch is ONE implicit
+ * transaction: every no-op `ALTER TABLE … IF NOT EXISTS` takes a brief
+ * AccessExclusiveLock and the transaction HOLDS all ~30 of them until commit.
+ * Under sustained production traffic those waits close into a cycle and
+ * Postgres aborts the whole batch with 40P01 — on every attempt. That is how
+ * the first versioned-migration adoption Job (v0.14.0, 2026-09-03) failed
+ * eight times in a row without applying anything: the ledger was empty, so
+ * version 1 had to run, and version 1 could never commit. Before versioned
+ * migrations the same batch ran on
+ * every boot and only ever got through production because a sentinel probe let
+ * a deadlocked no-op pass; that hatch is gone, and it would not have helped
+ * here anyway because the baseline had real columns to add.
+ *
+ * Per-statement autocommit holds one table's lock at a time and releases it
+ * immediately, so a no-op cannot participate in a lock cycle, and a real
+ * change waits at most `lock_timeout` (55P03) before this loop retries just
+ * that statement. Every statement in the baseline is idempotent (it ran on
+ * every application boot before the ledger existed), so a statement retry — or
+ * a rerun
+ * of the Job after a mid-batch failure — resumes safely; ensureSchema records
+ * version 1 only after the entire batch completed. Versioned migrations after
+ * the baseline keep their single-transaction atomicity.
+ */
+export async function runBaselineStatements(
+  client: BaselineStatementClient,
+  sql: string,
+  opts: { sleep?: (ms: number) => Promise<void>; maxAttempts?: number } = {},
+): Promise<number> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const maxAttempts = opts.maxAttempts ?? BASELINE_STATEMENT_ATTEMPTS
+  const statements = splitSqlStatements(sql)
+  for (let index = 0; index < statements.length; index++) {
+    const statement = statements[index]
+    const summary = statement.replace(/\s+/g, ' ').slice(0, 96)
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await client.query(statement)
+        break
+      } catch (err) {
+        const code = (err as { code?: unknown } | null)?.code
+        if (typeof code === 'string' && BASELINE_STATEMENT_LOCK_CODES.has(code) && attempt < maxAttempts) {
+          const backoffMs = Math.min(8_000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250)
+          console.warn(
+            `[db] baseline statement ${index + 1}/${statements.length} hit ${code} (attempt ${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms: ${summary}`,
+          )
+          await sleep(backoffMs)
+          continue
+        }
+        console.error(`[db] baseline statement ${index + 1}/${statements.length} failed: ${summary}`)
+        throw err
+      }
+    }
+  }
+  return statements.length
+}
+
+/** The frozen baseline text, for tests that check the splitter against it. */
+export function frozenBaselineSql(): string {
+  return DDL
+}
+
+async function applyLegacyBaseline(client: import('pg').PoolClient): Promise<void> {
+  // pgvector remains optional: deployments without the extension retain the
+  // recency-only memory path. All other baseline objects are mandatory.
+  try {
+    await client.query('CREATE EXTENSION IF NOT EXISTS vector')
+  } catch (err) {
+    console.warn(
+      '[db] pgvector unavailable — semantic memory disabled:',
+      err instanceof Error ? err.message : String(err),
+    )
+  }
+
+  // This is the frozen baseline for databases that predate versioned
+  // migrations. It runs once, from the dedicated migration owner, and is never
+  // re-applied by application replicas. It is sent one statement at a time —
+  // see runBaselineStatements for why the single-batch form cannot complete
+  // against live production traffic.
+  await runBaselineStatements(client, DDL)
+  await client.query(`
+    DO $migrate$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
+        EXECUTE 'ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS embedding vector(1536)';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_workspace_embed_hnsw
+                   ON agent_workspace
+                USING hnsw (embedding vector_cosine_ops)
+                WHERE path LIKE ''memory/%''';
+      END IF;
+    END
+    $migrate$;
+  `)
+
+  await renameAgentIdCollisions(client)
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS participants_agent_id_unique
+      ON participants(id) WHERE kind = 'agent'
+  `)
+  await client.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_participants_agent_creation_request
+      ON participants(company_id, creation_request_id)
+      WHERE kind = 'agent' AND creation_request_id IS NOT NULL
+  `)
+  await ensureMessageClientIdIndex(client)
+  await buildConcurrentIndexes(client)
+  await verifyRequiredIndexes(client, BASELINE_REQUIRED_SCHEMA_INDEXES)
+}
+
+/** Structural so the unit test can drive the precheck with a fake client. */
+export type MigrationPrecheckClient = {
+  query(sql: string): Promise<{ rows: Array<Record<string, unknown>> }>
+}
+
+const MIGRATION_0002_SAMPLE_LIMIT = 15
+
+// Member ids that migration 0002 cannot place in conversation_members: no
+// participant row with that id in the conversation's tenant, and not one of
+// the synthetic external:<addr> markers the migration strips on purpose.
+const UNRESOLVABLE_MEMBERS_CTE = `
+  WITH orphan AS (
+    SELECT c.id AS conversation_id, c.company_id, member.id AS member_id
+      FROM conversations c
+      CROSS JOIN LATERAL jsonb_array_elements_text(c.members) member(id)
+      LEFT JOIN participants p
+        ON p.id = member.id AND p.company_id = c.company_id
+     WHERE c.company_id IS NOT NULL
+       AND p.id IS NULL
+       AND member.id NOT LIKE 'external:%'
+  )`
+
+/**
+ * Read-only precondition report for migration 0002.
+ *
+ * The migration itself fails closed (23503) when a legacy JSONB member does
+ * not resolve to a same-tenant participant, which is the right call — but a
+ * bare "foreign or missing participant" from the pre-deploy Job tells the
+ * operator nothing about what the data looks like or how much of it there
+ * is. That is exactly where the first v0.14.1 adoption stopped (2026-09-03).
+ * This runs before the immutable SQL, on the same connection, and only reads:
+ * it counts the unresolvable (conversation, member) pairs, classifies them
+ * (id gone from participants entirely, id owned by another tenant, id that is
+ * a users row, id that authored messages in that conversation, …), prints a
+ * bounded sample, and raises the same 23503 with an actionable message. It
+ * lives outside the migration string so the v2 checksum is untouched.
+ */
+export async function checkConversationMembersResolvable(client: MigrationPrecheckClient): Promise<void> {
+  const { rows: [summary] } = await client.query(`${UNRESOLVABLE_MEMBERS_CTE}
+    SELECT
+      (SELECT count(*) FROM orphan)                                  AS pairs,
+      (SELECT count(DISTINCT conversation_id) FROM orphan)           AS conversations,
+      (SELECT count(DISTINCT member_id) FROM orphan)                 AS member_ids,
+      (SELECT count(*) FROM orphan o
+        WHERE NOT EXISTS (SELECT 1 FROM participants p WHERE p.id = o.member_id)) AS missing_everywhere,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM participants p
+                       WHERE p.id = o.member_id AND p.company_id <> o.company_id)) AS other_tenant,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM users u WHERE u.id = o.member_id))            AS user_rows,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM company_members cm
+                       WHERE cm.user_id = o.member_id AND cm.company_id = o.company_id)) AS company_members_without_participant,
+      (SELECT count(*) FROM orphan o WHERE o.company_id = 'personal')          AS personal_tenant,
+      (SELECT count(*) FROM orphan o
+        WHERE EXISTS (SELECT 1 FROM messages m
+                       WHERE m.conversation_id = o.conversation_id AND m.author_id = o.member_id)) AS authored_messages,
+      (SELECT count(*) FROM conversations WHERE company_id IS NULL)          AS null_company_conversations
+  `)
+  const n = (value: unknown): number => Number(value ?? 0)
+  const pairs = n(summary?.pairs)
+  const nullCompanies = n(summary?.null_company_conversations)
+  if (pairs === 0 && nullCompanies === 0) {
+    console.log('[db] migration 0002 precheck: every conversation member resolves to a same-tenant participant')
+    return
+  }
+
+  const { rows: samples } = await client.query(`${UNRESOLVABLE_MEMBERS_CTE}
+    SELECT o.conversation_id, o.company_id, o.member_id,
+           EXISTS (SELECT 1 FROM participants p WHERE p.id = o.member_id)   AS participant_elsewhere,
+           EXISTS (SELECT 1 FROM users u WHERE u.id = o.member_id)          AS is_user,
+           EXISTS (SELECT 1 FROM messages m
+                    WHERE m.conversation_id = o.conversation_id AND m.author_id = o.member_id) AS authored
+      FROM orphan o
+     ORDER BY o.company_id, o.conversation_id, o.member_id
+     LIMIT ${MIGRATION_0002_SAMPLE_LIMIT}
+  `)
+
+  // Ids are opaque, but never print a whole email address into a CI log.
+  const mask = (id: string): string => (id.includes('@') ? id.replace(/^(.{0,3}).*@/, '$1…@') : id)
+  const counts = [
+    `pairs=${pairs}`,
+    `conversations=${n(summary?.conversations)}`,
+    `member_ids=${n(summary?.member_ids)}`,
+    `missing_everywhere=${n(summary?.missing_everywhere)}`,
+    `other_tenant=${n(summary?.other_tenant)}`,
+    `user_rows=${n(summary?.user_rows)}`,
+    `company_members_without_participant=${n(summary?.company_members_without_participant)}`,
+    `personal_tenant=${n(summary?.personal_tenant)}`,
+    `authored_messages=${n(summary?.authored_messages)}`,
+    `null_company_conversations=${nullCompanies}`,
+  ]
+  console.error(`[db] migration 0002 precheck failed: ${counts.join(' ')}`)
+  for (const sample of samples) {
+    const flags = [
+      sample.participant_elsewhere ? 'participant-in-other-tenant' : 'no-participant-anywhere',
+      sample.is_user ? 'users-row' : null,
+      sample.authored ? 'authored-messages-here' : null,
+    ].filter(Boolean).join(',')
+    console.error(
+      `[db]   conversation=${String(sample.conversation_id)} company=${String(sample.company_id)} member=${mask(String(sample.member_id))} [${flags}]`,
+    )
+  }
+  const detail = [
+    pairs > 0
+      ? `${pairs} conversation member id(s) in ${n(summary?.conversations)} conversation(s) do not resolve to a same-tenant participant`
+      : null,
+    nullCompanies > 0 ? `${nullCompanies} conversation(s) have no company_id` : null,
+  ].filter(Boolean).join(' and ')
+  throw Object.assign(
+    new Error(`migration 0002 precondition failed: ${detail} — repair the data, then rerun the migration Job (see the precheck lines above)`),
+    { code: '23503' },
+  )
+}
+
+/** Where `archive-detach` parks the member ids it removes from
+ *  `conversations.members`, so the detach can be undone. */
+export const MIGRATION_0002_ARCHIVE_TABLE = 'conversation_members_detached_0002'
+
+export const MIGRATION_0002_ARCHIVE_DDL = `
+CREATE TABLE IF NOT EXISTS ${MIGRATION_0002_ARCHIVE_TABLE} (
+  conversation_id       TEXT NOT NULL,
+  company_id            TEXT NOT NULL,
+  member_id             TEXT NOT NULL,
+  ordinal               INTEGER NOT NULL,
+  original_members      JSONB NOT NULL,
+  authored_messages     BOOLEAN NOT NULL,
+  participant_elsewhere BOOLEAN NOT NULL,
+  archived_at           TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (conversation_id, member_id)
+)`
+
+// Same predicate as UNRESOLVABLE_MEMBERS_CTE, plus everything needed to say
+// afterwards exactly what was removed: `ordinal` is where the id sat and
+// `original_members` is the whole pre-detach array, so the old state can be
+// reconstructed without re-deriving an interleaving. `authored_messages` /
+// `participant_elsewhere` record *why* the id was unresolvable.
+const MIGRATION_0002_ARCHIVE_ORPHANS = `
+INSERT INTO ${MIGRATION_0002_ARCHIVE_TABLE} (
+  conversation_id, company_id, member_id, ordinal, original_members,
+  authored_messages, participant_elsewhere
+)
+SELECT c.id, c.company_id, member.id, (member.ord - 1)::integer, c.members,
+       EXISTS (SELECT 1 FROM messages m
+                WHERE m.conversation_id = c.id AND m.author_id = member.id),
+       EXISTS (SELECT 1 FROM participants p WHERE p.id = member.id)
+  FROM conversations c
+  CROSS JOIN LATERAL jsonb_array_elements_text(c.members)
+         WITH ORDINALITY AS member(id, ord)
+  LEFT JOIN participants p
+    ON p.id = member.id AND p.company_id = c.company_id
+ WHERE c.company_id IS NOT NULL
+   AND p.id IS NULL
+   AND member.id NOT LIKE 'external:%'
+ON CONFLICT (conversation_id, member_id) DO NOTHING`
+
+// Rewrite only the affected conversations, preserving the relative order of
+// the members that stay. `external:` markers are kept on purpose — migration
+// 0002 strips them itself and they are not participants by design.
+const MIGRATION_0002_DETACH_ORPHANS = `
+WITH affected AS (
+  SELECT DISTINCT a.conversation_id FROM ${MIGRATION_0002_ARCHIVE_TABLE} a
+), kept AS (
+  SELECT c.id,
+         COALESCE(
+           jsonb_agg(member.id ORDER BY member.ord) FILTER (
+             WHERE member.id LIKE 'external:%'
+                OR EXISTS (SELECT 1 FROM participants p
+                            WHERE p.id = member.id AND p.company_id = c.company_id)
+           ),
+           '[]'::jsonb
+         ) AS members
+    FROM conversations c
+    JOIN affected a ON a.conversation_id = c.id
+    CROSS JOIN LATERAL jsonb_array_elements_text(c.members)
+           WITH ORDINALITY AS member(id, ord)
+   GROUP BY c.id
+)
+UPDATE conversations c
+   SET members = kept.members
+  FROM kept
+ WHERE c.id = kept.id
+   AND c.members IS DISTINCT FROM kept.members`
+
+export type Migration0002RepairMode = 'off' | 'archive-detach'
+
+/**
+ * Read `MIGRATION_0002_REPAIR`. Unset means `off` — a deploy that has not
+ * asked for a repair keeps failing closed, which is the whole point of the
+ * precheck. An unrecognized value is a hard error rather than a silent `off`,
+ * because a typo in the one flag that touches production rows must not read
+ * as "operator declined".
+ */
+export function migration0002RepairMode(raw = process.env.MIGRATION_0002_REPAIR): Migration0002RepairMode {
+  const value = (raw ?? '').trim().toLowerCase()
+  if (value === '' || value === 'off') return 'off'
+  if (value === 'archive-detach') return 'archive-detach'
+  throw new Error(`MIGRATION_0002_REPAIR must be unset, 'off', or 'archive-detach' (got '${raw}')`)
+}
+
+/**
+ * Opt-in repair for the 0002 precondition (ADR 0004).
+ *
+ * The unresolvable rows are legacy `conversations.members` entries naming an
+ * id with no participant in that conversation's tenant — most of them ids
+ * that do exist, under a *different* company. They predate the tenant guard
+ * in `startPulledGroup`, which now refuses to build a cross-tenant members
+ * array at all. Such an id grants nothing today: every read path is
+ * tenant-scoped, so a foreign member id is unreachable membership, and ADR
+ * 0004's composite FK has no way to represent it in the first place.
+ *
+ * So the repair detaches them — but archives each one first, along with the
+ * conversation's whole pre-detach members array, so nothing is destroyed
+ * silently. That archive is a record, not a one-click undo: once 0002 has
+ * applied, its projection trigger enforces ADR 0004 on every write, so
+ * putting a detached id back requires making it a real participant in that
+ * tenant first. `messages` is never touched: an archived member that authored
+ * in the conversation keeps its authorship, it just stops being listed as a
+ * member.
+ *
+ * Runs inside migration 0002's transaction, so a failure later in the
+ * migration rolls the detach back with it.
+ */
+export async function repairConversationMembers(
+  client: MigrationPrecheckClient,
+): Promise<{ archived: number; conversations: number }> {
+  await client.query(MIGRATION_0002_ARCHIVE_DDL)
+  await client.query(MIGRATION_0002_ARCHIVE_ORPHANS)
+  await client.query(MIGRATION_0002_DETACH_ORPHANS)
+  const { rows: [totals] } = await client.query(`
+    SELECT count(*) AS archived, count(DISTINCT conversation_id) AS conversations
+      FROM ${MIGRATION_0002_ARCHIVE_TABLE}`)
+  return {
+    archived: Number(totals?.archived ?? 0),
+    conversations: Number(totals?.conversations ?? 0),
+  }
+}
+
+async function applyNormalizedConversationMembers(client: import('pg').PoolClient): Promise<void> {
+  const repair = migration0002RepairMode()
+  try {
+    await checkConversationMembersResolvable(client)
+  } catch (error) {
+    // The precheck only SELECTs; the 23503 it raises is constructed in JS
+    // after those reads succeeded, so the surrounding transaction is still
+    // live and the repair can run on this same connection.
+    if (repair !== 'archive-detach' || (error as { code?: string }).code !== '23503') throw error
+    const repaired = await repairConversationMembers(client)
+    console.warn(
+      `[db] migration 0002 repair(archive-detach): detached ${repaired.archived} member id(s) ` +
+      `from ${repaired.conversations} conversation(s) into ${MIGRATION_0002_ARCHIVE_TABLE}`,
+    )
+    // Re-run rather than assume. A conversation with no company_id, for
+    // instance, is not something detaching members can fix, and must still
+    // stop the deploy.
+    await checkConversationMembersResolvable(client)
+  }
+  await client.query(NORMALIZED_CONVERSATION_MEMBERS_SQL)
+}
+
+async function applyWorkspaceCleanupJobs(client: import('pg').PoolClient): Promise<void> {
+  await client.query(WORKSPACE_CLEANUP_JOBS_SQL)
+}
+
+async function applyAgentRuntimeAssignment(client: import('pg').PoolClient): Promise<void> {
+  await client.query(AGENT_RUNTIME_ASSIGNMENT_SQL)
+}
+
+/** Declared `transactional: false` below: PostgreSQL refuses CONCURRENTLY
+ * inside a transaction block. Both statements are idempotent, and
+ * `ensureConcurrentIndex` repairs an INVALID index left by an interrupted
+ * build, so an aborted run is safe to rerun. */
+async function applySearchTrigramIndex(client: import('pg').PoolClient): Promise<void> {
+  await client.query(SEARCH_TRIGRAM_EXTENSION_SQL)
+  await ensureConcurrentIndex(client, SEARCH_TRIGRAM_INDEX_NAME, SEARCH_TRIGRAM_INDEX_SQL)
+}
+
+/**
+ * Declared `transactional: false` below: PostgreSQL refuses CONCURRENTLY
+ * inside a transaction block. Both statements are idempotent:
+ * `ensureConcurrentIndex` repairs an INVALID index left by an interrupted
+ * build, and DROP INDEX CONCURRENTLY IF EXISTS is a safe no-op on retry.
+ */
+async function applyEmailMessagesCompanySmtpId(client: import('pg').PoolClient): Promise<void> {
+  await ensureConcurrentIndex(
+    client,
+    EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+    EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
+  )
+  await client.query(DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL)
+}
+
+const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
+  {
+    ...SCHEMA_MIGRATIONS[0],
+    sourceChecksum: computedBaselineMigrationChecksum(),
+    transactional: false,
+    up: applyLegacyBaseline,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[1],
+    sourceChecksum: normalizedConversationMembersChecksum(),
+    transactional: true,
+    up: applyNormalizedConversationMembers,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[2],
+    sourceChecksum: workspaceCleanupJobsChecksum(),
+    transactional: true,
+    up: applyWorkspaceCleanupJobs,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[3],
+    sourceChecksum: agentRuntimeAssignmentChecksum(),
+    transactional: true,
+    up: applyAgentRuntimeAssignment,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[4],
+    sourceChecksum: searchTrigramIndexChecksum(),
+    // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
+    transactional: false,
+    up: applySearchTrigramIndex,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[5],
+    sourceChecksum: emailMessagesCompanySmtpIdChecksum(),
+    // CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
+    transactional: false,
+    up: applyEmailMessagesCompanySmtpId,
+  },
+]
+
+export async function applyPendingMigration(
+  client: import('pg').PoolClient,
+  migration: VersionedMigration,
+): Promise<void> {
+  const started = Date.now()
+  console.log(`[db] applying migration ${migration.version} ${migration.name}`)
+  if (migration.transactional !== false) {
+    await client.query('BEGIN')
+    try {
+      await migration.up(client)
+      await client.query(
+        `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+         VALUES ($1, $2, $3, $4)`,
+        [migration.version, migration.name, migration.checksum, Date.now() - started],
+      )
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => { /* swallow rollback err */ })
+      throw err
+    }
+  } else {
+    await migration.up(client)
+    await client.query(
+      `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+       VALUES ($1, $2, $3, $4)`,
+      [migration.version, migration.name, migration.checksum, Date.now() - started],
+    )
+  }
+  console.log(`[db] applied migration ${migration.version} in ${Date.now() - started}ms`)
+}
+
+function validateMigrationDefinitions(): void {
+  if (VERSIONED_MIGRATIONS.length !== SCHEMA_MIGRATIONS.length) {
+    throw new Error('migration definitions and immutable manifest have different lengths')
+  }
+  for (let i = 0; i < VERSIONED_MIGRATIONS.length; i++) {
+    const definition = VERSIONED_MIGRATIONS[i]
+    const metadata = SCHEMA_MIGRATIONS[i]
+    if (
+      definition.version !== metadata.version ||
+      definition.name !== metadata.name ||
+      definition.sourceChecksum !== metadata.checksum
+    ) {
+      throw new Error(
+        `migration ${metadata.version} source checksum changed; append a new migration instead of editing applied history`,
+      )
+    }
+  }
+}
+
+/**
+ * Apply the immutable migration suffix exactly once.
+ *
+ * The advisory lock is defense in depth for an accidentally duplicated
+ * pre-deploy job. Normal server startup never calls this function.
+ */
 export async function ensureSchema(): Promise<void> {
-  // Two server instances booting at the same moment used to deadlock
-  // on concurrent CREATE TABLE / ALTER TABLE — Postgres serializes
-  // each DDL statement on system-catalog locks, but TWO migration
-  // sessions racing each other can wait on each other's catalog
-  // locks in a circle and PG aborts one with `40P01 deadlock
-  // detected`. Wrap the whole migration in a session-scoped advisory
-  // lock so only one instance migrates at a time; the rest queue up
-  // and find every DDL is already a no-op (everything is `IF NOT
-  // EXISTS` shaped). If the holder crashes mid-migration its
-  // connection drops and PG releases the lock automatically — next
-  // boot just picks up.
+  validateMigrationDefinitions()
   const client = await pool.connect()
   try {
-    // Exempt this session from the pool's default statement_timeout: the
-    // advisory-lock acquisition below is intentionally unbounded (cross-instance
-    // serialization), and CONCURRENTLY index builds run for minutes. lock_timeout
-    // (set after the advisory lock) still bounds DDL lock WAITS to fail fast.
     await client.query('SET statement_timeout = 0')
     await client.query('SET idle_in_transaction_session_timeout = 0')
     await client.query('SELECT pg_advisory_lock($1)', [SCHEMA_LOCK_KEY])
-    // Bound how long any DDL will WAIT to acquire a table lock. The advisory
-    // lock above only serializes migration-vs-migration; it does nothing about
-    // migration-vs-live-traffic. Migrations are almost always no-ops (every
-    // statement is `IF NOT EXISTS`-shaped), but a no-op ALTER still needs a brief
-    // AccessExclusiveLock, and against constant agent/server queries that wait can
-    // turn into a `40P01 deadlock` — or stall a hot table long enough to fail the
-    // OTHER (healthy) pod's /api/health probe, which is how both replicas went
-    // unhealthy at once and the LB returned 502. With lock_timeout a blocked DDL
-    // aborts fast (`55P03`) and the boot-retry wrapper retries in a quieter
-    // moment instead of holding locks hostage. Set AFTER the advisory lock so the
-    // cross-instance serialization wait itself stays unbounded.
     await client.query("SET lock_timeout = '5s'")
     try {
-      // pgvector for semantic memory retrieval. Best-effort: if the
-      // extension isn't installed (or the DB user lacks CREATE
-      // EXTENSION grants) we silently skip and `loadMemory` falls
-      // back to its recency-only path. The column + index DDL below
-      // is gated on the extension actually being present.
-      try {
-        await client.query('CREATE EXTENSION IF NOT EXISTS vector')
-      } catch (e) {
-        console.warn('[db] pgvector unavailable — semantic memory disabled:', e instanceof Error ? e.message : String(e))
-      }
-      // The idempotent DDL batch below runs as ONE implicit transaction (node-pg
-      // simple protocol), so it briefly AccessExclusive-locks ~30 tables and HOLDS
-      // them all until commit. On an already-migrated prod DB every statement is a
-      // no-op, but under sustained write traffic those lock waits form a cycle and
-      // Postgres aborts the migration with 40P01 (deadlock) on EVERY boot — so no
-      // new pod could start (a hard outage; this is exactly what wedged prod). If
-      // the batch hits a lock error but the schema is already at the current shape
-      // (sentinels present), it had nothing to do anyway: log + proceed instead of
-      // crash-looping. A genuinely un-migrated DB (fresh / dev / CI) has no traffic
-      // and no sentinels, so it still runs + retries to completion.
-      try {
-        await client.query(DDL)
-      // Conditionally add the embedding column + HNSW index — only
-      // if pgvector was actually installed. Wrapped in DO $$ so the
-      // whole statement is a no-op when the extension isn't there.
       await client.query(`
-        DO $migrate$
-        BEGIN
-          IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
-            EXECUTE 'ALTER TABLE agent_workspace ADD COLUMN IF NOT EXISTS embedding vector(1536)';
-            -- HNSW index is partial — only memory paths get it, so skills /
-            -- scripts files don't bloat the index with rows we never
-            -- semantic-search against.
-            EXECUTE 'CREATE INDEX IF NOT EXISTS idx_workspace_embed_hnsw
-                       ON agent_workspace
-                    USING hnsw (embedding vector_cosine_ops)
-                    WHERE path LIKE ''memory/%''';
-          END IF;
-        END
-        $migrate$;
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version      INTEGER PRIMARY KEY,
+          name         TEXT NOT NULL UNIQUE,
+          checksum     TEXT NOT NULL,
+          execution_ms INTEGER NOT NULL CHECK (execution_ms >= 0),
+          applied_at   TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+        )
       `)
 
-      // ============== Agent id global-uniqueness migration ==============
-      //
-      // The participants table's composite PK `(id, company_id)` was a
-      // multi-tenancy bolt-on that accidentally let the same agent id
-      // exist in multiple workspaces (humans use their user_id, which
-      // IS designed to be cross-workspace — but agents are supposed to
-      // be per-workspace and globally unique). The runtime resolves
-      // agents by id alone in many paths (persona cache, pod dedupe,
-      // `cumora doc ls` / `cumora kanban ls` company resolution), so
-      // any cross-tenant agent id collision causes the wrong tenant's
-      // library to be returned. Fix: rename the colliding rows so each
-      // agent id is globally unique, then enforce that with a partial
-      // unique index. Re-runs are no-ops (the SELECT finds 0 rows).
-      await renameAgentIdCollisions(client)
-      await client.query(`
-        CREATE UNIQUE INDEX IF NOT EXISTS participants_agent_id_unique
-          ON participants(id) WHERE kind = 'agent'
-      `)
-      await ensureMessageClientIdIndex(client)
+      const readHistory = async (): Promise<AppliedMigration[]> => (
+        await client.query<AppliedMigration>(
+          `SELECT version, name, checksum, applied_at
+             FROM schema_migrations
+            ORDER BY version ASC`,
+        )
+      ).rows
 
-        console.log('[db] schema ensured')
-      } catch (e) {
-        const code = (e as { code?: string } | null)?.code
-        if ((code === '40P01' || code === '55P03') && (await schemaAlreadyCurrent(client))) {
-          console.warn(`[db] schema DDL hit lock contention (${code}) but schema is already current — proceeding without re-applying (idempotent no-op under live load)`)
-        } else {
-          throw e
-        }
+      const history = validateMigrationHistory(await readHistory(), { allowPending: true })
+      for (const metadata of history.pending) {
+        const migration = VERSIONED_MIGRATIONS.find((candidate) => candidate.version === metadata.version)
+        if (!migration) throw new Error(`migration ${metadata.version} has metadata but no implementation`)
+
+        await applyPendingMigration(client, migration)
       }
+
+      const finalHistory = validateMigrationHistory(await readHistory())
+      await verifyRequiredIndexes(client)
+      console.log(`[db] schema is current at version ${finalHistory.currentVersion}`)
     } finally {
-      // Release on the same connection the lock was taken on.
-      // `pool.release(client)` below would do it implicitly via
-      // session close, but releasing explicitly lets the conn
-      // re-enter the pool with no lock state — cleaner.
       await client.query('SELECT pg_advisory_unlock($1)', [SCHEMA_LOCK_KEY]).catch(() => { /* swallow */ })
     }
-    // Heavy index builds run AFTER the advisory lock is released and OUTSIDE
-    // the migration transaction (CONCURRENTLY can't run in a txn, and we don't
-    // want a slow build to make other booting pods queue behind the advisory
-    // lock). Best-effort + non-fatal — see the helper.
-    await buildConcurrentIndexes(client)
   } finally {
     await releaseMigrationClient(client)
   }
@@ -2178,98 +2713,17 @@ export async function releaseMigrationClient(client: MigrationClient): Promise<v
   client.release()
 }
 
-/**
- * Cheap probe: are the schema's most-recently-added objects already present?
- *
- * Used to decide whether a lock-contention failure on the big DDL batch is safe
- * to ignore. If these sentinels all exist, the idempotent batch was a guaranteed
- * no-op, so a 40P01 / 55P03 trying to re-apply it changes nothing — we proceed
- * rather than crash-loop. Read-only, so it's fine to run on the same connection
- * right after the failed (auto-rolled-back) DDL.
- *
- * The expectations are derived FROM `DDL` itself rather than hand-listed. A
- * hand-kept list is a whitelist of things that must be present, so an entry
- * nobody remembered to add does not block the shortcut — its absence is simply
- * never checked. That is not benign, and this comment used to claim it was: on
- * 2026-08-31 #133 added `messages.delivery_recipient_id` without a sentinel, a
- * loaded prod lost the lock race on the hot `messages` table (55P03), this
- * function answered "current", migrate exited 0, and every daemon's /inbox 500'd
- * on the missing column until production was rolled back. The same shape had
- * already been caught twice before (llm_calls, llm_calls_rollup) — hence
- * deriving the list instead of remembering it.
- */
-/** Every table and column `DDL` promises, read out of the DDL text so this can
- *  never fall behind it. Comments are stripped first so a commented-out example
- *  cannot become a phantom expectation. */
-export function ddlExpectations(): { tables: string[]; columns: Array<{ table: string; column: string }> } {
-  const sql = DDL.replace(/--[^\n]*/g, '')
-  const tables = [...sql.matchAll(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
-    .map((m) => m[1] as string)
-  const columns = [...sql.matchAll(/ALTER\s+TABLE\s+([a-z_][a-z0-9_]*)\s+ADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\s+([a-z_][a-z0-9_]*)/gi)]
-    .map((m) => ({ table: m[1] as string, column: m[2] as string }))
-  return { tables: [...new Set(tables)], columns }
-}
-
-async function schemaAlreadyCurrent(client: import('pg').PoolClient): Promise<boolean> {
-  try {
-    const { tables, columns } = ddlExpectations()
-    // Indexes are not derivable the same way (partial/concurrent/renamed), so
-    // the few that gate correctness stay explicit.
-    const indexes = ['participants_agent_id_unique', 'uniq_messages_client_id']
-    const { rows } = await client.query<{
-      missing_tables: string[]; missing_columns: string[]; missing_indexes: string[]
-    }>(
-      `WITH want_t(name) AS (SELECT unnest($1::text[])),
-            want_c(t, c) AS (SELECT unnest($2::text[]), unnest($3::text[])),
-            want_i(name) AS (SELECT unnest($4::text[]))
-       SELECT
-         COALESCE(ARRAY(
-           SELECT w.name FROM want_t w
-            WHERE NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = w.name)
-         ), '{}') AS missing_tables,
-         COALESCE(ARRAY(
-           SELECT w.t || '.' || w.c FROM want_c w
-            WHERE NOT EXISTS (
-              SELECT 1 FROM information_schema.columns
-               WHERE table_name = w.t AND column_name = w.c
-            )
-         ), '{}') AS missing_columns,
-         COALESCE(ARRAY(
-           SELECT w.name FROM want_i w
-            WHERE NOT EXISTS (
-              SELECT 1 FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
-               WHERE c.relname = w.name AND i.indisvalid
-            )
-         ), '{}') AS missing_indexes`,
-      [tables, columns.map((c) => c.table), columns.map((c) => c.column), indexes],
-    )
-    const missing = [
-      ...(rows[0]?.missing_tables ?? []),
-      ...(rows[0]?.missing_columns ?? []),
-      ...(rows[0]?.missing_indexes ?? []),
-    ]
-    if (missing.length > 0) {
-      // Say what is missing. The failure this replaces was invisible: migrate
-      // logged "schema ensured" and exited 0 while a column the app queries on
-      // every request did not exist.
-      console.warn(`[db] schema is NOT current — missing: ${missing.slice(0, 20).join(', ')}${missing.length > 20 ? ` (+${missing.length - 20} more)` : ''}`)
-      return false
-    }
-    return true
-  } catch {
-    return false
-  }
-}
-
 /** Correctness index for message idempotency. Build it concurrently so adding
  *  the feature cannot block writes to the hot messages table. */
 async function ensureMessageClientIdIndex(client: import('pg').PoolClient): Promise<void> {
-  const { rows } = await client.query<{ indisvalid: boolean }>(
-    `SELECT i.indisvalid FROM pg_class c
+  const { rows } = await client.query<{ indisvalid: boolean; indisready: boolean; indislive: boolean }>(
+    `SELECT i.indisvalid, i.indisready, i.indislive FROM pg_class c
        JOIN pg_index i ON i.indexrelid = c.oid
-      WHERE c.relname = 'uniq_messages_client_id'`,
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = current_schema()
+        AND c.relname = 'uniq_messages_client_id'`,
   )
-  if (rows[0]?.indisvalid) return
+  if (rows[0]?.indisvalid && rows[0].indisready && rows[0].indislive) return
   await client.query("SET lock_timeout = '0'")
   try {
     if (rows[0]) await client.query('DROP INDEX CONCURRENTLY IF EXISTS uniq_messages_client_id')
@@ -2292,29 +2746,101 @@ async function ensureMessageClientIdIndex(client: import('pg').PoolClient): Prom
  *
  * `CREATE INDEX CONCURRENTLY` lets writes proceed during the build, so there is
  * no blocking lock and no deadlock. It MUST run outside any transaction — hence
- * its own statements here, after the DDL batch committed and the advisory lock
- * was released.
+ * its own statements here, after the DDL batch committed.
  *
- * Best-effort + NON-FATAL: these indexes are query optimizations, never a
- * correctness requirement. A lock_timeout / interruption must never block boot
- * (that was the whole bug). A previously-interrupted concurrent build leaves an
- * INVALID index behind; `IF NOT EXISTS` would then skip it forever, so we drop
- * any dead one first and rebuild.
+ * These are now promotion requirements. A previously interrupted concurrent
+ * build leaves an INVALID index behind; `IF NOT EXISTS` would then skip it
+ * forever, so the migration owner drops the dead entry and rebuilds it. Failure
+ * stops promotion but cannot crash-loop application replicas because replicas
+ * never run this code.
  */
+/**
+ * Build one `CREATE INDEX CONCURRENTLY` idempotently.
+ *
+ * `IF NOT EXISTS` alone is not enough: an interrupted concurrent build leaves an
+ * INVALID index behind that `IF NOT EXISTS` would then skip forever, so the
+ * table keeps paying for an index no planner will use. Check the catalog first
+ * and drop the dead entry before rebuilding.
+ *
+ * MUST run outside any transaction block — PostgreSQL forbids CONCURRENTLY
+ * inside one. Callers from the versioned ledger therefore declare
+ * `transactional: false`.
+ */
+export async function ensureConcurrentIndex(
+  client: import('pg').PoolClient,
+  name: string,
+  create: string,
+): Promise<void> {
+  const { rows } = await client.query<{ indisvalid: boolean; indisready: boolean; indislive: boolean }>(
+    `SELECT i.indisvalid, i.indisready, i.indislive FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = current_schema() AND c.relname = $1`,
+    [name],
+  )
+  if (rows[0] && rows[0].indisvalid && rows[0].indisready && rows[0].indislive) return
+
+  // `ensureSchema` pins the migration session at `lock_timeout = '5s'` so an
+  // ordinary ALTER cannot sit behind a long lock and stall the deploy. A
+  // CONCURRENTLY build is the one operation that guard must not cover.
+  //
+  // It takes no blocking lock — that is the entire point of it — but it does
+  // WaitForOlderSnapshots: it waits out every transaction that started before
+  // it, anywhere in the database, on any table. `lock_timeout` counts that wait,
+  // so ANY transaction open longer than five seconds kills the build with 55P03
+  // and leaves an index with indisvalid=f behind: every INSERT maintains it, no
+  // planner will use it. This repo documents such transactions itself — the
+  // per-agent scan below is noted at "~8s".
+  //
+  // Measured on Postgres 16: one 30s read on an UNRELATED table is enough. Under
+  // `lock_timeout='5s'` the build dies at 5.0s leaving indisvalid=f; with the
+  // timeout lifted the same build completes.
+  //
+  // ensureMessageClientIdIndex has bracketed itself this way since it was
+  // written; putting it here instead means every concurrent build inherits it,
+  // including the two migrations added in 0.16 that reach this from the
+  // versioned ledger rather than from the baseline.
+  const previous = await currentLockTimeout(client)
+  await client.query("SET lock_timeout = '0'")
+  try {
+    if (rows[0]) {
+      console.warn(`[db] dropping invalid leftover index ${name} before rebuild`)
+      await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${name}`)
+    }
+    await client.query(create)
+  } finally {
+    // Restore what the caller had rather than assuming '5s': the helper must not
+    // silently widen the guard for the statements that follow it.
+    await client.query(`SET lock_timeout = ${quoteLiteral(previous)}`)
+  }
+  console.log(`[db] concurrent index ready: ${name}`)
+}
+
+/** The session's current lock_timeout, as a string SET will accept back. */
+async function currentLockTimeout(client: import('pg').PoolClient): Promise<string> {
+  const { rows } = await client.query<{ lock_timeout: string }>('SHOW lock_timeout')
+  return rows[0]?.lock_timeout ?? '5s'
+}
+
+/** Single-quote a value for a SET that cannot take a bind parameter. */
+function quoteLiteral(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`
+}
+
 async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<void> {
-  const indexes: Array<{ name: string; table: string; create: string }> = [
+  const indexes: Array<{ name: string; create: string }> = [
     {
       name: 'idx_conversations_members_gin',
-      table: 'conversations',
-      // members @> [agentId] containment — the hottest read path (loadInbox /
-      // loadContext / inbox-triage, called per wake + poll). Without it each
-      // call seq-scans every conversation and saturates the pool.
+      // Retained for the expand-release rollback window only. `loadInbox` /
+      // `loadContext` / inbox-triage no longer read `members @> [agentId]` —
+      // they resolve membership through the normalized `conversation_members`
+      // participant index (see inproc-client.ts). Drop this index once the
+      // rollback window closes.
       create: `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_conversations_members_gin
                  ON conversations USING gin (members jsonb_path_ops)`,
     },
     {
       name: 'idx_messages_author_created',
-      table: 'messages',
       // MAX(created_at) WHERE author_id = $1 — the idle scheduler's "when did
       // this agent last speak?" probe (idle.ts). Without it that subquery
       // SEQ-SCANNED the whole messages table per agent (~8s, 20+ concurrent),
@@ -2324,7 +2850,6 @@ async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<
     },
     {
       name: 'idx_llm_calls_created_brin',
-      table: 'llm_calls',
       // Every Observability aggregation filters `created_at > NOW() - Ndays`,
       // and the DEFAULT admin view passes no companyId — so NONE of the other
       // llm_calls indexes (all led by company_id / run_id / agent_id / model /
@@ -2343,26 +2868,57 @@ async function buildConcurrentIndexes(client: import('pg').PoolClient): Promise<
     },
   ]
   for (const ix of indexes) {
-    try {
-      const { rows } = await client.query<{ indisvalid: boolean }>(
-        `SELECT i.indisvalid FROM pg_class c
-           JOIN pg_index i ON i.indexrelid = c.oid
-          WHERE c.relname = $1`,
-        [ix.name],
-      )
-      if (rows[0]?.indisvalid === false) {
-        console.warn(`[db] dropping invalid leftover index ${ix.name} before rebuild`)
-        await client.query(`DROP INDEX IF EXISTS ${ix.name}`)
-      } else if (rows[0]) {
-        continue // already present and valid — nothing to do
-      }
-      await client.query(ix.create)
-      console.log(`[db] concurrent index ready: ${ix.name}`)
-    } catch (e) {
-      console.warn(
-        `[db] concurrent index ${ix.name} skipped (non-fatal, retries next boot):`,
-        e instanceof Error ? e.message : String(e),
-      )
-    }
+    await ensureConcurrentIndex(client, ix.name, ix.create)
+  }
+}
+
+const BASELINE_REQUIRED_SCHEMA_INDEXES = [
+  'participants_agent_id_unique',
+  'uniq_participants_agent_creation_request',
+  'uniq_messages_client_id',
+  'uniq_board_creation_request',
+  'uniq_document_creation_request',
+  'uniq_calendar_event_creation_request',
+  'idx_realtime_outbox_pending',
+  'idx_conversations_members_gin',
+  'idx_messages_author_created',
+  'idx_llm_calls_created_brin',
+] as const
+
+export const REQUIRED_SCHEMA_INDEXES = [
+  ...BASELINE_REQUIRED_SCHEMA_INDEXES,
+  'conversation_members_conversation_ordinal_key',
+  'idx_conversation_members_participant',
+  SEARCH_TRIGRAM_INDEX_NAME,
+  EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+] as const
+
+/** Promotion gate: every required index must exist and be valid, ready, and
+ * live. An interrupted CREATE INDEX CONCURRENTLY must never look healthy. */
+async function verifyRequiredIndexes(
+  client: import('pg').PoolClient,
+  requiredIndexes: readonly string[] = REQUIRED_SCHEMA_INDEXES,
+): Promise<void> {
+  const { rows } = await client.query<{
+    name: string
+    indisvalid: boolean
+    indisready: boolean
+    indislive: boolean
+  }>(
+    `SELECT c.relname AS name, i.indisvalid, i.indisready, i.indislive
+       FROM pg_class c
+       JOIN pg_index i ON i.indexrelid = c.oid
+       JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = current_schema()
+        AND c.relname = ANY($1::text[])`,
+    [[...requiredIndexes]],
+  )
+  const byName = new Map(rows.map((row) => [row.name, row]))
+  const invalid = requiredIndexes.filter((name) => {
+    const row = byName.get(name)
+    return !row || !row.indisvalid || !row.indisready || !row.indislive
+  })
+  if (invalid.length > 0) {
+    throw new Error(`required schema indexes missing or invalid: ${invalid.join(', ')}`)
   }
 }

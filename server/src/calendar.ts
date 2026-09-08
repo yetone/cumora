@@ -17,9 +17,14 @@
  */
 import { randomUUID } from 'node:crypto'
 import { pool } from './db/pool.js'
-import { CH_MESSAGE_NEW, CH_CALENDAR_REMINDER, publish } from './redis.js'
+import { CH_MESSAGE_NEW, CH_CALENDAR_REMINDER, CH_CALENDAR_EVENTS, publish } from './redis.js'
+import { enqueueBroadcast, withOutboxTransaction } from './realtime-outbox.js'
 import { env } from './env.js'
 import { formatAddress, sendViaProvider, mintMessageId } from './email.js'
+// The pure half lives apart so it can be tested without a database, Redis or an
+// email transport. Re-exported here so every existing importer is unaffected.
+export { nextOccurrenceOnOrAfter, type RecurrenceRule } from './recurrence.js'
+import { nextOccurrenceOnOrAfter, type RecurrenceRule } from './recurrence.js'
 
 const TICK_INTERVAL_MS = 60_000
 const CALENDAR_SYSTEM_AUTHOR_ID = 'calendar'
@@ -29,19 +34,6 @@ const CALENDAR_SYSTEM_AUTHOR_ID = 'calendar'
  *  next slot fell more than this many minutes ago get fast-forwarded to
  *  the next future slot without firing. */
 const MAX_CATCHUP_MS = 60 * 60_000
-
-export interface RecurrenceRule {
-  freq: 'daily' | 'weekly' | 'monthly' | 'yearly'
-  interval: number
-  /** 0=Sun … 6=Sat. Only honored when freq='weekly'. Empty/undefined = use
-   *  the weekday of the seed start_at. */
-  byweekday?: number[]
-  /** Inclusive end of the series — no occurrences after this ISO timestamp. */
-  until?: string | null
-  /** Hard cap on total firings (including the seed). Once reached, the
-   *  series is marked 'done'. */
-  count?: number | null
-}
 
 export interface CalendarEventRow {
   id: string
@@ -64,94 +56,6 @@ export interface CalendarEventRow {
   is_private: boolean
   created_at: Date
   updated_at: Date
-}
-
-/* ─────────────────────────── recurrence math ─────────────────────────── */
-
-/** Add N days to a Date without mutating the input. */
-function addDays(d: Date, n: number): Date {
-  const out = new Date(d.getTime())
-  out.setUTCDate(out.getUTCDate() + n)
-  return out
-}
-
-function addMonths(d: Date, n: number): Date {
-  const out = new Date(d.getTime())
-  out.setUTCMonth(out.getUTCMonth() + n)
-  return out
-}
-
-function addYears(d: Date, n: number): Date {
-  const out = new Date(d.getTime())
-  out.setUTCFullYear(out.getUTCFullYear() + n)
-  return out
-}
-
-/** Step one rrule "interval" forward from `from`. For weekly with
- *  byweekday this scans day-by-day (cheap — bounded at 7 iterations). */
-function stepOnce(from: Date, rule: RecurrenceRule): Date {
-  const interval = Math.max(1, Math.floor(rule.interval || 1))
-  switch (rule.freq) {
-    case 'daily':
-      return addDays(from, interval)
-    case 'weekly': {
-      // No explicit byweekday → just hop intervals*7 days at a time.
-      const days = rule.byweekday && rule.byweekday.length > 0 ? rule.byweekday : null
-      if (!days) return addDays(from, interval * 7)
-      // Walk forward one day at a time until we hit a permitted weekday.
-      // Skip the first interval-1 full weeks first, then resume scanning.
-      // For interval=1 this is "next allowed day after `from`".
-      let candidate = addDays(from, 1)
-      const sorted = [...days].sort((a, b) => a - b)
-      // For interval>1 we need: same DOW family, just N weeks later. The
-      // simplest correct behavior — scan forward N*7 days, then pick the
-      // next allowed weekday within the week of that target.
-      if (interval > 1) {
-        candidate = addDays(from, (interval - 1) * 7 + 1)
-      }
-      for (let i = 0; i < 14; i++) {
-        if (sorted.includes(candidate.getUTCDay())) return candidate
-        candidate = addDays(candidate, 1)
-      }
-      return candidate
-    }
-    case 'monthly':
-      return addMonths(from, interval)
-    case 'yearly':
-      return addYears(from, interval)
-  }
-}
-
-/**
- * Compute the next firing time strictly >= `after`, walking forward from
- * the event's seed `start_at`. Returns null if:
- *   - the series has no recurrence and start_at < after (already fired)
- *   - rule.until is earlier than the next computed slot
- *   - rule.count is exhausted
- */
-export function nextOccurrenceOnOrAfter(
-  startAt: Date,
-  recurrence: RecurrenceRule | null,
-  after: Date,
-): Date | null {
-  // One-shot: the only possible slot is start_at itself.
-  if (!recurrence) {
-    return startAt.getTime() >= after.getTime() ? startAt : null
-  }
-  const untilTs = recurrence.until ? new Date(recurrence.until).getTime() : Infinity
-  const maxCount = recurrence.count ?? Infinity
-  let current = startAt
-  let fired = 1            // start_at counts as occurrence #1
-  // Cap iterations defensively so a misconfigured rule (e.g. byweekday=[])
-  // can't tie up the tick loop forever.
-  for (let i = 0; i < 5000; i++) {
-    if (current.getTime() > untilTs) return null
-    if (fired > maxCount) return null
-    if (current.getTime() >= after.getTime()) return current
-    current = stepOnce(current, recurrence)
-    fired += 1
-  }
-  return null
 }
 
 /* ─────────────────────────── dispatcher ─────────────────────────── */
@@ -187,15 +91,23 @@ function renderDispatchBody(event: CalendarEventRow, scheduledFor: Date): string
  *  missing, target conversation deleted, etc.). */
 async function resolveTargetConversation(event: CalendarEventRow): Promise<string | null> {
   if (event.target_conversation_id) {
-    const { rows } = await pool.query<{ members: string[] }>(
-      `SELECT members FROM conversations WHERE id = $1 AND company_id = $2 LIMIT 1`,
-      [event.target_conversation_id, event.company_id],
+    const { rows } = await pool.query<{ assignee_is_member: boolean }>(
+      `SELECT ($3::text IS NULL OR EXISTS (
+                SELECT 1 FROM conversation_members member
+                 WHERE member.conversation_id = c.id
+                   AND member.company_id = c.company_id
+                   AND member.participant_id = $3
+              )) AS assignee_is_member
+         FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        LIMIT 1`,
+      [event.target_conversation_id, event.company_id, event.assignee_id],
     )
     if (!rows[0]) return null
     // Best-effort: skip dispatch if the assignee isn't a member of the
     // target conversation. Avoids the @mention dangling in a room the
     // agent can't see.
-    if (event.assignee_id && !rows[0].members.includes(event.assignee_id)) return null
+    if (!rows[0].assignee_is_member) return null
     return event.target_conversation_id
   }
   if (!event.assignee_id) return null
@@ -203,11 +115,22 @@ async function resolveTargetConversation(event: CalendarEventRow): Promise<strin
   // creator and the assignee. We don't auto-create one — if it doesn't
   // exist the dispatch records 'skipped'.
   const { rows } = await pool.query<{ id: string }>(
-    `SELECT id FROM conversations
-      WHERE company_id = $1 AND kind = 'direct'
-        AND members @> $2::jsonb AND members @> $3::jsonb
+    `SELECT c.id FROM conversations c
+      WHERE c.company_id = $1 AND c.kind = 'direct'
+        AND EXISTS (
+          SELECT 1 FROM conversation_members creator
+           WHERE creator.conversation_id = c.id
+             AND creator.participant_id = $2
+        )
+        AND EXISTS (
+          SELECT 1 FROM conversation_members assignee
+           WHERE assignee.conversation_id = c.id
+             AND assignee.participant_id = $3
+        )
+        AND (SELECT COUNT(*) FROM conversation_members member
+              WHERE member.conversation_id = c.id) = 2
       LIMIT 1`,
-    [event.company_id, JSON.stringify([event.created_by]), JSON.stringify([event.assignee_id])],
+    [event.company_id, event.created_by, event.assignee_id],
   )
   return rows[0]?.id ?? null
 }
@@ -218,39 +141,56 @@ async function postDispatchMessage(args: {
   body: string
 }): Promise<string> {
   const { event, conversationId, body } = args
-  const seqResult = await pool.query<{ seq: number }>(
-    `INSERT INTO conversation_counters (conversation_id, next_sequence)
-     VALUES ($1, 2)
-     ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
-     RETURNING next_sequence - 1 AS seq`,
-    [conversationId],
-  )
-  const sequence = seqResult.rows[0]?.seq ?? 1
-  const messageId = `m-${randomUUID()}`
-  // Author: Calendar itself. The creator is preserved in the payload, but the
-  // agent should read this as a scheduled Calendar event, not as the creator
-  // manually sending a generic system row.
-  await pool.query(
-    `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
-     VALUES ($1,$2,$3,'system',$4,$5,$6)`,
-    [messageId, conversationId, CALENDAR_SYSTEM_AUTHOR_ID, body, sequence, event.company_id],
-  )
-  await pool.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId,
-    companyId: event.company_id,
-    message: {
-      id: messageId,
+  return withOutboxTransaction(async (client) => {
+    const target = await client.query(
+      `SELECT c.id FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+        FOR UPDATE OF c`,
+      [conversationId, event.company_id],
+    )
+    if (!target.rowCount) throw new Error('calendar target conversation disappeared')
+    const membership = await client.query(
+      `SELECT 1 FROM conversation_members
+        WHERE conversation_id = $1
+          AND company_id = $2
+          AND participant_id = $3`,
+      [conversationId, event.company_id, event.assignee_id],
+    )
+    if (!membership.rowCount) throw new Error('calendar assignee is no longer a target member')
+    const seqResult = await client.query<{ seq: number }>(
+      `INSERT INTO conversation_counters (conversation_id, next_sequence)
+       VALUES ($1, 2)
+       ON CONFLICT (conversation_id) DO UPDATE SET next_sequence = conversation_counters.next_sequence + 1
+       RETURNING next_sequence - 1 AS seq`,
+      [conversationId],
+    )
+    const sequence = seqResult.rows[0]?.seq ?? 1
+    const messageId = `m-${randomUUID()}`
+    // Author: Calendar itself. The creator is preserved in the payload, but the
+    // agent should read this as a scheduled Calendar event, not as the creator
+    // manually sending a generic system row.
+    await client.query(
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+       VALUES ($1,$2,$3,'system',$4,$5,$6)`,
+      [messageId, conversationId, CALENDAR_SYSTEM_AUTHOR_ID, body, sequence, event.company_id],
+    )
+    await client.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [conversationId])
+    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+      type: 'message.new',
       conversationId,
-      authorId: CALENDAR_SYSTEM_AUTHOR_ID,
-      kind: 'system',
-      body,
-      sequence,
-      at: new Date().toISOString(),
-    },
+      companyId: event.company_id,
+      message: {
+        id: messageId,
+        conversationId,
+        authorId: CALENDAR_SYSTEM_AUTHOR_ID,
+        kind: 'system',
+        body,
+        sequence,
+        at: new Date().toISOString(),
+      },
+    })
+    return messageId
   })
-  return messageId
 }
 
 /** Dispatch a single event's occurrence. Inserts the dispatch row first
@@ -445,7 +385,7 @@ async function sendReminder(event: CalendarEventRow, occurrence: Date, now: Date
 
 function sanitizeReminderSubject(event: CalendarEventRow, leadMinutes: number): string {
   // Strip control characters to stop header injection, keep subject short.
-  const title = event.title.replace(/[\r\n\t -]/g, ' ').slice(0, 160)
+  const title = event.title.replace(/[\r\n\t\x00-\x1f]/g, ' ').slice(0, 160)
   if (leadMinutes <= 1) return `Starting now: ${title}`
   if (leadMinutes < 60) return `In ${leadMinutes} min: ${title}`
   const h = Math.round(leadMinutes / 60)
@@ -513,10 +453,12 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
     const after = row.last_fired_at
       ? new Date(row.last_fired_at.getTime() + 1)
       : row.start_at
-    const slot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, after)
+    let slot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, after)
     if (!slot) {
-      await pool.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
-      void publishCalendarChanged(row.company_id, 'event.updated', row.id)
+      await withOutboxTransaction(async (client) => {
+        await client.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
+        await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+      })
       continue
     }
 
@@ -535,52 +477,86 @@ export async function tickCalendar(now: Date = new Date()): Promise<{ scanned: n
     if (slot.getTime() > now.getTime()) continue           // not yet
     const lag = now.getTime() - slot.getTime()
     if (lag > MAX_CATCHUP_MS) {
-      await pool.query(
-        `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
-        [row.id, slot],
-      )
-      continue
+      if (!row.recurrence) {
+        await withOutboxTransaction(async (client) => {
+          await client.query(
+            `UPDATE calendar_events SET last_fired_at = $2, status = 'done', updated_at = NOW() WHERE id = $1`,
+            [row.id, slot],
+          )
+          await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+        })
+        continue
+      }
+
+      // Stale recurring event: fast-forward past the backlog in a single step
+      // instead of slow-crawling one slot per tick.
+      const catchupFloor = new Date(now.getTime() - MAX_CATCHUP_MS)
+      const nextSlot = nextOccurrenceOnOrAfter(row.start_at, row.recurrence, catchupFloor)
+      if (!nextSlot) {
+        await withOutboxTransaction(async (client) => {
+          await client.query(
+            `UPDATE calendar_events SET last_fired_at = $2, status = 'done', updated_at = NOW() WHERE id = $1`,
+            [row.id, slot],
+          )
+          await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+        })
+        continue
+      }
+
+      if (nextSlot.getTime() <= now.getTime()) {
+        // There is an occurrence inside the catch-up window [now - MAX_CATCHUP_MS, now].
+        // Jump directly to this slot so it can fire on this tick.
+        slot = nextSlot
+      } else {
+        // No occurrences fell inside the catch-up window; the next occurrence is in the future.
+        // Fast-forward last_fired_at to now so subsequent ticks await nextSlot without firing.
+        await withOutboxTransaction(async (client) => {
+          await client.query(
+            `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
+            [row.id, now],
+          )
+          await enqueueCalendarChanged(client, row.company_id, 'event.updated', row.id)
+        })
+        continue
+      }
     }
     const result = await dispatchEvent(row, slot)
     if (result.status === 'dispatched' || result.status === 'skipped' || result.status === 'failed') {
-      await pool.query(
-        `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
-        [row.id, slot],
-      )
+      await withOutboxTransaction(async (client) => {
+        await client.query(
+          `UPDATE calendar_events SET last_fired_at = $2, updated_at = NOW() WHERE id = $1`,
+          [row.id, slot],
+        )
+        if (!row.recurrence) {
+          await client.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
+        }
+        await enqueueCalendarChanged(
+          client,
+          row.company_id,
+          result.status === 'dispatched' ? 'event.dispatched' : 'event.updated',
+          row.id,
+        )
+      })
       if (result.status === 'dispatched') fired += 1
-      if (!row.recurrence) {
-        await pool.query(`UPDATE calendar_events SET status='done', updated_at=NOW() WHERE id=$1`, [row.id])
-      }
-      void publishCalendarChanged(
-        row.company_id,
-        result.status === 'dispatched' ? 'event.dispatched' : 'event.updated',
-        row.id,
-      )
     }
   }
   return { scanned: rows.length, fired, reminded }
 }
 
-/** Tick-driven WS broadcast for a calendar row. Best-effort — never let a
- *  publish failure abort the scheduler loop. Mirrors `publishCalendarChange`
- *  on the REST side and `publishCalendarCli` on the CLI side. */
-async function publishCalendarChanged(
+/** Queue the tick-driven invalidation in the calendar mutation transaction. */
+async function enqueueCalendarChanged(
+  client: import('pg').PoolClient,
   companyId: string,
   kind: 'event.updated' | 'event.dispatched',
   eventId: string,
 ): Promise<void> {
-  try {
-    const { CH_CALENDAR_EVENTS, publish } = await import('./redis.js')
-    await publish(CH_CALENDAR_EVENTS, {
-      type: 'calendar.changed',
-      companyId,
-      kind,
-      eventId,
-      actorId: null,
-    })
-  } catch (e) {
-    console.warn('[calendar] publish failed', e instanceof Error ? e.message : e)
-  }
+  await enqueueBroadcast(client, CH_CALENDAR_EVENTS, {
+    type: 'calendar.changed',
+    companyId,
+    kind,
+    eventId,
+    actorId: null,
+  })
 }
 
 let started = false

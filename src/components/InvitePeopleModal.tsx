@@ -16,19 +16,20 @@
  * regular members.
  */
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { api, type ApiInvitation, type ApiInvitationWithToken } from '@/api/client'
-import { useAuth } from '@/stores/auth'
+import { type ApiInvitation, type ApiInvitationWithToken, api } from '@/api/client'
 import { useT } from '@/lib/i18n'
+import { useAuth } from '@/stores/auth'
 
 interface Props {
   companyId: string
   companyName: string
+  actorRole: string
   onClose: () => void
 }
 
 type Tab = 'link' | 'email'
 
-export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
+export function InvitePeopleModal({ companyId, companyName, actorRole, onClose }: Props) {
   const t = useT()
   const [tab, setTab] = useState<Tab>('link')
   const [list, setList] = useState<ApiInvitation[]>([])
@@ -202,7 +203,7 @@ export function InvitePeopleModal({ companyId, companyName, onClose }: Props) {
                 {t('invite.fieldRole')}
               </label>
               <div className="flex gap-1.5">
-                {(['member', 'admin'] as const).map((r) => {
+                {(actorRole === 'owner' ? ['member', 'admin'] as const : ['member'] as const).map((r) => {
                   const on = role === r
                   return (
                     <button

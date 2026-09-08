@@ -14,13 +14,24 @@
  * forever), so old rows are pure dead weight.
  *
  * Strategy: a periodic sweep deletes rows past a per-table retention
- * window, in small ctid batches so locks stay short and vacuums keep up.
- * These tables have no standalone index on their time column (only
- * composite (agent_id, created_at) style), so batches select victims by
- * partial seq scan — cheap in practice because old rows cluster at the
- * heap's start on append-mostly tables. Each batch runs under its own
- * statement_timeout so a pathological scan can't wedge the worker; a
- * timed-out batch just retries next tick.
+ * window, in small batches so locks stay short and vacuums keep up. Each
+ * batch runs under its own statement_timeout so a pathological scan can't
+ * wedge the worker; a timed-out batch just retries next tick.
+ *
+ * Every sweep target carries a BARE index on its time column — the ones
+ * named `-- db-gc sweep` in migrate.ts exist for no other reader. The
+ * composite (agent_id, created_at) indexes cannot serve this query: it
+ * filters and orders on time alone, with no leading-column predicate.
+ * Measured on 300k rows of agent_log, the same batch:
+ *
+ *   with idx_agent_log_created:  Index Scan,          15 buffers
+ *   without it:                  Seq Scan + Sort,   2244 buffers
+ *
+ * and that gap grows with the table. On the 31GB agent_log this GC was
+ * written for it is the difference between a batch and the 55s timeout —
+ * see the note on deleteBatch, which is the incident this comes from. So
+ * these indexes are load-bearing rather than incidental, and
+ * `db-gc-sweep-index.test.ts` fails if one goes missing.
  *
  * Deleting agent_runs cascades to its remaining agent_events (FK ON
  * DELETE CASCADE); agent_events is swept first with the same window so
@@ -38,7 +49,7 @@ import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { inc } from './metrics.js'
 
-interface SweepTarget {
+export interface SweepTarget {
   table: string
   /** Primary-key column used to address the delete batch. */
   pkCol: string
@@ -48,7 +59,7 @@ interface SweepTarget {
   days: number
 }
 
-function targets(): SweepTarget[] {
+export function targets(): SweepTarget[] {
   return [
     // ws_tickets keys off expires_at: a ticket is garbage once expired,
     // the extra day is just diagnostic slack.

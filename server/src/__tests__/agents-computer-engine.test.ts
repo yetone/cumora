@@ -10,6 +10,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
+import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
@@ -21,8 +22,19 @@ const tempDirs: string[] = []
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
 
 function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const base: NodeJS.ProcessEnv = { ...process.env }
+  // withClaudeUserSettingsEnv only imports a key from settings.json when the
+  // process environment does NOT already define it — an explicit value wins, by
+  // design. Spreading process.env therefore let the developer's own shell
+  // decide the outcome: anyone running Claude Code has ANTHROPIC_BASE_URL set,
+  // so the settings-import assertions below failed on their machine and nowhere
+  // else. Drop the bootstrap keys so these tests measure the import, not the
+  // shell. Sourced from the module under test so a fifth key cannot drift.
+  for (const key of CLAUDE_CORE_ENV_KEYS) delete base[key]
+  for (const key of CLAUDE_TURN_ENV_KEYS) delete base[key]
+  base.CLAUDE_CONFIG_DIR = join(root, 'missing-claude-config')
   return {
-    ...process.env,
+    ...base,
     CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'),
     CUMORA_AGENT_MCP_SHIM: join(root, 'trusted', 'cumora-mcp'),
     ...overrides,
@@ -66,7 +78,7 @@ afterEach(async () => {
 })
 
 test('secure inventory exposes only engines with a verified boundary', () => {
-  const installed = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini'] as const
+  const installed = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity'] as const
   assert.deepEqual(runnableEngineIds(installed, {}, 'darwin'), ['claude', 'codex'])
   assert.deepEqual(runnableEngineIds(installed, {}, 'linux'), ['claude', 'codex'])
   assert.deepEqual(runnableEngineIds(installed, {}, 'win32'), ['codex'])
@@ -172,13 +184,24 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-secure-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
+  const configDir = join(root, 'claude-config')
   const home = join(root, 'home')
   await mkdir(binDir)
+  await mkdir(configDir)
   await mkdir(home)
+  await writeFile(join(configDir, 'settings.json'), JSON.stringify({
+    model: 'provider/default-model',
+    env: {
+      ANTHROPIC_API_KEY: 'settings-api-key-must-lose',
+      ANTHROPIC_AUTH_TOKEN: 'settings-auth-token',
+      ANTHROPIC_BASE_URL: 'https://provider.example.test',
+      UNRELATED_SECRET: 'must-not-be-imported',
+    },
+  }), 'utf8')
   await writeFakeCli(
     binDir,
     'claude',
-    "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB }))\nprocess.exit(1)\n",
+    "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, coreEnv: { apiKey: process.env.ANTHROPIC_API_KEY, authToken: process.env.ANTHROPIC_AUTH_TOKEN, baseUrl: process.env.ANTHROPIC_BASE_URL, unrelated: process.env.UNRELATED_SECRET } }))\nprocess.exit(1)\n",
   )
   useFakeCliPath(binDir)
 
@@ -188,14 +211,25 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
     home,
     prompt: 'wake',
     env: secureClaudeEnv(root, {
+      CLAUDE_CONFIG_DIR: configDir,
+      ANTHROPIC_API_KEY: 'explicit-daemon-api-key',
       OPENAI_API_KEY: 'must-not-appear-in-settings',
     }),
     onLog: (line) => logs.push(line),
     signal: new AbortController().signal,
   })
 
-  const captured = JSON.parse(logs[0] ?? '{}') as { argv?: string[]; scrub?: string }
+  const captured = JSON.parse(logs[0] ?? '{}') as {
+    argv?: string[]
+    scrub?: string
+    coreEnv?: { apiKey?: string; authToken?: string; baseUrl?: string; unrelated?: string }
+  }
   assert.equal(captured.scrub, '1')
+  assert.deepEqual(captured.coreEnv, {
+    apiKey: 'explicit-daemon-api-key',
+    authToken: 'settings-auth-token',
+    baseUrl: 'https://provider.example.test',
+  })
   assert.ok(captured.argv?.includes('--restricted'))
   assert.ok(captured.argv?.includes('dontAsk'))
   assert.ok(captured.argv?.includes('Read,Write,Edit,Glob,Grep,mcp__cumora__cli'))
@@ -229,7 +263,151 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
   assert.ok(settings.sandbox?.filesystem?.denyRead?.includes(process.platform === 'darwin' ? '/Users' : '/home'))
   assert.ok(settings.sandbox?.filesystem?.allowRead?.includes(home))
   assert.ok(settings.sandbox?.credentials?.envVars?.some((entry) => entry.name === 'OPENAI_API_KEY' && entry.mode === 'deny'))
+  for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL']) {
+    assert.ok(settings.sandbox?.credentials?.envVars?.some((entry) => entry.name === name && entry.mode === 'deny'))
+  }
   assert.doesNotMatch(settingsText, /must-not-appear-in-settings/)
+  assert.doesNotMatch(settingsText, /settings-auth-token|explicit-daemon-api-key|provider\.example\.test/)
+})
+
+test('Claude secure triage stays inside the custom provider model namespace', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-provider-model-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const configDir = join(root, 'claude-config')
+  const cwd = join(root, 'triage')
+  await mkdir(binDir)
+  await mkdir(configDir)
+  await mkdir(cwd)
+  await writeFakeCli(
+    binDir,
+    'claude',
+    "process.stdout.write(JSON.stringify({ result: JSON.stringify({ argv: process.argv.slice(2) }) }))\n",
+  )
+  useFakeCliPath(binDir)
+
+  const settingsPath = join(configDir, 'settings.json')
+  await writeFile(settingsPath, JSON.stringify({
+    env: {
+      ANTHROPIC_AUTH_TOKEN: 'fixture-token',
+      ANTHROPIC_BASE_URL: 'https://provider.example.test',
+      ANTHROPIC_SMALL_FAST_MODEL: 'provider/legacy-fast-model',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'provider/fast-model',
+    },
+  }), 'utf8')
+  const env = secureClaudeEnv(root, {
+    CLAUDE_CONFIG_DIR: configDir,
+    CUMORA_TRIAGE_MODEL: undefined,
+    ANTHROPIC_SMALL_FAST_MODEL: undefined,
+  })
+  const configured = await getAdapter('claude').classify({
+    cwd, prompt: 'classify', env, signal: new AbortController().signal,
+  })
+  const configuredArgv = JSON.parse(configured.text) as { argv: string[] }
+  const configuredModel = configuredArgv.argv.indexOf('--model')
+  assert.ok(configuredModel >= 0)
+  assert.equal(configuredArgv.argv[configuredModel + 1], 'provider/fast-model')
+
+  await writeFile(settingsPath, JSON.stringify({
+    env: {
+      ANTHROPIC_AUTH_TOKEN: 'fixture-token',
+      ANTHROPIC_BASE_URL: 'https://provider.example.test',
+    },
+  }), 'utf8')
+  const unnamed = await getAdapter('claude').classify({
+    cwd, prompt: 'classify', env, signal: new AbortController().signal,
+  })
+  const unnamedArgv = JSON.parse(unnamed.text) as { argv: string[] }
+  assert.equal(unnamedArgv.argv.includes('--model'), false)
+  assert.equal(unnamedArgv.argv.includes('haiku'), false)
+})
+
+test('Claude turn preferences reach one-shot and persistent children without widening tools or triage', { skip: IS_WIN }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-preferences-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const configDir = join(root, 'config')
+  const home = join(root, 'home')
+  await Promise.all([mkdir(binDir), mkdir(configDir), mkdir(home)])
+  await writeFakeCli(binDir, 'claude', `
+const argv = process.argv.slice(2)
+const capture = () => JSON.stringify({ argv, env: Object.fromEntries(
+  ${JSON.stringify([...CLAUDE_CORE_ENV_KEYS, ...CLAUDE_TURN_ENV_KEYS])}.filter(k => process.env[k] !== undefined).map(k => [k, process.env[k]])
+) })
+if (argv.includes('--input-format')) {
+  require('node:readline').createInterface({ input: process.stdin }).on('line', () => {
+    process.stderr.write(capture() + '\\n')
+    process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK', session_id:'fixture'}) + '\\n')
+  })
+} else if (argv.includes('--output-format') && argv[argv.indexOf('--output-format') + 1] === 'json') {
+  process.stdout.write(JSON.stringify({result: capture()}))
+} else {
+  process.stderr.write(capture() + '\\n')
+  process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK'}) + '\\n')
+}
+`)
+  useFakeCliPath(binDir)
+  const preferences = {
+    effortLevel: 'xhigh', modelSettings: { 'claude-opus-5': { effortLevel: 'medium' } },
+    alwaysThinkingEnabled: true, language: 'Chinese',
+  }
+  for (const thinking of [undefined, false, true]) {
+    await writeFile(join(configDir, 'settings.json'), JSON.stringify({
+      ...preferences, alwaysThinkingEnabled: thinking,
+      hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'untrusted-command' }] }] },
+      permissions: { allow: ['Bash'], defaultMode: 'bypassPermissions' },
+      sandbox: { enabled: false },
+      env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'provider/main', ANTHROPIC_DEFAULT_HAIKU_MODEL: 'provider/small', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8192' },
+    }))
+    const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir })
+    for (const persistent of [false, true]) {
+      const logs: string[] = []
+      const args = { home, env, model: 'opus', fastModel: 'agent/small', onLog: (line: string) => logs.push(line) }
+      if (persistent) {
+        const session = getAdapter('claude').startSession?.(args)
+        assert.ok(session)
+        liveSessions.push(session)
+        assert.equal((await session.send('wake')).exitCode, 0)
+        await session.stop()
+      } else {
+        assert.equal((await getAdapter('claude').run({ ...args, prompt: 'wake', signal: new AbortController().signal })).exitCode, 0)
+      }
+      const captured = JSON.parse(logs[0]) as { argv: string[]; env: NodeJS.ProcessEnv }
+      const settings = JSON.parse(captured.argv[captured.argv.indexOf('--settings') + 1])
+      assert.equal(settings.effortLevel, 'xhigh')
+      assert.deepEqual(settings.modelSettings, preferences.modelSettings)
+      assert.equal(settings.alwaysThinkingEnabled, thinking)
+      assert.equal(settings.language, 'Chinese')
+      assert.equal(captured.env.MAX_THINKING_TOKENS, undefined)
+      assert.equal(captured.env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'provider/main')
+      assert.equal(captured.env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'agent/small')
+      assert.equal(captured.env.ANTHROPIC_SMALL_FAST_MODEL, 'agent/small')
+      assert.equal(captured.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, '8192')
+      assert.equal(settings.hooks, undefined)
+      assert.equal(settings.sandbox.enabled, true)
+      assert.equal(settings.permissions.defaultMode, 'dontAsk')
+      assert.ok(settings.sandbox.credentials.envVars.some((x: {name: string; mode: string}) => x.name === 'CLAUDE_CODE_MAX_OUTPUT_TOKENS' && x.mode === 'deny'))
+      assert.doesNotMatch(JSON.stringify(captured.argv), /untrusted-command|provider\/main/)
+    }
+  }
+  await writeFile(join(configDir, 'settings.json'), JSON.stringify({
+    effortLevel: 'xhigh', alwaysThinkingEnabled: true,
+    env: { MAX_THINKING_TOKENS: '4096', CLAUDE_CODE_EFFORT_LEVEL: 'max', CLAUDE_CODE_MAX_OUTPUT_TOKENS: '8192' },
+  }))
+  const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir, MAX_THINKING_TOKENS: '0', CLAUDE_CODE_EFFORT_LEVEL: 'low' })
+  const logs: string[] = []
+  await getAdapter('claude').run({ home, env, prompt: 'wake', onLog: l => logs.push(l), signal: new AbortController().signal })
+  const captured = JSON.parse(logs[0])
+  assert.equal(captured.env.MAX_THINKING_TOKENS, '0')
+  assert.equal(captured.env.CLAUDE_CODE_EFFORT_LEVEL, 'low')
+  const triage = await getAdapter('claude').classify({
+    cwd: home, env: secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir }), prompt: 'classify', signal: new AbortController().signal,
+  })
+  const cheap = JSON.parse(triage.text)
+  assert.equal(cheap.env.MAX_THINKING_TOKENS, '0')
+  assert.equal(cheap.env.CLAUDE_CODE_EFFORT_LEVEL, undefined)
+  assert.equal(cheap.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS, undefined)
+  assert.equal(cheap.argv.includes('--settings'), false)
 })
 
 test('persistent Claude startup failure keeps stderr for first send', async () => {
@@ -399,6 +577,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   const runCapture = JSON.parse(logs.at(-1) ?? '{}') as { argv?: string[]; stdin?: string }
   assert.ok(runCapture.argv?.includes('default_permissions="cumora"'))
   assert.ok(runCapture.argv?.includes('permissions.cumora.network.enabled=false'))
+  if (IS_WIN) assert.ok(runCapture.argv?.includes('windows.sandbox="elevated"'))
   assert.ok(runCapture.argv?.includes('shell_environment_policy.inherit="none"'))
   assert.equal(runCapture.argv?.some((arg) => arg.includes(`${join(root, 'private-ipc', 'requests')}"="write`)), false)
   assert.equal(runCapture.argv?.some((arg) => arg.includes(`${join(root, 'private-ipc', 'responses')}"="write`)), false)

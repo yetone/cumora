@@ -1,6 +1,6 @@
-import { clsx, type ClassValue } from 'clsx'
-import { twMerge } from 'tailwind-merge'
+import { type ClassValue, clsx } from 'clsx'
 import { useEffect, useState } from 'react'
+import { twMerge } from 'tailwind-merge'
 
 export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs))
@@ -76,6 +76,7 @@ export type RichToken =
 
 import emojiRegex from 'emoji-regex'
 import { findSkypeByShortcode, SKYPE_SHORTCODE_RE } from '@/lib/skypeEmojis'
+import { splitHttpUrlCandidate } from './markdownUrls'
 
 const DOC_REF_TOKEN_RE = /^doc_[A-Za-z0-9]+$/
 const BOARD_REF_TOKEN_RE = /^board-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*$/
@@ -119,28 +120,6 @@ function splitUnicodeEmoji(seg: string, out: RichToken[]): void {
   if (last < seg.length) out.push({ kind: 'text', value: seg.slice(last) })
 }
 
-/** Strip trailing sentence punctuation from a captured URL match. Keeps
- *  balanced ()[]{}<> inside the URL — only trims a closing bracket when
- *  there's no matching opener inside the URL (typical case: the URL was
- *  inside parens in prose, e.g. "(see https://x.com)"). */
-function trimUrlTrailing(raw: string): { url: string; trail: string } {
-  const closers: Record<string, string> = { ')': '(', ']': '[', '}': '{', '>': '<' }
-  let i = raw.length
-  while (i > 'https://'.length) {
-    const c = raw[i - 1]
-    if (c === '.' || c === ',' || c === ';' || c === ':' || c === '!' || c === '?' || c === '"' || c === "'") {
-      i--
-    } else if (closers[c]) {
-      const inside = raw.slice(0, i - 1)
-      const opens = (inside.match(new RegExp(`\\${closers[c]}`, 'g')) ?? []).length
-      const closes = (inside.match(new RegExp(`\\${c}`, 'g')) ?? []).length
-      if (closes >= opens) i--
-      else break
-    } else break
-  }
-  return { url: raw.slice(0, i), trail: raw.slice(i) }
-}
-
 export function parseBody(body: string): RichToken[] {
   const tokens: RichToken[] = []
   // Order matters: inline `code` first so backtick-wrapped @mentions / bold
@@ -181,7 +160,7 @@ export function parseBody(body: string): RichToken[] {
       // Strip trailing punctuation, keeping balanced () [] {} <> inside the
       // URL (Wikipedia titles, Mediawiki anchors, etc.) and re-emitting the
       // trimmed tail as plain text so the message keeps its grammar.
-      const { url, trail } = trimUrlTrailing(t)
+      const { url, trail } = splitHttpUrlCandidate(t)
       tokens.push({ kind: 'link', url, text: url })
       if (trail) splitEmoji(trail, tokens)
     } else if (t.startsWith('doc_')) {

@@ -416,6 +416,14 @@ export const env = {
   DB_GC_LLM_CALLS_DAYS: Number(process.env.DB_GC_LLM_CALLS_DAYS ?? 90),
   /** Days past expires_at before a ws_ticket row is reaped. */
   DB_GC_WS_TICKETS_DAYS: Number(process.env.DB_GC_WS_TICKETS_DAYS ?? 1),
+  /** Durable external-resource cleanup after workspace deletion. Set the
+   * interval to 0 to leave jobs queued for a separately invoked worker. */
+  WORKSPACE_CLEANUP_INTERVAL_MS: Number(process.env.WORKSPACE_CLEANUP_INTERVAL_MS ?? 60_000),
+  /** Explicitly enable Kubernetes Pod/PVC cleanup. Local and integration
+   * environments default off without relying on database-name heuristics. */
+  WORKSPACE_RUNTIME_CLEANUP_ENABLED: ['1', 'true', 'yes', 'on'].includes(
+    (process.env.WORKSPACE_RUNTIME_CLEANUP_ENABLED ?? '').toLowerCase(),
+  ),
   /** Interval between poll-expiration sweeps. Defaults to 60s. The sweep
    *  flips polls past their expiresAt to closed and broadcasts the close
    *  event. Set to 0 to disable (polls then stay open forever even after

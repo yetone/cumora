@@ -52,10 +52,14 @@ async function appendTranscript(args: {
       }
     }
     const conversation = await client.query(
-      `SELECT id FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND ($3::text = 'system' OR members @> to_jsonb(ARRAY[$3::text]))
-        FOR SHARE`,
+      `SELECT c.id FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+          AND ($3::text = 'system' OR EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $3
+          ))
+        FOR SHARE OF c`,
       [initial.conversation_id, initial.company_id, args.authorId],
     )
     if (!conversation.rowCount) {
@@ -137,10 +141,14 @@ export async function startConvene(args: {
     )
     if (!actor.rowCount) throw new Error('convene starter is no longer an active tenant participant')
     const { rows } = await client.query<{ title: string }>(
-      `SELECT title FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR UPDATE`,
+      `SELECT c.title FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $3
+          )
+        FOR UPDATE OF c`,
       [args.conversationId, args.companyId, args.startedBy],
     )
     if (!rows[0]) throw new Error(`conversation ${args.conversationId} not found or not authorized`)
@@ -210,9 +218,10 @@ async function orchestrate(args: {
     const { rows: agentMembers } = await pool.query<{ id: string }>(
       `SELECT p.id
          FROM conversations c
-         CROSS JOIN LATERAL jsonb_array_elements_text(c.members) member(id)
+         JOIN conversation_members cm
+           ON cm.conversation_id = c.id AND cm.company_id = c.company_id
          JOIN participants p
-           ON p.id = member.id AND p.company_id = c.company_id
+           ON p.id = cm.participant_id AND p.company_id = cm.company_id
           AND p.kind = 'agent' AND p.departed_at IS NULL
         WHERE c.id = $1 AND c.company_id = $2
         ORDER BY p.id`,
@@ -319,10 +328,14 @@ async function loadAuthorizedTurnSnapshot(args: {
       return null
     }
     const conversation = await client.query(
-      `SELECT id FROM conversations
-        WHERE id = $1 AND company_id = $2
-          AND members @> to_jsonb(ARRAY[$3::text])
-        FOR SHARE`,
+      `SELECT c.id FROM conversations c
+        WHERE c.id = $1 AND c.company_id = $2
+          AND EXISTS (
+            SELECT 1 FROM conversation_members cm
+             WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+               AND cm.participant_id = $3
+          )
+        FOR SHARE OF c`,
       [args.session.conversation_id, args.companyId, args.agentId],
     )
     if (!conversation.rowCount) {

@@ -12,7 +12,9 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
-import { CH_MESSAGE_NEW, publish } from '../redis.js'
+import { CH_MESSAGE_NEW } from '../redis.js'
+import { dispatchMessagePush } from '../push.js'
+import { enqueueBroadcast, nudgeRealtimeOutbox } from '../realtime-outbox.js'
 
 /** Find an existing direct conversation between two participants, or
  *  create one and return its id. Order-independent on members. */
@@ -26,15 +28,24 @@ async function findOrCreateDirect(
   bName: string,
 ): Promise<string> {
   const { rows } = await client.query<{ id: string }>(
-    `SELECT id FROM conversations
-       WHERE kind = 'direct'
-         AND members @> $1::jsonb
-         AND members @> $2::jsonb
-         AND jsonb_array_length(members) = 2
-         AND company_id = $3
-       ORDER BY created_at DESC LIMIT 1
-       FOR UPDATE`,
-    [JSON.stringify([aId]), JSON.stringify([bId]), companyId],
+    `SELECT c.id FROM conversations c
+       WHERE c.kind = 'direct'
+         AND c.company_id = $3
+         AND EXISTS (
+           SELECT 1 FROM conversation_members cm
+            WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+              AND cm.participant_id = $1
+         )
+         AND EXISTS (
+           SELECT 1 FROM conversation_members cm
+            WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id
+              AND cm.participant_id = $2
+         )
+         AND (SELECT COUNT(*) FROM conversation_members cm
+               WHERE cm.conversation_id = c.id AND cm.company_id = c.company_id) = 2
+       ORDER BY c.created_at DESC LIMIT 1
+       FOR UPDATE OF c`,
+    [aId, bId, companyId],
   )
   if (rows[0]) {
     if (topic) {
@@ -203,7 +214,22 @@ export async function startPrivateChat(args: {
        ON CONFLICT (user_id, conversation_id) DO UPDATE SET last_read_at = NOW()`,
       [instigatorId, conversationId],
     )
+    await enqueueBroadcast(client, CH_MESSAGE_NEW, {
+      type: 'message.new',
+      conversationId,
+      companyId,
+      message: {
+        id: messageId,
+        conversationId,
+        authorId: instigatorId,
+        kind: 'text',
+        body: opening,
+        sequence,
+        at: new Date().toISOString(),
+      },
+    })
     await client.query('COMMIT')
+    nudgeRealtimeOutbox()
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error
@@ -211,20 +237,16 @@ export async function startPrivateChat(args: {
     client.release()
   }
 
-  // Same channel as every other message. Agent recipients wake through the
-  // mailbox scheduler; human recipients see the direct conversation normally.
-  await publish(CH_MESSAGE_NEW, {
-    type: 'message.new',
-    conversationId,
-    companyId,
-    message: {
-      id: messageId, conversationId, authorId: instigatorId,
-      kind: 'text', body: opening, sequence,
-      at: new Date().toISOString(),
-    },
-  }).catch((error) => {
-    console.warn(`[private_chat] durable message ${messageId} committed but publish failed`, error)
-  })
+  // #199 gave `cumora reply` the push it was missing, but an agent can also
+  // START a conversation, and this opening line is the one a human has the
+  // least other way to learn about: a brand-new thread they were not looking
+  // at, whose first message is authored by an agent. In-app it toasts like any
+  // other — NotificationToasts skips only system rows — so the phone was the
+  // one surface that stayed quiet. Fire-and-forget after COMMIT, for the same
+  // reason the other two dispatches are: a push must never hold up the write.
+  // A DM between two agents pushes to nobody on its own, because
+  // computeMessageRecipients joins `users`.
+  void dispatchMessagePush({ conversationId, authorId: instigatorId, messageId, body: opening, companyId })
 
   return { conversationId, messageId }
 }
