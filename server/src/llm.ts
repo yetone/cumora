@@ -206,6 +206,7 @@ let _legacy: OpenAI | null = null
 function legacyClient(): OpenAI {
   if (!_legacy) _legacy = new OpenAI({
     apiKey: env.OPENAI_API_KEY,
+    baseURL: env.OPENAI_BASE_URL || undefined,
     maxRetries: SDK_MAX_RETRIES,
     timeout: SDK_TIMEOUT_MS,
   })

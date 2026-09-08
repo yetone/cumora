@@ -35,6 +35,10 @@ export const env = {
   DATABASE_URL: required('DATABASE_URL', `postgres://${process.env.USER ?? 'postgres'}@localhost:5432/cumora`),
   REDIS_URL: required('REDIS_URL', 'redis://localhost:6379'),
   OPENAI_API_KEY: required('OPENAI_API_KEY'),
+  /** Optional base URL override for the OpenAI-compatible API (e.g. a
+   *  self-hosted proxy or alternative provider). When unset the OpenAI
+   *  SDK uses its default (https://api.openai.com/v1). */
+  OPENAI_BASE_URL: process.env.OPENAI_BASE_URL ?? '',
   /**
    * "Brain" model — the agent's main reasoning loop and convene speech.
    * Default model used when an agent's `participants.model` is NULL.
