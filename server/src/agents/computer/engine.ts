@@ -26,7 +26,6 @@ import { type ChildProcess, execFile, execFileSync, spawn as nodeSpawn, type Spa
 import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
-import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -2873,15 +2872,18 @@ class GrokAdapter implements EngineAdapter {
 // lookup, or ZCODE_BIN, decides which CLI runs — Cumora only probes `zcode`
 // to decide whether the engine is installed). The bridge is a spawn-type
 // dependency: it cannot be esbuild-bundled into the daemon because its whole
-// job is to be a separate process tree, so it is resolved at spawn time —
-// CUMORA_ZCODE_ACP_BIN first, then require.resolve from the daemon's own
-// installation, then `npx -y zcode-acp-server`.
+// job is to be a separate process tree. The npm-published package IS the
+// source of truth: the daemon runs `npx -y zcode-acp-server`, so protocol
+// fixes ship to operators without a daemon release, and no local checkout can
+// silently shadow the published bridge. CUMORA_ZCODE_ACP_BIN pins an explicit
+// entry script (a specific npm version on disk, an offline copy, or a dev
+// workspace) ahead of that.
 //
 // Zcode is a COMPATIBILITY engine: Cumora cannot impose a verified fail-closed
 // host boundary on the bridge + app-server pair (the operator's zcode login
 // and permission config decide what a turn may touch), so it never auto-runs —
 // pairing requires CUMORA_BYOA_ALLOW_UNSANDBOXED=1. Zcode reads its persona
-// and skills natively from AGENTS.md and .zcode/skills/ in the agent home.
+// and skills natively from AGENTS.md and .agents/skills/ in the agent home.
 // There is no out-of-band standing-prompt channel in the bridge, so
 // carriesStandingPrompt stays false and the daemon inlines the invariant
 // scaffold into each turn prompt (the Cursor/OpenCode contract).
@@ -2890,13 +2892,7 @@ class GrokAdapter implements EngineAdapter {
 function resolveZcodeAcpSpawn(env: NodeJS.ProcessEnv): { command: string; args: string[]; shell: boolean } {
   const explicit = env.CUMORA_ZCODE_ACP_BIN?.trim()
   if (explicit) return { command: process.execPath, args: [explicit], shell: false }
-  try {
-    // In-repo dev (tsx) resolves the workspace install; a published daemon
-    // resolves only when the operator installed the bridge next to it.
-    const entry = createRequire(import.meta.url).resolve('zcode-acp-server/dist/index.js')
-    return { command: process.execPath, args: [entry], shell: false }
-  } catch { /* not installed alongside the daemon — fall through to npx */ }
-  const npx = resolveSpawn(IS_WIN ? 'npx.cmd' : 'npx')
+  const npx = resolveSpawn('npx')
   return { command: npx.command, args: ['-y', 'zcode-acp-server'], shell: npx.shell }
 }
 
@@ -3083,7 +3079,7 @@ class ZcodeSession implements EngineSession {
   private queuedPrompt: string | null = null
   private steerWarned = false
   private readonly model: string | null
-  private readonly modelUnapplied: boolean
+  private modelUnapplied: boolean
   readonly carriesStandingPrompt = false
 
   constructor(home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
@@ -3154,7 +3150,9 @@ class ZcodeSession implements EngineSession {
   /** Apply the operator's model pin once per process, before the first turn.
    *  The bridge's session/new is lazy (the backend session materializes on
    *  first use), so the pin rides the first prompt boundary where a real
-   *  backend session exists to receive it. */
+   *  backend session exists to receive it. A rejected pin retries on the next
+   *  wake (an early failure can be purely the not-yet-live backend session)
+   *  and stops once the bridge accepts it. */
   private maybePinThenPrompt(prompt: string): void {
     if (!this.sid || !this.pending) return
     if (this.modelUnapplied && this.model) {
@@ -3234,6 +3232,7 @@ class ZcodeSession implements EngineSession {
     }
     if (msg.id !== undefined && msg.id === this.configReqId && msg.result) {
       this.configReqId = null
+      this.modelUnapplied = false
       if (this.queuedPrompt && this.pending) {
         const p = this.queuedPrompt
         this.queuedPrompt = null
@@ -3307,10 +3306,13 @@ class ZcodeAdapter implements EngineAdapter {
 
   async seedHome(home: string, persona: EnginePersona): Promise<void> {
     await ensureCommonHome(home)
-    await mkdir(join(home, '.zcode', 'skills'), { recursive: true })
+    // zcode-acp-server's skill discovery scans PROJECT skills from
+    // .agents/skills/ in the session cwd (the same shared directory
+    // Antigravity reads) — not a zcode-specific folder.
+    await mkdir(join(home, '.agents', 'skills'), { recursive: true })
     await atomicAgentWrite(
       join(home, 'AGENTS.md'),
-      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.zcode/skills/' }),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.agents/skills/' }),
     )
   }
 

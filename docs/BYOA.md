@@ -226,7 +226,7 @@ interface EngineSession {
 | Standing prompt | `--append-system-prompt-file <home>/.cumora-standing-prompt.md` | inlined into each secure one-shot wake | compatibility ACP `_meta.rules` | inlined | inlined | compatibility `--append-system-prompt` | inlined | inlined | inlined | inlined |
 | One-shot | sandboxed `claude -p … --output-format stream-json` | sandboxed `codex exec --ignore-user-config --ignore-rules …` | compatibility `grok -p … --always-approve` | compatibility `cursor-agent … --force --trust` | compatibility `opencode run … --auto` | compatibility `pi … -p` | compatibility `gemini … --yolo` | compatibility `qwen --output-format stream-json --yolo` | same stream-json protocol for one turn | one fresh bridge process per turn (ACP `session/prompt`) |
 | Custom argv | ignored securely; requires the compatibility opt-in | ignored securely; requires the compatibility opt-in | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | compatibility opt-in required | not supported initially | not supported — `CUMORA_ZCODE_ACP_BIN` picks the bridge entry, never engine argv |
-| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` | `AGENTS.md` plus `.pi/skills/` (loaded via `--skill`) | `GEMINI.md` plus `.gemini/skills/` | `QWEN.md` plus `.qwen/skills/` | `AGENTS.md` plus `.agents/skills/` | `AGENTS.md` plus `.zcode/skills/` |
+| Memory / persona file | `CLAUDE.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` | `AGENTS.md` plus `.opencode/skills/` | `AGENTS.md` plus `.pi/skills/` (loaded via `--skill`) | `GEMINI.md` plus `.gemini/skills/` | `QWEN.md` plus `.qwen/skills/` | `AGENTS.md` plus `.agents/skills/` | `AGENTS.md` plus `.agents/skills/` |
 | Triage (small brain) | restricted and tool-free | read-only custom profile and tool env | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only | compatibility only | plan mode inside `agy --sandbox` | one fresh bridge process in the neutral triage cwd |
 
 Sessions carry a resume id (`~/.cumora/sessions/<agentId>.session`); a
@@ -253,14 +253,17 @@ engine until Cumora has independently verified that its complete file, tool,
 credential, and network boundary fails closed on every supported platform.
 ZCode runs through the `zcode-acp-server` npm bridge (initialize → session/new →
 session/prompt over stdio; the same ACP surface Grok Build's persistent session
-uses), which in turn drives the operator's `zcode` CLI. The bridge is resolved at
-spawn time — `CUMORA_ZCODE_ACP_BIN` (a path to its `dist/index.js`) first, then a
-`zcode-acp-server` install resolvable next to the daemon, then `npx -y
-zcode-acp-server` — and the engine's model pin rides ACP's
-`session/set_config_option` once per session, falling back to the operator's
-zcode default when the bridge rejects it. Zcode stays a compatibility engine:
-the bridge + app-server pair runs with the operator's own zcode login and
-permission configuration, which Cumora can neither verify nor narrow.
+uses), which in turn drives the operator's `zcode` CLI. The npm-published bridge
+is the source of truth: the daemon spawns `npx -y zcode-acp-server`, so bridge
+fixes reach operators without a daemon release, and `CUMORA_ZCODE_ACP_BIN` pins
+an explicit entry script (a specific version on disk or an offline copy) ahead
+of that. The engine's model pin rides ACP's `session/set_config_option` once
+per session — applied at the first prompt boundary, where the bridge's lazy
+`session/new` has materialized a real backend session — falling back to the
+operator's zcode default when the bridge rejects it. Zcode stays a
+compatibility engine: the bridge + app-server pair runs with the operator's own
+zcode login and permission configuration, which Cumora can neither verify nor
+narrow.
 Secure-default engines run headless inside a fail-closed local sandbox; an
 unavailable sandbox stops the turn instead of widening access. On Windows the daemon resolves the real
 `claude`/`codex`/`grok`/`cursor-agent`/`opencode`/`pi`/`gemini`/`qwen`/`agy` `.cmd` shims and routes large
@@ -421,8 +424,7 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
     .gemini/skills/                 ← Gemini-native skill directory
     .qwen/skills/                   ← Qwen-native skill directory
     .pi/skills/                     ← pi-native skill directory (via --skill)
-    .zcode/skills/                  ← ZCode-native skill directory
-    .agents/skills/                 ← Antigravity-native skill directory
+    .agents/skills/                 ← Antigravity- and ZCode-native skill directory
     bin/cumora                     ← compatibility mode only
     memory/MEMORY.md               ← the agent's durable memory index
     notes/                         ← scratch notes
