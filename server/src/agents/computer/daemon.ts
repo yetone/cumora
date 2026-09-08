@@ -787,6 +787,9 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'antigravity') {
     return 'Open Antigravity on that computer and run `agy` to refresh its login, model access, or quota, then wake the agent again.'
   }
+  if (engine === 'zcode') {
+    return 'Open ZCode on that computer and run `zcode` to refresh its login, model access, or quota, then wake the agent again.'
+  }
   return 'Check the daemon terminal for details, then wake the agent again.'
 }
 
@@ -806,6 +809,9 @@ function missingEngineMessage(): string {
     '  - Gemini CLI: install the `gemini` CLI, then run `gemini` once to sign in',
     '  - Qwen Code: install the `qwen` CLI, then run `qwen` once to sign in',
     '  - Antigravity: install the `agy` CLI, then run `agy` once to sign in',
+    '  - ZCode: install the `zcode` CLI, then run `zcode` once to sign in',
+    '    (the daemon drives it through the `zcode-acp-server` bridge: CUMORA_ZCODE_ACP_BIN,',
+    '     a local `npm i zcode-acp-server`, or npx — in that order)',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -2322,6 +2328,7 @@ class AgentRunner {
     if (this.adapter.id === 'opencode') return this.agent.model ?? '<opencode-default>'
     if (this.adapter.id === 'pi') return this.agent.model ?? '<pi-default>'
     if (this.adapter.id === 'antigravity') return this.agent.model ?? 'gemini-3.8-flash-high'
+    if (this.adapter.id === 'zcode') return this.agent.model ?? '<zcode-default>'
     if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }

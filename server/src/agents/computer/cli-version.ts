@@ -119,6 +119,9 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     versionArgs: ['--version'],
     selfUpdate: 'agy update',
   },
+  zcode: {
+    versionArgs: ['--version'],
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',

@@ -22,7 +22,7 @@ import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -62,6 +62,7 @@ const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   claude: true, codex: true, grok: true, cursor: true, opencode: true, pi: true, gemini: true,
   qwen: true,
   antigravity: true,
+  zcode: true,
 }
 export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
@@ -113,6 +114,7 @@ const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   gemini: 'gemini',
   qwen: 'qwen',
   antigravity: 'agy',
+  zcode: 'zcode',
 }
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
@@ -673,6 +675,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const geminiDefault = process.env.CUMORA_DEFAULT_GEMINI_MODEL?.trim() || null
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
+  const zcodeDefault = process.env.CUMORA_DEFAULT_ZCODE_MODEL?.trim() || null
   return rows.map((r) => {
     const { availableEngines, detectedEngines, engineDefaults, ...agent } = r
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
@@ -717,6 +720,8 @@ export async function listAgentsForComputer(computerId: string): Promise<
                     ? qwenDefault
                     : r.engine === 'antigravity'
                       ? antigravityDefault
+                      : r.engine === 'zcode'
+                        ? zcodeDefault
                     : null
     return dflt ? { ...agent, model: dflt, fastModel: fastModelWithEngineDefault } : { ...agent, fastModel: fastModelWithEngineDefault }
   })

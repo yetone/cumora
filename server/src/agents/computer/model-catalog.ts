@@ -123,6 +123,17 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     fastModelScope: 'agent',
     source: 'presets',
   },
+  zcode: {
+    // The model namespace is the operator's zcode config (GLM plan or a
+    // third-party provider), so there is no first-party preset to name —
+    // supportsCustom lets an agent pin any id their zcode install accepts.
+    models: [],
+    defaultModel: null,
+    defaultFastModel: null,
+    supportsCustom: true,
+    fastModelScope: 'agent',
+    source: 'presets',
+  },
 }
 
 const MODEL_PROBE_TIMEOUT_MS = 10_000

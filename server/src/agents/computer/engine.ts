@@ -3,7 +3,7 @@
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
  * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent,
- * OpenCode, pi, Gemini CLI, Qwen Code, or Antigravity. The daemon (daemon.ts) hands
+ * OpenCode, pi, Gemini CLI, Qwen Code, Antigravity, or ZCode. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * dedicated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -26,6 +26,7 @@ import { type ChildProcess, execFile, execFileSync, spawn as nodeSpawn, type Spa
 import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
@@ -351,10 +352,10 @@ function resolveCodexSpawn(): CodexSpawn {
   return { command: node, argsPrefix: [script], shell: false, wantsStdinPrompt: false }
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -2859,6 +2860,566 @@ class GrokAdapter implements EngineAdapter {
   }
 }
 
+// ─── zcode ────────────────────────────────────────────────────────────────
+//
+// ZCode (the `zcode` CLI) is driven through the `zcode-acp-server` npm
+// bridge, which wraps ZCode's headless app-server in the standard ACP agent
+// surface (initialize / session/new / session/prompt over stdio) — the same
+// wire protocol GrokSession speaks. The adapter therefore spawns
+//
+//   node <zcode-acp-server>/dist/index.js
+//
+// and the bridge, not Cumora, spawns the actual `zcode` process (its PATH
+// lookup, or ZCODE_BIN, decides which CLI runs — Cumora only probes `zcode`
+// to decide whether the engine is installed). The bridge is a spawn-type
+// dependency: it cannot be esbuild-bundled into the daemon because its whole
+// job is to be a separate process tree, so it is resolved at spawn time —
+// CUMORA_ZCODE_ACP_BIN first, then require.resolve from the daemon's own
+// installation, then `npx -y zcode-acp-server`.
+//
+// Zcode is a COMPATIBILITY engine: Cumora cannot impose a verified fail-closed
+// host boundary on the bridge + app-server pair (the operator's zcode login
+// and permission config decide what a turn may touch), so it never auto-runs —
+// pairing requires CUMORA_BYOA_ALLOW_UNSANDBOXED=1. Zcode reads its persona
+// and skills natively from AGENTS.md and .zcode/skills/ in the agent home.
+// There is no out-of-band standing-prompt channel in the bridge, so
+// carriesStandingPrompt stays false and the daemon inlines the invariant
+// scaffold into each turn prompt (the Cursor/OpenCode contract).
+
+/** Locate the zcode-acp-server bridge entry script on this machine. */
+function resolveZcodeAcpSpawn(env: NodeJS.ProcessEnv): { command: string; args: string[]; shell: boolean } {
+  const explicit = env.CUMORA_ZCODE_ACP_BIN?.trim()
+  if (explicit) return { command: process.execPath, args: [explicit], shell: false }
+  try {
+    // In-repo dev (tsx) resolves the workspace install; a published daemon
+    // resolves only when the operator installed the bridge next to it.
+    const entry = createRequire(import.meta.url).resolve('zcode-acp-server/dist/index.js')
+    return { command: process.execPath, args: [entry], shell: false }
+  } catch { /* not installed alongside the daemon — fall through to npx */ }
+  const npx = resolveSpawn(IS_WIN ? 'npx.cmd' : 'npx')
+  return { command: npx.command, args: ['-y', 'zcode-acp-server'], shell: npx.shell }
+}
+
+interface ZcodeTurnOptions {
+  cwd: string
+  env: NodeJS.ProcessEnv
+  prompt: string
+  model?: string | null
+  signal: AbortSignal
+  onLog?: (line: string) => void
+  onHopUsage?: (r: EngineHopReport) => void
+}
+
+/** One full bridge lifecycle: spawn → initialize → session/new → optional
+ *  model pin (`session/set_config_option`) → session/prompt → resolve on the
+ *  prompt response → tear the bridge down. A fresh process per call; this is
+ *  the shape classify()/probe()/run() all share. Failures fold into the
+ *  result — a missing bridge or a rejected handshake is a failed turn, not a
+ *  thrown one. */
+function runZcodeAcpTurn(opts: ZcodeTurnOptions): Promise<EngineRunResult & { text: string }> {
+  return new Promise((resolve) => {
+    const spec = resolveZcodeAcpSpawn(opts.env)
+    const child = spawnEngineChild(spec.command, spec.args, {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: spec.shell,
+    })
+    const abort = bindAbortTermination(child, opts.signal)
+    const onLog = opts.onLog ?? (() => {})
+    let settled = false
+    let reqId = 0
+    let initId: number | null = null
+    let sessionReqId: number | null = null
+    let configReqId: number | null = null
+    let promptId: number | null = null
+    let sessionId: string | null = null
+    let text = ''
+    let usage: EngineUsage | undefined
+    let model: string | null = opts.model ?? null
+    let error: string | null = null
+    let startedAt: number | null = null
+    let buf = ''
+    const stderrTail: string[] = []
+    const req = (method: string, params: Record<string, unknown>): number => {
+      reqId += 1
+      writeStdin(child, JSON.stringify({ jsonrpc: '2.0', id: reqId, method, params }) + '\n')
+      return reqId
+    }
+    const finish = (code: number): void => {
+      if (settled) return
+      settled = true
+      abort.dispose()
+      try { child.stdin?.end() } catch { /* ignore */ }
+      void terminateEngineTree(child).then(() => {
+        resolve({ exitCode: code, error: error ?? undefined, sessionId, usage, model, text })
+      })
+    }
+    const startPrompt = (): void => {
+      startedAt = Date.now()
+      promptId = req('session/prompt', {
+        sessionId,
+        prompt: [{ type: 'text', text: stripLoneSurrogates(opts.prompt) }],
+      })
+    }
+    initId = req('initialize', {
+      protocolVersion: 1,
+      clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    })
+    child.stdout?.on('data', (b: Buffer) => {
+      buf += b.toString('utf8')
+      let nl: number
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        const t = line.trim()
+        if (!t.startsWith('{')) { const c = cleanLine(line); if (c) onLog(c); continue }
+        let msg: AcpMsg
+        try { msg = JSON.parse(t) as AcpMsg } catch { continue }
+        if (msg.error && msg.id !== undefined) {
+          if (msg.id === initId) { error = `zcode bridge initialize failed: ${String(msg.error.message || '')}`; finish(1); continue }
+          if (msg.id === sessionReqId) { error = `zcode bridge session start failed: ${String(msg.error.message || '')}`; finish(1); continue }
+          if (msg.id === promptId) { error = `zcode turn failed: ${String(msg.error.message || '')}`; finish(1); continue }
+          // A rejected model pin is a preference loss, not a turn failure.
+          if (msg.id === configReqId) {
+            configReqId = null
+            onLog(`[zcode] model pin rejected (${String(msg.error.message || '')}) — continuing on the engine default`)
+            startPrompt()
+            continue
+          }
+        }
+        if (msg.id !== undefined && msg.id === initId && msg.result) {
+          initId = null
+          sessionReqId = req('session/new', { cwd: opts.cwd, mcpServers: [] })
+          continue
+        }
+        if (msg.id !== undefined && msg.id === sessionReqId && msg.result) {
+          sessionReqId = null
+          const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : null
+          if (sid) sessionId = sid
+          if (opts.model && sessionId) {
+            configReqId = req('session/set_config_option', { sessionId, configId: 'model', value: opts.model })
+          } else {
+            startPrompt()
+          }
+          continue
+        }
+        if (msg.id !== undefined && msg.id === configReqId && msg.result) {
+          configReqId = null
+          startPrompt()
+          continue
+        }
+        if (msg.id !== undefined && msg.id === promptId) {
+          usage = extractAcpUsage(msg.result) ?? undefined
+          if (msg.error) error = `zcode turn failed: ${String(msg.error.message || '')}`
+          if (opts.onHopUsage && !error) {
+            try {
+              opts.onHopUsage({
+                model: model ?? 'zcode',
+                usage: usage ?? {},
+                latencyMs: startedAt != null ? Date.now() - startedAt : undefined,
+                hopIndex: 1,
+              })
+            } catch { /* ledger best-effort — never break the stream */ }
+          }
+          finish(msg.error ? 1 : 0)
+          continue
+        }
+        if (msg.method === 'session/update') {
+          const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+          const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+          if (kind === 'agent_message_chunk') {
+            const content = u?.content as { text?: unknown } | undefined
+            if (typeof content?.text === 'string') text += content.text
+          } else if (kind === 'tool_call' && typeof u?.title === 'string') {
+            onLog(`[zcode] tool ${u.title}`)
+          }
+        }
+      }
+    })
+    child.stderr?.on('data', (b: Buffer) => {
+      for (const raw of b.toString('utf8').split('\n')) {
+        const l = cleanLine(raw)
+        if (!l) continue
+        pushTail(stderrTail, l)
+        onLog(l)
+      }
+    })
+    child.on('error', (err) => { error = `zcode bridge spawn error: ${err.message}`; finish(1) })
+    child.on('close', (code, sig) => {
+      if (settled) return
+      const stage = initId != null ? 'during initialize'
+        : sessionReqId != null ? 'during session start'
+          : promptId != null ? 'MID-TURN' : 'before the turn'
+      error = `zcode bridge died ${stage} (${sig ? `terminated by ${sig}` : `exit ${code}`})${stderrTail.length ? `: ${salientError(stderrTail.join('\n'))}` : ''}`
+      finish(code ?? (sig ? 128 : 1))
+    })
+  })
+}
+
+/** Persistent ZCode session over the zcode-acp-server bridge's stdio.
+ *  Handshake: initialize → session/new|load → best-effort model pin →
+ *  session/prompt per wake. Mid-turn steer is not in the ACP surface —
+ *  steer() is a no-op and the daemon's next-wake coalescing carries the ping
+ *  (same contract as GrokSession). */
+class ZcodeSession implements EngineSession {
+  private readonly child: ChildProcess
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private outBuf = ''
+  private sid: string | null
+  private exited = false
+  private exitCode = 0
+  private reqId = 0
+  private initializeId: number | null = null
+  private sessionReqId: number | null = null
+  private configReqId: number | null = null
+  private sessionWasLoad = false
+  private readonly sessionNewParams: Record<string, unknown>
+  private readonly spawnSpec: { command: string; args: string[]; shell: boolean }
+  private ready = false
+  private pending: { resolve: (r: EngineRunResult) => void; id: number; startedAt: number } | null = null
+  private queuedPrompt: string | null = null
+  private steerWarned = false
+  private readonly model: string | null
+  private readonly modelUnapplied: boolean
+  readonly carriesStandingPrompt = false
+
+  constructor(home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.sid = opts.resumeSessionId ?? null
+    this.model = opts.model ?? null
+    this.modelUnapplied = !!opts.model
+    this.sessionNewParams = { cwd: home, mcpServers: [] }
+    this.sessionWasLoad = !!opts.resumeSessionId
+    this.spawnSpec = resolveZcodeAcpSpawn(env)
+    this.child = spawnEngineChild(this.spawnSpec.command, this.spawnSpec.args, {
+      cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: this.spawnSpec.shell,
+    })
+    this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
+    this.child.stderr?.on('data', (b: Buffer) => {
+      for (const raw of b.toString('utf8').split('\n')) {
+        const l = cleanLine(raw)
+        if (l) this.onLog(l)
+      }
+    })
+    this.child.on('error', (err) => this.die(1, err.message))
+    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    queueMicrotask(() => {
+      this.initializeId = this.req('initialize', {
+        protocolVersion: 1,
+        clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
+        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+      })
+    })
+  }
+
+  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
+  get sessionId(): string | null { return this.sid }
+
+  send(prompt: string): Promise<EngineRunResult> {
+    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
+    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid })
+    return new Promise<EngineRunResult>((resolve) => {
+      this.pending = { resolve, id: 0, startedAt: Date.now() }
+      if (this.ready && this.sid) this.maybePinThenPrompt(prompt)
+      else this.queuedPrompt = prompt
+    })
+  }
+
+  steer(_text: string): void {
+    // ACP session/prompt is one-in-flight. A mid-turn inject would cancel the
+    // running turn. The daemon coalesces the ping onto the next wake instead.
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.onLog('[zcode] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    }
+  }
+
+  stop(options: { force?: boolean } = {}): Promise<void> {
+    this.exited = true
+    try { this.child.stdin?.end() } catch { /* ignore */ }
+    return terminateEngineTree(this.child, options.force)
+  }
+
+  private nextId(): number { this.reqId += 1; return this.reqId }
+  private req(method: string, params: Record<string, unknown>): number {
+    const id = this.nextId()
+    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+    return id
+  }
+
+  /** Apply the operator's model pin once per process, before the first turn.
+   *  The bridge's session/new is lazy (the backend session materializes on
+   *  first use), so the pin rides the first prompt boundary where a real
+   *  backend session exists to receive it. */
+  private maybePinThenPrompt(prompt: string): void {
+    if (!this.sid || !this.pending) return
+    if (this.modelUnapplied && this.model) {
+      this.queuedPrompt = prompt
+      this.configReqId = this.req('session/set_config_option', { sessionId: this.sid, configId: 'model', value: this.model })
+      return
+    }
+    this.startPrompt(prompt)
+  }
+
+  private startPrompt(prompt: string): void {
+    if (!this.sid || !this.pending) return
+    const id = this.req('session/prompt', {
+      sessionId: this.sid,
+      prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+    })
+    this.pending.id = id
+  }
+
+  private onStdout(buf: Buffer): void {
+    this.outBuf += buf.toString('utf8')
+    let nl: number
+    while ((nl = this.outBuf.indexOf('\n')) >= 0) {
+      const line = this.outBuf.slice(0, nl)
+      this.outBuf = this.outBuf.slice(nl + 1)
+      const t = line.trim()
+      if (!t.startsWith('{')) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      let msg: AcpMsg | null = null
+      try { msg = JSON.parse(t) as AcpMsg } catch { msg = null }
+      if (!msg) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      this.handle(msg)
+    }
+  }
+
+  private handle(msg: AcpMsg): void {
+    if (msg.id !== undefined && msg.id === this.initializeId) {
+      this.initializeId = null
+      if (msg.error) { this.failPending(String(msg.error.message || 'zcode bridge initialize failed')); return }
+      this.sessionReqId = this.sessionWasLoad && this.sid
+        ? this.req('session/load', { sessionId: this.sid, ...this.sessionNewParams })
+        : this.req('session/new', this.sessionNewParams)
+      return
+    }
+    if (msg.error && msg.id !== undefined && msg.id === this.sessionReqId) {
+      if (this.sessionWasLoad) {
+        this.onLog(`[zcode] session/load failed (${String(msg.error.message || '')}) — starting a fresh session`)
+        this.sessionWasLoad = false
+        this.sid = null
+        this.sessionReqId = this.req('session/new', this.sessionNewParams)
+        return
+      }
+      this.failPending(String(msg.error.message || 'zcode bridge session start failed'))
+      return
+    }
+    if (msg.id !== undefined && msg.id === this.sessionReqId && msg.result) {
+      this.sessionReqId = null
+      const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : this.sid
+      if (typeof sid === 'string' && sid) this.sid = sid
+      this.ready = true
+      if (this.queuedPrompt && this.pending) {
+        const p = this.queuedPrompt
+        this.queuedPrompt = null
+        this.maybePinThenPrompt(p)
+      }
+      return
+    }
+    if (msg.error && msg.id !== undefined && msg.id === this.configReqId) {
+      // A rejected model pin is a preference loss, not a turn failure.
+      this.configReqId = null
+      this.onLog(`[zcode] model pin rejected (${String(msg.error.message || '')}) — continuing on the engine default`)
+      if (this.queuedPrompt && this.pending) {
+        const p = this.queuedPrompt
+        this.queuedPrompt = null
+        this.startPrompt(p)
+      }
+      return
+    }
+    if (msg.id !== undefined && msg.id === this.configReqId && msg.result) {
+      this.configReqId = null
+      if (this.queuedPrompt && this.pending) {
+        const p = this.queuedPrompt
+        this.queuedPrompt = null
+        this.startPrompt(p)
+      }
+      return
+    }
+    if (msg.method === 'session/update') {
+      const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+      const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+      if (kind === 'tool_call' && typeof u?.title === 'string') this.onLog(`[zcode] tool ${u.title}`)
+      else if (kind === 'agent_message_chunk') {
+        const content = u?.content as { text?: unknown } | undefined
+        if (typeof content?.text === 'string' && content.text.trim()) {
+          this.onLog(`[zcode] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+        }
+      }
+      return
+    }
+    if (this.pending && msg.id !== undefined && msg.id === this.pending.id) {
+      if (msg.error) { this.failPending(String(msg.error.message || 'zcode turn failed')); return }
+      const usage = extractAcpUsage(msg.result)
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model: this.model ?? 'zcode',
+            usage: usage ?? {},
+            latencyMs: Date.now() - this.pending.startedAt,
+            hopIndex: 1,
+          })
+        } catch { /* never break the stream */ }
+      }
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.model })
+      return
+    }
+    if (msg.error && msg.id !== undefined) {
+      this.failPending(String(msg.error.message || 'zcode bridge request failed'))
+    }
+  }
+
+  private failPending(error: string): void {
+    if (this.pending) {
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: 1, error, sessionId: this.sid })
+    } else {
+      this.onLog(`[zcode] ${error}`)
+    }
+  }
+
+  private die(code: number, why: string): void {
+    const alreadyDown = this.exited
+    this.exited = true
+    this.exitCode = code
+    if (!alreadyDown) {
+      this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    if (this.pending) {
+      const p = this.pending
+      this.pending = null
+      p.resolve({ exitCode: code, error: why, sessionId: this.sid })
+    }
+  }
+}
+
+class ZcodeAdapter implements EngineAdapter {
+  readonly id = 'zcode' as const
+  readonly bin = 'zcode'
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.zcode', 'skills'), { recursive: true })
+    await atomicAgentWrite(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.zcode/skills/' }),
+    )
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    return runZcodeAcpTurn({
+      cwd: args.home,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      signal: args.signal,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return new ZcodeSession(args.home, args.env, args)
+  }
+
+  classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    // One fresh bridge process in the neutral triage cwd: slower than Claude's
+    // restricted one-shot, but the bridge has no cheaper no-tool surface.
+    return runZcodeAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      signal: args.signal,
+      onLog: args.onLog,
+    })
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    // Both tiers run the same bridge probe: the model catalog is the
+    // operator's zcode config, so there is no first-party cheap alias to pin.
+    return runZcodeAcpTurn({ cwd: args.cwd, env: args.env, prompt: DOCTOR_PROMPT, signal: args.signal })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    // The wake path IS the bridge handshake on every platform — never skipped.
+    // Exercise initialize → session/new with a fresh bridge, then tear down.
+    const spec = resolveZcodeAcpSpawn(args.env)
+    return new Promise<EngineWakeProbeResult>((resolve) => {
+      let settled = false
+      const finish = (r: EngineWakeProbeResult) => {
+        if (settled) return
+        settled = true
+        try { child.stdin?.end() } catch { /* ignore */ }
+        void terminateEngineTree(child).then(() => resolve(r))
+      }
+      const child = spawnEngineChild(spec.command, spec.args, {
+        cwd: args.cwd,
+        env: args.env,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        shell: spec.shell,
+      })
+      const onAbort = () => finish({ ok: false, detail: 'aborted (timeout)' })
+      if (args.signal.aborted) { onAbort(); return }
+      args.signal.addEventListener('abort', onAbort, { once: true })
+      let buf = ''
+      let stderrTail = ''
+      let initialized = false
+      const writeRpc = (msg: object) => {
+        writeStdin(child, JSON.stringify(msg) + '\n')
+      }
+      writeRpc({
+        jsonrpc: '2.0', id: 1, method: 'initialize',
+        params: { protocolVersion: 1, clientInfo: { name: 'cumora-doctor', version: '1.0.0' }, clientCapabilities: {} },
+      })
+      child.stdout?.on('data', (b: Buffer) => {
+        buf += b.toString('utf8')
+        for (;;) {
+          const nl = buf.indexOf('\n')
+          if (nl < 0) break
+          const line = buf.slice(0, nl).trim()
+          buf = buf.slice(nl + 1)
+          if (!line.startsWith('{')) continue
+          let msg: AcpMsg
+          try { msg = JSON.parse(line) as AcpMsg } catch { continue }
+          if (msg.error?.message) {
+            finish({ ok: false, detail: `zcode bridge rejected handshake: ${String(msg.error.message).slice(0, 240)}` })
+            return
+          }
+          if (!initialized && msg.id === 1 && msg.result) {
+            initialized = true
+            writeRpc({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: args.cwd, mcpServers: [] } })
+            continue
+          }
+          if (initialized && msg.id === 2 && msg.result) {
+            finish({ ok: true, detail: '' })
+            return
+          }
+        }
+      })
+      child.stderr?.on('data', (b: Buffer) => {
+        const tail = stderrTail + b.toString('utf8')
+        stderrTail = tail.length > 2000 ? tail.slice(-2000) : tail
+      })
+      child.on('error', (err) => finish({ ok: false, detail: `spawn error: ${err.message}` }))
+      child.on('close', (code, sig) => {
+        if (settled) return
+        const stage = !initialized ? 'before initialize ack' : 'before session/new ack'
+        const exit = sig ? `terminated by ${sig}` : `exit ${code}`
+        finish({ ok: false, detail: `zcode bridge died ${stage} (${exit}): ${salientError(stderrTail) || 'no stderr'}` })
+      })
+    })
+  }
+}
+
 // ─── cursor ───────────────────────────────────────────────────────────────
 //
 // Cursor Agent (the `cursor-agent` CLI bundled with Cursor, 2026.08.11-e8db854)
@@ -5268,6 +5829,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   gemini: new GeminiAdapter(),
   qwen: new QwenAdapter(),
   antigravity: new AntigravityAdapter(),
+  zcode: new ZcodeAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
