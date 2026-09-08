@@ -29,6 +29,7 @@ function fromApi(c: ApiComputer): Computer {
     daemonSupervised: c.daemon_supervised ?? null,
     latestDaemonVersion: c.latest_daemon_version ?? null,
     daemonOutdated: c.daemon_outdated ?? false,
+    engineDefaults: c.engine_defaults,
   }
 }
 

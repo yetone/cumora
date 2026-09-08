@@ -858,6 +858,39 @@ function ComputersTab() {
   const [repairCopied, setRepairCopied] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [copiedCli, setCopiedCli] = useState<string | null>(null)
+  // Engine model defaults editing: which computer+engine is being edited
+  const [editingModel, setEditingModel] = useState<{ computerId: string; engineId: string } | null>(null)
+  const [modelInput, setModelInput] = useState('')
+  const [fastModelInput, setFastModelInput] = useState('')
+  const [savingModel, setSavingModel] = useState(false)
+
+  const saveEngineDefaults = async (computerId: string, engineId: string) => {
+    setSavingModel(true)
+    setErr(null)
+    try {
+      const defaults = {
+        [engineId]: {
+          model: modelInput.trim() || null,
+          fastModel: fastModelInput.trim() || null,
+        },
+      }
+      await api.updateEngineDefaults(computerId, defaults)
+      await useComputers.getState().refresh()
+      setEditingModel(null)
+    } catch (e) {
+      console.warn('[engine-defaults] save failed', e)
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSavingModel(false)
+    }
+  }
+
+  const startEditModel = (computerId: string, engineId: string, currentModel?: string | null, currentFastModel?: string | null) => {
+    setEditingModel({ computerId, engineId })
+    setModelInput(currentModel ?? '')
+    setFastModelInput(currentFastModel ?? '')
+  }
+
   useEffect(() => {
     void useComputers.getState().refresh()
   }, [])
@@ -1150,6 +1183,99 @@ function ComputersTab() {
                                   {copiedCli === copyKey ? t('me.copied') : t('me.agentsCopyUpdate')}
                                 </button>
                                 </div>
+                              </div>
+                            )}
+                            {/* Engine model configuration */}
+                            {engineId && (
+                              <div className="mt-3 pt-3" style={{ borderTop: '1px dashed var(--ink-100)' }}>
+                                {editingModel?.computerId === c.id && editingModel?.engineId === row.id ? (
+                                  <div className="space-y-2">
+                                    <div className="text-[11px] font-semibold text-ink-600 uppercase tracking-wider">
+                                      {t('me.engineModelConfig', { engine: engineLabel(row.id) })}
+                                    </div>
+                                    <div>
+                                      <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineDefaultModel')}</label>
+                                      <input
+                                        type="text"
+                                        value={modelInput}
+                                        onChange={(e) => setModelInput(e.target.value)}
+                                        placeholder={t('me.engineModelPlaceholder')}
+                                        className="w-full px-2 py-1.5 text-[12px] rounded-[8px] font-mono"
+                                        style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
+                                      />
+                                    </div>
+                                    <div>
+                                      <label className="block text-[11px] text-ink-500 mb-1">{t('me.engineFastModel')}</label>
+                                      <input
+                                        type="text"
+                                        value={fastModelInput}
+                                        onChange={(e) => setFastModelInput(e.target.value)}
+                                        placeholder={t('me.engineFastModelPlaceholder')}
+                                        className="w-full px-2 py-1.5 text-[12px] rounded-[8px] font-mono"
+                                        style={{ border: '1px solid var(--ink-100)', background: 'var(--paper)' }}
+                                      />
+                                    </div>
+                                    <div className="flex gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => saveEngineDefaults(c.id, row.id)}
+                                        disabled={savingModel}
+                                        className="px-3 py-1 rounded-[7px] text-[11px] font-semibold text-white disabled:opacity-50"
+                                        style={{ background: 'var(--skype)' }}
+                                      >
+                                        {savingModel ? t('common.saving') : t('common.save')}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setEditingModel(null)}
+                                        className="px-3 py-1 rounded-[7px] text-[11px] font-semibold text-ink-600 hover:bg-ink-50"
+                                      >
+                                        {t('common.cancel')}
+                                      </button>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="flex items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                      {(() => {
+                                        const def = c.engineDefaults?.[engineId]
+                                        const main = def?.model?.trim()
+                                        const fast = def?.fastModel?.trim()
+                                        if (!main && !fast) {
+                                          return <span className="text-[11px] text-ink-400">{t('me.engineModelNotSet')}</span>
+                                        }
+                                        return (
+                                          <div className="flex items-center gap-2 flex-wrap">
+                                            {main && (
+                                              <span className="inline-flex items-center gap-1 rounded-[6px] px-1.5 py-0.5 font-mono text-[10.5px] text-ink-700"
+                                                style={{ background: 'var(--ink-100)' }}>
+                                                {main}
+                                              </span>
+                                            )}
+                                            {fast && (
+                                              <span className="inline-flex items-center gap-1 rounded-[6px] px-1.5 py-0.5 font-mono text-[10.5px] text-ink-500"
+                                                style={{ background: 'var(--sky2-100)' }}>
+                                                fast: {fast}
+                                              </span>
+                                            )}
+                                          </div>
+                                        )
+                                      })()}
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => startEditModel(
+                                        c.id,
+                                        row.id,
+                                        c.engineDefaults?.[engineId]?.model,
+                                        c.engineDefaults?.[engineId]?.fastModel
+                                      )}
+                                      className="shrink-0 text-[11px] font-semibold text-skype-deep hover:underline"
+                                    >
+                                      {t('me.engineModelConfigure')}
+                                    </button>
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>

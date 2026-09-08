@@ -2,8 +2,8 @@ import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
 import type {
   BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
   CalendarDispatch, CalendarEvent, CalendarEventKind, CalendarEventStatus,
-  CalendarReminderChannel, ComputerKind, ComputerStatus, DetectedEngine, EngineId,
-  Message, RecurrenceRule, Status,
+  CalendarReminderChannel, ComputerKind, ComputerStatus, DetectedEngine,
+  EngineDefaultsMap, EngineId, Message, RecurrenceRule, Status,
 } from '@/types'
 
 const DEVTOOLS_KEY = 'cumora.devtools.enabled'
@@ -251,6 +251,8 @@ export interface ApiComputer {
   latest_daemon_version?: string | null
   /** True when this BYOA daemon is behind the latest version → show upgrade banner. */
   daemon_outdated?: boolean
+  /** Per-engine default model settings. */
+  engine_defaults?: EngineDefaultsMap
 }
 
 /** Universal-search response. The backend ranks results inside each bucket;
@@ -991,6 +993,15 @@ export const api = {
   requestComputerEngineDetect: (id: string) =>
     http<{ ok: boolean }>(
       `/computers/${encodeURIComponent(id)}/detect`, { method: 'POST', body: '{}' }),
+  /** Read per-engine default model settings for a computer. */
+  getEngineDefaults: (id: string) =>
+    http<{ defaults: EngineDefaultsMap }>(
+      `/computers/${encodeURIComponent(id)}/engine-defaults`),
+  /** Update per-engine default model settings for a computer. */
+  updateEngineDefaults: (id: string, defaults: EngineDefaultsMap) =>
+    http<{ ok: boolean; defaults: EngineDefaultsMap }>(
+      `/computers/${encodeURIComponent(id)}/engine-defaults`,
+      { method: 'PUT', body: JSON.stringify({ defaults }) }),
   /** Move an agent to a computer, choosing its engine (Cumora Cloud = managed). */
   assignAgentComputer: (
     agentId: string,

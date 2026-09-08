@@ -256,12 +256,13 @@ provider hops; uncached input, output+reasoning, and cache read/write tokens map
 to Cumora's common usage ledger without double-counting. OpenCode may race its
 final `step_finish` against the terminal idle event, so a clean process exit is
 the completion signal and accounting is best-effort when that event is absent.
-Model selection normally remains an explicit per-agent `participants.model` /
-`fast_model`, then the matching deploy-level `CUMORA_DEFAULT_*_MODEL` pin. When
-a Computer reports a custom Claude endpoint, its configured main/fast defaults
-fill unpinned fields first. It may also own an unnamed local default; in that
-case the daemon passes no model flag rather than crossing a vendor-specific
-deployment pin into the wrong namespace.
+Model selection resolves per agent as: an explicit `participants.model` /
+`fast_model` pin wins; otherwise the computer's per-engine defaults
+(`computers.engine_defaults`, configured on the Computer card in the Me page)
+fill unpinned fields; then a reported custom-Claude provider default; then the
+matching deploy-level `CUMORA_DEFAULT_*_MODEL` pin. When a custom endpoint
+owns an unnamed local default, the daemon passes no model flag rather than
+crossing a vendor-specific deployment pin into the wrong namespace.
 
 ### Secure default and compatibility opt-in
 
@@ -356,14 +357,17 @@ authentication value, and default model in `~/.claude/settings.json`. Secure
 Claude imports that provider bootstrap subset, reports the configured
 default model without reporting credentials or endpoint details, and gives it
 precedence over Cumora's deploy-level Anthropic pin for Agents left on **Follow
-engine default**. Explicit per-Agent model choices still win.
+engine default**. Explicit per-Agent model choices still win, as do per-engine
+defaults configured on the Computer card (`computers.engine_defaults`) — both
+let an operator name provider-specific model ids that the local CLI catalog
+cannot enumerate (e.g. a proxy endpoint's renamed model).
 
 `CUMORA_ENGINE_MODEL` remains the operator override when the provider needs a
 different policy or an older daemon has not reported its local default:
 
 | value | effect |
 | --- | --- |
-| unset | explicit Agent pin → reported local default → deploy pin → CLI default |
+| unset | explicit Agent pin → computer engine_defaults → reported local default → deploy pin → CLI default |
 | `local` | pass **no** model at all — the CLI runs on whatever it is already configured for, and the small/fast pin is dropped too |
 | any model id | use that model instead of the pinned one |
 

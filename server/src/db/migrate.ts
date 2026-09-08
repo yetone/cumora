@@ -37,6 +37,10 @@ import {
   EMAIL_MESSAGES_COMPANY_SMTP_ID_SQL,
   emailMessagesCompanySmtpIdChecksum,
 } from './migrations/0006-email-messages-company-smtp-id.js'
+import {
+  ENGINE_DEFAULTS_SQL,
+  engineDefaultsChecksum,
+} from './migrations/0007-engine-defaults.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2542,6 +2546,10 @@ async function applyEmailMessagesCompanySmtpId(client: import('pg').PoolClient):
   await client.query(DROP_LEGACY_EMAIL_MESSAGES_SMTP_ID_SQL)
 }
 
+async function applyEngineDefaults(client: import('pg').PoolClient): Promise<void> {
+  await client.query(ENGINE_DEFAULTS_SQL)
+}
+
 const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   {
     ...SCHEMA_MIGRATIONS[0],
@@ -2580,6 +2588,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     // CREATE/DROP INDEX CONCURRENTLY cannot run inside a transaction block.
     transactional: false,
     up: applyEmailMessagesCompanySmtpId,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[6],
+    sourceChecksum: engineDefaultsChecksum(),
+    transactional: true,
+    up: applyEngineDefaults,
   },
 ]
 

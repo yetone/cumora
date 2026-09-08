@@ -40,7 +40,7 @@ import {
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
-  setComputerDefaultEngine,
+  setComputerDefaultEngine, updateEngineDefaults, getEngineDefaults,
   PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
 import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
@@ -1309,6 +1309,30 @@ api.post('/computers/:id/default-engine', safe(async (req, res) => {
   const out = await setComputerDefaultEngine({ computerId: String(req.params.id), companyId, engine })
   if (!out) throw new HttpError(400, 'engine is not installed on this computer')
   res.json({ ok: true, ...out })
+}))
+
+// Per-engine default model settings. Read and write the models each engine
+// uses by default when an agent has no explicit model set.
+api.get('/computers/:id/engine-defaults', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const defaults = await getEngineDefaults({ computerId: String(req.params.id), companyId })
+  if (defaults === null) throw new HttpError(404, 'computer not found')
+  res.json({ defaults })
+}))
+
+api.put('/computers/:id/engine-defaults', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const defaults = req.body?.defaults
+  if (!defaults || typeof defaults !== 'object') {
+    throw new HttpError(400, 'defaults object required')
+  }
+  const updated = await updateEngineDefaults({
+    computerId: String(req.params.id),
+    companyId,
+    defaults,
+  })
+  if (updated === null) throw new HttpError(404, 'computer not found')
+  res.json({ ok: true, defaults: updated })
 }))
 
 api.post('/computers/me/engines', safe(async (req, res) => {

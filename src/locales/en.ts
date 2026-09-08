@@ -32,6 +32,7 @@ export const en = {
   'common.cancel': 'Cancel',
   'common.done': 'Done',
   'common.save': 'Save',
+  'common.saving': 'Saving…',
   'common.delete': 'Delete',
   'common.you': 'You',
   'common.idle': 'idle',
@@ -1329,6 +1330,13 @@ export const en = {
   'me.computerStatus.online': 'online',
   'me.computerStatus.busy': 'busy',
   'me.computerStatus.offline': 'offline',
+  'me.engineModelConfig': 'Default models for {engine}',
+  'me.engineModelNotSet': 'Follow engine default',
+  'me.engineModelConfigure': 'Configure models',
+  'me.engineDefaultModel': 'Main (big-brain) model — blank = follow CLI default',
+  'me.engineFastModel': 'Fast (small-brain) model — blank = follow CLI default',
+  'me.engineModelPlaceholder': 'e.g. claude-sonnet-4-20250514',
+  'me.engineFastModelPlaceholder': 'e.g. claude-haiku-4-20250514',
 
   // ─── updater dialog + banner ──────────────────────────────────────
   'updater.bannerUpdateReady': 'Update ready',

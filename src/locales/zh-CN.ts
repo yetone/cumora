@@ -38,6 +38,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'common.cancel': '取消',
   'common.done': '完成',
   'common.save': '保存',
+  'common.saving': '保存中…',
   'common.delete': '删除',
   'common.you': '你',
   'common.idle': '空闲',
@@ -1331,6 +1332,13 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'me.computerStatus.online': '在线',
   'me.computerStatus.busy': '忙碌',
   'me.computerStatus.offline': '离线',
+  'me.engineModelConfig': '{engine} 的默认模型',
+  'me.engineModelNotSet': '跟随引擎默认',
+  'me.engineModelConfigure': '配置模型',
+  'me.engineDefaultModel': '主模型（大模型）— 留空则跟随 CLI 默认',
+  'me.engineFastModel': '快速模型（小模型）— 留空则跟随 CLI 默认',
+  'me.engineModelPlaceholder': '例如 claude-sonnet-4-20250514',
+  'me.engineFastModelPlaceholder': '例如 claude-haiku-4-20250514',
 
   // ─── 自动更新对话框 + 横幅 ────────────────────────────────────────
   'updater.bannerUpdateReady': '更新就绪',

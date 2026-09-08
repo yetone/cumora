@@ -254,6 +254,15 @@ export function sanitizeDetectedEngines(
   return allowed.map((id) => byId.get(id) ?? unreportedEngine(id))
 }
 
+/** Per-engine default model settings stored on a Computer.
+ *  Structure: { "claude": { "model": "x", "fastModel": "y" }, ... } */
+export interface EngineDefaults {
+  model?: string | null
+  fastModel?: string | null
+}
+
+export type EngineDefaultsMap = Record<string, EngineDefaults>
+
 export interface ComputerRow {
   id: string
   company_id: string
@@ -275,6 +284,9 @@ export interface ComputerRow {
   detected_engines: DetectedEngine[]
   engines_detected_at: string | null
   detect_requested_at: string | null
+  /** Per-engine default model settings. Agents inherit these when their own
+   *  model/fastModel is not set. */
+  engine_defaults: EngineDefaultsMap
 }
 
 /** A computer plus the computed upgrade signal the app uses to show the banner. */
@@ -626,16 +638,12 @@ export async function mintAgentRuntimeToken(args: {
  *  Includes the per-agent big-brain (`model`) + small-brain (`fastModel`)
  *  overrides so the daemon can pass them to the engine.
  *
- *  When a row has no explicit model, a reported custom-Claude provider default
- *  takes precedence; otherwise fall back to the deploy-level default
- *  (CUMORA_DEFAULT_CLAUDE_MODEL / CUMORA_DEFAULT_CODEX_MODEL /
- *  CUMORA_DEFAULT_GROK_MODEL / CUMORA_DEFAULT_CURSOR_MODEL /
- *  CUMORA_DEFAULT_OPENCODE_MODEL / CUMORA_DEFAULT_PI_MODEL /
- *  CUMORA_DEFAULT_GEMINI_MODEL / CUMORA_DEFAULT_QWEN_MODEL /
- *  CUMORA_DEFAULT_ANTIGRAVITY_MODEL) so every BYOA
- *  daemon without a custom provider gets a consistent pin. Critical: a model
- *  upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently changes
- *  agent behavior on every user's machine unless we pin here. A custom
+ *  When a row has no explicit model, the computer's engine_defaults take
+ *  precedence; then a reported custom-Claude provider default; then fall back
+ *  to the deploy-level default (CUMORA_DEFAULT_CLAUDE_MODEL / etc.) so every
+ *  BYOA daemon without a custom provider gets a consistent pin. Critical: a
+ *  model upgrade in the underlying CLI (e.g. claude 4.7 → 4.8) silently
+ *  changes agent behavior on every user's machine unless we pin here. A custom
  *  provider can explicitly make its unnamed local default authoritative so a
  *  vendor-specific deploy pin never crosses into the wrong namespace. */
 export async function listAgentsForComputer(computerId: string): Promise<
@@ -644,11 +652,12 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
     engine: EngineId | null; model: string | null; fastModel: string | null
-    availableEngines?: string[]; detectedEngines?: unknown
+    availableEngines?: string[]; detectedEngines?: unknown; engineDefaults?: unknown
   }>(
     `SELECT p.id, p.name, p.role, p.system_prompt AS "systemPrompt", p.engine, p.model,
             p.fast_model AS "fastModel", c.available_engines AS "availableEngines",
-            COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines"
+            COALESCE(c.detected_engines, '[]'::jsonb) AS "detectedEngines",
+            COALESCE(c.engine_defaults, '{}'::jsonb) AS "engineDefaults"
        FROM participants p
        JOIN computers c ON c.id = p.computer_id
       WHERE p.computer_id = $1 AND p.kind = 'agent' AND p.departed_at IS NULL
@@ -665,9 +674,14 @@ export async function listAgentsForComputer(computerId: string): Promise<
   const qwenDefault = process.env.CUMORA_DEFAULT_QWEN_MODEL?.trim() || null
   const antigravityDefault = process.env.CUMORA_DEFAULT_ANTIGRAVITY_MODEL?.trim() || null
   return rows.map((r) => {
-    const { availableEngines, detectedEngines, ...agent } = r
+    const { availableEngines, detectedEngines, engineDefaults, ...agent } = r
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
       .find((entry) => entry.id === agent.engine)?.modelCatalog
+    // Parse the engine_defaults JSONB
+    const defaults = (engineDefaults && typeof engineDefaults === 'object'
+      ? engineDefaults as EngineDefaultsMap
+      : {}) as EngineDefaultsMap
+    const engineDefaultsForAgent = agent.engine ? defaults[agent.engine] : undefined
     // A custom Claude endpoint owns its model namespace. Its reported defaults
     // fill only unpinned fields; explicit per-Agent choices still win. When it
     // cannot name a main/fast default, leave that field null so the CLI chooses
@@ -675,11 +689,16 @@ export async function listAgentsForComputer(computerId: string): Promise<
     if (r.engine === 'claude' && localCatalog?.prefersLocalDefault) {
       return {
         ...agent,
-        model: agent.model ?? localCatalog.defaultModel,
-        fastModel: agent.fastModel ?? localCatalog.defaultFastModel,
+        model: agent.model ?? engineDefaultsForAgent?.model ?? localCatalog.defaultModel,
+        fastModel: agent.fastModel ?? engineDefaultsForAgent?.fastModel ?? localCatalog.defaultFastModel,
       }
     }
-    if (agent.model) return agent
+    // Apply engine_defaults before deploy-level defaults
+    const modelWithEngineDefault = agent.model ?? engineDefaultsForAgent?.model ?? null
+    const fastModelWithEngineDefault = agent.fastModel ?? engineDefaultsForAgent?.fastModel ?? null
+    if (modelWithEngineDefault) {
+      return { ...agent, model: modelWithEngineDefault, fastModel: fastModelWithEngineDefault }
+    }
     const dflt = r.engine === 'codex'
       ? codexDefault
       : r.engine === 'claude'
@@ -699,7 +718,7 @@ export async function listAgentsForComputer(computerId: string): Promise<
                     : r.engine === 'antigravity'
                       ? antigravityDefault
                     : null
-    return dflt ? { ...agent, model: dflt } : agent
+    return dflt ? { ...agent, model: dflt, fastModel: fastModelWithEngineDefault } : { ...agent, fastModel: fastModelWithEngineDefault }
   })
 }
 
@@ -711,7 +730,8 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
     `SELECT id, company_id, owner_user_id, name, kind, available_engines, status,
             last_seen_at, paired_at, revoked_at, created_at, daemon_version, daemon_supervised,
             COALESCE(detected_engines, '[]'::jsonb) AS detected_engines,
-            engines_detected_at, detect_requested_at
+            engines_detected_at, detect_requested_at,
+            COALESCE(engine_defaults, '{}'::jsonb) AS engine_defaults
        FROM computers
       WHERE company_id = $1 AND revoked_at IS NULL
       ORDER BY (kind = 'cloud') DESC, created_at ASC`,
@@ -1055,6 +1075,88 @@ export async function reportDetectedEngines(args: {
   )
   await broadcastComputerStatus(args.computerId, row.company_id, 'online')
   return true
+}
+
+/** Sanitize and validate engine defaults before storage. Only accepts known
+ *  engine ids and string model names within length limits. */
+function sanitizeEngineDefaults(raw: unknown): EngineDefaultsMap {
+  if (!raw || typeof raw !== 'object') return {}
+  const result: EngineDefaultsMap = {}
+  for (const [engineId, defaults] of Object.entries(raw as Record<string, unknown>)) {
+    if (!PAIRABLE_ENGINES.has(engineId)) continue
+    if (!defaults || typeof defaults !== 'object') continue
+    const rec = defaults as Record<string, unknown>
+    // Empty/whitespace-only strings mean "clear" — same as an explicit null.
+    const cleanModel = (value: unknown): string | null | undefined => {
+      if (typeof value === 'string') {
+        const trimmed = value.trim()
+        return trimmed ? trimmed.slice(0, 160) : null
+      }
+      return value === null ? null : undefined
+    }
+    const model = cleanModel(rec.model)
+    const fastModel = cleanModel(rec.fastModel)
+    if (model !== undefined || fastModel !== undefined) {
+      result[engineId] = {
+        ...(model !== undefined ? { model } : {}),
+        ...(fastModel !== undefined ? { fastModel } : {}),
+      }
+    }
+  }
+  return result
+}
+
+/** Update the per-engine default model settings for a computer.
+ *  Merges with existing defaults — pass null for a field to clear it. */
+export async function updateEngineDefaults(args: {
+  computerId: string
+  companyId: string
+  defaults: EngineDefaultsMap
+}): Promise<EngineDefaultsMap | null> {
+  const { rows } = await pool.query<{ engine_defaults: unknown }>(
+    `SELECT engine_defaults FROM computers
+      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
+    [args.computerId, args.companyId],
+  )
+  if (!rows[0]) return null
+  const existing = sanitizeEngineDefaults(rows[0].engine_defaults)
+  const merged = sanitizeEngineDefaults(args.defaults)
+  // Deep merge: for each engine, merge model and fastModel
+  for (const [engineId, defaults] of Object.entries(merged)) {
+    if (defaults.model === null && defaults.fastModel === null) {
+      // Both null means remove this engine's defaults entirely
+      delete existing[engineId]
+    } else {
+      existing[engineId] = {
+        ...(existing[engineId] ?? {}),
+        ...(defaults.model !== undefined ? { model: defaults.model } : {}),
+        ...(defaults.fastModel !== undefined ? { fastModel: defaults.fastModel } : {}),
+      }
+      // Clean up nulls
+      if (existing[engineId].model === null) delete existing[engineId].model
+      if (existing[engineId].fastModel === null) delete existing[engineId].fastModel
+      if (!existing[engineId].model && !existing[engineId].fastModel) delete existing[engineId]
+    }
+  }
+  await pool.query(
+    `UPDATE computers SET engine_defaults = $2::jsonb WHERE id = $1`,
+    [args.computerId, JSON.stringify(existing)],
+  )
+  return existing
+}
+
+/** Get the per-engine default model settings for a computer. */
+export async function getEngineDefaults(args: {
+  computerId: string
+  companyId: string
+}): Promise<EngineDefaultsMap | null> {
+  const { rows } = await pool.query<{ engine_defaults: unknown }>(
+    `SELECT engine_defaults FROM computers
+      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
+    [args.computerId, args.companyId],
+  )
+  if (!rows[0]) return null
+  return sanitizeEngineDefaults(rows[0].engine_defaults)
 }
 
 /** Make `engine` this computer's default and move every inheriting agent onto it. */
