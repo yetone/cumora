@@ -1,7 +1,7 @@
 // cumora-fuse — a FUSE driver that maps the agent's slice of the
 // `agent_workspace` table to a real filesystem at the mount point.
 //
-//   cumora-fuse "$CUMORA_AGENT_RUNTIME_URL" "$CUMORA_AGENT_RUNTIME_TOKEN" /workspace
+//	cumora-fuse "$CUMORA_AGENT_RUNTIME_URL" "$CUMORA_AGENT_RUNTIME_TOKEN" /workspace
 //
 // Instead of connecting to Postgres directly, the FUSE driver issues
 // HTTP requests to the cumora server's `/runtime/fs/*` endpoints.
@@ -126,7 +126,9 @@ func (w *ws) readFile(p string) ([]byte, syscall.Errno) {
 		log.Printf("[cumora-fuse] read(%q) http %d: %s", p, code, truncate(body))
 		return nil, syscall.EIO
 	}
-	var out struct{ Body string `json:"body"` }
+	var out struct {
+		Body string `json:"body"`
+	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, syscall.EIO
 	}
@@ -172,7 +174,9 @@ func (w *ws) listChildren(dir string) ([]dirent, syscall.Errno) {
 	if code != 200 {
 		return nil, syscall.EIO
 	}
-	var out struct{ Entries []dirent `json:"entries"` }
+	var out struct {
+		Entries []dirent `json:"entries"`
+	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return nil, syscall.EIO
 	}
@@ -258,10 +262,15 @@ func (d *dirNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse
 
 func (d *dirNode) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (*fs.Inode, fs.FileHandle, uint32, syscall.Errno) {
 	child := joinRel(d.relPath, name)
+	// The kernel normally sends CREATE only after Lookup reported ENOENT, so
+	// an existing file is rejected by VFS before this callback for O_EXCL.
+	// The runtime endpoint is an upsert, however; closing the lookup/create
+	// race requires an atomic create-exclusive server operation, not a local
+	// stat-then-write sequence.
 	if errno := d.w.writeFile(child, nil); errno != 0 {
 		return nil, nil, 0, errno
 	}
-	fn := &fileNode{w: d.w, relPath: child, cachedBody: []byte{}, cachedAt: time.Now()}
+	fn := &fileNode{w: d.w, relPath: child, cachedBody: []byte{}, cachedAt: time.Now(), loaded: true}
 	fn.fillAttr(&out.Attr, 0)
 	return d.NewInode(ctx, fn, fs.StableAttr{Mode: fuse.S_IFREG}), &fileHandle{f: fn}, 0, 0
 }
@@ -296,9 +305,12 @@ type fileNode struct {
 	size    int64
 
 	mu         sync.Mutex
+	flushMu    sync.Mutex
 	cachedBody []byte
 	cachedAt   time.Time
+	loaded     bool
 	dirty      bool
+	generation uint64
 }
 
 func (f *fileNode) fillAttr(a *fuse.Attr, size int64) {
@@ -308,19 +320,36 @@ func (f *fileNode) fillAttr(a *fuse.Attr, size int64) {
 	a.Size = uint64(size)
 }
 
-func (f *fileNode) loadIfStale() ([]byte, syscall.Errno) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if !f.dirty && time.Since(f.cachedAt) < fileCacheTTL {
-		return f.cachedBody, 0
+// ensureCurrentLocked hydrates the cache when it is uncached or stale. The
+// caller must hold f.mu. Keeping the HTTP read under the same lock as cache
+// updates means a partial write cannot race hydration and apply to the wrong
+// base. It deliberately does not clone the body; write callers mutate the
+// cache while snapshot-returning callers clone it below.
+func (f *fileNode) ensureCurrentLocked() syscall.Errno {
+	// A dirty cache is authoritative until its snapshot has been uploaded. Its
+	// TTL must not cause an in-flight local edit to be replaced by remote data.
+	if f.dirty || (f.loaded && time.Since(f.cachedAt) < fileCacheTTL) {
+		return 0
 	}
 	body, errno := f.w.readFile(f.relPath)
 	if errno != 0 {
-		return nil, errno
+		return errno
 	}
 	f.cachedBody = body
 	f.cachedAt = time.Now()
-	return body, 0
+	f.loaded = true
+	return 0
+}
+
+func (f *fileNode) loadIfStale() ([]byte, syscall.Errno) {
+	f.mu.Lock()
+	errno := f.ensureCurrentLocked()
+	var body []byte
+	if errno == 0 {
+		body = bytes.Clone(f.cachedBody)
+	}
+	f.mu.Unlock()
+	return body, errno
 }
 
 func (f *fileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
@@ -341,6 +370,9 @@ func (f *fileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 	if errno != 0 {
 		return nil, errno
 	}
+	if off < 0 {
+		return nil, syscall.EINVAL
+	}
 	end := off + int64(len(dest))
 	if end > int64(len(body)) {
 		end = int64(len(body))
@@ -354,6 +386,16 @@ func (f *fileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 func (f *fileNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off int64) (uint32, syscall.Errno) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if off < 0 {
+		return 0, syscall.EINVAL
+	}
+	maxInt := int(^uint(0) >> 1)
+	if uint64(off) > uint64(maxInt-len(data)) {
+		return 0, syscall.EFBIG
+	}
+	if errno := f.ensureCurrentLocked(); errno != 0 {
+		return 0, errno
+	}
 	need := int(off) + len(data)
 	if need > len(f.cachedBody) {
 		grown := make([]byte, need)
@@ -362,6 +404,7 @@ func (f *fileNode) Write(ctx context.Context, fh fs.FileHandle, data []byte, off
 	}
 	copy(f.cachedBody[off:], data)
 	f.dirty = true
+	f.generation++
 	return uint32(len(data)), 0
 }
 
@@ -374,40 +417,63 @@ func (f *fileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 }
 
 func (f *fileNode) Setattr(ctx context.Context, fh fs.FileHandle, in *fuse.SetAttrIn, out *fuse.AttrOut) syscall.Errno {
+	f.mu.Lock()
+	if errno := f.ensureCurrentLocked(); errno != 0 {
+		f.mu.Unlock()
+		return errno
+	}
 	if size, ok := in.GetSize(); ok {
-		f.mu.Lock()
+		maxInt := uint64(^uint(0) >> 1)
+		if size > maxInt {
+			f.mu.Unlock()
+			return syscall.EFBIG
+		}
 		if int(size) < len(f.cachedBody) {
-			f.cachedBody = f.cachedBody[:size]
+			f.cachedBody = f.cachedBody[:int(size)]
 		} else if int(size) > len(f.cachedBody) {
 			grown := make([]byte, size)
 			copy(grown, f.cachedBody)
 			f.cachedBody = grown
 		}
 		f.dirty = true
-		f.mu.Unlock()
+		f.generation++
 	}
-	body, errno := f.loadIfStale()
-	if errno != 0 {
-		return errno
-	}
+	body := bytes.Clone(f.cachedBody)
+	f.mu.Unlock()
 	f.fillAttr(&out.Attr, int64(len(body)))
 	return 0
 }
 
 func (f *fileNode) persist() syscall.Errno {
+	// FUSE can issue overlapping Flush/Fsync callbacks. Serialize the remote
+	// whole-file writes so an older request cannot complete after a newer one.
+	f.flushMu.Lock()
+	defer f.flushMu.Unlock()
+
 	f.mu.Lock()
-	dirty := f.dirty
-	body := append([]byte(nil), f.cachedBody...)
-	f.mu.Unlock()
-	if !dirty {
+	if !f.dirty {
+		f.mu.Unlock()
 		return 0
 	}
+	body := bytes.Clone(f.cachedBody)
+	generation := f.generation
+	f.mu.Unlock()
+
 	if errno := f.w.writeFile(f.relPath, body); errno != 0 {
+		// Keep dirty=true on network or HTTP failures. The next Flush/Fsync
+		// can retry the same local snapshot.
 		return errno
 	}
+
 	f.mu.Lock()
-	f.dirty = false
-	f.cachedAt = time.Now()
+	if f.generation == generation {
+		f.dirty = false
+		f.cachedAt = time.Now()
+		f.loaded = true
+	}
+	// A write may have raced the upload. Leave that newer generation dirty;
+	// the next Flush/Fsync will upload it without letting this older response
+	// clear the local change.
 	f.mu.Unlock()
 	return 0
 }

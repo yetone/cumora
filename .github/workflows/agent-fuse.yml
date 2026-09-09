@@ -1,0 +1,34 @@
+name: Agent FUSE
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "agent-fuse/**"
+      - ".github/workflows/agent-fuse.yml"
+  push:
+    branches: [main]
+    paths:
+      - "agent-fuse/**"
+      - ".github/workflows/agent-fuse.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go tests (race)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: agent-fuse
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: agent-fuse/go.mod
+          cache-dependency-path: agent-fuse/go.sum
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - run: go test -race ./...
