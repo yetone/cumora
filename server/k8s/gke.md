@@ -228,23 +228,14 @@ kubectl rollout status deployment/cumora-server
 The application Pods only read `schema_migrations` and refuse to start outside
 their supported version range. They never execute DDL during startup.
 
-> **Patch the liveness probe after applying.** The checked-in manifest still
-> points `livenessProbe` at `/api/health`, which touches the database. The
-> Deploy workflow patches it to `/api/livez` on every rollout precisely
-> because a DB-backed liveness probe turned a connection-pool stall into a
-> restart loop (2026-05-27). A manual `kubectl apply` re-introduces the bad
-> config, so follow it with:
->
-> ```sh
-> kubectl patch deployment/cumora-server --type=json -p='[{
->   "op": "replace",
->   "path": "/spec/template/spec/containers/0/livenessProbe/httpGet/path",
->   "value": "/api/livez"
-> }]'
-> ```
->
-> Readiness should stay on `/api/health` — that one *should* pull a pod out of
-> rotation when its dependencies are gone.
+The checked-in manifest gives the server a startup grace window for the
+schema gate: `/api/livez` is checked every 5 seconds with a 60-failure budget
+(about 5 minutes). Once startup succeeds, liveness continues to use the
+DB-free `/api/livez` process check while readiness uses `/api/health` to keep a
+pod out of rotation when its dependencies are unavailable. The production
+Deploy workflow reapplies the same probe contract during its Pod-template
+patch, so a manual `kubectl apply` does not require a follow-up imperative
+probe patch.
 
 ## 7. Verify end-to-end
 

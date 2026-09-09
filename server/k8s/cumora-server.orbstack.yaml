@@ -94,15 +94,20 @@ spec:
         # for the agent FUSE driver's HTTP traffic; PG itself lives
         # on the host in dev (host.docker.internal:5432, set in the
         # Secret's DATABASE_URL).
-        # `/` now serves the SPA's index.html (when dist/ is baked in) —
-        # /api/health is the right place for liveness/readiness because
-        # it actually hits the DB.
+        # Startup waits for the schema gate's bounded DB retry budget. Liveness
+        # only checks the process; readiness checks DB reachability and keeps a
+        # booting or degraded pod out of service without killing it.
+        startupProbe:
+          httpGet: { path: /api/livez, port: http }
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 60
         readinessProbe:
           httpGet: { path: /api/health, port: http }
           periodSeconds: 5
           timeoutSeconds: 2
         livenessProbe:
-          httpGet: { path: /api/health, port: http }
+          httpGet: { path: /api/livez, port: http }
           periodSeconds: 30
           timeoutSeconds: 3
         resources:

@@ -251,16 +251,13 @@ jobs:
 
           # Apply one atomic Pod-template patch: select the candidate server,
           # remove the retired per-replica migration init container, and
-          # re-assert the liveness probe path. Liveness MUST hit
-          # /api/livez (a DB-free "process alive" check), NOT /api/health
-          # (which runs SELECT 1). A DB-backed liveness probe let a slow /
-          # overloaded DB fail the probe and SIGTERM-kill otherwise-healthy
-          # pods — the connection-exhaustion outage on 2026-05-27. Readiness
-          # stays on /api/health (a pod that can't reach the DB shouldn't get
-          # traffic, but should NOT be killed). Idempotent: a no-op when the
-          # path is already /api/livez. This keeps the fix durable even if the
-          # Deployment is ever recreated from a base manifest that still has
-          # the old /api/health liveness path.
+          # re-assert the startup/readiness/liveness probe contract. Startup
+          # allows the server's bounded schema transport retry to finish;
+          # liveness MUST hit /api/livez (a DB-free "process alive" check),
+          # NOT /api/health (which runs SELECT 1). Readiness stays on
+          # /api/health so a pod that cannot reach the DB is kept out of
+          # rotation without being killed. This keeps the fix durable even if
+          # the Deployment is recreated from an older base manifest.
           AGENT="${{ steps.digest.outputs.agent }}"
           PATCH=$(jq -nc --arg server "$SERVER" --arg agent "$AGENT" '
             {
@@ -272,7 +269,22 @@ jobs:
                   ({
                     name: "server",
                     image: $server,
-                    livenessProbe: { httpGet: { path: "/api/livez" } }
+                    startupProbe: {
+                      httpGet: { path: "/api/livez", port: "http" },
+                      periodSeconds: 5,
+                      timeoutSeconds: 2,
+                      failureThreshold: 60
+                    },
+                    readinessProbe: {
+                      httpGet: { path: "/api/health", port: "http" },
+                      periodSeconds: 5,
+                      timeoutSeconds: 2
+                    },
+                    livenessProbe: {
+                      httpGet: { path: "/api/livez", port: "http" },
+                      periodSeconds: 30,
+                      timeoutSeconds: 3
+                    }
                   } + if $agent == "" then {} else {
                     env: [{ name: "CUMORA_AGENT_COMPUTER_IMAGE", value: $agent }]
                   } end)
@@ -290,7 +302,7 @@ jobs:
           # the job fails, otherwise GHA just shows "Process completed
           # with exit code 1" and we have to manually kubectl-investigate.
           set +e
-          kubectl rollout status deployment/cumora-server --timeout=5m
+          kubectl rollout status deployment/cumora-server --timeout=10m
           RC=$?
           set -e
           echo "rc=$RC" >> $GITHUB_OUTPUT
@@ -349,7 +361,7 @@ jobs:
         run: |
           echo "::warning::Authenticated smoke failed; rolling deployment back to the previous revision."
           kubectl rollout undo deployment/cumora-server
-          kubectl rollout status deployment/cumora-server --timeout=5m
+          kubectl rollout status deployment/cumora-server --timeout=10m
           echo "::error::Candidate was rolled back. Previous server was ${{ steps.patch.outputs.previous_server }}."
 
       - name: Fail release after rollback

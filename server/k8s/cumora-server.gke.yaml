@@ -155,14 +155,20 @@ spec:
         # Optional: pin agent pods to a specific node pool / GKE
         # Workload Identity SA via CUMORA_AGENT_SERVICE_ACCOUNT
         # (defaults to namespace `default` SA when unset).
-        # `/` now serves the SPA's index.html, so we point probes at the
-        # DB-touching /api/health instead.
+        # Startup waits for the schema gate's bounded DB retry budget. Liveness
+        # only checks the process; readiness checks DB reachability and keeps a
+        # booting or degraded pod out of service without killing it.
+        startupProbe:
+          httpGet: { path: /api/livez, port: http }
+          periodSeconds: 5
+          timeoutSeconds: 2
+          failureThreshold: 60
         readinessProbe:
           httpGet: { path: /api/health, port: http }
           periodSeconds: 5
           timeoutSeconds: 2
         livenessProbe:
-          httpGet: { path: /api/health, port: http }
+          httpGet: { path: /api/livez, port: http }
           periodSeconds: 30
           timeoutSeconds: 3
         resources:
