@@ -52,10 +52,13 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
     return () => { memberLoadGeneration.current += 1 }
   }, [loadMembers])
 
-  useEffect(() => ws.on((event) => {
-    if (event.type !== 'workspace.membership' || event.companyId !== company.id) return
-    void loadMembers(false)
-  }), [company.id, loadMembers])
+  useEffect(() => {
+    const unsub = ws.on((event) => {
+      if (event.type !== 'workspace.membership' || event.companyId !== company.id) return
+      void loadMembers(false)
+    })
+    return () => unsub()
+  }, [company.id, loadMembers])
 
   const changeRole = async (member: ApiWorkspaceMember, role: 'member' | 'admin') => {
     if (member.role === role) return
