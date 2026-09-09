@@ -25,10 +25,12 @@ on:
           Let migration 0002 repair its own precondition (off | archive-detach).
           archive-detach copies every conversations.members id that has no
           participant in that conversation's tenant into
-          conversation_members_detached_0002 (with its ordinal, so it is
-          reversible) and removes it from the array. Messages are untouched.
-          Runs inside 0002's transaction. Leave off unless you have read the
-          precheck report from a failed run.
+          conversation_members_detached_0002 (with its ordinal and the whole
+          pre-detach members array) and removes it from the array. Messages are
+          untouched. The archive is a complete record, not a one-click undo:
+          once 0002 has applied, its projection trigger rejects writing an
+          unresolvable id back. Runs inside 0002's transaction. Leave off
+          unless you have read the precheck report from a failed run.
         required: false
         default: 'off'
         type: choice
