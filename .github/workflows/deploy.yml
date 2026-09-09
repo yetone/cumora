@@ -1,11 +1,7 @@
-# Roll the cumora-server Deployment to a specific image tag.
-#
-# Production has one ignition path: an explicit workflow_dispatch. Build and
-# deploy are intentionally separate so green CI produces a candidate, not a
-# production mutation. GitHub's protected `production` environment supplies
-# the independent approval step; this workflow then pins the selected tag to
-# a digest, captures the previous revision, rolls out, runs authenticated
-# smoke, and automatically rolls back if the evidence fails.
+# Roll cumora-server to an immutable image digest with guarded recovery.
+# The executable orchestration lives in scripts/deploy-release.mjs so the same
+# capture, migration, CAS, timeout, smoke, and recovery path can be tested with
+# a fake kubectl.  A recovered candidate still leaves this workflow failed.
 
 name: Deploy
 
@@ -13,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag in AR (e.g. d1389e2, latest). Resolved to digest before set-image.'
+        description: 'Image tag in AR (e.g. d1389e2, latest). Resolved to digest before touching GKE.'
         required: false
         default: 'latest'
       include_agent:
@@ -21,22 +17,25 @@ on:
         required: false
         default: 'Y'
       repair_0002:
-        description: >-
-          Let migration 0002 repair its own precondition (off | archive-detach).
-          archive-detach copies every conversations.members id that has no
-          participant in that conversation's tenant into
-          conversation_members_detached_0002 (with its ordinal, so it is
-          reversible) and removes it from the array. Messages are untouched.
-          Runs inside 0002's transaction. Leave off unless you have read the
-          precheck report from a failed run.
+        description: 'Migration 0002 repair mode (off | archive-detach)'
         required: false
         default: 'off'
         type: choice
         options: ['off', 'archive-detach']
+      recovery_mode:
+        description: 'Baseline mode (normal requires known-good baseline; forward-only never auto-restores)'
+        required: false
+        default: 'normal'
+        type: choice
+        options: ['normal', 'forward-only']
 
 permissions:
   contents: read
   id-token: write
+
+concurrency:
+  group: cumora-production-deploy
+  cancel-in-progress: false
 
 env:
   GCP_PROJECT: cumora
@@ -44,26 +43,46 @@ env:
   AR_REPO: cumora
   CLUSTER: cumora-prod-z
   CLUSTER_LOCATION: us-west2-a
+  DEPLOYMENT: cumora-server
 
 jobs:
   deploy:
     name: Roll cumora-server
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # The candidate rollout, bounded old-image verifier, restore rollout, and
+    # two authenticated smokes fit inside this job budget.  A cancellation
+    # cannot be relied on to run cleanup, so recovery state remains protected.
+    timeout-minutes: 45
     environment:
       name: production
       url: https://api.cumora.ai
+    env:
+      RECOVERY_SECRET: cumora-deploy-recovery-${{ github.run_id }}
+      RECEIPT_SECRET: cumora-deploy-recovery-${{ github.run_id }}-receipt
+
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install recovery helper runtime
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
       - name: Resolve image tag
         id: tag
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_INCLUDE_AGENT: ${{ inputs.include_agent || 'Y' }}
         run: |
-          TAG="${{ inputs.tag }}"
-          INCLUDE_AGENT="${{ inputs.include_agent || 'Y' }}"
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
-          echo "include_agent=$INCLUDE_AGENT" >> $GITHUB_OUTPUT
-          echo "→ event=${{ github.event_name }}  deploying tag: $TAG  include_agent: $INCLUDE_AGENT"
+          set -euo pipefail
+          TAG="$INPUT_TAG"
+          INCLUDE_AGENT="$INPUT_INCLUDE_AGENT"
+          case "$INCLUDE_AGENT" in Y|N) ;; *) echo "::error::include_agent must be Y or N"; exit 1 ;; esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "include_agent=$INCLUDE_AGENT" >> "$GITHUB_OUTPUT"
 
       - uses: google-github-actions/auth@v2
         with:
@@ -76,305 +95,73 @@ jobs:
         run: gcloud components install gke-gcloud-auth-plugin --quiet
 
       - name: kubectl cluster-credentials
-        run: gcloud container clusters get-credentials ${{ env.CLUSTER }} --location ${{ env.CLUSTER_LOCATION }}
+        run: gcloud container clusters get-credentials "$CLUSTER" --location "$CLUSTER_LOCATION"
 
       - name: Preflight current production API
+        continue-on-error: ${{ inputs.recovery_mode == 'forward-only' }}
         env:
           CUMORA_SMOKE_TOKEN: ${{ secrets.CUMORA_SMOKE_TOKEN }}
           CUMORA_SMOKE_COMPANY_ID: ${{ secrets.CUMORA_SMOKE_COMPANY_ID }}
           CUMORA_SMOKE_BASE: https://api.cumora.ai
-          # The currently deployed release may predate the candidate's new
-          # Shipping endpoints. Preflight proves auth + core reads; the
-          # post-rollout smoke below is the strict Shipping contract gate.
           CUMORA_SMOKE_REQUIRE_SHIPPING: N
         run: node scripts/release-smoke.mjs
 
-      - name: Resolve image to digest
+      - name: Resolve candidate image digests
         id: digest
-        run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          AR="${{ env.AR_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT }}/${{ env.AR_REPO }}"
-
-          # Resolve through the tag REFERENCE, never `list --filter`. The
-          # filter's `tags:X` is a substring match over every tag in the repo,
-          # so `tags:89e7022` also matched 5e60594, 706e708, 7e34456 and five
-          # more; `head -1` then picked whichever digest sorted first, which on
-          # 2026-08-31 was a June image. That deploy rolled a three-month-old
-          # server into production and was only caught because the image
-          # predated /api/shipping/overview and the smoke gate 404'd. `tags=X`
-          # is no better — it fuzzy-matches too. `describe <image>:<tag>` is
-          # exact, and leaves the digest empty when the tag does not exist.
-          SERVER_DIGEST=$(gcloud artifacts docker images describe "$AR/server:$TAG" \
-            --format='value(image_summary.digest)' 2>/dev/null)
-          if [ -z "$SERVER_DIGEST" ]; then
-            echo "::error::server tag $TAG not found in AR"
-            exit 1
-          fi
-          echo "server=$AR/server@$SERVER_DIGEST" >> $GITHUB_OUTPUT
-          echo "→ server: $AR/server@$SERVER_DIGEST"
-
-          if [ "${{ steps.tag.outputs.include_agent }}" = "Y" ]; then
-            AGENT_DIGEST=$(gcloud artifacts docker images describe "$AR/agent-computer:$TAG" \
-              --format='value(image_summary.digest)' 2>/dev/null)
-            if [ -z "$AGENT_DIGEST" ]; then
-              echo "::error::agent-computer tag $TAG not found in AR while include_agent=Y"
-              echo "::error::Refusing a server-only deploy because runtime/CLI shim changes require server and agent-computer to stay on the same SHA. For an intentional server-only rollback, rerun manually with include_agent=N."
-              exit 1
-            else
-              echo "agent=$AR/agent-computer@$AGENT_DIGEST" >> $GITHUB_OUTPUT
-              echo "→ agent: $AR/agent-computer@$AGENT_DIGEST"
-            fi
-          fi
-
-      - name: Run candidate migrations once
-        id: migrate
         env:
-          SERVER_IMAGE: ${{ steps.digest.outputs.server }}
-          REPAIR_0002: ${{ inputs.repair_0002 || 'off' }}
+          TAG: ${{ steps.tag.outputs.tag }}
+          INCLUDE_AGENT: ${{ steps.tag.outputs.include_agent }}
         run: |
           set -euo pipefail
-          case "$REPAIR_0002" in
-            off|archive-detach) ;;
-            *) echo "::error::repair_0002 must be 'off' or 'archive-detach' (got '$REPAIR_0002')"; exit 1 ;;
-          esac
-          if [ "$REPAIR_0002" != off ]; then
-            echo "::warning::migration 0002 will run repair mode '$REPAIR_0002' — it rewrites conversations.members and archives what it removes into conversation_members_detached_0002"
-          fi
-          JOB="cumora-migrate-${GITHUB_SHA:0:7}-${GITHUB_RUN_ATTEMPT}"
-          DEPLOY_JSON="$RUNNER_TEMP/cumora-deployment.json"
-          JOB_JSON="$RUNNER_TEMP/cumora-migration-job.json"
-
-          # DATABASE_URL points at 127.0.0.1 because production reaches Cloud
-          # SQL through the proxy. Copy the live proxy container and workload
-          # identity settings into one candidate migration Job. A native
-          # sidecar init container exits automatically when the Job completes.
-          kubectl get deployment cumora-server -o json > "$DEPLOY_JSON"
-          jq --arg job "$JOB" --arg server "$SERVER_IMAGE" --arg repair "$REPAIR_0002" '
-            .spec.template.spec as $pod
-            | ([ $pod.initContainers[]?, $pod.containers[]? ]
-               | map(select(.name == "cloud-sql-proxy")) | first) as $proxy
-            | if $proxy == null then
-                error("cumora-server has no cloud-sql-proxy container")
-              else
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  metadata: {
-                    name: $job,
-                    labels: { app: "cumora-schema-migration" }
-                  },
-                  spec: {
-                    backoffLimit: 0,
-                    activeDeadlineSeconds: 600,
-                    ttlSecondsAfterFinished: 600,
-                    template: {
-                      metadata: { labels: { app: "cumora-schema-migration" } },
-                      spec: {
-                        serviceAccountName: $pod.serviceAccountName,
-                        imagePullSecrets: ($pod.imagePullSecrets // []),
-                        restartPolicy: "Never",
-                        initContainers: [
-                          ($proxy
-                           | del(.readinessProbe, .livenessProbe, .lifecycle)
-                           | .restartPolicy = "Always"
-                           | .startupProbe = (.startupProbe // {
-                               httpGet: { path: "/readiness", port: 9090 },
-                               periodSeconds: 1,
-                               failureThreshold: 60
-                             }))
-                        ],
-                        containers: [
-                          {
-                            name: "migrate",
-                            image: $server,
-                            imagePullPolicy: "IfNotPresent",
-                            command: ["npm", "run", "migrate"],
-                            envFrom: [{ secretRef: { name: "cumora" } }],
-                            # After envFrom on purpose: an explicit `env` entry
-                            # wins over one supplied by envFrom, so the
-                            # operator choice for this one run cannot be
-                            # shadowed by whatever the Secret happens to hold.
-                            env: [{ name: "MIGRATION_0002_REPAIR", value: $repair }],
-                            resources: {
-                              requests: { cpu: "100m", memory: "256Mi" },
-                              limits: { cpu: "1000m", memory: "1Gi" }
-                            }
-                          }
-                        ]
-                      }
-                    }
-                  }
-                }
-              end
-          ' "$DEPLOY_JSON" > "$JOB_JSON"
-
-          kubectl delete job "$JOB" --ignore-not-found --wait=true
-          kubectl apply -f "$JOB_JSON"
-
-          SUCCEEDED=N
-          for _ in $(seq 1 120); do
-            STATUS=$(kubectl get job "$JOB" -o json)
-            if [ "$(echo "$STATUS" | jq -r '.status.succeeded // 0')" -ge 1 ]; then
-              SUCCEEDED=Y
-              break
-            fi
-            if [ "$(echo "$STATUS" | jq -r '.status.failed // 0')" -ge 1 ]; then
-              break
-            fi
-            sleep 5
-          done
-
-          echo "::group::Migration output"
-          kubectl logs "job/$JOB" -c migrate --tail=300 2>&1 || true
-          echo "::endgroup::"
-          if [ "$SUCCEEDED" != "Y" ]; then
-            kubectl describe job "$JOB"
-            kubectl get pods -l job-name="$JOB" -o wide
-            echo "::error::Candidate database migration did not complete; deployment was not mutated."
+          AR="${AR_REGION}-docker.pkg.dev/${GCP_PROJECT}/${AR_REPO}"
+          SERVER_DIGEST=$(gcloud artifacts docker images describe "$AR/server:$TAG" --format='value(image_summary.digest)' 2>/dev/null)
+          if [ -z "$SERVER_DIGEST" ]; then
+            echo "::error::server tag $TAG not found in Artifact Registry"
             exit 1
           fi
+          echo "server=$AR/server@$SERVER_DIGEST" >> "$GITHUB_OUTPUT"
+          if [ "$INCLUDE_AGENT" = "Y" ]; then
+            AGENT_DIGEST=$(gcloud artifacts docker images describe "$AR/agent-computer:$TAG" --format='value(image_summary.digest)' 2>/dev/null)
+            if [ -z "$AGENT_DIGEST" ]; then
+              echo "::error::agent-computer tag $TAG not found while include_agent=Y"
+              exit 1
+            fi
+            echo "agent=$AR/agent-computer@$AGENT_DIGEST" >> "$GITHUB_OUTPUT"
+          fi
 
-          kubectl delete job "$JOB" --wait=true
-          echo "job=$JOB" >> "$GITHUB_OUTPUT"
-
-      - name: Patch deployment
-        id: patch
-        run: |
-          SERVER="${{ steps.digest.outputs.server }}"
-
-          PREVIOUS_SERVER=$(kubectl get deployment cumora-server -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].image}')
-          PREVIOUS_AGENT=$(kubectl get deployment cumora-server -o jsonpath='{.spec.template.spec.containers[?(@.name=="server")].env[?(@.name=="CUMORA_AGENT_COMPUTER_IMAGE")].value}')
-          echo "previous_server=$PREVIOUS_SERVER" >> $GITHUB_OUTPUT
-          echo "previous_agent=$PREVIOUS_AGENT" >> $GITHUB_OUTPUT
-          echo "→ rollback baseline server: $PREVIOUS_SERVER"
-          echo "→ rollback baseline agent: ${PREVIOUS_AGENT:-'(unset)'}"
-
-          # Apply one atomic Pod-template patch: select the candidate server,
-          # remove the retired per-replica migration init container, and
-          # re-assert the startup/readiness/liveness probe contract. Startup
-          # allows the server's bounded schema transport retry to finish;
-          # liveness MUST hit /api/livez (a DB-free "process alive" check),
-          # NOT /api/health (which runs SELECT 1). Readiness stays on
-          # /api/health so a pod that cannot reach the DB is kept out of
-          # rotation without being killed. This keeps the fix durable even if
-          # the Deployment is recreated from an older base manifest.
-          AGENT="${{ steps.digest.outputs.agent }}"
-          PATCH=$(jq -nc --arg server "$SERVER" --arg agent "$AGENT" '
-            {
-              spec: { template: { spec: {
-                initContainers: [
-                  { name: "migrate", "$patch": "delete" }
-                ],
-                containers: [
-                  ({
-                    name: "server",
-                    image: $server,
-                    startupProbe: {
-                      httpGet: { path: "/api/livez", port: "http" },
-                      periodSeconds: 5,
-                      timeoutSeconds: 2,
-                      failureThreshold: 60
-                    },
-                    readinessProbe: {
-                      httpGet: { path: "/api/health", port: "http" },
-                      periodSeconds: 5,
-                      timeoutSeconds: 2
-                    },
-                    livenessProbe: {
-                      httpGet: { path: "/api/livez", port: "http" },
-                      periodSeconds: 30,
-                      timeoutSeconds: 3
-                    }
-                  } + if $agent == "" then {} else {
-                    env: [{ name: "CUMORA_AGENT_COMPUTER_IMAGE", value: $agent }]
-                  } end)
-                ]
-              } } }
-            }
-          ')
-          kubectl patch deployment cumora-server --type=strategic -p="$PATCH"
-
-      - name: Wait for rollout
-        id: rollout
-        run: |
-          # If rollout times out, fall through to the post-mortem
-          # step below — we want the diagnostic dump to print BEFORE
-          # the job fails, otherwise GHA just shows "Process completed
-          # with exit code 1" and we have to manually kubectl-investigate.
-          set +e
-          kubectl rollout status deployment/cumora-server --timeout=10m
-          RC=$?
-          set -e
-          echo "rc=$RC" >> $GITHUB_OUTPUT
-          # Don't exit yet — let the post-mortem step run regardless of RC.
-          # The "Fail if rollout failed" step at the end actually fails the job.
-
-      - name: Post-mortem on rollout failure
-        if: steps.rollout.outputs.rc != '0'
-        run: |
-          echo "::group::Pods"
-          kubectl get pods -l app=cumora-server -o wide
-          echo "::endgroup::"
-          echo "::group::Pod descriptions (events)"
-          # Per-pod describe; tail keeps the output focused on Events
-          for POD in $(kubectl get pods -l app=cumora-server -o name); do
-            echo "==== $POD ===="
-            kubectl describe "$POD" | sed -n '/Events:/,$p' | head -40
-          done
-          echo "::endgroup::"
-          echo "::group::Deployment status"
-          kubectl describe deployment cumora-server | grep -A 10 'Replicas:\|Conditions:\|StrategyType:'
-          echo "::endgroup::"
-          echo "::group::Recent cluster events"
-          kubectl get events --sort-by=.lastTimestamp 2>&1 | tail -30
-          echo "::endgroup::"
-          echo "::group::Server container logs (current run)"
-          for POD in $(kubectl get pods -l app=cumora-server -o jsonpath='{.items[*].metadata.name}'); do
-            echo "==== $POD ===="
-            kubectl logs "$POD" -c server --tail=100 2>&1 || true
-          done
-          echo "::endgroup::"
-          echo "::group::Server container logs (previous run, if crashloop)"
-          for POD in $(kubectl get pods -l app=cumora-server -o jsonpath='{.items[*].metadata.name}'); do
-            echo "==== $POD ===="
-            kubectl logs "$POD" -c server --previous --tail=100 2>&1 || true
-          done
-          echo "::endgroup::"
-
-      - name: Fail if rollout failed
-        if: steps.rollout.outputs.rc != '0'
-        run: |
-          echo "::error::Rollout failed with rc=${{ steps.rollout.outputs.rc }} — see Post-mortem step above."
-          exit 1
-
-      - name: Authenticated smoke test
-        id: smoke
-        continue-on-error: true
+      # This is the only mutating production step.  The helper captures the
+      # baseline before migration, creates immutable state records, preserves
+      # Job identity/proxy/volumes/env/securityContext, applies JSON Patch CAS,
+      # handles every rollout failure and smoke failure, and never calls
+      # rollout undo.
+      - name: Run deployment transaction with guarded recovery
+        id: deploy
         env:
+          RECOVERY_WORKDIR: ${{ runner.temp }}/cumora-recovery-${{ github.run_id }}
+          DEPLOYMENT: ${{ env.DEPLOYMENT }}
+          INCLUDE_AGENT: ${{ steps.tag.outputs.include_agent }}
+          RECOVERY_MODE: ${{ inputs.recovery_mode || 'normal' }}
+          CANDIDATE_SERVER_IMAGE: ${{ steps.digest.outputs.server }}
+          CANDIDATE_AGENT_IMAGE: ${{ steps.digest.outputs.agent }}
+          MIGRATION_REPAIR: ${{ inputs.repair_0002 || 'off' }}
+          MIGRATION_DEADLINE_SECONDS: '600'
+          MIGRATION_POLL_ATTEMPTS: '200'
+          VERIFIER_POLL_ATTEMPTS: '75'
+          RECOVERY_POLL_MS: '3000'
+          ROLLOUT_TIMEOUT_SECONDS: '600'
+          SMOKE_TIMEOUT_SECONDS: '120'
           CUMORA_SMOKE_TOKEN: ${{ secrets.CUMORA_SMOKE_TOKEN }}
           CUMORA_SMOKE_COMPANY_ID: ${{ secrets.CUMORA_SMOKE_COMPANY_ID }}
           CUMORA_SMOKE_BASE: https://api.cumora.ai
-        run: node scripts/release-smoke.mjs
-
-      - name: Automatic rollback when smoke evidence fails
-        if: steps.smoke.outcome == 'failure'
-        run: |
-          echo "::warning::Authenticated smoke failed; rolling deployment back to the previous revision."
-          kubectl rollout undo deployment/cumora-server
-          kubectl rollout status deployment/cumora-server --timeout=10m
-          echo "::error::Candidate was rolled back. Previous server was ${{ steps.patch.outputs.previous_server }}."
-
-      - name: Fail release after rollback
-        if: steps.smoke.outcome == 'failure'
-        run: exit 1
+        run: node --import tsx scripts/deploy-release.mjs run
 
       - name: Summary
+        if: steps.deploy.outcome == 'success'
+        env:
+          SERVER_DIGEST: ${{ steps.digest.outputs.server }}
+          AGENT_DIGEST: ${{ steps.digest.outputs.agent || '(unchanged)' }}
         run: |
-          echo "### Deployed" >> $GITHUB_STEP_SUMMARY
-          echo "- tag: \`${{ steps.tag.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- server: \`${{ steps.digest.outputs.server }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- agent: \`${{ steps.digest.outputs.agent || '(unchanged)' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- previous server: \`${{ steps.patch.outputs.previous_server }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- migration owner: one pre-deploy Job (\`${{ steps.migrate.outputs.job }}\`)" >> $GITHUB_STEP_SUMMARY
-          echo "- authenticated smoke: passed" >> $GITHUB_STEP_SUMMARY
-          echo "- cluster: \`${{ env.CLUSTER }}\` / \`${{ env.CLUSTER_LOCATION }}\`" >> $GITHUB_STEP_SUMMARY
+          printf '%s\n' '### Deployed' >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "- server digest: $SERVER_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' "- agent digest: $AGENT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
+          printf '%s\n' '- candidate migration, rollout, and authenticated smoke: passed' >> "$GITHUB_STEP_SUMMARY"

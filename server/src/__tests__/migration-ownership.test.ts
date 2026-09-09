@@ -25,13 +25,12 @@ test('application Pod manifests contain no per-replica migration container', asy
   }
 })
 
-test('production deploy migrates before one atomic Deployment mutation', async () => {
+test('production deploy delegates one guarded transaction to the recovery runner', async () => {
   const workflow = await readRepo('.github/workflows/deploy.yml')
-  const migrationAt = workflow.indexOf('- name: Run candidate migrations once')
-  const patchAt = workflow.indexOf('- name: Patch deployment')
-  assert.ok(migrationAt >= 0, 'deploy must create a single candidate migration Job')
-  assert.ok(patchAt > migrationAt, 'migration must complete before Deployment mutation')
-  assert.match(workflow, /kind:\s*"Job"/)
-  assert.match(workflow, /Candidate database migration did not complete; deployment was not mutated/)
-  assert.match(workflow, /\{ name: "migrate", "\$patch": "delete" \}/)
+  assert.match(workflow, /scripts\/deploy-release\.mjs run/)
+  assert.match(workflow, /CANDIDATE_SERVER_IMAGE/)
+  assert.match(workflow, /MIGRATION_REPAIR/)
+  assert.match(workflow, /RECOVERY_WORKDIR/)
+  assert.match(workflow, /concurrency:/)
+  assert.doesNotMatch(workflow, /kubectl rollout undo/)
 })

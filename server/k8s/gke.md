@@ -219,7 +219,10 @@ After replacing `REPLACE-*` placeholders in
 ```sh
 # For a manual installation, run the candidate image's migration command once
 # against the same DATABASE_URL before starting application replicas. The
-# production Deploy workflow creates and verifies this one-shot Job for you.
+# production Deploy workflow creates and verifies this one-shot Job for you;
+# it captures a create-only Deployment recovery record before that Job and
+# restores an exact template only after the old image proves read-only schema
+# compatibility.
 npm run migrate
 kubectl apply -f server/k8s/cumora-server.gke.yaml
 kubectl rollout status deployment/cumora-server
@@ -267,10 +270,17 @@ kubectl logs agent-<id>
 - **Image upgrades** — tag both images with the same git sha;
   redeploy by updating both the server Deployment image and
   `CUMORA_AGENT_COMPUTER_IMAGE` to the same tag. The Deploy workflow runs one
-  candidate migration Job before mutating the Deployment.
+  candidate migration Job before mutating the Deployment. Production resolves
+  both to immutable `@sha256:` digests and uses a JSON Patch UID/template CAS;
+  mutable tags, unknown image sources, and template drift are refused.
 - **PG schema changes** — append an immutable version and checksum; never edit
   an applied migration. Use expand/contract changes that remain compatible with
-  the old server version still serving during the rolling-update window.
+  the old server version still serving during the rolling-update window. A
+  rollout timeout or smoke failure may recover only when the captured old image
+  reports the current ledger inside its own supported range through the
+  independent read-only verifier. Unknown or newer schema history requires a
+  forward-compatible image or reviewed repair; it is never treated as proof
+  that an arbitrary old image can start.
 - **Idle scheduler** — runs in-process on EACH server replica.
   That's fine because idle's tick currently publishes to
   CH_MESSAGE_NEW which SETNX-dedups; only one replica handles

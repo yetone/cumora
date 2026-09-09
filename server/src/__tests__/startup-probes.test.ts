@@ -1,19 +1,21 @@
 import assert from 'node:assert/strict'
-import { execFile as execFileCallback } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { dirname, resolve } from 'node:path'
 import { test } from 'node:test'
-import { promisify } from 'node:util'
-import { load, loadAll } from 'js-yaml'
+import { loadAll } from 'js-yaml'
 import { MigrationHistoryError } from '../db/migrations/manifest.js'
+import {
+  DEPLOYMENT_PROBE_CONTRACT,
+  buildCandidatePatch,
+  extractDeploymentSnapshot,
+} from '../deploy/recovery.js'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
 const { verifySchemaWithBootRetry } = await import('../db/schema-version.js')
 const { pool } = await import('../db/pool.js')
-const execFile = promisify(execFileCallback)
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
 const readRepo = (path: string): Promise<string> => readFile(resolve(repoRoot, path), 'utf8')
@@ -37,23 +39,13 @@ interface Deployment {
   spec?: { template?: { spec?: { containers?: Container[] } } }
 }
 
-interface WorkflowStep {
-  name?: string
-  run?: string
-}
-
-interface Workflow {
-  jobs?: Record<string, { steps?: WorkflowStep[] }>
-}
-
-interface ProbePatch {
-  spec?: { template?: { spec?: { containers?: Container[] } } }
-}
-
 const manifestPaths = [
   'server/k8s/cumora-server.gke.yaml',
   'server/k8s/cumora-server.orbstack.yaml',
 ]
+
+const PROBE_FIXTURE_SERVER_IMAGE = `server@sha256:${'a'.repeat(64)}`
+const PROBE_FIXTURE_AGENT_IMAGE = `agent@sha256:${'b'.repeat(64)}`
 
 async function serverContainer(path: string): Promise<Container> {
   const docs = loadAll(await readRepo(path)) as unknown[]
@@ -89,41 +81,46 @@ test('both server manifests keep startup, liveness, and readiness probes on the 
   }
 })
 
-test('the deploy patch reapplies the same probe contract and rollout deadline', async (t) => {
-  const workflow = load(await readRepo('.github/workflows/deploy.yml')) as Workflow
-  const patchStep = workflow.jobs?.deploy?.steps?.find((step) => step.name === 'Patch deployment')
-  assert.ok(patchStep?.run, 'deploy must have a parsed Patch deployment step')
-  const patch = patchStep.run
-  assert.match(patch, /startupProbe:\s*\{\s*httpGet:\s*\{\s*path: "\/api\/livez",\s*port: "http"\s*\}/)
-  assert.match(patch, /readinessProbe:\s*\{\s*httpGet:\s*\{\s*path: "\/api\/health",\s*port: "http"\s*\}/)
-  assert.match(patch, /livenessProbe:\s*\{\s*httpGet:\s*\{\s*path: "\/api\/livez",\s*port: "http"\s*\}/)
-  assert.match(patch, /periodSeconds: 5/)
-  assert.match(patch, /timeoutSeconds: 2/)
-  assert.match(patch, /failureThreshold: 60/)
-  const rolloutStep = workflow.jobs?.deploy?.steps?.find((step) => step.name === 'Wait for rollout')
-  assert.match(rolloutStep?.run ?? '', /kubectl rollout status deployment\/cumora-server --timeout=10m/)
+test('the recovery helper reapplies the same probe contract and workflow calls it', async () => {
+  const workflowText = await readRepo('.github/workflows/deploy.yml')
+  assert.match(workflowText, /scripts\/deploy-release\.mjs run/)
+  assert.match(workflowText, /CANDIDATE_SERVER_IMAGE/)
+  assert.match(workflowText, /ROLLOUT_TIMEOUT_SECONDS/)
+  assert.match(workflowText, /VERIFIER_POLL_ATTEMPTS:\s*'75'/)
+  assert.doesNotMatch(workflowText, /kubectl rollout undo/)
 
-  const filterOpen = patch.indexOf("'\n")
-  const filterClose = patch.indexOf("\n')", filterOpen + 2)
-  assert.ok(filterOpen >= 0 && filterClose > filterOpen, 'Patch deployment must contain a jq filter')
-  const jqFilter = patch.slice(filterOpen + 2, filterClose)
-  let jq: { stdout: string }
-  try {
-    jq = await execFile(
-      'jq',
-      ['-nc', '--arg', 'server', 'fixture-server', '--arg', 'agent', 'fixture-agent', jqFilter],
-      { encoding: 'utf8' },
-    ) as { stdout: string }
-  } catch (error) {
-    if (!process.env.CI && (error as { code?: unknown })?.code === 'ENOENT') {
-      t.skip('jq is unavailable locally; CI must provide jq for this workflow patch test')
-      return
-    }
-    throw error
+  const baseline = extractDeploymentSnapshot({
+    apiVersion: 'apps/v1',
+    kind: 'Deployment',
+    metadata: { name: 'cumora-server', uid: 'probe-fixture' },
+    spec: {
+      template: {
+        metadata: { labels: { app: 'cumora-server' } },
+        spec: {
+          containers: [{
+            name: 'server',
+            image: PROBE_FIXTURE_SERVER_IMAGE,
+            env: [{ name: 'CUMORA_AGENT_COMPUTER_IMAGE', value: PROBE_FIXTURE_AGENT_IMAGE }],
+          }],
+        },
+      },
+    },
+  })
+  const patch = buildCandidatePatch(baseline, {
+    server: `server@sha256:${'c'.repeat(64)}`,
+    agent: `agent@sha256:${'d'.repeat(64)}`,
+  })
+  const replacement = patch.find((operation) => {
+    const candidate = operation as any
+    return candidate?.op === 'replace' && candidate?.path === '/spec/template'
+  }) as any
+  assert.ok(replacement && typeof replacement.value === 'object' && replacement.value !== null)
+  const patchedServer = (replacement.value as { spec: { containers: Container[] } }).spec.containers
+    .find((container) => container.name === 'server')
+  assert.ok(patchedServer, 'recovery helper patch must target the server container')
+  for (const [name, expected] of Object.entries(DEPLOYMENT_PROBE_CONTRACT)) {
+    assert.deepEqual(patchedServer[name as keyof Container], expected, `${name} helper contract`)
   }
-  const patchObject = JSON.parse(String(jq.stdout)) as ProbePatch
-  const patchedServer = patchObject.spec?.template?.spec?.containers?.find((container) => container.name === 'server')
-  assert.ok(patchedServer, 'evaluated deploy patch must target the server container')
   for (const path of manifestPaths) {
     const manifestServer = await serverContainer(path)
     assert.deepEqual(patchedServer.startupProbe, manifestServer.startupProbe, `${path} startup contract`)

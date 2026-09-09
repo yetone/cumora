@@ -71,9 +71,11 @@ the mute point without replaying the old backlog.
 
 Backend deployment is intentionally separate from desktop tagging. See
 [RELEASE.md](./RELEASE.md) for protected production approval, digest-pinned GKE
-rollout, authenticated smoke, automatic rollback, and scheduled readback.
+rollout, immutable recovery records, read-only schema compatibility checks,
+authenticated smoke, conditional exact-template recovery, and scheduled
+readback. A recovered candidate remains a failed release until a new reviewed
+forward deployment is verified.
 
 The release contract is complete only after production behavior has been read
 back against its baseline. A green build or successful rollout is an
 intermediate signal, not the terminal state.
-
