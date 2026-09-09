@@ -81,6 +81,10 @@ jobs:
         run: npx tsc --noEmit
       - name: tsc (server)
         run: npm run server:typecheck
+      - name: Install R2 Worker dependencies
+        run: npm ci --prefix workers/r2-gate
+      - name: tsc (R2 gate)
+        run: npm run typecheck --prefix workers/r2-gate
 
   quality:
     name: Guards + unit + integration

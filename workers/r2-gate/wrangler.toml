@@ -13,8 +13,9 @@
 #   npx wrangler secret put R2_URL_SIGNING_SECRET   # paste the same value as the server's .env
 #
 # Anything under `avatars/` is served unsigned (portraits are not private).
-# Anything under `attachments/` requires a valid `?exp&sig` pair signed by
-# the Cumora server with the same `R2_URL_SIGNING_SECRET`.
+# Anything under `attachments/` or `email-attachments/` requires a valid
+# `?exp&sig` pair signed by the Cumora server with the same
+# `R2_URL_SIGNING_SECRET`.
 
 name = "cumora-r2-gate"
 main = "src/index.ts"

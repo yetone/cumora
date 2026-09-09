@@ -6,11 +6,12 @@
  *   - GET /avatars/<key>           → unsigned, public. Portraits aren't
  *                                    sensitive and benefit from full CDN
  *                                    caching.
- *   - GET /attachments/<key>       → must carry `?exp=<unix>&sig=<hex>`,
- *                                    where `sig` = HMAC-SHA256(secret,
+ *   - GET /attachments/<key>       → must carry `?exp=<unix>&sig=<hex>`;
+ *   - GET /email-attachments/<key> → uses the same signed query contract.
+ *                                    `sig` = HMAC-SHA256(secret,
  *                                    `<key>:<exp>`). Both `exp` (not in
  *                                    the past) and `sig` (constant-time
- *                                    equal) checked before reading R2.
+ *                                    equal) are checked before reading R2.
  *   - HEAD                         → same auth as GET; useful for size
  *                                    probes from clients.
  *   - everything else              → 405.
@@ -27,7 +28,7 @@ export interface Env {
 
 /** Prefixes that demand a valid `?exp&sig` pair. Anything outside this
  *  list is treated as publicly cacheable. */
-const SIGNED_PREFIXES = ['attachments/']
+const SIGNED_PREFIXES = ['attachments/', 'email-attachments/']
 
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {

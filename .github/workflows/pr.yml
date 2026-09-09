@@ -104,6 +104,10 @@ jobs:
       # for hours in mid-May 2026.
       - name: tsc (server)
         run: npm run server:typecheck
+      - name: Install R2 Worker dependencies
+        run: npm ci --prefix workers/r2-gate
+      - name: tsc (R2 gate)
+        run: npm run typecheck --prefix workers/r2-gate
 
   test:
     name: Unit tests
