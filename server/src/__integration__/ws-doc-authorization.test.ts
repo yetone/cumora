@@ -89,11 +89,11 @@ async function waitForFrame(
   predicate: (frame: Frame) => boolean,
   label: string,
   timeoutMs = FRAME_TIMEOUT_MS,
+  fromIndex = 0,
 ): Promise<Frame> {
-  const start = harness.messages.length
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
-    const found = harness.messages.slice(start).find(predicate)
+    const found = harness.messages.slice(fromIndex).find(predicate)
     if (found) return found
     await delay(5)
   }
@@ -156,11 +156,14 @@ async function openSocket(userId: string): Promise<SocketHarness> {
 async function subscribeSocket(harness: SocketHarness, documentId: string, replaySupported = true, omitCapability = false): Promise<void> {
   const frame: Record<string, unknown> = { type: 'doc.subscribe', documentId }
   if (!omitCapability) frame.replaySupported = replaySupported
+  const cursor = harness.messages.length
   harness.socket.send(JSON.stringify(frame))
   await waitForFrame(
     harness,
     (frame) => frame.type === 'doc.sync' && frame.documentId === documentId,
     `doc.sync for ${documentId}`,
+    FRAME_TIMEOUT_MS,
+    cursor,
   )
 }
 
@@ -428,11 +431,18 @@ test('revocation committed before a retried authorization prevents the queued se
     await beginUserLock(barrier, fixture.users[1]!)
     const afterOrigin = `after-revoke-${randomUUID()}`
     const targetBefore = target.messages.length
+    const peerCursor = peer.messages.length
     const fanout = emitAwareness(fixture, afterOrigin)
     await revokeMembership(fixture.users[1]!, fixture.companyId)
     await barrier.query('ROLLBACK')
     await fanout
-    await waitForFrame(peer, (frame) => frame.type === 'doc.awareness' && frame.originId === afterOrigin, 'valid peer after revoke')
+    await waitForFrame(
+      peer,
+      (frame) => frame.type === 'doc.awareness' && frame.originId === afterOrigin,
+      'valid peer after revoke',
+      FRAME_TIMEOUT_MS,
+      peerCursor,
+    )
     await delay(100)
     assert.equal(
       target.messages.slice(targetBefore).some((frame) => frame.originId === afterOrigin),
@@ -534,11 +544,14 @@ test('close and unsubscribe during blocked hydration do not leave active subscri
     // first sync may be dropped legitimately: FIFO can run the queued
     // unsubscribe immediately after hydration, before the sync's outbound
     // authorization batch gets its turn.
+    const syncCursor = unsubscribeSocket.messages.length
     unsubscribeSocket.socket.send(JSON.stringify({ type: 'doc.subscribe', documentId: unsubscribeFixture.documentId }))
     await waitForFrame(
       unsubscribeSocket,
       (frame) => frame.type === 'doc.sync' && frame.documentId === unsubscribeFixture.documentId,
       'second sync after queued unsubscribe',
+      FRAME_TIMEOUT_MS,
+      syncCursor,
     )
     unsubscribeSocket.socket.send(JSON.stringify({ type: 'doc.unsubscribe', documentId: unsubscribeFixture.documentId }))
     await delay(50)
