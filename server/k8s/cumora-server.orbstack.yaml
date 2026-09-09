@@ -41,6 +41,17 @@ rules:
 - apiGroups: [""]
   resources: ["pods/log"]
   verbs: ["get", "list"]
+# Per-agent Chromium profile PVCs outlive Pods so cookies/login state survive
+# an idle restart. Keep this namespace-local; never delete or recreate the
+# existing PVC as part of a Pod security upgrade.
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# The orchestrator reads the pre-deployed agent NetworkPolicies before it
+# creates or reuses a Pod. It never grants itself policy mutation rights.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -88,6 +99,13 @@ spec:
           value: "http://cumora-server.default.svc.cluster.local:5181/runtime"
         - name: CUMORA_AGENT_NAMESPACE
           value: "default"
+        # Namespace containing the trusted server Pods selected by the agent
+        # NetworkPolicy. Keep explicit when agents move to a dedicated ns.
+        - name: CUMORA_AGENT_SERVER_NAMESPACE
+          value: "default"
+        # Pre-deploy server/k8s/cumora-agent-network-policy.yaml in this
+        # namespace. The orchestrator checks its v1 objects and fails closed;
+        # it does not apply policies or infer URL-specific exceptions.
         - name: WORKSPACE_RUNTIME_CLEANUP_ENABLED
           value: "true"
         # In-cluster PG is also reachable via the service URL above

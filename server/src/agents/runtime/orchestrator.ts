@@ -22,18 +22,18 @@
  * laptop.
  */
 import { spawn } from 'node:child_process'
-import { env } from '../../env.js'
-import { pool } from '../../db/pool.js'
-import { sub2apiConfigured, sub2apiOpenAIBaseURL } from '../../sub2api.js'
-import { inprocClient } from './inproc-client.js'
-import { signAgentToken } from './jwt.js'
 import { notifyAlert } from '../../alerting.js'
 import { Semaphore } from '../../concurrency.js'
+import { pool } from '../../db/pool.js'
+import { env } from '../../env.js'
+import { sub2apiConfigured, sub2apiOpenAIBaseURL } from '../../sub2api.js'
 import {
+  type AgentHostResolution,
   managedPodPlacement,
   resolveAgentHost,
-  type AgentHostResolution,
 } from '../computer/registry.js'
+import { inprocClient } from './inproc-client.js'
+import { signAgentToken } from './jwt.js'
 
 const KUBECTL = process.env.CUMORA_KUBECTL ?? 'kubectl'
 /** kubectl context to target. In dev we pin to OrbStack so a stray
@@ -53,6 +53,23 @@ const IMAGE = process.env.CUMORA_AGENT_COMPUTER_IMAGE
 const TOKEN_TTL_SECONDS = Number(process.env.CUMORA_AGENT_TOKEN_TTL_SECONDS ?? 24 * 60 * 60)
 /** K8s namespace pods land in. Default = current context's namespace. */
 const NS = process.env.CUMORA_AGENT_NAMESPACE ?? 'default'
+/** Namespace carrying the trusted cumora-server Service/Pods. Keep this an
+ * explicit operator setting; never derive it from a per-user runtime URL. */
+const SERVER_NS = process.env.CUMORA_AGENT_SERVER_NAMESPACE ?? 'default'
+/** Stable labels and command that identify the post-SEC-10 agent contract.
+ * These values are deliberately constants rather than derived from a
+ * per-user URL or model setting.  A running Pod is reusable only when its
+ * actual API object proves this contract. */
+export const AGENT_SECURITY_PROFILE_LABEL = 'cumora.dev/security-profile'
+export const AGENT_SECURITY_PROFILE = 'fuse-demoted-v1'
+export const AGENT_BOOTSTRAP_COMMAND = '/usr/local/bin/cumora-agent-bootstrap'
+export const AGENT_NETWORK_POLICY_VERSION = 'v1'
+export const REQUIRED_AGENT_NETWORK_POLICIES = [
+  'cumora-agent-default-deny',
+  'cumora-agent-egress',
+] as const
+const BOOTSTRAP_CAPABILITIES = ['SYS_ADMIN', 'SETUID', 'SETGID', 'SETPCAP', 'KILL'] as const
+const MODEL_UID = 65532
 /** Comma-separated list of imagePullSecrets to attach to the agent
  *  Pod. Needed when the image lives in a private registry (e.g.
  *  quay.io with auth, gcr.io / Artifact Registry without Workload
@@ -60,10 +77,11 @@ const NS = process.env.CUMORA_AGENT_NAMESPACE ?? 'default'
  *  OrbStack-local builds. */
 const PULL_SECRETS = (process.env.CUMORA_AGENT_PULL_SECRETS ?? '')
   .split(',').map((s) => s.trim()).filter(Boolean)
-/** Optional ServiceAccount the agent Pod runs as. Useful for GKE
- *  Workload Identity (binding to a GCP service account) when the
- *  agent's bash tool ends up calling GCP APIs. Empty = use the
- *  namespace's `default` SA. */
+/** Optional ServiceAccount identity for the agent Pod. The Pod explicitly
+ *  disables automountServiceAccountToken, which only suppresses the projected
+ *  Kubernetes API token. It does not by itself suppress GCP Workload Identity
+ *  or metadata credentials; those remain governed by runtime/CNI/operator
+ *  policy. Empty = namespace `default` SA. */
 const POD_SERVICE_ACCOUNT = process.env.CUMORA_AGENT_SERVICE_ACCOUNT ?? ''
 
 export interface KubectlResult { code: number; out: string; err: string; timedOut: boolean }
@@ -302,14 +320,41 @@ metadata:
   name: ${podName(args.agentId)}
   labels:
     app: cumora-agent
+    ${AGENT_SECURITY_PROFILE_LABEL}: ${yamlQuote(AGENT_SECURITY_PROFILE)}
     cumora.agent: ${yamlQuote(labelValue)}
 spec:
-  restartPolicy: OnFailure${saBlock}${pullSecretsBlock}
+  restartPolicy: OnFailure
+  automountServiceAccountToken: false
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    runAsNonRoot: false
+    fsGroup: ${MODEL_UID}
+    fsGroupChangePolicy: OnRootMismatch
+    seccompProfile:
+      type: RuntimeDefault${saBlock}${pullSecretsBlock}
+  hostPID: false
+  hostIPC: false
+  hostNetwork: false
+  shareProcessNamespace: false
   containers:
   - name: agent-computer
     image: ${yamlQuote(args.image)}
     imagePullPolicy: IfNotPresent
+    command: [${yamlQuote(AGENT_BOOTSTRAP_COMMAND)}]
     securityContext:
+      # The container starts as root only for the trusted FUSE bootstrap.
+      # The bootstrap must then exec setpriv -> tini as UID/GID 65532 with
+      # all capabilities cleared and NoNewPrivs=1.  These fields describe
+      # the pre-mount capability envelope; they are not the post-bootstrap
+      # process boundary.
+      runAsUser: 0
+      runAsGroup: 0
+      runAsNonRoot: false
+      allowPrivilegeEscalation: false
+      privileged: false
+      seccompProfile:
+        type: RuntimeDefault
       # FUSE mount needs three things to work on GKE-COS:
       #   1. CAP_SYS_ADMIN — for the mount(2) syscall.
       #   2. /dev/fuse in the cgroup device whitelist — granted by the
@@ -325,7 +370,8 @@ spec:
       appArmorProfile:
         type: Unconfined
       capabilities:
-        add: ["SYS_ADMIN"]
+        drop: ["ALL"]
+        add: ["SYS_ADMIN", "SETUID", "SETGID", "SETPCAP", "KILL"]
     resources:
       requests:
         # Measured in prod, per-pod working-set ≈ 420 MiB, but only
@@ -428,8 +474,282 @@ spec:
 `
 }
 
+type JsonRecord = Record<string, unknown>
+
+function asRecord(value: unknown): JsonRecord | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as JsonRecord
+    : null
+}
+
+function asStringRecord(value: unknown): Record<string, string> {
+  const record = asRecord(value)
+  if (!record) return {}
+  const out: Record<string, string> = {}
+  for (const [key, item] of Object.entries(record)) {
+    if (typeof item === 'string') out[key] = item
+  }
+  return out
+}
+
+function asArray(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : []
+}
+
+function hasExactStringSet(value: unknown, expected: readonly string[]): boolean {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) return false
+  if (value.length !== expected.length) return false
+  const actual = [...new Set(value as string[])].sort()
+  return actual.length === expected.length
+    && actual.every((item, index) => item === [...expected].sort()[index])
+}
+
+function hasStringArray(value: unknown, expected: readonly string[]): boolean {
+  return Array.isArray(value)
+    && value.length === expected.length
+    && value.every((item, index) => item === expected[index])
+}
+
+/**
+ * Parse the API representation of a Pod and prove that it is the exact
+ * trusted bootstrap shape emitted by podManifest(). This is intentionally
+ * stricter than checking the profile label: labels can be stale, copied, or
+ * changed by an operator while an immutable Pod template remains legacy.
+ */
+export function isSecureManagedPod(
+  raw: unknown,
+  expectedImage: string = IMAGE,
+  expectedAgentId?: string,
+): boolean {
+  let pod = raw
+  if (typeof raw === 'string') {
+    try { pod = JSON.parse(raw) as unknown } catch { return false }
+  }
+  const root = asRecord(pod)
+  const metadata = asRecord(root?.metadata)
+  const labels = asStringRecord(metadata?.labels)
+  if (labels.app !== 'cumora-agent' || labels[AGENT_SECURITY_PROFILE_LABEL] !== AGENT_SECURITY_PROFILE) {
+    return false
+  }
+  if (expectedAgentId !== undefined) {
+    const slug = safeName(expectedAgentId).replace(/^agent-/, '') || 'unknown'
+    if (labels['cumora.agent'] !== slug) return false
+  }
+
+  const spec = asRecord(root?.spec)
+  if (spec?.automountServiceAccountToken !== false) return false
+  for (const field of ['hostPID', 'hostIPC', 'hostNetwork', 'shareProcessNamespace']) {
+    const value = spec?.[field]
+    // These API fields are Go bool/pointer fields with omitempty, so a
+    // correctly defaulted Pod may omit false. Accept only false or omitted;
+    // true and every malformed value still fail closed.
+    if (value !== undefined && value !== false) return false
+  }
+  for (const field of ['initContainers', 'ephemeralContainers']) {
+    const value = spec?.[field]
+    if (value !== undefined) return false
+  }
+  const podSecurity = asRecord(spec?.securityContext)
+  if (podSecurity?.runAsUser !== 0 || podSecurity?.runAsGroup !== 0 || podSecurity?.runAsNonRoot !== false) return false
+  if (podSecurity?.fsGroup !== MODEL_UID) return false
+  const podSeccomp = asRecord(podSecurity?.seccompProfile)
+  if (podSeccomp?.type !== 'RuntimeDefault') return false
+
+  const containers = asArray(spec?.containers)
+  if (containers.length !== 1) return false
+  const container = asRecord(containers[0])
+  if (!container || container.name !== 'agent-computer') return false
+  if (container.image !== expectedImage) return false
+  if (!hasStringArray(container.command, [AGENT_BOOTSTRAP_COMMAND])) return false
+  if (container.args !== undefined && (!Array.isArray(container.args) || container.args.length !== 0)) return false
+  if (container.lifecycle !== undefined) return false
+  for (const field of ['startupProbe', 'readinessProbe', 'livenessProbe']) {
+    const probe = asRecord(container[field])
+    if (probe?.exec !== undefined) return false
+  }
+  const volumeMounts = container.volumeMounts
+  if (!Array.isArray(volumeMounts) || volumeMounts.length !== 1) return false
+  const chromeMount = asRecord(volumeMounts[0])
+  if (!chromeMount || chromeMount.name !== 'chrome-profile' || chromeMount.mountPath !== '/opt/chrome-profile') return false
+  for (const field of ['subPath', 'subPathExpr']) {
+    if (chromeMount[field] !== undefined) return false
+  }
+  if (chromeMount.mountPropagation !== undefined && chromeMount.mountPropagation !== 'None') return false
+  if (container.volumeDevices !== undefined) return false
+  const volumes = spec.volumes
+  if (!Array.isArray(volumes) || volumes.length !== 1) return false
+  const chromeVolume = asRecord(volumes[0])
+  if (!chromeVolume || chromeVolume.name !== 'chrome-profile') return false
+  const volumeSources = Object.keys(chromeVolume).filter((key) => key !== 'name')
+  if (volumeSources.length !== 1) return false
+  const pvc = asRecord(chromeVolume.persistentVolumeClaim)
+  const emptyDir = asRecord(chromeVolume.emptyDir)
+  if (!pvc && !emptyDir) return false
+  if (pvc) {
+    if (expectedAgentId === undefined || pvc.claimName !== chromeProfilePvcName(expectedAgentId)) return false
+  }
+  const security = asRecord(container.securityContext)
+  if (!security) return false
+  if (security.runAsUser !== 0 || security.runAsGroup !== 0) return false
+  if (security.runAsNonRoot !== false) return false
+  if (security.allowPrivilegeEscalation !== false) return false
+  if (security.privileged !== false) return false
+  const seccomp = asRecord(security.seccompProfile)
+  if (seccomp?.type !== 'RuntimeDefault') return false
+  const appArmor = asRecord(security.appArmorProfile)
+  if (appArmor?.type !== 'Unconfined') return false
+  const capabilities = asRecord(security.capabilities)
+  if (!capabilities) return false
+  if (!hasStringArray(capabilities.drop, ['ALL'])) return false
+  if (!hasExactStringSet(capabilities.add, BOOTSTRAP_CAPABILITIES)) return false
+  return true
+}
+
+function policyMetadataMatches(policy: JsonRecord, expectedName: string): boolean {
+  const metadata = asRecord(policy.metadata)
+  const labels = asStringRecord(metadata?.labels)
+  return metadata?.name === expectedName
+    && labels[AGENT_SECURITY_PROFILE_LABEL] === AGENT_SECURITY_PROFILE
+    && labels['cumora.dev/network-policy-version'] === AGENT_NETWORK_POLICY_VERSION
+}
+
+function policyTypesExactly(policy: JsonRecord, ...types: string[]): boolean {
+  const spec = asRecord(policy.spec)
+  const raw = asArray(spec?.policyTypes)
+  if (raw.some((type) => typeof type !== 'string')) return false
+  const actual = raw as string[]
+  actual.sort()
+  const expected = [...types].sort()
+  return actual.length === expected.length && actual.every((type, index) => type === expected[index])
+}
+
+function selectorHasLabels(value: unknown, expected: Record<string, string>): boolean {
+  const selector = asRecord(value)
+  if (!selector) return false
+  const labels = asRecord(selector.matchLabels)
+  if (!labels || Object.values(labels).some((item) => typeof item !== 'string')) return false
+  const expectedKeys = Object.keys(expected).sort()
+  const actualKeys = Object.keys(labels).sort()
+  if (actualKeys.length !== expectedKeys.length || actualKeys.some((key, index) => key !== expectedKeys[index])) return false
+  if (!Object.entries(expected).every(([key, item]) => labels[key] === item)) return false
+  const matchExpressions = selector.matchExpressions
+  return matchExpressions === undefined || (Array.isArray(matchExpressions) && matchExpressions.length === 0)
+}
+
+function portMatches(value: unknown, protocol: string, port: number): boolean {
+  const item = asRecord(value)
+  return item?.protocol === protocol
+    && item.endPort === undefined
+    && (item.port === port || item.port === String(port))
+}
+
+function hasPeerSelector(
+  peer: unknown,
+  namespaceName: string,
+  podLabels: Record<string, string>,
+): boolean {
+  const item = asRecord(peer)
+  return selectorHasLabels(item?.namespaceSelector, { 'kubernetes.io/metadata.name': namespaceName })
+    && selectorHasLabels(item?.podSelector, podLabels)
+}
+
+function hasPublicWebBlock(value: unknown, cidr: string, requiredExcept: readonly string[]): boolean {
+  const blocks = asArray(value)
+  if (blocks.length !== 1) return false
+  const peer = asRecord(blocks[0])
+  const block = asRecord(peer?.ipBlock)
+  if (block?.cidr !== cidr) return false
+  const except = asArray(block.except)
+  return requiredExcept.every((item) => except.includes(item))
+}
+
+/**
+ * Validate the required pre-deployed NetworkPolicies. NetworkPolicy
+ * objects are additive and their enforcement is asynchronous, so this only
+ * proves the required API objects/version exist. It deliberately does not
+ * infer allowlists from OPENAI_BASE_URL or another per-user setting.
+ */
+export function isRequiredAgentNetworkPolicy(
+  expectedName: string,
+  raw: unknown,
+  agentNamespace: string = NS,
+  trustedServerNamespace: string = SERVER_NS,
+): boolean {
+  const policy = typeof raw === 'string'
+    ? (() => { try { return JSON.parse(raw) as unknown } catch { return null } })()
+    : raw
+  const object = asRecord(policy)
+  if (!object || !policyMetadataMatches(object, expectedName)) return false
+  const metadata = asRecord(object.metadata)
+  if (typeof metadata?.namespace === 'string' && metadata.namespace !== agentNamespace) return false
+  const spec = asRecord(object.spec)
+  if (!spec) return false
+
+  if (expectedName === 'cumora-agent-default-deny') {
+    return selectorHasLabels(spec.podSelector, { app: 'cumora-agent' })
+      && policyTypesExactly(object, 'Ingress', 'Egress')
+      && asArray(spec.ingress).length === 0
+      && asArray(spec.egress).length === 0
+  }
+
+  if (expectedName === 'cumora-agent-egress') {
+    const egress = asArray(spec.egress)
+    if (!selectorHasLabels(spec.podSelector, { app: 'cumora-agent' })
+      || !policyTypesExactly(object, 'Egress')
+      || asArray(spec.ingress).length !== 0
+      || egress.length !== 4) return false
+    const dns = asRecord(egress[0])
+    const server = asRecord(egress[1])
+    const ipv4 = asRecord(egress[2])
+    const ipv6 = asRecord(egress[3])
+    const dnsPeers = asArray(dns?.to)
+    const dnsPorts = asArray(dns?.ports)
+    const serverPeers = asArray(server?.to)
+    const serverPorts = asArray(server?.ports)
+    const webPorts4 = asArray(ipv4?.ports)
+    const webPorts6 = asArray(ipv6?.ports)
+    const dnsPeer = asRecord(dnsPeers[0])
+    const dnsNamespace = asRecord(dnsPeer?.namespaceSelector)
+    const dnsPod = asRecord(dnsPeer?.podSelector)
+    return dnsPeers.length === 1
+      && selectorHasLabels(dnsNamespace, { 'kubernetes.io/metadata.name': 'kube-system' })
+      && selectorHasLabels(dnsPod, { 'k8s-app': 'kube-dns' })
+      && dnsPorts.length === 2
+      && dnsPorts.some((port) => portMatches(port, 'UDP', 53))
+      && dnsPorts.some((port) => portMatches(port, 'TCP', 53))
+      && serverPeers.length === 1
+      && hasPeerSelector(serverPeers[0], trustedServerNamespace, { app: 'cumora-server' })
+      && serverPorts.length === 1
+      && portMatches(serverPorts[0], 'TCP', 5181)
+      && hasPublicWebBlock(ipv4?.to, '0.0.0.0/0', [
+        '0.0.0.0/8', '10.0.0.0/8', '100.64.0.0/10', '127.0.0.0/8',
+        '169.254.0.0/16', '172.16.0.0/12', '192.0.0.0/24', '192.0.2.0/24',
+        '192.168.0.0/16', '198.18.0.0/15', '198.51.100.0/24', '203.0.113.0/24',
+        '224.0.0.0/4', '240.0.0.0/4',
+      ])
+      && webPorts4.length === 2
+      && webPorts4.some((port) => portMatches(port, 'TCP', 80))
+      && webPorts4.some((port) => portMatches(port, 'TCP', 443))
+      && hasPublicWebBlock(ipv6?.to, '::/0', [
+        '::/128', '::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8', '2001:db8::/32',
+      ])
+      && webPorts6.length === 2
+      && webPorts6.some((port) => portMatches(port, 'TCP', 80))
+      && webPorts6.some((port) => portMatches(port, 'TCP', 443))
+  }
+  return false
+}
+
 /** Exported for tests — production callers go through ensurePod. */
-export const _testing = { podManifest, yamlQuote, dnsLabelValue, chromeProfilePvcManifest, chromeProfilePvcName }
+export const _testing = {
+  podManifest,
+  yamlQuote,
+  dnsLabelValue,
+  chromeProfilePvcManifest,
+  chromeProfilePvcName,
+  isSecureManagedPod,
+  isRequiredAgentNetworkPolicy,
+}
 
 // ─── cluster-wide FUSE admission control ─────────────────────────────
 //
@@ -587,11 +907,133 @@ export function parsePodHealth(rawJson: string): PodHealth {
   return { phase, waitingReasons, unschedulable }
 }
 
-async function podHealth(agentId: string): Promise<PodHealth> {
-  // `get pod` is the read path — retry on transient API-server issues.
-  const r = await kubectlWithRetry(['get', 'pod', podName(agentId), '-o', 'json'])
-  if (r.code !== 0) return { phase: '', waitingReasons: [], unschedulable: false }
-  return parsePodHealth(r.out)
+interface PodSnapshot {
+  exists: boolean
+  lookupFailed: boolean
+  raw: unknown
+  health: PodHealth
+  error?: string
+}
+
+/** With --ignore-not-found=true, kubectl reports a missing named object as
+ * success with no stdout. A nonzero result is always an API/auth/transport
+ * failure; an error message containing "not found" is not resource absence
+ * evidence (for example, an auth plugin executable may be missing). */
+function resultIsMissingWithIgnoreNotFound(r: KubectlResult): boolean {
+  return r.code === 0 && r.out.trim() === ''
+}
+
+/** Read both health and the actual API object. Reusing a Pod is allowed only
+ * after the latter passes isSecureManagedPod(); a status-only read cannot
+ * distinguish a secure immutable template from a legacy one. */
+async function podSnapshot(agentId: string): Promise<PodSnapshot> {
+  const r = await kubectlWithRetry(['get', 'pod', podName(agentId), '--ignore-not-found=true', '-o', 'json'])
+  if (r.code !== 0) {
+    return {
+      exists: false,
+      lookupFailed: true,
+      raw: null,
+      health: { phase: '', waitingReasons: [], unschedulable: false },
+      error: (r.err || r.out).trim(),
+    }
+  }
+  if (resultIsMissingWithIgnoreNotFound(r)) {
+    return {
+      exists: false,
+      lookupFailed: false,
+      raw: null,
+      health: { phase: '', waitingReasons: [], unschedulable: false },
+    }
+  }
+  let raw: unknown = null
+  try { raw = JSON.parse(r.out) as unknown } catch { /* malformed = existing unknown Pod */ }
+  return { exists: true, lookupFailed: false, raw, health: parsePodHealth(r.out) }
+}
+
+type NetworkPolicyPreflight = {
+  ok: true
+} | {
+  ok: false
+  code: 'network_policy_missing' | 'network_policy_invalid' | 'network_policy_lookup_failed'
+  reason: string
+}
+
+async function checkRequiredAgentNetworkPolicies(): Promise<NetworkPolicyPreflight> {
+  for (const name of REQUIRED_AGENT_NETWORK_POLICIES) {
+    const r = await kubectlWithRetry(
+      ['get', 'networkpolicy', name, '--ignore-not-found=true', '-o', 'json'],
+      { timeoutMs: 10_000 },
+    )
+    if (r.code !== 0) {
+      const detail = (r.err || r.out).trim().slice(0, 240)
+      return { ok: false, code: 'network_policy_lookup_failed', reason: `could not read required NetworkPolicy ${name}: ${detail}` }
+    }
+    if (resultIsMissingWithIgnoreNotFound(r)) {
+      return { ok: false, code: 'network_policy_missing', reason: `required NetworkPolicy ${name} is missing in namespace ${NS}` }
+    }
+    let raw: unknown
+    try { raw = JSON.parse(r.out) as unknown } catch {
+      return { ok: false, code: 'network_policy_invalid', reason: `required NetworkPolicy ${name} returned invalid JSON` }
+    }
+    if (!isRequiredAgentNetworkPolicy(name, raw, NS, SERVER_NS)) {
+      return { ok: false, code: 'network_policy_invalid', reason: `required NetworkPolicy ${name} does not match ${AGENT_NETWORK_POLICY_VERSION} contract` }
+    }
+  }
+  return { ok: true }
+}
+
+export type PodDeletionResult = { ok: true } | { ok: false; reason: string }
+type PodKubectlRunner = (
+  args: string[],
+  opts?: { timeoutMs?: number; maxAttempts?: number },
+) => Promise<KubectlResult>
+
+/** Delete an immutable Pod and prove its name is gone before a replacement
+ * can be applied. The runner/sleep seams keep this lifecycle testable without
+ * talking to a production cluster. */
+export async function waitForPodDeletion(
+  agentId: string,
+  runner: PodKubectlRunner = kubectlWithRetry,
+  options: { deadlineMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<PodDeletionResult> {
+  const name = podName(agentId)
+  const reap = await runner(
+    ['delete', 'pod', name, '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
+    { timeoutMs: 40_000 },
+  )
+  if (reap.code !== 0) {
+    return { ok: false, reason: `delete failed: ${(reap.err || reap.out).trim()}` }
+  }
+
+  // `kubectl delete --wait` normally gives this guarantee, but it can return
+  // after an API timeout or a finalizer race. Confirm the name is gone before
+  // applying a replacement, otherwise an immutable Pod can leave two model
+  // lifecycles or turn the apply into a misleading AlreadyExists failure.
+  const deadline = Date.now() + (options.deadlineMs ?? 10_000)
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  while (Date.now() < deadline) {
+    const check = await runner(
+      ['get', 'pod', name, '--ignore-not-found=true', '-o', 'json'],
+      { timeoutMs: 5_000, maxAttempts: 1 },
+    )
+    if (resultIsMissingWithIgnoreNotFound(check)) return { ok: true }
+    if (check.code !== 0 && !isRetryableKubectlError(check)) {
+      return { ok: false, reason: `deletion confirmation failed: ${(check.err || check.out).trim()}` }
+    }
+    await sleep(options.pollMs ?? 250)
+  }
+  return { ok: false, reason: `pod ${name} did not disappear before timeout` }
+}
+
+async function reapPodAndConfirmGone(agentId: string, reason: string): Promise<EnsurePodResult | null> {
+  const result = await waitForPodDeletion(agentId)
+  if (result.ok) return null
+  return {
+    created: false,
+    ok: false,
+    code: 'pod_reap_failed',
+    reason: `pod reap failed (${reason}): ${result.reason}`,
+  }
 }
 
 /** Waiting reasons that K8s will not recover from on its own — image
@@ -637,6 +1079,9 @@ export type EnsurePodResult =
         | 'agent_not_found'
         | 'placement_lookup_failed'
         | 'placement_denied'
+        | 'network_policy_missing'
+        | 'network_policy_invalid'
+        | 'network_policy_lookup_failed'
         | 'pod_apply_failed'
     }
 
@@ -770,82 +1215,73 @@ async function ensurePodImpl(agentId: string): Promise<EnsurePodResult> {
     }
     return null
   }
-  const h = await podHealth(agentId)
-  if (h.phase === 'Running') {
-    const denied = await recheckPlacement()
-    if (denied) return denied
-    return { created: false, ok: true, reason: 'already running' }
+  const snapshot = await podSnapshot(agentId)
+  if (snapshot.lookupFailed) {
+    return {
+      created: false,
+      ok: false,
+      code: 'pod_reap_failed',
+      reason: `could not inspect existing pod before replacement: ${snapshot.error ?? 'kubectl failed'}`,
+    }
   }
-  if (h.phase === 'Pending') {
-    const stuck = stuckPendingReason(h)
-    if (!stuck) {
+
+  if (snapshot.exists) {
+    const secure = isSecureManagedPod(snapshot.raw, IMAGE, agentId)
+    const h = snapshot.health
+    const stuck = h.phase === 'Pending' ? stuckPendingReason(h) : null
+    const reusable = secure && (h.phase === 'Running' || (h.phase === 'Pending' && !stuck))
+
+    if (reusable) {
+      // A secure label alone is not enough: isSecureManagedPod already
+      // checked the immutable command/image/security fields. The policy
+      // check below proves the required pre-deployed objects are present
+      // before we treat the Pod as usable.
       const denied = await recheckPlacement()
       if (denied) return denied
-      return { created: false, ok: true, reason: 'already pending' }
+      const policies = await checkRequiredAgentNetworkPolicies()
+      if (!policies.ok) return { created: false, ...policies }
+      return { created: false, ok: true, reason: h.phase === 'Running' ? 'already running' : 'already pending' }
     }
-    // Fall through to the stuck-Pending reap path below. Don't admission-
-    // gate this: reaping is a cleanup that frees a slot, not a fresh
-    // demand on cluster capacity.
-    // Pod will never recover on its own (ImagePullBackOff / Unschedulable /
-    // CrashLoopBackOff / etc.) — reap so the apply below installs a
-    // fresh manifest. kubectl apply against an immutable existing Pod
-    // would fail, hence the explicit delete first.
-    //
-    // Alert because stuck pods point at infra problems (bad image
-    // tag, exhausted node pool) that need a human to look. The reap
-    // unblocks the agent in the short term but the underlying cause
-    // will re-surface on the NEXT ensurePod unless someone fixes it.
-    console.warn(`[orchestrator] ${agentId} pending pod is stuck (${stuck}); reaping`)
-    void notifyAlert({
-      label: 'orchestrator.stuck_pending_reap',
-      error: new Error(`pod for ${agentId} stuck in Pending (${stuck}); reaping for fresh start`),
-      extras: { agentId, stuckReason: stuck, waitingReasons: h.waitingReasons.join(',') },
-    })
-    // `--timeout=30s` on the kubectl side AND our wrapper timeout —
-    // belt-and-braces. A pod with stuck finalizers shouldn't block
-    // the orchestrator's main loop indefinitely.
-    const denied = await recheckPlacement()
-    if (denied) return denied
-    const reap = await kubectlWithRetry(
-      ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
-      { timeoutMs: 40_000 },
-    )
-    if (reap.code !== 0) {
-      // The reap failed — apply will almost certainly fail too (it
-      // can't create a Pod with the same name as an existing one).
-      // Surface a precise error rather than letting the apply step
-      // try and produce a misleading "already exists" message.
-      return {
-        created: false, ok: false, code: 'pod_reap_failed',
-        reason: `pod reap failed (was stuck=${stuck}): ${(reap.err || reap.out).trim()}`,
-      }
-    }
-  } else if (h.phase === 'Succeeded' || h.phase === 'Failed' || h.phase === 'Unknown') {
-    // Plain Pods (not Jobs) don't have ttlSecondsAfterFinished, so a
-    // Pod that idle-exited stays in Completed state until something
-    // deletes it. Reap it before applying the new manifest so kubectl
-    // apply doesn't see it as an existing immutable Pod. Unknown
-    // (node lost / kubelet unreachable) is also a clean-slate case.
-    if (h.phase === 'Failed') {
-      // Failed = the container exited non-zero AND restartPolicy gave
-      // up. That's a real bug inside the pod we should surface, not
-      // just an idle teardown.
+
+    const reason = !secure
+      ? 'legacy or unknown security contract'
+      : stuck
+        ? `stuck pending=${stuck}`
+        : h.phase === 'Failed'
+          ? 'previous pod ended in Failed'
+          : h.phase === 'Succeeded'
+            ? 'previous pod completed'
+            : h.phase === 'Unknown'
+              ? 'previous pod phase is Unknown'
+              : `unrecognized pod phase=${h.phase || 'empty'}`
+    if (stuck) {
+      console.warn(`[orchestrator] ${agentId} pending pod is stuck (${stuck}); reaping`)
+      void notifyAlert({
+        label: 'orchestrator.stuck_pending_reap',
+        error: new Error(`pod for ${agentId} stuck in Pending (${stuck}); reaping for fresh start`),
+        extras: { agentId, stuckReason: stuck, waitingReasons: h.waitingReasons.join(',') },
+      })
+    } else if (h.phase === 'Failed') {
       console.warn(`[orchestrator] ${agentId} previous pod ended in Failed; reaping to recreate`)
       void notifyAlert({
         label: 'orchestrator.previous_pod_failed',
         error: new Error(`previous pod for ${agentId} ended in Failed phase; recreating`),
         extras: { agentId, waitingReasons: h.waitingReasons.join(',') },
       })
-    } else if (h.phase === 'Unknown') {
-      console.warn(`[orchestrator] ${agentId} previous pod was in Unknown phase (node lost?); reaping`)
+    } else if (h.phase === 'Unknown' || !secure) {
+      console.warn(`[orchestrator] ${agentId} ${reason}; deleting before replacement`)
     }
     const denied = await recheckPlacement()
     if (denied) return denied
-    await kubectlWithRetry(
-      ['delete', 'pod', podName(agentId), '--ignore-not-found=true', '--wait=true', '--timeout=30s'],
-      { timeoutMs: 40_000 },
-    )
+    const reapFailure = await reapPodAndConfirmGone(agentId, reason)
+    if (reapFailure) return reapFailure
   }
+
+  // NetworkPolicy objects are a deployment prerequisite. The orchestrator
+  // never applies them and never derives exceptions from a user-controlled
+  // model/provider URL; API success is not evidence that a CNI enforces them.
+  const policies = await checkRequiredAgentNetworkPolicies()
+  if (!policies.ok) return { created: false, ...policies }
 
   // Cluster-wide FUSE admission: refuse the spawn if the cluster is
   // near its /dev/fuse capacity. The scheduler puts durable

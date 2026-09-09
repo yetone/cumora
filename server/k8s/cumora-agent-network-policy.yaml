@@ -1,0 +1,115 @@
+# Pre-deploy these policies in the namespace selected by
+# CUMORA_AGENT_NAMESPACE.  They are intentionally separate from the server
+# Deployment manifest so the same server image can target an explicitly
+# chosen agent namespace without silently moving existing PVCs.
+# The server namespace selector below defaults to `default`; if trusted
+# cumora-server Pods live elsewhere, update it and set
+# CUMORA_AGENT_SERVER_NAMESPACE on the server Deployment.
+#
+# Example:
+#   kubectl apply -n "$CUMORA_AGENT_NAMESPACE" \
+#     -f server/k8s/cumora-agent-network-policy.yaml
+#
+# The orchestrator only reads and validates these objects.  It never applies
+# them at wake time.  NetworkPolicy enforcement is asynchronous and depends
+# on the cluster CNI; see server/k8s/gke.md for the required CNI checks. Both
+# objects select only `app=cumora-agent`, so server/Redis/other Pods in a
+# shared namespace are outside this policy set.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cumora-agent-default-deny
+  labels:
+    cumora.dev/security-profile: fuse-demoted-v1
+    cumora.dev/network-policy-version: v1
+spec:
+  podSelector:
+    matchLabels:
+      app: cumora-agent
+  policyTypes:
+  - Ingress
+  - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: cumora-agent-egress
+  labels:
+    cumora.dev/security-profile: fuse-demoted-v1
+    cumora.dev/network-policy-version: v1
+spec:
+  podSelector:
+    matchLabels:
+      app: cumora-agent
+  policyTypes:
+  - Egress
+  egress:
+  # Cluster DNS.  If the CNI uses a different DNS label, update this peer
+  # explicitly and update the orchestrator's policy contract together.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # The in-cluster runtime server. Replace the namespace label when
+  # CUMORA_AGENT_SERVER_NAMESPACE is changed.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: default
+      podSelector:
+        matchLabels:
+          app: cumora-server
+    ports:
+    - protocol: TCP
+      port: 5181
+  # Public IPv4 Web only.  RFC1918, CGNAT, loopback, link-local, metadata,
+  # documentation, multicast, and reserved ranges stay excluded.
+  - to:
+    - ipBlock:
+        cidr: 0.0.0.0/0
+        except:
+        - 0.0.0.0/8
+        - 10.0.0.0/8
+        - 100.64.0.0/10
+        - 127.0.0.0/8
+        - 169.254.0.0/16
+        - 172.16.0.0/12
+        - 192.0.0.0/24
+        - 192.0.2.0/24
+        - 192.168.0.0/16
+        - 198.18.0.0/15
+        - 198.51.100.0/24
+        - 203.0.113.0/24
+        - 224.0.0.0/4
+        - 240.0.0.0/4
+    ports:
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443
+  # Public IPv6 Web only.  ULA/private, link-local, loopback, multicast,
+  # and documentation ranges stay excluded when the CNI supports IPv6.
+  - to:
+    - ipBlock:
+        cidr: ::/0
+        except:
+        - ::/128
+        - ::1/128
+        - fc00::/7
+        - fe80::/10
+        - ff00::/8
+        - 2001:db8::/32
+    ports:
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 443

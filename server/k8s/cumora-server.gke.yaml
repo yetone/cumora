@@ -58,6 +58,11 @@ rules:
 - apiGroups: [""]
   resources: ["persistentvolumeclaims"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# The orchestrator reads the pre-deployed agent NetworkPolicies before it
+# creates or reuses a Pod. It never grants itself policy mutation rights.
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
+  verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -142,6 +147,13 @@ spec:
         # sure the Role above is bound in THAT namespace too.
         - name: CUMORA_AGENT_NAMESPACE
           value: "default"
+        # Namespace containing the trusted server Pods selected by the agent
+        # NetworkPolicy. Keep explicit when agents move to a dedicated ns.
+        - name: CUMORA_AGENT_SERVER_NAMESPACE
+          value: "default"
+        # Pre-deploy server/k8s/cumora-agent-network-policy.yaml in this
+        # namespace. The orchestrator checks its v1 objects and fails closed;
+        # it does not apply policies or infer URL-specific exceptions.
         # Image for agent-computer pods. Must be pushed to a registry
         # reachable from the cluster (and pull-secret-able if private).
         - name: CUMORA_AGENT_COMPUTER_IMAGE
@@ -152,9 +164,11 @@ spec:
         # spec. Comma-separated. Must exist in CUMORA_AGENT_NAMESPACE.
         - name: CUMORA_AGENT_PULL_SECRETS
           value: "quay-pull"
-        # Optional: pin agent pods to a specific node pool / GKE
-        # Workload Identity SA via CUMORA_AGENT_SERVICE_ACCOUNT
-        # (defaults to namespace `default` SA when unset).
+        # Optional: pin agent Pods to a specific ServiceAccount identity via
+        # CUMORA_AGENT_SERVICE_ACCOUNT. Agent Pod token automount stays off;
+        # that only suppresses the projected Kubernetes token. GCP Workload
+        # Identity/metadata credentials remain a separate runtime/CNI/operator
+        # policy decision.
         # Startup waits for the schema gate's bounded DB retry budget. Liveness
         # only checks the process; readiness checks DB reachability and keeps a
         # booting or degraded pod out of service without killing it.

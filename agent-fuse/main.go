@@ -1,7 +1,12 @@
 // cumora-fuse — a FUSE driver that maps the agent's slice of the
 // `agent_workspace` table to a real filesystem at the mount point.
 //
-//	cumora-fuse "$CUMORA_AGENT_RUNTIME_URL" "$CUMORA_AGENT_RUNTIME_TOKEN" /workspace
+//	cumora-fuse \
+//	  --runtime-base-url "$CUMORA_AGENT_RUNTIME_URL" \
+//	  --mount-point /workspace \
+//	  --token-file /run/cumora/fuse-token \
+//	  --ready-fd 4 --lifetime-fd 5 \
+//	  --log-file /tmp/cumora-fuse.log
 //
 // Instead of connecting to Postgres directly, the FUSE driver issues
 // HTTP requests to the cumora server's `/runtime/fs/*` endpoints.
@@ -494,18 +499,41 @@ func joinRel(parent, name string) string {
 // ─── main ──────────────────────────────────────────────────────────
 
 func main() {
-	if len(os.Args) != 4 {
-		fmt.Fprintln(os.Stderr, "usage: cumora-fuse <runtime-base-url> <bearer-token> <mount-point>")
+	cfg, err := parseRuntimeConfig(os.Args[1:])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "cumora-fuse: %v\n", err)
 		os.Exit(2)
 	}
-	baseURL := os.Args[1]
-	token := os.Args[2]
-	mountPoint := os.Args[3]
 
-	w := newWs(baseURL, token)
+	var fuseLogFile *os.File
+	if cfg.logFile != "" {
+		fuseLogFile, err = openSecureLogFile(cfg.logFile)
+		if err != nil {
+			log.Fatalf("open FUSE log: %v", err)
+		}
+		defer fuseLogFile.Close()
+		log.SetOutput(fuseLogFile)
+	}
+
+	token, err := readRootOnlyToken(cfg.tokenFile)
+	if err != nil {
+		log.Fatalf("read FUSE token: %v", err)
+	}
+	readyFD, lifetimeFD, err := prepareNotifierFDs(cfg.readyFD, cfg.lifetimeFD)
+	if err != nil {
+		log.Fatalf("prepare readiness/lifetime FDs: %v", err)
+	}
+	// Keep the lifetime writer open until this process exits. The bootstrap
+	// owns the reader and uses EOF as an unambiguous process-lifetime signal;
+	// CloseOnExec is set by prepareNotifierFDs so a fusermount helper cannot
+	// accidentally keep that pipe open.
+	defer lifetimeFD.Close()
+
+	parentPID := os.Getppid()
+	w := newWs(cfg.baseURL, token)
 	// Probe once so we fail fast if the URL is wrong.
 	if _, errno := w.stat(""); errno != 0 {
-		log.Fatalf("[cumora-fuse] sanity-stat failed: errno=%d (is %s reachable?)", errno, baseURL)
+		log.Fatalf("[cumora-fuse] sanity-stat failed: errno=%d (is %s reachable?)", errno, cfg.baseURL)
 	}
 
 	root := &dirNode{w: w, relPath: ""}
@@ -514,21 +542,30 @@ func main() {
 		MountOptions: fuse.MountOptions{
 			Name:          "cumora-workspace",
 			FsName:        "cumora-workspace",
-			AllowOther:    false,
+			AllowOther:    true,
+			Options:       []string{"default_permissions"},
 			DisableXAttrs: true,
 			Debug:         os.Getenv("CUMORA_FUSE_DEBUG") == "1",
 			DirectMount:   false,
 		},
+		UID:             modelUID,
+		GID:             modelGID,
 		EntryTimeout:    durptr(0),
 		AttrTimeout:     durptr(0),
 		NegativeTimeout: durptr(0),
 	}
 
-	srv, err := fs.Mount(mountPoint, root, opts)
+	srv, err := fs.Mount(cfg.mountPoint, root, opts)
 	if err != nil {
-		log.Fatalf("[cumora-fuse] mount %q: %v", mountPoint, err)
+		log.Fatalf("[cumora-fuse] mount %q: %v", cfg.mountPoint, err)
 	}
-	log.Printf("[cumora-fuse] mounted at %s (backend %s)", mountPoint, baseURL)
+	if err := demoteAfterMount(parentPID); err != nil {
+		log.Fatalf("[cumora-fuse] privilege drop failed after mount: %v", err)
+	}
+	if err := writeReadyMarker(readyFD); err != nil {
+		log.Fatalf("[cumora-fuse] readiness marker failed: %v", err)
+	}
+	log.Printf("[cumora-fuse] mounted at %s (backend %s)", cfg.mountPoint, cfg.baseURL)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT)
@@ -539,14 +576,18 @@ func main() {
 		// Unmount() ends up blocking on a stuck in-flight request.
 		// go-fuse's Wait() is documented to return after Unmount, but
 		// in practice we've seen it stall waiting on the IO loop. The
-		// kernel mount goes away the moment Unmount returns; once it
-		// does there's nothing useful left to do, so just leave.
+		// A successful Unmount removes the kernel mount. After a demoted
+		// daemon, EPERM is possible; container namespace teardown remains
+		// responsible for reclaiming the mount in that case.
 		time.AfterFunc(3*time.Second, func() {
-			log.Printf("[cumora-fuse] grace period elapsed, exit 0")
+			log.Printf("[cumora-fuse] grace period elapsed; exiting; container namespace teardown is required")
 			os.Exit(0)
 		})
 		if err := srv.Unmount(); err != nil {
-			log.Printf("[cumora-fuse] unmount error: %v", err)
+			// After the daemon has dropped CAP_SYS_ADMIN, EPERM is expected
+			// on the container stop path. The parent/container teardown owns
+			// final mount-namespace cleanup; do not claim that unmount worked.
+			log.Printf("[cumora-fuse] unmount error (namespace teardown may be required): %v", err)
 		}
 	}()
 

@@ -1,13 +1,10 @@
 # cumora-agent-computer — the per-agent pod image.
 #
-# Inside the pod two processes run:
-#   1. /usr/local/bin/cumora-fuse — mounts the agent's slice of
-#      `agent_workspace` from Postgres at /workspace, via FUSE. The
-#      agent's persona dir, memory, skills, scratch — all on the FS,
-#      backed by DB rows.
-#   2. node /app/agent-computer.cjs — the agent loop. Connects to the
-#      cumora server's /runtime/wake-stream over SSE, processes wakes,
-#      idle-times-out and exits cleanly when there's no work.
+# The root bootstrap is PID 1 only for the short, trusted mount setup. It
+# starts cumora-fuse with a token file and dedicated READY/lifetime FDs, then
+# replaces itself with a capless, no-new-privileges model supervisor. The
+# supervisor owns the browser and Node process tree; FUSE remains a separate
+# UID and is observed through its lifetime FD and /proc/mountinfo.
 #
 # Build (from repo root, AFTER running build-agent-bundle.mjs):
 #   docker build \
@@ -58,7 +55,7 @@ FROM node:20-bookworm-slim
 #   Without these, OpenCLI's DOM snapshots come back with tofu boxes
 #   and the LLM can't tell what's on the page.
 # unzip — for unpacking the OpenCLI browser-bridge extension at build time
-# procps — for pgrep used by the entrypoint heartbeat
+# procps — for pgrep used by the supervisor's child-tree shutdown
 RUN apt-get update \
   && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
        tini \
@@ -81,8 +78,29 @@ RUN apt-get update \
        fonts-noto-cjk \
        fonts-noto-color-emoji \
        unzip \
+       passwd \
+       util-linux \
        procps \
   && rm -rf /var/lib/apt/lists/*
+
+# The runtime intentionally uses numeric identities at the trust boundary.
+# Keep real passwd/group/home entries in the image: OpenCLI resolves $HOME
+# through libc and otherwise tries to create /.opencli after setpriv.
+RUN groupadd --gid 65532 cumora-agent \
+  && useradd --uid 65532 --gid 65532 --home-dir /home/cumora-agent \
+       --create-home --shell /usr/sbin/nologin cumora-agent \
+  && groupadd --gid 65533 cumora-fuse \
+  && useradd --uid 65533 --gid 65533 --home-dir /home/cumora-fuse \
+       --create-home --shell /usr/sbin/nologin cumora-fuse \
+  && install -d -o 65532 -g 65532 -m 0700 \
+       /home/cumora-agent/.opencli \
+       /home/cumora-agent/.cache \
+       /home/cumora-agent/.config \
+       /opt/chrome-profile \
+       /run/user/65532 \
+  && chmod 0700 /home/cumora-agent /home/cumora-fuse \
+  && install -d -o 0 -g 0 -m 0755 /workspace \
+  && install -d -o 0 -g 0 -m 0700 /run/cumora
 
 # ─── uv: Astral's Rust-built Python package/project manager ───────────
 # Bundled because skill packages and many agent scripts assume `uv` for
@@ -142,9 +160,11 @@ COPY server/docker/agent-computer-cumora.sh /usr/local/bin/cumora
 COPY server/docker/agent-computer-cumora-web.sh /usr/local/bin/cumora-web
 RUN chmod +x /usr/local/bin/cumora /usr/local/bin/cumora-web /usr/local/bin/cumora-fuse
 
-# Entrypoint: mount FUSE first, then exec the agent loop.
+# Legacy path retained as the already-demoted supervisor. It rejects direct
+# root invocation; only the bootstrap may invoke it after setpriv.
 COPY server/docker/agent-computer-entrypoint.sh /usr/local/bin/agent-entrypoint
-RUN chmod +x /usr/local/bin/agent-entrypoint
+COPY server/docker/agent-computer-bootstrap.sh /usr/local/bin/cumora-agent-bootstrap
+RUN chmod +x /usr/local/bin/agent-entrypoint /usr/local/bin/cumora-agent-bootstrap
 
 # Env contract — orchestrator injects all of these at pod-spawn time:
 #   CUMORA_AGENT_ID            which agent to wake
@@ -156,8 +176,16 @@ RUN chmod +x /usr/local/bin/agent-entrypoint
 ENV CUMORA_RUNTIME_CLIENT=http \
     NODE_ENV=production \
     DISPLAY=:99 \
+    HOME=/home/cumora-agent \
+    USER=cumora-agent \
+    LOGNAME=cumora-agent \
+    XDG_CONFIG_HOME=/home/cumora-agent/.config \
+    XDG_CACHE_HOME=/home/cumora-agent/.cache \
+    XDG_RUNTIME_DIR=/run/user/65532 \
     OPENCLI_EXTENSION_DIR=/opt/opencli-extension \
     CHROME_PROFILE_DIR=/opt/chrome-profile \
     CHROMIUM_BIN=/usr/bin/chromium
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/agent-entrypoint"]
+# Do not add an outer root tini. The bootstrap is the trusted PID 1 and
+# execs setpriv -> tini after FUSE has reported READY.
+ENTRYPOINT ["/usr/local/bin/cumora-agent-bootstrap"]

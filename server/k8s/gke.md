@@ -205,13 +205,102 @@ CPU, memory, API-server, and provider concurrency budget.
 > `ClusterRoleBinding` for `nodes: [get, list]` is added, only
 > `AGENT_POD_ADMISSION_MAX` actually bounds admission.
 
-On **GKE Autopilot**: the plugin DaemonSet works but Autopilot may
-reject `securityContext.capabilities.add: [SYS_ADMIN]` depending on
-admission policy. If so, switch to **GKE Standard**, OR fall back
-to `privileged: true` (Autopilot allows it for explicit workloads
-with extra annotations — read the Autopilot security docs).
+On **GKE Autopilot**: the agent Pod needs the checked-in FUSE capability
+envelope and `AppArmor: Unconfined` for the mount phase. If Autopilot rejects
+that envelope, use a GKE **Standard** node pool or stop the agent deployment;
+do not silently change the Pod to `privileged: true` or claim that a restricted
+profile preserves the FUSE contract.
 
-## 6. Apply the manifest
+## 6. Agent policy and runtime security prerequisites
+
+The agent image and Pod use a short trusted bootstrap phase. The Pod starts
+`/usr/local/bin/cumora-agent-bootstrap` as UID/GID `0:0` with the exact
+bootstrap capability set `SYS_ADMIN, SETUID, SETGID, SETPCAP, KILL`; its
+container and Pod templates drop `ALL`, use `RuntimeDefault` seccomp, disable
+service-account-token mounting, and set `fsGroup: 65532`. The bootstrap must
+mount FUSE, verify readiness, then exec the demoted supervisor. Long-lived
+Node, browser, Xvfb, OpenCLI, and PID 1 processes must be UID/GID `65532:65532`
+with empty capability sets and `NoNewPrivs=1`; `allowPrivilegeEscalation: false`
+and `SYS_ADMIN` in the initial template do not prove that post-bootstrap state.
+AppArmor remains `Unconfined` because GKE's default profile blocks the FUSE
+mount syscall. This is a FUSE prerequisite, not a claim that the Pod is
+restricted during the mount phase.
+
+Pre-deploy the policy bundle in the exact namespace configured by
+`CUMORA_AGENT_NAMESPACE` and before waking any managed agent:
+
+```sh
+AGENT_NS=default                 # must equal the server Deployment env
+kubectl apply -n "$AGENT_NS" -f server/k8s/cumora-agent-network-policy.yaml
+kubectl get networkpolicy -n "$AGENT_NS" \
+  cumora-agent-default-deny cumora-agent-egress
+```
+
+The server Role only has `get/list/watch` on `networkpolicies`; the agent Pod
+does not receive the projected Kubernetes API token and cannot mutate policy.
+That setting does not by itself suppress GCP Workload Identity or metadata
+credentials; those require separate runtime, CNI, and operator controls. The
+orchestrator checks the actual objects, labels, selectors, policy version,
+DNS/server ports, and public Web
+CIDR exclusions before creating or reusing a Pod. Missing or malformed policy
+objects fail closed. Both policies select only `app=cumora-agent`; the
+default-deny object therefore leaves server, Redis, and other namespace Pods
+outside its scope. The bundle permits DNS UDP/TCP 53, the trusted
+`kubernetes.io/metadata.name` namespace plus `app=cumora-server` on TCP 5181,
+and public TCP 80/443. Set `CUMORA_AGENT_SERVER_NAMESPACE` to the namespace
+whose `app=cumora-server` Pods are trusted, and update the server namespace
+selector in the policy bundle when that namespace differs from the agent
+namespace. IPv4 RFC1918, CGNAT, loopback, link-local, metadata,
+documentation, multicast, and reserved ranges are excluded. IPv6 excludes
+loopback, ULA/private, link-local, multicast, and documentation ranges.
+There is no automatic exception for `OPENAI_BASE_URL`, model URLs, or other
+per-user configuration; an operator exception must be an explicit reviewed
+NetworkPolicy change.
+
+NetworkPolicy objects are additive, enforcement is asynchronous, and a cluster
+without a NetworkPolicy-capable CNI ignores these manifests. Before enabling
+agents, verify the CNI's NetworkPolicy support and test from an ephemeral
+agent-like Pod in this namespace: DNS works, the server service on 5181 works,
+public HTTPS works, and RFC1918/metadata destinations fail. `kubectl apply`
+success alone is not enforcement evidence. This repository has no claim that
+OrbStack or this workstation has verified production CNI behavior.
+
+## 7. Existing Pods and Chrome PVC migration
+
+The orchestrator reuses a Running/Pending Pod only after parsing its live API
+object and matching the security profile label, exact bootstrap command and
+image, root bootstrap identity, capability set, seccomp/AppArmor, token
+automount setting, and `fsGroup`. A legacy or unknown Pod is deleted and
+confirmed absent with a bounded wait before a replacement is created; a timeout
+fails closed. It preserves the existing namespace, placement, tenant, capacity
+checks, and Chrome PVC. It never starts a second Pod with the same agent name
+while the old immutable object remains.
+
+The UID change leaves existing Chrome PVC data in place. Kubernetes storage
+drivers may apply `fsGroup` at mount time, but hostPath/local drivers often do
+not. For each existing PVC, first verify in the configured agent namespace
+that the mounted profile is readable and writable by UID/GID `65532:65532` and
+that Chromium can open the old profile. If the driver does not honor fsGroup,
+use a reviewed, offline operator migration that preserves the PVC and backup;
+do not recursively `chown` attacker-writable profile data in the bootstrap,
+delete the PVC, clear cookies, or move it to another namespace. A failed
+permission check must stop the rollout until the storage migration is done.
+
+For a manual upgrade, inspect one old Pod and PVC first, delete only that Pod,
+wait for its name to disappear, then let the next wake create the new template:
+
+```sh
+kubectl get pod -n "$AGENT_NS" agent-<id> -o yaml
+kubectl get pvc -n "$AGENT_NS" agent-<id>-chrome -o yaml
+kubectl delete pod -n "$AGENT_NS" agent-<id> --wait=true --timeout=30s
+kubectl wait -n "$AGENT_NS" --for=delete pod/agent-<id> --timeout=60s
+```
+
+Do not run a production-wide cleanup as part of this change. Roll out one
+agent, verify FUSE/browser/runtime and PVC behavior, then proceed using the
+normal capacity and placement controls.
+
+## 8. Apply the manifest
 
 After replacing `REPLACE-*` placeholders in
 `server/k8s/cumora-server.gke.yaml`:
@@ -240,7 +329,7 @@ Deploy workflow reapplies the same probe contract during its Pod-template
 patch, so a manual `kubectl apply` does not require a follow-up imperative
 probe patch.
 
-## 7. Verify end-to-end
+## 9. Verify end-to-end
 
 ```sh
 # Server pods running, both 2/2 containers ready

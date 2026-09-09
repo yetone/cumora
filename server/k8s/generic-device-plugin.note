@@ -26,8 +26,12 @@
 #   # Should show `devic.es/fuse: 800` under Allocatable.
 #
 # The agent Pod manifest (orchestrator.ts) requests this resource
-# via `resources.limits["devic.es/fuse"]: 1` and adds CAP_SYS_ADMIN.
-# No `privileged: true`. Runtime admission still applies the lower
+# via `resources.limits["devic.es/fuse"]: 1` and starts the trusted
+# bootstrap as root with the exact temporary capabilities
+# `SYS_ADMIN, SETUID, SETGID, SETPCAP, KILL`; it also drops `ALL` and
+# sets `RuntimeDefault` seccomp. The bootstrap must then exec the
+# capability-free, `NoNewPrivs=1` UID/GID 65532 supervisor. No
+# `privileged: true`. Runtime admission still applies the lower
 # app-level AGENT_POD_ADMISSION_MAX cap (default 40), so this device
 # count is not the effective production pod ceiling.
 #

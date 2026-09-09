@@ -18,20 +18,34 @@
  *
  * Run: node --import tsx --test server/src/__tests__/agents-orchestrator.test.ts
  */
-import { test, after } from 'node:test'
 import assert from 'node:assert/strict'
-import { pool } from '../db/pool.js'
+import { readFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+import { after, test } from 'node:test'
+import { fileURLToPath } from 'node:url'
+import { load, loadAll } from 'js-yaml'
 import {
-  parsePodHealth,
-  stuckPendingReason,
-  safeName,
-  isRetryableKubectlError,
-  planIdlePvcGc,
   _testing,
+  isRetryableKubectlError,
   type KubectlResult,
+  parsePodHealth,
+  planIdlePvcGc,
+  safeName,
+  stuckPendingReason,
+  waitForPodDeletion,
 } from '../agents/runtime/orchestrator.js'
+import { pool } from '../db/pool.js'
 
-const { yamlQuote, dnsLabelValue, podManifest } = _testing
+const {
+  yamlQuote,
+  dnsLabelValue,
+  podManifest,
+  isSecureManagedPod,
+  isRequiredAgentNetworkPolicy,
+} = _testing
+
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../../..')
+const readRepo = (path: string): Promise<string> => readFile(resolve(repoRoot, path), 'utf8')
 
 after(async () => {
   // orchestrator.ts transitively imports inproc-client.ts → redis.ts
@@ -460,6 +474,254 @@ test('podManifest: well-formed inputs produce a parseable manifest with the slug
   // emptyDir escape hatch tested separately.
   assert.match(m, /volumeMounts:\n\s+- name: chrome-profile\n\s+mountPath: \/opt\/chrome-profile/)
   assert.match(m, /volumes:\n\s+- name: chrome-profile\n\s+persistentVolumeClaim:\n\s+claimName: "agent-iris-0c97-chrome"/)
+})
+
+test('podManifest: parsed API shape contains the complete bootstrap security contract', () => {
+  const image = 'quay.io/img:security-test'
+  const manifest = podManifest({
+    agentId: 'iris-0c97',
+    token: 'jwt.token.part',
+    image,
+    serverUrl: 'http://server/runtime',
+    openaiKey: 'sk-test',
+    openaiBaseUrl: '',
+    idleMs: 600_000,
+    noWorkMs: 90_000,
+  })
+  const pod = load(manifest) as unknown
+  assert.equal(isSecureManagedPod(pod, image, 'iris-0c97'), true)
+  const root = pod as {
+    metadata?: { labels?: Record<string, string> }
+    spec?: {
+      automountServiceAccountToken?: boolean
+      securityContext?: {
+        runAsUser?: number
+        runAsGroup?: number
+        runAsNonRoot?: boolean
+        fsGroup?: number
+        seccompProfile?: { type?: string }
+      }
+      containers?: Array<{
+        command?: string[]
+        securityContext?: {
+          runAsUser?: number
+          runAsGroup?: number
+          capabilities?: { drop?: string[]; add?: string[] }
+        }
+      }>
+    }
+  }
+  assert.equal(root.metadata?.labels?.['cumora.dev/security-profile'], 'fuse-demoted-v1')
+  assert.equal(root.spec?.automountServiceAccountToken, false)
+  assert.equal(root.spec?.securityContext?.runAsUser, 0)
+  assert.equal(root.spec?.securityContext?.runAsGroup, 0)
+  assert.equal(root.spec?.securityContext?.fsGroup, 65532)
+  assert.equal(root.spec?.securityContext?.seccompProfile?.type, 'RuntimeDefault')
+  const security = root.spec?.containers?.[0]
+  assert.deepEqual(security?.command, ['/usr/local/bin/cumora-agent-bootstrap'])
+  assert.equal(security?.securityContext?.runAsUser, 0)
+  assert.equal(security?.securityContext?.runAsGroup, 0)
+  assert.deepEqual(security?.securityContext?.capabilities?.drop, ['ALL'])
+  assert.deepEqual(
+    [...(security?.securityContext?.capabilities?.add ?? [])].sort(),
+    ['KILL', 'SETGID', 'SETPCAP', 'SETUID', 'SYS_ADMIN'],
+  )
+})
+
+test('isSecureManagedPod: stale label and legacy command cannot be reused', () => {
+  const image = 'quay.io/img:security-test'
+  const pod = load(podManifest({
+    agentId: 'iris-0c97',
+    token: 'jwt',
+    image,
+    serverUrl: 'http://server/runtime',
+    openaiKey: 'sk-test',
+    openaiBaseUrl: '',
+    idleMs: 600_000,
+    noWorkMs: 90_000,
+  })) as Record<string, unknown>
+  const spec = pod.spec as Record<string, unknown>
+  const container = (spec.containers as Array<Record<string, unknown>>)[0]
+  container.command = ['/usr/local/bin/agent-computer-entrypoint.sh']
+  assert.equal(isSecureManagedPod(pod, image, 'iris-0c97'), false)
+})
+
+test('isSecureManagedPod: namespace/process/mount hooks cannot shadow the trusted bootstrap', () => {
+  const image = 'quay.io/img:security-test'
+  const secure = load(podManifest({
+    agentId: 'iris-0c97',
+    token: 'jwt',
+    image,
+    serverUrl: 'http://server/runtime',
+    openaiKey: 'sk-test',
+    openaiBaseUrl: '',
+    idleMs: 600_000,
+    noWorkMs: 90_000,
+  })) as Record<string, unknown>
+  const reject = (label: string, mutate: (pod: Record<string, unknown>) => void) => {
+    const candidate = structuredClone(secure) as Record<string, unknown>
+    mutate(candidate)
+    assert.equal(isSecureManagedPod(candidate, image, 'iris-0c97'), false, label)
+  }
+  const apiDefaulted = structuredClone(secure) as Record<string, unknown>
+  const apiDefaultedSpec = apiDefaulted.spec as Record<string, unknown>
+  for (const field of ['hostPID', 'hostIPC', 'hostNetwork', 'shareProcessNamespace']) delete apiDefaultedSpec[field]
+  assert.equal(isSecureManagedPod(apiDefaulted, image, 'iris-0c97'), true, 'API omission of default-false host fields remains secure')
+  const spec = (pod: Record<string, unknown>) => pod.spec as Record<string, unknown>
+  const container = (pod: Record<string, unknown>) => (spec(pod).containers as Array<Record<string, unknown>>)[0]
+  reject('host PID namespace is rejected', (pod) => { spec(pod).hostPID = true })
+  reject('host IPC namespace is rejected', (pod) => { spec(pod).hostIPC = true })
+  reject('host network namespace is rejected', (pod) => { spec(pod).hostNetwork = true })
+  reject('shared process namespace is rejected', (pod) => { spec(pod).shareProcessNamespace = true })
+  reject('init containers are rejected', (pod) => { spec(pod).initContainers = [{ name: 'shadow' }] })
+  reject('ephemeral containers are rejected', (pod) => { spec(pod).ephemeralContainers = [{ name: 'shadow' }] })
+  reject('container lifecycle hooks are rejected', (pod) => { container(pod).lifecycle = { postStart: { exec: { command: ['sh'] } } } })
+  reject('extra args are rejected', (pod) => { container(pod).args = ['--legacy'] })
+  reject('exec probes are rejected', (pod) => { container(pod).livenessProbe = { exec: { command: ['sh'] } } })
+  reject('extra volume mounts are rejected', (pod) => {
+    const mounts = container(pod).volumeMounts as Array<Record<string, unknown>>
+    mounts.push({ name: 'shadow', mountPath: '/shadow' })
+  })
+  reject('hostPath volumes are rejected', (pod) => {
+    const volume = (spec(pod).volumes as Array<Record<string, unknown>>)[0]
+    delete volume.persistentVolumeClaim
+    volume.hostPath = { path: '/' }
+  })
+  reject('a PVC for another agent is rejected', (pod) => {
+    const volume = (spec(pod).volumes as Array<Record<string, unknown>>)[0]
+    const pvc = volume.persistentVolumeClaim as Record<string, unknown>
+    pvc.claimName = 'agent-other-chrome'
+  })
+})
+
+test('secure reuse, legacy/unknown replacement, and bounded deletion are fail-closed', async () => {
+  const image = 'quay.io/img:security-test'
+  const secure = load(podManifest({
+    agentId: 'iris-0c97',
+    token: 'jwt',
+    image,
+    serverUrl: 'http://server/runtime',
+    openaiKey: 'sk-test',
+    openaiBaseUrl: '',
+    idleMs: 600_000,
+    noWorkMs: 90_000,
+  })) as Record<string, unknown>
+  assert.equal(isSecureManagedPod(secure, image, 'iris-0c97'), true, 'secure live object is reusable')
+  assert.equal(isSecureManagedPod({ metadata: { labels: { app: 'cumora-agent' } } }, image, 'iris-0c97'), false, 'unknown object is not reusable')
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-egress', null, 'default'), false, 'missing policy fails closed')
+
+  const calls: string[][] = []
+  let getCount = 0
+  const eventuallyGone = await waitForPodDeletion('iris-0c97', async (args) => {
+    calls.push(args)
+    if (args[0] === 'delete') return { code: 0, out: '', err: '', timedOut: false }
+    getCount++
+    return getCount === 1
+      ? { code: 0, out: JSON.stringify(secure), err: '', timedOut: false }
+      : { code: 0, out: '', err: '', timedOut: false }
+  }, { deadlineMs: 100, pollMs: 0, sleep: async () => {} })
+  assert.deepEqual(eventuallyGone, { ok: true })
+  assert.equal(calls[0][0], 'delete')
+  assert.ok(calls.filter((args) => args[0] === 'get').length >= 2, 'waits for the old name to disappear')
+
+  const stuck = await waitForPodDeletion('iris-0c97', async (args) => (
+    args[0] === 'delete'
+      ? { code: 0, out: '', err: '', timedOut: false }
+      : { code: 0, out: JSON.stringify(secure), err: '', timedOut: false }
+  ), { deadlineMs: 0, pollMs: 0, sleep: async () => {} })
+  assert.equal(stuck.ok, false, 'a Pod that never disappears blocks replacement')
+
+  const authFailure = await waitForPodDeletion('iris-0c97', async (args) => (
+    args[0] === 'delete'
+      ? { code: 0, out: '', err: '', timedOut: false }
+      : { code: 1, out: '', err: 'exec: gke-gcloud-auth-plugin: not found', timedOut: false }
+  ), { deadlineMs: 100, pollMs: 0, sleep: async () => {} })
+  assert.equal(authFailure.ok, false, 'auth/plugin failure is not resource absence')
+})
+
+test('checked-in NetworkPolicies parse and match the orchestrator contract', async () => {
+  const docs = loadAll(await readRepo('server/k8s/cumora-agent-network-policy.yaml')) as unknown[]
+  assert.equal(docs.length, 2, 'policy bundle must contain only scoped deny and egress policies')
+  const byName = new Map<string, unknown>()
+  for (const doc of docs) {
+    const metadata = (doc as { metadata?: { name?: unknown } } | null)?.metadata
+    if (typeof metadata?.name === 'string') byName.set(metadata.name, doc)
+  }
+  for (const name of ['cumora-agent-default-deny', 'cumora-agent-egress']) {
+    assert.equal(byName.has(name), true, `${name} must be present in the checked-in policy bundle`)
+    assert.equal(isRequiredAgentNetworkPolicy(name, byName.get(name), 'default'), true, `${name} must satisfy v1`)
+  }
+  const deny = byName.get('cumora-agent-default-deny') as Record<string, unknown>
+  const denySelector = ((deny.spec as Record<string, unknown>).podSelector as Record<string, unknown>).matchLabels as Record<string, string>
+  const selected = (labels: Record<string, string>) => Object.entries(denySelector).every(([key, value]) => labels[key] === value)
+  assert.equal(selected({ app: 'cumora-agent' }), true)
+  assert.equal(selected({ app: 'cumora-server' }), false, 'default namespace server is not selected')
+  assert.equal(selected({ app: 'redis' }), false, 'default namespace Redis is not selected')
+  assert.equal(selected({ app: 'other-workload' }), false, 'other workloads are not selected')
+  const broad = structuredClone(deny)
+  ;(broad.spec as Record<string, unknown>).podSelector = {}
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-default-deny', broad, 'default'), false, 'namespace-wide selector is rejected')
+  const extraLabel = structuredClone(deny)
+  const extraSelector = ((extraLabel.spec as Record<string, unknown>).podSelector as Record<string, unknown>).matchLabels as Record<string, string>
+  extraSelector.team = 'agents'
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-default-deny', extraLabel, 'default'), false, 'extra selector labels are rejected')
+  const extraExpression = structuredClone(deny)
+  const expressionSelector = (extraExpression.spec as Record<string, unknown>).podSelector as Record<string, unknown>
+  expressionSelector.matchExpressions = [{ key: 'team', operator: 'Exists' }]
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-default-deny', extraExpression, 'default'), false, 'selector expressions are rejected')
+  const egress = byName.get('cumora-agent-egress') as Record<string, unknown>
+  const egressSpec = egress.spec as Record<string, unknown>
+  assert.deepEqual((egressSpec.podSelector as Record<string, unknown>).matchLabels, { app: 'cumora-agent' })
+  const egressRules = egressSpec.egress as Array<Record<string, unknown>>
+  const publicIpv4 = egressRules[2].to as Array<Record<string, unknown>>
+  const block = publicIpv4[0].ipBlock as { except?: string[] }
+  assert.ok(block.except?.includes('169.254.0.0/16'), 'metadata/link-local range must be excluded')
+  assert.ok(block.except?.includes('100.64.0.0/10'), 'CGNAT range must be excluded')
+  const tampered = structuredClone(egress)
+  const tamperedRules = (tampered.spec as Record<string, unknown>).egress as Array<Record<string, unknown>>
+  const tamperedBlock = ((tamperedRules[2].to as Array<Record<string, unknown>>)[0].ipBlock) as { except?: string[] }
+  tamperedBlock.except = tamperedBlock.except?.filter((cidr) => cidr !== '100.64.0.0/10')
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-egress', tampered, 'default'), false, 'a broad private-range exception is rejected')
+
+  const wideDns = structuredClone(egress)
+  const wideDnsRules = (wideDns.spec as Record<string, unknown>).egress as Array<Record<string, unknown>>
+  const wideDnsPorts = wideDnsRules[0].ports as Array<Record<string, unknown>>
+  wideDnsPorts[0].endPort = 65535
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-egress', wideDns, 'default'), false, 'DNS port ranges are rejected')
+
+  const wideServer = structuredClone(egress)
+  const wideServerRules = (wideServer.spec as Record<string, unknown>).egress as Array<Record<string, unknown>>
+  const wideServerPorts = wideServerRules[1].ports as Array<Record<string, unknown>>
+  wideServerPorts[0].endPort = 65535
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-egress', wideServer, 'default'), false, 'server port ranges are rejected')
+
+  const wideWeb = structuredClone(egress)
+  const wideWebRules = (wideWeb.spec as Record<string, unknown>).egress as Array<Record<string, unknown>>
+  const wideWebPorts = wideWebRules[2].ports as Array<Record<string, unknown>>
+  wideWebPorts[0].endPort = 65535
+  assert.equal(isRequiredAgentNetworkPolicy('cumora-agent-egress', wideWeb, 'default'), false, 'public Web port ranges are rejected')
+})
+
+test('server RBAC manifests grant policy reads only and disable agent SA tokens', async () => {
+  for (const path of ['server/k8s/cumora-server.gke.yaml', 'server/k8s/cumora-server.orbstack.yaml']) {
+    const docs = loadAll(await readRepo(path)) as unknown[]
+    const role = docs.find((doc) => {
+      const object = doc as { kind?: unknown; metadata?: { name?: unknown } } | null
+      return object?.kind === 'Role' && object.metadata?.name === 'cumora-server-agent-pods'
+    }) as { rules?: Array<{ apiGroups?: string[]; resources?: string[]; verbs?: string[] }> } | undefined
+    assert.ok(role, `${path} must define the server Role`)
+    const policyRule = role.rules?.find((rule) => rule.resources?.includes('networkpolicies'))
+    assert.deepEqual(policyRule?.apiGroups, ['networking.k8s.io'], `${path} policy API group`)
+    assert.deepEqual(policyRule?.verbs, ['get', 'list', 'watch'], `${path} policy verbs are read-only`)
+    const deployment = docs.find((doc) => (doc as { kind?: unknown } | null)?.kind === 'Deployment') as {
+      spec?: { template?: { spec?: { containers?: Array<{ name?: string; automountServiceAccountToken?: boolean }> } } }
+    } | undefined
+    const server = deployment?.spec?.template?.spec?.containers?.find((container) => container.name === 'server')
+    assert.ok(server, `${path} must contain the server container`)
+    // Agent token mounting is controlled by the generated agent Pod, not the
+    // server container; ensure the checked-in Role has no policy mutation path.
+    assert.equal(policyRule?.verbs?.includes('create'), false)
+  }
 })
 
 test('podManifest: image with embedded quote is escaped (CUMORA_AGENT_COMPUTER_IMAGE env is user-set)', () => {

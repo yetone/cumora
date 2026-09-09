@@ -1,8 +1,8 @@
 # PR checks — fast feedback on every pull request to main.
 #
-# Intentionally cheap: just tsc on both projects, plus `npm test` if a
-# test script exists. No Docker, no GCP auth, no secrets — these run
-# safely on forks too.
+# The ordinary checks stay cheap and require no cloud credentials. Boundary
+# changes additionally run the real Linux agent image smoke locally, without
+# pushing an image or contacting a provider.
 
 name: PR
 
@@ -17,6 +17,72 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  agent-boundary-changes:
+    name: Detect agent boundary changes
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      boundary: ${{ steps.filter.outputs.boundary }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            boundary:
+              - 'agent-fuse/**'
+              - 'server/docker/agent-computer.Dockerfile'
+              - 'server/docker/agent-computer.Dockerfile.dockerignore'
+              - 'server/docker/agent-computer-bootstrap.sh'
+              - 'server/docker/agent-computer-entrypoint.sh'
+              - 'server/scripts/agent-boundary-smoke.mjs'
+              - 'server/scripts/fixtures/**'
+              - 'server/src/agents/runtime/orchestrator.ts'
+              - 'server/src/__tests__/agent-computer-image.test.ts'
+              - 'server/src/__tests__/agents-orchestrator.test.ts'
+              - 'server/k8s/cumora-agent-network-policy.yaml'
+              - 'server/k8s/cumora-server.gke.yaml'
+              - 'server/k8s/cumora-server.orbstack.yaml'
+              - 'server/k8s/gke.md'
+              - '.github/workflows/pr.yml'
+              - '.github/workflows/build.yml'
+              - '.github/workflows/agent-fuse.yml'
+
+  agent-boundary-smoke:
+    name: Real agent boundary smoke (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [agent-boundary-changes]
+    if: needs.agent-boundary-changes.outputs.boundary == 'true'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - name: Bundle agent CLI
+        run: node server/src/scripts/build-agent-bundle.mjs
+      - name: Require Docker FUSE device
+        run: test -c /dev/fuse
+      - name: Build local Linux agent image
+        env:
+          IMAGE: cumora-agent-boundary-pr:${{ github.run_id }}
+        run: docker build --platform linux/amd64 -f server/docker/agent-computer.Dockerfile -t "$IMAGE" .
+      - name: Run real boundary smoke
+        env:
+          CUMORA_AGENT_BOUNDARY_IMAGE: cumora-agent-boundary-pr:${{ github.run_id }}
+        run: node server/scripts/agent-boundary-smoke.mjs
+      - name: Upload boundary smoke report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-boundary-smoke-pr-${{ github.run_id }}
+          path: /tmp/cumora-agent-boundary-smoke-*/report.json
+          if-no-files-found: ignore
+
   # P0 tripwire: the BIG (brain) model may ONLY do real, heavy tasks. Any
   # ungated big-model selection is a P0 incident. This job runs the static
   # scanner first and fast — no npm install, no deps — so a regression turns
