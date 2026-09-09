@@ -2906,270 +2906,144 @@ interface ZcodeTurnOptions {
   onHopUsage?: (r: EngineHopReport) => void
 }
 
-/** One full bridge lifecycle: spawn → initialize → session/new → optional
- *  model pin (`session/set_config_option`) → session/prompt → resolve on the
- *  prompt response → tear the bridge down. A fresh process per call; this is
- *  the shape classify()/probe()/run() all share. Failures fold into the
- *  result — a missing bridge or a rejected handshake is a failed turn, not a
- *  thrown one. */
-function runZcodeAcpTurn(opts: ZcodeTurnOptions): Promise<EngineRunResult & { text: string }> {
-  return new Promise((resolve) => {
-    const spec = resolveZcodeAcpSpawn(opts.env)
-    const child = spawnEngineChild(spec.command, spec.args, {
-      cwd: opts.cwd,
-      env: opts.env,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: spec.shell,
-    })
-    const abort = bindAbortTermination(child, opts.signal)
-    const onLog = opts.onLog ?? (() => {})
-    let settled = false
-    let reqId = 0
-    let initId: number | null = null
-    let sessionReqId: number | null = null
-    let configReqId: number | null = null
-    let promptId: number | null = null
-    let sessionId: string | null = null
-    let text = ''
-    let usage: EngineUsage | undefined
-    let model: string | null = opts.model ?? null
-    let error: string | null = null
-    let startedAt: number | null = null
-    let buf = ''
-    const stderrTail: string[] = []
-    const req = (method: string, params: Record<string, unknown>): number => {
-      reqId += 1
-      writeStdin(child, JSON.stringify({ jsonrpc: '2.0', id: reqId, method, params }) + '\n')
-      return reqId
-    }
-    const finish = (code: number): void => {
-      if (settled) return
-      settled = true
-      abort.dispose()
-      try { child.stdin?.end() } catch { /* ignore */ }
-      void terminateEngineTree(child).then(() => {
-        resolve({ exitCode: code, error: error ?? undefined, sessionId, usage, model, text })
-      })
-    }
-    const startPrompt = (): void => {
-      startedAt = Date.now()
-      promptId = req('session/prompt', {
-        sessionId,
-        prompt: [{ type: 'text', text: stripLoneSurrogates(opts.prompt) }],
-      })
-    }
-    initId = req('initialize', {
-      protocolVersion: 1,
-      clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-    })
-    child.stdout?.on('data', (b: Buffer) => {
-      buf += b.toString('utf8')
-      let nl: number
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, nl)
-        buf = buf.slice(nl + 1)
-        const t = line.trim()
-        if (!t.startsWith('{')) { const c = cleanLine(line); if (c) onLog(c); continue }
-        let msg: AcpMsg
-        try { msg = JSON.parse(t) as AcpMsg } catch { continue }
-        if (msg.error && msg.id !== undefined) {
-          if (msg.id === initId) { error = `zcode bridge initialize failed: ${String(msg.error.message || '')}`; finish(1); continue }
-          if (msg.id === sessionReqId) { error = `zcode bridge session start failed: ${String(msg.error.message || '')}`; finish(1); continue }
-          if (msg.id === promptId) { error = `zcode turn failed: ${String(msg.error.message || '')}`; finish(1); continue }
-          // A rejected model pin is a preference loss, not a turn failure.
-          if (msg.id === configReqId) {
-            configReqId = null
-            onLog(`[zcode] model pin rejected (${String(msg.error.message || '')}) — continuing on the engine default`)
-            startPrompt()
-            continue
-          }
-        }
-        if (msg.id !== undefined && msg.id === initId && msg.result) {
-          initId = null
-          sessionReqId = req('session/new', { cwd: opts.cwd, mcpServers: [] })
-          continue
-        }
-        if (msg.id !== undefined && msg.id === sessionReqId && msg.result) {
-          sessionReqId = null
-          const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : null
-          if (sid) sessionId = sid
-          if (opts.model && sessionId) {
-            configReqId = req('session/set_config_option', { sessionId, configId: 'model', value: opts.model })
-          } else {
-            startPrompt()
-          }
-          continue
-        }
-        if (msg.id !== undefined && msg.id === configReqId && msg.result) {
-          configReqId = null
-          startPrompt()
-          continue
-        }
-        if (msg.id !== undefined && msg.id === promptId) {
-          usage = extractAcpUsage(msg.result) ?? undefined
-          if (msg.error) error = `zcode turn failed: ${String(msg.error.message || '')}`
-          if (opts.onHopUsage && !error) {
-            try {
-              opts.onHopUsage({
-                model: model ?? 'zcode',
-                usage: usage ?? {},
-                latencyMs: startedAt != null ? Date.now() - startedAt : undefined,
-                hopIndex: 1,
-              })
-            } catch { /* ledger best-effort — never break the stream */ }
-          }
-          finish(msg.error ? 1 : 0)
-          continue
-        }
-        if (msg.method === 'session/update') {
-          const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
-          const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
-          if (kind === 'agent_message_chunk') {
-            const content = u?.content as { text?: unknown } | undefined
-            if (typeof content?.text === 'string') text += content.text
-          } else if (kind === 'tool_call' && typeof u?.title === 'string') {
-            onLog(`[zcode] tool ${u.title}`)
-          }
-        }
-      }
-    })
-    child.stderr?.on('data', (b: Buffer) => {
-      for (const raw of b.toString('utf8').split('\n')) {
-        const l = cleanLine(raw)
-        if (!l) continue
-        pushTail(stderrTail, l)
-        onLog(l)
-      }
-    })
-    child.on('error', (err) => { error = `zcode bridge spawn error: ${err.message}`; finish(1) })
-    child.on('close', (code, sig) => {
-      if (settled) return
-      const stage = initId != null ? 'during initialize'
-        : sessionReqId != null ? 'during session start'
-          : promptId != null ? 'MID-TURN' : 'before the turn'
-      error = `zcode bridge died ${stage} (${sig ? `terminated by ${sig}` : `exit ${code}`})${stderrTail.length ? `: ${salientError(stderrTail.join('\n'))}` : ''}`
-      finish(code ?? (sig ? 128 : 1))
-    })
-  })
+interface ZcodeSessionOptions extends EngineSessionArgs {
+  /** Assistant text chunks, streamed out for one-shot callers (classify/
+   *  probe/run read the turn's reply text; persistent wakes only log it). */
+  onAgentText?: (text: string) => void
+  /** Aborts the session (one-shot turns only; persistent sessions rely on
+   *  stop()). Wired to the platform tree terminator. */
+  signal?: AbortSignal
 }
 
-/** Persistent ZCode session over the zcode-acp-server bridge's stdio.
- *  Handshake: initialize → session/new|load → best-effort model pin →
- *  session/prompt per wake. Mid-turn steer is not in the ACP surface —
- *  steer() is a no-op and the daemon's next-wake coalescing carries the ping
- *  (same contract as GrokSession). */
-class ZcodeSession implements EngineSession {
+/** The bridge's backend rejects an unknown / no-longer-live zcode session with
+ *  this phrasing (its dispatch code documents the literal: "Session is not
+ *  active"). The shared classifier's resume patterns don't match it, so a
+ *  resumed session that dies mid-life maps through this adapter-aware rule to
+ *  the same fresh-retry recovery vocabulary as the other engines. */
+const ZCODE_MISSING_SESSION_RE = /session is not active|no such session|unknown session/i
+
+/** Hook surface the connection exposes upward. The connection owns only wire
+ *  state — turn settlement stays with the session above it. */
+interface AcpRpcConnectionHooks {
+  onLog: (line: string) => void
+  /** Server→client notifications; unrecognized methods are the hook's to ignore. */
+  onNotification: (msg: AcpMsg) => void
+  /** Process death, fired exactly once. In-flight rpc() calls have already
+   *  been rejected when it fires. */
+  onDeath: (exitCode: number, why: string) => void
+  /** session/load fell back to a fresh session/new. */
+  onLoadFallback: (why: string) => void
+}
+
+/**
+ * Wire-level ACP stdio connection for one bridge process: spawn, JSON-RPC
+ * framing, the initialize handshake, session new/load, notification routing,
+ * and death. Deliberately composition (the codebase shares via helpers, not
+ * inheritance): turn settlement and resume classification stay with the
+ * session, which observes death and handshake fallback through the hooks.
+ */
+class AcpRpcConnection {
   private readonly child: ChildProcess
-  private readonly onLog: (line: string) => void
-  private readonly onHopUsage?: (r: EngineHopReport) => void
-  private outBuf = ''
-  private sid: string | null
-  private exited = false
+  private readonly sessionParams: () => Record<string, unknown>
+  private readonly hooks: AcpRpcConnectionHooks
+  private readonly signal?: AbortSignal
+  /** Current session id — absorbed from session/new|load responses. */
+  sid: string | null
+  /** True while the current context came from a session/load. The session
+   *  consumes (and clears) this for the failure classifier's resume kind. */
+  resumed = false
+  private dead = false
+  private stopRequested = false
   private exitCode = 0
   private reqId = 0
-  private initializeId: number | null = null
-  private sessionReqId: number | null = null
-  private configReqId: number | null = null
-  private sessionWasLoad = false
-  private readonly sessionNewParams: Record<string, unknown>
-  private readonly spawnSpec: { command: string; args: string[]; shell: boolean }
-  private ready = false
-  private pending: { resolve: (r: EngineRunResult) => void; id: number; startedAt: number } | null = null
-  private queuedPrompt: string | null = null
-  private steerWarned = false
-  private readonly model: string | null
-  private modelUnapplied: boolean
-  readonly carriesStandingPrompt = false
+  /** In-flight requests awaiting their JSON-RPC response. */
+  private readonly waiters = new Map<number, (msg: AcpMsg) => void>()
+  private outBuf = ''
+  /** Settles when the handshake completes; rejects when the handshake or the
+   *  process itself failed. send() awaits it, and so does probeWake(). */
+  readonly ready: Promise<void>
 
-  constructor(home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs) {
-    this.onLog = opts.onLog
-    this.onHopUsage = opts.onHopUsage
-    this.sid = opts.resumeSessionId ?? null
-    this.model = opts.model ?? null
-    this.modelUnapplied = !!opts.model
-    this.sessionNewParams = { cwd: home, mcpServers: [] }
-    this.sessionWasLoad = !!opts.resumeSessionId
-    this.spawnSpec = resolveZcodeAcpSpawn(env)
-    this.child = spawnEngineChild(this.spawnSpec.command, this.spawnSpec.args, {
-      cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: this.spawnSpec.shell,
+  constructor(
+    spawnSpec: { command: string; args: string[]; shell: boolean },
+    home: string,
+    env: NodeJS.ProcessEnv,
+    initialSid: string | null,
+    sessionParams: () => Record<string, unknown>,
+    hooks: AcpRpcConnectionHooks,
+    signal?: AbortSignal,
+  ) {
+    this.child = spawnEngineChild(spawnSpec.command, spawnSpec.args, {
+      cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: spawnSpec.shell,
     })
+    this.sid = initialSid
+    this.sessionParams = sessionParams
+    this.hooks = hooks
+    this.signal = signal
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
     this.child.stderr?.on('data', (b: Buffer) => {
       for (const raw of b.toString('utf8').split('\n')) {
         const l = cleanLine(raw)
-        if (l) this.onLog(l)
+        if (l) this.hooks.onLog(l)
       }
     })
     this.child.on('error', (err) => this.die(1, err.message))
     this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
-    queueMicrotask(() => {
-      this.initializeId = this.req('initialize', {
-        protocolVersion: 1,
-        clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
-        clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
-      })
-    })
-  }
-
-  get alive(): boolean { return !this.exited && this.child.stdin?.writable === true }
-  get sessionId(): string | null { return this.sid }
-
-  send(prompt: string): Promise<EngineRunResult> {
-    if (this.pending) return Promise.resolve({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.sid })
-    if (!this.alive) return Promise.resolve({ exitCode: this.exitCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.sid })
-    return new Promise<EngineRunResult>((resolve) => {
-      this.pending = { resolve, id: 0, startedAt: Date.now() }
-      if (this.ready && this.sid) this.maybePinThenPrompt(prompt)
-      else this.queuedPrompt = prompt
-    })
-  }
-
-  steer(_text: string): void {
-    // ACP session/prompt is one-in-flight. A mid-turn inject would cancel the
-    // running turn. The daemon coalesces the ping onto the next wake instead.
-    if (!this.steerWarned) {
-      this.steerWarned = true
-      this.onLog('[zcode] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    if (this.signal) {
+      const abort = () => { void terminateEngineTree(this.child, true) }
+      if (this.signal.aborted) abort()
+      else this.signal.addEventListener('abort', abort, { once: true })
     }
+    this.ready = this.handshake()
+    // An idle failed handshake (no send()/whenReady() consumer) must not
+    // become an unhandled rejection — the next send() reports it as dead.
+    this.ready.catch(() => {})
+  }
+
+  get alive(): boolean { return !this.dead && !this.stopRequested && this.child.stdin?.writable === true }
+  get exitStatusCode(): number { return this.exitCode }
+  whenReady(): Promise<void> { return this.ready }
+
+  /** One JSON-RPC request → response. Server→client notifications route to
+   *  the onNotification hook; a dead process fails every waiter from die(). */
+  rpc(method: string, params: Record<string, unknown>): Promise<AcpMsg> {
+    if (this.dead || this.stopRequested) return Promise.reject(new Error('engine session is not alive (process gone)'))
+    const id = ++this.reqId
+    return new Promise<AcpMsg>((resolve, reject) => {
+      this.waiters.set(id, (msg) => {
+        if (msg.error) reject(new Error(String(msg.error.message || `${method} failed`)))
+        else resolve(msg)
+      })
+      writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
+    })
   }
 
   stop(options: { force?: boolean } = {}): Promise<void> {
-    this.exited = true
+    this.stopRequested = true
     try { this.child.stdin?.end() } catch { /* ignore */ }
     return terminateEngineTree(this.child, options.force)
   }
 
-  private nextId(): number { this.reqId += 1; return this.reqId }
-  private req(method: string, params: Record<string, unknown>): number {
-    const id = this.nextId()
-    writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n')
-    return id
-  }
-
-  /** Apply the operator's model pin once per process, before the first turn.
-   *  The bridge's session/new is lazy (the backend session materializes on
-   *  first use), so the pin rides the first prompt boundary where a real
-   *  backend session exists to receive it. A rejected pin retries on the next
-   *  wake (an early failure can be purely the not-yet-live backend session)
-   *  and stops once the bridge accepts it. */
-  private maybePinThenPrompt(prompt: string): void {
-    if (!this.sid || !this.pending) return
-    if (this.modelUnapplied && this.model) {
-      this.queuedPrompt = prompt
-      this.configReqId = this.req('session/set_config_option', { sessionId: this.sid, configId: 'model', value: this.model })
-      return
-    }
-    this.startPrompt(prompt)
-  }
-
-  private startPrompt(prompt: string): void {
-    if (!this.sid || !this.pending) return
-    const id = this.req('session/prompt', {
-      sessionId: this.sid,
-      prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+  /** initialize → session/load|new. A stale resume falls back to a fresh
+   *  session; anything else rejects `ready` and fails the pending turn. */
+  private async handshake(): Promise<void> {
+    await this.rpc('initialize', {
+      protocolVersion: 1,
+      clientInfo: { name: 'cumora-daemon', version: '1.0.0' },
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
     })
-    this.pending.id = id
+    if (this.sid) {
+      try {
+        this.absorbSessionId(await this.rpc('session/load', { sessionId: this.sid, ...this.sessionParams() }))
+        this.resumed = true
+        return
+      } catch (err) {
+        const why = err instanceof Error ? err.message : String(err)
+        this.resumed = false
+        this.sid = null
+        this.hooks.onLoadFallback(why)
+      }
+    }
+    this.absorbSessionId(await this.rpc('session/new', this.sessionParams()))
   }
 
   private onStdout(buf: Buffer): void {
@@ -3179,124 +3053,218 @@ class ZcodeSession implements EngineSession {
       const line = this.outBuf.slice(0, nl)
       this.outBuf = this.outBuf.slice(nl + 1)
       const t = line.trim()
-      if (!t.startsWith('{')) { const c = cleanLine(line); if (c) this.onLog(c); continue }
+      if (!t.startsWith('{')) { const c = cleanLine(line); if (c) this.hooks.onLog(c); continue }
       let msg: AcpMsg | null = null
       try { msg = JSON.parse(t) as AcpMsg } catch { msg = null }
-      if (!msg) { const c = cleanLine(line); if (c) this.onLog(c); continue }
-      this.handle(msg)
+      if (!msg) { const c = cleanLine(line); if (c) this.hooks.onLog(c); continue }
+      if (msg.id !== undefined) {
+        const waiter = this.waiters.get(msg.id)
+        if (waiter) { this.waiters.delete(msg.id); waiter(msg); continue }
+      }
+      this.hooks.onNotification(msg)
     }
   }
 
-  private handle(msg: AcpMsg): void {
-    if (msg.id !== undefined && msg.id === this.initializeId) {
-      this.initializeId = null
-      if (msg.error) { this.failPending(String(msg.error.message || 'zcode bridge initialize failed')); return }
-      this.sessionReqId = this.sessionWasLoad && this.sid
-        ? this.req('session/load', { sessionId: this.sid, ...this.sessionNewParams })
-        : this.req('session/new', this.sessionNewParams)
-      return
-    }
-    if (msg.error && msg.id !== undefined && msg.id === this.sessionReqId) {
-      if (this.sessionWasLoad) {
-        this.onLog(`[zcode] session/load failed (${String(msg.error.message || '')}) — starting a fresh session`)
-        this.sessionWasLoad = false
-        this.sid = null
-        this.sessionReqId = this.req('session/new', this.sessionNewParams)
-        return
-      }
-      this.failPending(String(msg.error.message || 'zcode bridge session start failed'))
-      return
-    }
-    if (msg.id !== undefined && msg.id === this.sessionReqId && msg.result) {
-      this.sessionReqId = null
-      const sid = typeof msg.result.sessionId === 'string' ? msg.result.sessionId : this.sid
-      if (typeof sid === 'string' && sid) this.sid = sid
-      this.ready = true
-      if (this.queuedPrompt && this.pending) {
-        const p = this.queuedPrompt
-        this.queuedPrompt = null
-        this.maybePinThenPrompt(p)
-      }
-      return
-    }
-    if (msg.error && msg.id !== undefined && msg.id === this.configReqId) {
-      // A rejected model pin is a preference loss, not a turn failure.
-      this.configReqId = null
-      this.onLog(`[zcode] model pin rejected (${String(msg.error.message || '')}) — continuing on the engine default`)
-      if (this.queuedPrompt && this.pending) {
-        const p = this.queuedPrompt
-        this.queuedPrompt = null
-        this.startPrompt(p)
-      }
-      return
-    }
-    if (msg.id !== undefined && msg.id === this.configReqId && msg.result) {
-      this.configReqId = null
-      this.modelUnapplied = false
-      if (this.queuedPrompt && this.pending) {
-        const p = this.queuedPrompt
-        this.queuedPrompt = null
-        this.startPrompt(p)
-      }
-      return
-    }
-    if (msg.method === 'session/update') {
-      const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
-      const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
-      if (kind === 'tool_call' && typeof u?.title === 'string') this.onLog(`[zcode] tool ${u.title}`)
-      else if (kind === 'agent_message_chunk') {
-        const content = u?.content as { text?: unknown } | undefined
-        if (typeof content?.text === 'string' && content.text.trim()) {
-          this.onLog(`[zcode] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
-        }
-      }
-      return
-    }
-    if (this.pending && msg.id !== undefined && msg.id === this.pending.id) {
-      if (msg.error) { this.failPending(String(msg.error.message || 'zcode turn failed')); return }
-      const usage = extractAcpUsage(msg.result)
+  private absorbSessionId(msg: AcpMsg): void {
+    const sid = typeof msg.result?.sessionId === 'string' ? msg.result.sessionId : null
+    if (sid) this.sid = sid
+  }
+
+  private die(code: number, why: string): void {
+    const firstDeath = !this.dead
+    this.dead = true
+    this.exitCode = code
+    // Fail every in-flight request so rpc() callers don't hang on a dead pipe.
+    for (const [, waiter] of this.waiters) waiter({ error: { message: why } })
+    this.waiters.clear()
+    if (firstDeath) this.hooks.onDeath(code, why)
+  }
+}
+
+/** Persistent ZCode session: turn settlement, the lazy model pin, and the
+ *  bridge's missing-session phrasing on top of a wire-level AcpRpcConnection.
+ *  Mid-turn steer is not in the ACP surface — steer() is a no-op and the
+ *  daemon's next-wake coalescing carries the ping (same contract as
+ *  GrokSession). */
+class ZcodeSession implements EngineSession {
+  readonly carriesStandingPrompt = false
+
+  private readonly conn: AcpRpcConnection
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private readonly onAgentText?: (text: string) => void
+  private readonly model: string | null
+  private modelUnapplied: boolean
+  private turn: { resolve: (r: EngineRunResult) => void } | null = null
+  private steerWarned = false
+  private stopped = false
+
+  constructor(home: string, env: NodeJS.ProcessEnv, opts: ZcodeSessionOptions) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.onAgentText = opts.onAgentText
+    this.model = opts.model ?? null
+    this.modelUnapplied = !!opts.model
+    this.conn = new AcpRpcConnection(
+      resolveZcodeAcpSpawn(env),
+      home,
+      env,
+      opts.resumeSessionId ?? null,
+      () => ({ cwd: home, mcpServers: [] }),
+      {
+        onLog: (line) => this.onLog(line),
+        onNotification: (msg) => this.onUpdate(msg),
+        onDeath: (code, why) => this.onDeath(code, why),
+        onLoadFallback: (why) => {
+          this.onLog(`[zcode] session/load failed (${why}) — starting a fresh session`)
+        },
+      },
+      opts.signal,
+    )
+  }
+
+  get alive(): boolean { return this.conn.alive }
+  get sessionId(): string | null { return this.conn.sid }
+  whenReady(): Promise<void> { return this.conn.ready }
+
+  async send(prompt: string): Promise<EngineRunResult> {
+    if (this.turn) return classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.conn.sid }, this.conn.resumed)
+    if (!this.alive) return classifyEngineResult({ exitCode: this.conn.exitStatusCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.conn.sid }, this.conn.resumed)
+    let resolveTurn!: (r: EngineRunResult) => void
+    const done = new Promise<EngineRunResult>((resolve) => { resolveTurn = resolve })
+    // Only the first settler wins: process death (onDeath → this.turn.resolve)
+    // races the async body below, and whichever lands first closes the turn.
+    // Held in a local because onDeath() nulls this.turn when it settles first.
+    let settled = false
+    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn(r) } }
+    this.turn = { resolve: settle }
+    try {
+      await this.conn.ready
+      await this.applyModelPin()
+      if (!this.alive) throw new Error('engine session is not alive (process gone)')
+      const wasResume = this.conn.resumed
+      const startedAt = Date.now()
+      const resp = await this.conn.rpc('session/prompt', {
+        sessionId: this.conn.sid,
+        prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+      })
+      this.conn.resumed = false
+      const usage = extractAcpUsage(resp.result) ?? undefined
       if (this.onHopUsage) {
         try {
           this.onHopUsage({
             model: this.model ?? 'zcode',
             usage: usage ?? {},
-            latencyMs: Date.now() - this.pending.startedAt,
+            latencyMs: Date.now() - startedAt,
             hopIndex: 1,
           })
         } catch { /* never break the stream */ }
       }
-      const p = this.pending
-      this.pending = null
-      p.resolve({ exitCode: 0, sessionId: this.sid, usage, model: this.model })
-      return
+      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model: this.model }, wasResume))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const wasResume = this.conn.resumed
+      this.conn.resumed = false
+      settle(this.failureResult(message, wasResume, this.conn.exitStatusCode || 1))
     }
-    if (msg.error && msg.id !== undefined) {
-      this.failPending(String(msg.error.message || 'zcode bridge request failed'))
+    return done
+  }
+
+  steer(_text: string): void {
+    // ACP session/prompt is one-in-flight. A mid-turn inject would cancel the
+    // running turn. The daemon coalesces the ping onto the next wake instead.
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.log('[zcode] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
     }
   }
 
-  private failPending(error: string): void {
-    if (this.pending) {
-      const p = this.pending
-      this.pending = null
-      p.resolve({ exitCode: 1, error, sessionId: this.sid })
-    } else {
-      this.onLog(`[zcode] ${error}`)
+  async stop(options: { force?: boolean } = {}): Promise<void> {
+    this.stopped = true
+    await this.conn.stop(options)
+  }
+
+  /** The bridge's session/new is lazy (the backend session materializes on
+   *  first use), so the pin rides the first prompt boundary. A rejected pin
+   *  is a preference loss, not a turn failure — log it and keep retrying on
+   *  later wakes until the bridge accepts. */
+  private async applyModelPin(): Promise<void> {
+    if (!this.modelUnapplied || !this.model || !this.conn.sid) return
+    try {
+      await this.conn.rpc('session/set_config_option', { sessionId: this.conn.sid, configId: 'model', value: this.model })
+      this.modelUnapplied = false
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err)
+      this.log(`[zcode] model pin rejected (${why}) — continuing on the engine default`)
     }
   }
 
-  private die(code: number, why: string): void {
-    const alreadyDown = this.exited
-    this.exited = true
-    this.exitCode = code
-    if (!alreadyDown) {
-      this.onLog(`[session] engine process died ${this.pending ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+  /** A failed turn in the shared vocabulary. A resumed session whose backend
+   *  went missing maps to resume-not-found (the bridge's "Session is not
+   *  active" is not in the generic patterns); the generic classifier covers
+   *  everything else. */
+  private failureResult(message: string, wasResume: boolean, exitCode = 1): EngineRunResult {
+    return classifyEngineResult({
+      exitCode,
+      error: message,
+      failure: wasResume && ZCODE_MISSING_SESSION_RE.test(message)
+        ? { kind: 'resume-not-found', message, diagnostic: message }
+        : undefined,
+      sessionId: this.conn.sid,
+    }, wasResume)
+  }
+
+  private onDeath(code: number, why: string): void {
+    if (!this.stopped) {
+      this.log(`[session] engine process died ${this.turn ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
     }
-    if (this.pending) {
-      const p = this.pending
-      this.pending = null
-      p.resolve({ exitCode: code, error: why, sessionId: this.sid })
+    const wasResume = this.conn.resumed
+    this.conn.resumed = false
+    this.turn?.resolve(this.failureResult(why, wasResume, code))
+  }
+
+  /** Common ACP notification surface; unrecognized update kinds are ignored,
+   *  so a new event type in a future bridge never breaks a turn. */
+  private onUpdate(msg: AcpMsg): void {
+    if (msg.method !== 'session/update') return
+    const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+    const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+    if (kind === 'tool_call' && typeof u?.title === 'string') {
+      this.log(`[zcode] tool ${u.title}`)
+    } else if (kind === 'agent_message_chunk') {
+      const content = u?.content as { text?: unknown } | undefined
+      if (typeof content?.text === 'string' && content.text) {
+        this.onAgentText?.(content.text)
+        if (content.text.trim()) this.log(`[zcode] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+      }
     }
+  }
+
+  private log(line: string): void { this.onLog(line) }
+}
+
+/** One full bridge lifecycle for the stateless paths (run/classify/probe): a
+ *  fresh session, one turn, tear-down. Failures fold into the result — a
+ *  missing bridge or a rejected handshake is a failed turn, not a thrown
+ *  one. One-shot turns never resume, so hadResume stays false and the generic
+ *  classifier still tags auth/rate-limit/overflow/transport kinds. */
+async function runZcodeAcpTurn(opts: ZcodeTurnOptions): Promise<EngineRunResult & { text: string }> {
+  const chunks: string[] = []
+  const session = new ZcodeSession(opts.cwd, opts.env, {
+    home: opts.cwd,
+    env: opts.env,
+    model: opts.model,
+    standingPrompt: null,
+    resumeSessionId: null,
+    onLog: opts.onLog ?? (() => {}),
+    onHopUsage: opts.onHopUsage,
+    onAgentText: (text) => chunks.push(text),
+    signal: opts.signal,
+  })
+  try {
+    return { ...await session.send(opts.prompt), text: chunks.join('') }
+  } finally {
+    await session.stop({ force: true })
   }
 }
 
@@ -3353,72 +3321,28 @@ class ZcodeAdapter implements EngineAdapter {
 
   async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
     // The wake path IS the bridge handshake on every platform — never skipped.
-    // Exercise initialize → session/new with a fresh bridge, then tear down.
-    const spec = resolveZcodeAcpSpawn(args.env)
-    return new Promise<EngineWakeProbeResult>((resolve) => {
-      let settled = false
-      const finish = (r: EngineWakeProbeResult) => {
-        if (settled) return
-        settled = true
-        try { child.stdin?.end() } catch { /* ignore */ }
-        void terminateEngineTree(child).then(() => resolve(r))
-      }
-      const child = spawnEngineChild(spec.command, spec.args, {
-        cwd: args.cwd,
-        env: args.env,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        shell: spec.shell,
-      })
-      const onAbort = () => finish({ ok: false, detail: 'aborted (timeout)' })
-      if (args.signal.aborted) { onAbort(); return }
-      args.signal.addEventListener('abort', onAbort, { once: true })
-      let buf = ''
-      let stderrTail = ''
-      let initialized = false
-      const writeRpc = (msg: object) => {
-        writeStdin(child, JSON.stringify(msg) + '\n')
-      }
-      writeRpc({
-        jsonrpc: '2.0', id: 1, method: 'initialize',
-        params: { protocolVersion: 1, clientInfo: { name: 'cumora-doctor', version: '1.0.0' }, clientCapabilities: {} },
-      })
-      child.stdout?.on('data', (b: Buffer) => {
-        buf += b.toString('utf8')
-        for (;;) {
-          const nl = buf.indexOf('\n')
-          if (nl < 0) break
-          const line = buf.slice(0, nl).trim()
-          buf = buf.slice(nl + 1)
-          if (!line.startsWith('{')) continue
-          let msg: AcpMsg
-          try { msg = JSON.parse(line) as AcpMsg } catch { continue }
-          if (msg.error?.message) {
-            finish({ ok: false, detail: `zcode bridge rejected handshake: ${String(msg.error.message).slice(0, 240)}` })
-            return
-          }
-          if (!initialized && msg.id === 1 && msg.result) {
-            initialized = true
-            writeRpc({ jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: args.cwd, mcpServers: [] } })
-            continue
-          }
-          if (initialized && msg.id === 2 && msg.result) {
-            finish({ ok: true, detail: '' })
-            return
-          }
-        }
-      })
-      child.stderr?.on('data', (b: Buffer) => {
-        const tail = stderrTail + b.toString('utf8')
-        stderrTail = tail.length > 2000 ? tail.slice(-2000) : tail
-      })
-      child.on('error', (err) => finish({ ok: false, detail: `spawn error: ${err.message}` }))
-      child.on('close', (code, sig) => {
-        if (settled) return
-        const stage = !initialized ? 'before initialize ack' : 'before session/new ack'
-        const exit = sig ? `terminated by ${sig}` : `exit ${code}`
-        finish({ ok: false, detail: `zcode bridge died ${stage} (${exit}): ${salientError(stderrTail) || 'no stderr'}` })
-      })
+    // Run a real session against the same spawn the wake uses and wait for the
+    // handshake to settle, then tear down; the bridge's lazy session/new means
+    // the probe leaves no backend session behind.
+    const session = new ZcodeSession(args.cwd, args.env, {
+      home: args.cwd,
+      env: args.env,
+      standingPrompt: null,
+      resumeSessionId: null,
+      onLog: () => {},
+      signal: args.signal,
     })
+    try {
+      await session.whenReady()
+      return { ok: true, detail: '' }
+    } catch (err) {
+      const why = args.signal.aborted
+        ? 'aborted (timeout)'
+        : err instanceof Error ? err.message : String(err)
+      return { ok: false, detail: `zcode bridge handshake failed: ${why}`.slice(0, 240) }
+    } finally {
+      await session.stop({ force: true })
+    }
   }
 }
 
