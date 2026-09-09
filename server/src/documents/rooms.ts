@@ -17,6 +17,7 @@
 import * as Y from 'yjs'
 import type { PoolClient } from 'pg'
 import { pool } from '../db/pool.js'
+import { compactDocument, readDocumentState } from './persistence.js'
 import {
   redis, sub, publish,
   CH_DOC_UPDATE, CH_DOC_AWARENESS,
@@ -49,6 +50,7 @@ interface Room {
   subs: Set<DocSubscriber>
   /** Updates since last snapshot — drives the compaction threshold. */
   updatesSinceSnapshot: number
+  compacting: boolean
   /** Set during cold-load to coalesce concurrent waiters. */
   loaded: Promise<void>
   /** Marked true after the doc is hydrated from DB; flips OFF doc.on('update')
@@ -68,36 +70,6 @@ const evictions = new Map<string, NodeJS.Timeout>()
  *  echo-suppressed when they originated here. */
 const INSTANCE_ORIGIN = `instance:${env.INSTANCE_ID}`
 
-async function loadSnapshot(
-  documentId: string,
-  dbClient?: PoolClient,
-): Promise<{ state: Uint8Array | null; lastIncluded: bigint }> {
-  const { rows } = await (dbClient ?? pool).query<{ state_bytes: Buffer; snapshot_at_update_id: string }>(
-    `SELECT state_bytes, snapshot_at_update_id
-       FROM document_snapshots
-      WHERE document_id = $1`,
-    [documentId],
-  )
-  const row = rows[0]
-  if (!row) return { state: null, lastIncluded: 0n }
-  return { state: new Uint8Array(row.state_bytes), lastIncluded: BigInt(row.snapshot_at_update_id) }
-}
-
-async function loadUpdatesAfter(
-  documentId: string,
-  afterId: bigint,
-  dbClient?: PoolClient,
-): Promise<Array<{ id: bigint; bytes: Uint8Array }>> {
-  const { rows } = await (dbClient ?? pool).query<{ id: string; update_bytes: Buffer }>(
-    `SELECT id, update_bytes
-       FROM document_updates
-      WHERE document_id = $1 AND id > $2
-      ORDER BY id ASC`,
-    [documentId, afterId.toString()],
-  )
-  return rows.map((r) => ({ id: BigInt(r.id), bytes: new Uint8Array(r.update_bytes) }))
-}
-
 async function persistUpdate(documentId: string, authorId: string, bytes: Uint8Array): Promise<void> {
   await pool.query(
     `INSERT INTO document_updates (document_id, author_id, update_bytes)
@@ -113,49 +85,22 @@ async function persistUpdate(documentId: string, authorId: string, bytes: Uint8A
 }
 
 async function maybeCompact(room: Room): Promise<void> {
-  if (room.updatesSinceSnapshot < COMPACT_AFTER_UPDATES) return
-  // Snapshot the current state and find the latest update id covered.
-  const state = Y.encodeStateAsUpdate(room.doc)
-  const { rows } = await pool.query<{ max_id: string | null }>(
-    `SELECT MAX(id)::text AS max_id FROM document_updates WHERE document_id = $1`,
-    [room.documentId],
-  )
-  const maxId = rows[0]?.max_id ? BigInt(rows[0].max_id) : 0n
-  await pool.query(
-    `INSERT INTO document_snapshots (document_id, state_bytes, snapshot_at_update_id, updated_at)
-     VALUES ($1, $2, $3, NOW())
-     ON CONFLICT (document_id)
-       DO UPDATE SET state_bytes = EXCLUDED.state_bytes,
-                     snapshot_at_update_id = EXCLUDED.snapshot_at_update_id,
-                     updated_at = NOW()`,
-    [room.documentId, Buffer.from(state), maxId.toString()],
-  )
-  // Trim updates that are now safely captured in the snapshot.
-  await pool.query(
-    `DELETE FROM document_updates WHERE document_id = $1 AND id <= $2`,
-    [room.documentId, maxId.toString()],
-  )
-  room.updatesSinceSnapshot = 0
+  if (room.compacting || room.updatesSinceSnapshot < COMPACT_AFTER_UPDATES) return
+  room.compacting = true
+  const updatesAtStart = room.updatesSinceSnapshot
+  try {
+    if (await compactDocument(pool, room.documentId)) {
+      // Keep edits persisted while compaction was running in the next count.
+      room.updatesSinceSnapshot -= updatesAtStart
+    }
+  } finally {
+    room.compacting = false
+  }
 }
 
 async function hydrateDoc(documentId: string, doc: Y.Doc, dbClient?: PoolClient): Promise<void> {
-  // A cold load is a two-query logical read. When the caller does not already
-  // own a transaction connection, reserve one for the whole hydration rather
-  // than returning it between snapshot and tail. Otherwise a pool-full wave
-  // of locked CLI callers can occupy every released slot while waiting on the
-  // shared `room.loaded`, leaving each hydration's tail query queued behind
-  // the callers that depend on it.
-  const client = dbClient ?? await pool.connect()
-  try {
-    const snap = await loadSnapshot(documentId, client)
-    if (snap.state) Y.applyUpdate(doc, snap.state, 'hydrate')
-    const tail = await loadUpdatesAfter(documentId, snap.lastIncluded, client)
-    for (const u of tail) {
-      Y.applyUpdate(doc, u.bytes, 'hydrate')
-    }
-  } finally {
-    if (!dbClient) client.release()
-  }
+  const rows = await readDocumentState(dbClient ?? pool, documentId)
+  for (const row of rows) Y.applyUpdate(doc, new Uint8Array(row.bytes), 'hydrate')
 }
 
 function roomKey(documentId: string): string {
@@ -184,6 +129,7 @@ async function getOrCreateRoom(
     doc,
     subs: new Set(),
     updatesSinceSnapshot: 0,
+    compacting: false,
     hydrated: false,
     loaded: Promise.resolve(),
   }
@@ -218,8 +164,10 @@ async function getOrCreateRoom(
       // Persist + fan-out unless this update arrived FROM another instance
       // (it's already persisted there + already on the bus).
       if (!isRemote) {
-        room.updatesSinceSnapshot += 1
-        void persistUpdate(documentId, authorId, update).catch((e) => {
+        void persistUpdate(documentId, authorId, update).then(() => {
+          room.updatesSinceSnapshot += 1
+          void maybeCompact(room).catch((e) => console.warn('[docs] compact failed', e))
+        }).catch((e) => {
           console.warn('[docs] persistUpdate failed', e)
         })
         void publish(CH_DOC_UPDATE, {
@@ -230,7 +178,6 @@ async function getOrCreateRoom(
           originId,
           authorId,
         }).catch(() => { /* swallow */ })
-        void maybeCompact(room).catch((e) => console.warn('[docs] compact failed', e))
       }
     })
     normalizeMarkdownImageParagraphs(doc, pmFragment(doc), { originId: 'system:doc-image-normalize', authorId: 'system' })
