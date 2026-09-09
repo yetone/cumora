@@ -379,6 +379,7 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'docEdit.linkPrompt': '链接地址（留空可取消链接）：',
   'docEdit.link': '链接',
   'docEdit.syncing': '同步中…',
+  'docEdit.syncError': '本地编辑内容超过单帧同步限制。请先复制未同步的内容，再关闭文档。',
   'docEdit.onlyYou': '只有你',
     // ─── 图片查看器浮层 ────────────────────────────────────────────
     'imageView.zoomOut': '缩小（−）',

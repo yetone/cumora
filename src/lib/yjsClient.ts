@@ -14,6 +14,7 @@
 import * as Y from 'yjs'
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from 'y-protocols/awareness'
 import { ws, type WsEvent } from '@/api/client'
+import { applyServerSyncAndGetLocalReplay, replayFitsDocFrame } from './yjsSync'
 
 function bytesToB64(bytes: Uint8Array): string {
   let binary = ''
@@ -48,6 +49,9 @@ export interface OpenDocumentOptions {
   /** Free-form identity stamped on awareness so peers can render
    *  "<name> is editing". Typically the user's display name. */
   user: { id: string; name: string; color: string }
+  /** Called when local state cannot fit in one authorized replay frame, and
+   *  again with null after a later sync recovers. */
+  onSyncState?: (error: Error | null) => void
 }
 
 export function openDocument(opts: OpenDocumentOptions): YDocSession {
@@ -94,7 +98,7 @@ export function openDocument(opts: OpenDocumentOptions): YDocSession {
   const subscribe = () => {
     // The server replies with `doc.sync` carrying the encoded state.
     if (ws.isOpen()) {
-      ws.send({ type: 'doc.subscribe', documentId })
+      ws.send({ type: 'doc.subscribe', documentId, replaySupported: true })
     }
   }
 
@@ -113,7 +117,19 @@ export function openDocument(opts: OpenDocumentOptions): YDocSession {
       return
     }
     if (e.type === 'doc.sync' && e.documentId === documentId) {
-      Y.applyUpdate(doc, b64ToBytes(e.stateB64), 'remote')
+      const replay = applyServerSyncAndGetLocalReplay(doc, b64ToBytes(e.stateB64))
+      if (!replayFitsDocFrame(replay, documentId)) {
+        opts.onSyncState?.(new Error('document replay exceeds the sync frame limit'))
+        return
+      }
+      if (replay.byteLength > 0) {
+        ws.send({
+          type: 'doc.update',
+          documentId,
+          updateB64: bytesToB64(replay),
+        })
+      }
+      opts.onSyncState?.(null)
       resolveSynced()
       return
     }

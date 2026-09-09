@@ -23,6 +23,7 @@ import {
   broadcastAwareness as docBroadcastAwareness,
   type DocSubscriber,
 } from './documents/rooms.js'
+import { Semaphore } from './concurrency.js'
 import { randomUUID } from 'node:crypto'
 
 interface AuthedSocket {
@@ -36,6 +37,12 @@ interface AuthedSocket {
   companies: Set<string>
   /** Active doc subscriptions on this socket. Released on close. */
   docSubs: Map<string, DocSubscriber>
+  /** Document protocol frames are handled FIFO per socket. This keeps an
+   *  async subscribe/hydration from racing a later unsubscribe or update. */
+  docFrameQueue: Promise<void>
+  pendingDocFrames: number
+  pendingDocBytes: number
+  closed: boolean
   /** Heartbeat liveness flag. Set true on every received pong; the periodic
    *  ping loop flips it to false right before sending the next ping. If the
    *  next round still sees false, the socket is half-open and we terminate
@@ -58,6 +65,39 @@ const redisFanoutQueues = new Map<string, Promise<void>>()
 const WS_MAX_BUFFERED_BYTES = 2 * 1024 * 1024        // 2 MB
 const WS_TERMINATE_BUFFERED_BYTES = 8 * 1024 * 1024  // 8 MB
 const DOC_SYNC_MAX_BYTES = 32 * 1024 * 1024          // bounded one-shot snapshot
+const DOC_AUTH_CONCURRENCY = 4
+const DOC_AUTH_MAX_PENDING_FRAMES = 512
+const DOC_AUTH_MAX_PENDING_BYTES = 64 * 1024 * 1024
+const DOC_AUTH_MAX_BATCH_FRAMES = 64
+const DOC_AUTH_MAX_BATCH_BYTES = 512 * 1024
+const DOC_AUTH_LOCK_RETRY_LIMIT = 2
+// Keep legacy clients inside the same bounded window as pool.ts's 60s
+// statement timeout. New clients use the short reconnect-safe retry window.
+const DOC_AUTH_LEGACY_DEADLINE_MS = 60_000
+const DOC_AUTH_RETRY_DELAY_MS = 50
+
+/** Authorization is deliberately below the pg pool size. Admission is
+ * bounded separately because Semaphore itself has an unbounded waiter list. */
+const docAuthSemaphore = new Semaphore(DOC_AUTH_CONCURRENCY)
+const docReplaySupport = new WeakMap<DocSubscriber, boolean>()
+let pendingDocAuthFrames = 0
+let pendingDocAuthBytes = 0
+
+function reserveDocAuth(bytes: number): boolean {
+  const bounded = Math.max(1, bytes)
+  if (
+    pendingDocAuthFrames >= DOC_AUTH_MAX_PENDING_FRAMES
+    || pendingDocAuthBytes + bounded > DOC_AUTH_MAX_PENDING_BYTES
+  ) return false
+  pendingDocAuthFrames++
+  pendingDocAuthBytes += bounded
+  return true
+}
+
+function releaseDocAuth(bytes: number): void {
+  pendingDocAuthFrames = Math.max(0, pendingDocAuthFrames - 1)
+  pendingDocAuthBytes = Math.max(0, pendingDocAuthBytes - Math.max(1, bytes))
+}
 
 /** Open WS connections per user. Drives real human presence:
  *   - 0 → 1  : user is now online, flip participant status to 'avail'.
@@ -267,70 +307,375 @@ export async function resolveWsEventRecipientUserIds(
  *  Returns null when the doc doesn't exist OR the caller can't see it —
  *  same opaque posture the chat handlers use to avoid leaking existence. */
 async function docCompanyFor(documentId: string, userId: string): Promise<string | null> {
-  const { rows } = await pool.query<{ company_id: string }>(
-    `SELECT d.company_id
-       FROM documents d
-       JOIN company_members m ON m.company_id = d.company_id AND m.user_id = $2
-       JOIN users u ON u.id = m.user_id AND u.deleted_at IS NULL
-       JOIN participants p
-         ON p.id = m.user_id
-        AND p.company_id = d.company_id
-        AND p.kind = 'human'
-        AND p.departed_at IS NULL
-      WHERE d.id = $1
-      LIMIT 1`,
-    [documentId, userId],
-  )
-  return rows[0]?.company_id ?? null
-}
-
-/** Deliver one document frame while holding share locks on every row whose
- * mutation can revoke access. A concurrent delete/offboard waits until the
- * synchronous ws.send has happened; once revocation commits, the next lookup
- * fails closed and detaches the stale room subscription. */
-async function sendAuthorizedDocFrame(
-  c: AuthedSocket,
-  documentId: string,
-  subRec: DocSubscriber,
-  payload: unknown,
-): Promise<boolean> {
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    const authorized = await client.query(
-      `SELECT d.id
+  return docAuthSemaphore.run(async () => {
+    const { rows } = await pool.query<{ company_id: string }>(
+      `SELECT d.company_id
          FROM documents d
-         JOIN company_members cm ON cm.company_id = d.company_id AND cm.user_id = $2
-         JOIN users u ON u.id = cm.user_id AND u.deleted_at IS NULL
+         JOIN company_members m ON m.company_id = d.company_id AND m.user_id = $2
+         JOIN users u ON u.id = m.user_id AND u.deleted_at IS NULL
          JOIN participants p
-           ON p.id = cm.user_id
+           ON p.id = m.user_id
           AND p.company_id = d.company_id
           AND p.kind = 'human'
           AND p.departed_at IS NULL
         WHERE d.id = $1
-        FOR SHARE OF d, cm, u, p`,
-      [documentId, c.userId],
+        LIMIT 1`,
+      [documentId, userId],
     )
-    if (!authorized.rowCount || c.docSubs.get(documentId) !== subRec) {
-      await client.query('ROLLBACK')
-      detachDocSubscription(c, documentId, subRec)
-      return false
-    }
-    if (c.ws.readyState !== c.ws.OPEN || c.ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
-      await client.query('ROLLBACK')
-      detachDocSubscription(c, documentId, subRec)
-      try { c.ws.terminate() } catch { /* ignore */ }
-      return false
-    }
-    sendJson(c.ws, payload)
-    await client.query('COMMIT')
-    return true
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw error
-  } finally {
-    client.release()
+    return rows[0]?.company_id ?? null
+  })
+}
+
+interface DocFanoutItem {
+  c: AuthedSocket
+  documentId: string
+  subRec: DocSubscriber
+  payload: string
+  bytes: number
+  replaySupported: boolean
+  released: boolean
+  onDone?: () => void
+}
+
+interface DocFanoutQueue {
+  items: DocFanoutItem[]
+  running: boolean
+  scheduled: boolean
+}
+
+const docFanoutQueues = new Map<string, DocFanoutQueue>()
+
+function isLockNotAvailable(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  return code === '55P03' || code === '40P01'
+}
+
+function isTransientDocAuthError(error: unknown): boolean {
+  if (isLockNotAvailable(error)) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /timeout|ECONNREFUSED|ECONNRESET|connection|terminated|EOF/i.test(message)
+}
+
+function detachAndTerminate(item: DocFanoutItem): void {
+  const current = item.c.docSubs.get(item.documentId) === item.subRec
+  detachDocSubscription(item.c, item.documentId, item.subRec)
+  if (current && !item.c.closed) {
+    try { item.c.ws.terminate() } catch { /* ignore */ }
   }
+}
+
+function itemIsCurrent(item: DocFanoutItem): boolean {
+  const { c, documentId, subRec } = item
+  return !c.closed
+    && c.docSubs.get(documentId) === subRec
+    && c.ws.readyState === c.ws.OPEN
+}
+
+function itemIsLive(item: DocFanoutItem): boolean {
+  return itemIsCurrent(item) && item.c.ws.bufferedAmount <= WS_MAX_BUFFERED_BYTES
+}
+
+function sendSerialized(ws: WebSocket, payload: string): boolean {
+  if (ws.readyState !== ws.OPEN) return false
+  try {
+    ws.send(payload)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function finalizeDocFanoutItem(item: DocFanoutItem): void {
+  if (item.released) return
+  item.released = true
+  item.onDone?.()
+  releaseDocAuth(item.bytes)
+}
+
+/** Authorize one item after a contended batch has been split. The semaphore
+ * is acquired here only after the batch transaction has released its permit. */
+type SingleDocAuthOutcome = 'sent' | 'revoked' | 'busy' | 'failed'
+
+async function sendAuthorizedDocFrame(item: DocFanoutItem): Promise<SingleDocAuthOutcome> {
+  let sideEffectStarted = false
+  if (!itemIsCurrent(item)) return 'failed'
+  return docAuthSemaphore.run(async () => {
+    if (!itemIsCurrent(item)) return 'failed'
+    const client = await pool.connect()
+    try {
+      if (!itemIsCurrent(item)) return 'failed'
+      await client.query('BEGIN')
+      const authorized = await client.query(
+        `SELECT d.id
+           FROM documents d
+           JOIN company_members cm ON cm.company_id = d.company_id AND cm.user_id = $2
+           JOIN users u ON u.id = cm.user_id AND u.deleted_at IS NULL
+           JOIN participants p
+             ON p.id = cm.user_id
+            AND p.company_id = d.company_id
+            AND p.kind = 'human'
+            AND p.departed_at IS NULL
+          WHERE d.id = $1
+          FOR SHARE OF d, cm, u, p NOWAIT`,
+        [item.documentId, item.c.userId],
+      )
+      if (!authorized.rowCount) {
+        await client.query('ROLLBACK')
+        detachDocSubscription(item.c, item.documentId, item.subRec)
+        return 'revoked'
+      }
+      if (!itemIsLive(item)) {
+        await client.query('ROLLBACK')
+        detachAndTerminate(item)
+        return 'failed'
+      }
+      sideEffectStarted = true
+      if (!sendSerialized(item.c.ws, item.payload)) {
+        await client.query('ROLLBACK')
+        detachAndTerminate(item)
+        return 'failed'
+      }
+      await client.query('COMMIT')
+      return 'sent'
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      if (!sideEffectStarted && isTransientDocAuthError(error)) return 'busy'
+      throw error
+    } finally {
+      client.release()
+    }
+  }).catch((error) => {
+    console.warn(`[ws] document authorization lookup failed for ${item.documentId}`, error)
+    if (sideEffectStarted) {
+      detachAndTerminate(item)
+      return 'failed' as const
+    }
+    if (isTransientDocAuthError(error)) return 'busy' as const
+    detachAndTerminate(item)
+    return 'failed' as const
+  })
+}
+
+interface DocBatchResult {
+  contended: boolean
+  fallback: DocFanoutItem[]
+}
+
+/** Authorize all distinct recipients for one document in one transaction.
+ * Invalid recipients are detached individually; they never discard valid
+ * peers in the same frame batch. NOWAIT keeps a writer from pinning every
+ * recipient behind one lock; the caller retries, then splits the batch. */
+async function authorizeDocBatch(items: DocFanoutItem[]): Promise<DocBatchResult> {
+  const initial = items.filter((item) => itemIsCurrent(item))
+  if (initial.length === 0) return { contended: false, fallback: [] }
+  return docAuthSemaphore.run(async () => {
+    if (!initial.some((item) => itemIsCurrent(item))) return { contended: false, fallback: [] }
+    const client = await pool.connect()
+    let sideEffectStarted = false
+    let eligible: DocFanoutItem[] = []
+    try {
+      eligible = initial.filter((item) => itemIsCurrent(item))
+      if (eligible.length === 0) return { contended: false, fallback: [] }
+      await client.query('BEGIN')
+      const userIds = [...new Set(eligible.map((item) => item.c.userId))]
+      const { rows } = await client.query<{ user_id: string }>(
+        `SELECT cm.user_id
+           FROM documents d
+           JOIN company_members cm
+             ON cm.company_id = d.company_id
+            AND cm.user_id = ANY($2::text[])
+           JOIN users u ON u.id = cm.user_id AND u.deleted_at IS NULL
+           JOIN participants p
+             ON p.id = cm.user_id
+            AND p.company_id = d.company_id
+            AND p.kind = 'human'
+            AND p.departed_at IS NULL
+          WHERE d.id = $1
+          FOR SHARE OF d, cm, u, p NOWAIT`,
+        [eligible[0]?.documentId, userIds],
+      )
+      const authorized = new Set(rows.map((row) => row.user_id))
+      for (const item of eligible) {
+        if (!authorized.has(item.c.userId)) {
+          detachDocSubscription(item.c, item.documentId, item.subRec)
+          continue
+        }
+        if (!itemIsLive(item)) {
+          detachAndTerminate(item)
+          continue
+        }
+        // The lock is held until COMMIT, immediately after this synchronous
+        // send. A revocation cannot commit between auth and delivery.
+        sideEffectStarted = true
+        if (!sendSerialized(item.c.ws, item.payload)) detachAndTerminate(item)
+      }
+      await client.query('COMMIT')
+      return { contended: false, fallback: [] }
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {})
+      if (!sideEffectStarted && isTransientDocAuthError(error)) return { contended: true, fallback: eligible }
+      for (const item of eligible) {
+        detachAndTerminate(item)
+      }
+      console.warn(`[ws] document authorization batch failed for ${items[0]?.documentId ?? 'unknown'}`, error)
+      return { contended: false, fallback: [] }
+    } finally {
+      client.release()
+    }
+  })
+}
+
+async function processDocBatch(items: DocFanoutItem[]): Promise<void> {
+  const active = items.filter((item) => {
+    if (!itemIsCurrent(item)) return false
+    if (item.c.ws.bufferedAmount > WS_MAX_BUFFERED_BYTES) {
+      detachAndTerminate(item)
+      return false
+    }
+    return true
+  })
+  try {
+    if (active.length === 0) return
+    let result: DocBatchResult = { contended: true, fallback: active }
+    for (let attempt = 0; attempt <= DOC_AUTH_LOCK_RETRY_LIMIT && result.contended; attempt++) {
+      result = await authorizeDocBatch(active)
+      if (result.contended && attempt < DOC_AUTH_LOCK_RETRY_LIMIT) {
+        await new Promise((resolve) => setTimeout(resolve, 5 * (attempt + 1)))
+      }
+    }
+    if (!result.contended) return
+    // The batch permit and client have been released before this split. Each
+    // item gets an independent NOWAIT authorization so a contended/revoked
+    // peer cannot discard healthy peers or deadlock through nested acquisition.
+    const groups = new Map<DocSubscriber, DocFanoutItem[]>()
+    for (const item of result.fallback) {
+      const group = groups.get(item.subRec) ?? []
+      group.push(item)
+      groups.set(item.subRec, group)
+    }
+    // Different subscribers can make progress in parallel (the semaphore
+    // still caps DB work), but each subscriber's frames remain FIFO.
+    await Promise.all([...groups.values()].map(async (group) => {
+      const item = group[0]!
+      const deadline = Date.now() + (item.replaySupported
+        ? DOC_AUTH_RETRY_DELAY_MS * (DOC_AUTH_LOCK_RETRY_LIMIT + 1)
+        : DOC_AUTH_LEGACY_DEADLINE_MS)
+      for (const current of group) {
+        let outcome: SingleDocAuthOutcome = 'busy'
+        let attempt = 0
+        while (outcome === 'busy') {
+          outcome = await sendAuthorizedDocFrame(current)
+          if (outcome === 'busy') {
+            const remaining = deadline - Date.now()
+            if (remaining <= 0) break
+            const backoff = item.replaySupported
+              ? 5 * (attempt + 1)
+              : Math.min(DOC_AUTH_RETRY_DELAY_MS * (attempt + 1), 1_000)
+            await new Promise((resolve) => setTimeout(resolve, Math.min(backoff, remaining)))
+            attempt++
+          }
+        }
+        if (outcome === 'busy') detachAndTerminate(current)
+      }
+    }))
+  } catch (error) {
+    console.warn(`[ws] document authorization batch failed for ${items[0]?.documentId ?? 'unknown'}`, error)
+    for (const item of items) detachAndTerminate(item)
+  } finally {
+    for (const item of items) finalizeDocFanoutItem(item)
+  }
+}
+
+function scheduleDocFanout(documentId: string): void {
+  const queue = docFanoutQueues.get(documentId)
+  if (!queue || queue.scheduled || queue.running) return
+  queue.scheduled = true
+  queueMicrotask(() => {
+    queue.scheduled = false
+    void drainDocFanout(documentId, queue)
+  })
+}
+
+async function drainDocFanout(documentId: string, queue: DocFanoutQueue): Promise<void> {
+  if (queue.running) return
+  queue.running = true
+  try {
+    while (queue.items.length > 0) {
+      const batch: DocFanoutItem[] = []
+      let bytes = 0
+      while (queue.items.length > 0 && batch.length < DOC_AUTH_MAX_BATCH_FRAMES) {
+        const next = queue.items[0]!
+        if (batch.length > 0 && bytes + next.bytes > DOC_AUTH_MAX_BATCH_BYTES) break
+        queue.items.shift()
+        batch.push(next)
+        bytes += next.bytes
+      }
+      await processDocBatch(batch)
+    }
+  } catch (error) {
+    console.warn(`[ws] document fan-out failed for ${documentId}`, error)
+    for (const item of queue.items.splice(0)) {
+      detachDocSubscription(item.c, item.documentId, item.subRec)
+      finalizeDocFanoutItem(item)
+    }
+  } finally {
+    queue.running = false
+    if (queue.items.length > 0) scheduleDocFanout(documentId)
+    else if (docFanoutQueues.get(documentId) === queue) docFanoutQueues.delete(documentId)
+  }
+}
+
+function removeQueuedDocItems(c: AuthedSocket): void {
+  for (const [documentId, queue] of docFanoutQueues) {
+    const retained: DocFanoutItem[] = []
+    for (const item of queue.items) {
+      if (item.c === c) finalizeDocFanoutItem(item)
+      else retained.push(item)
+    }
+    queue.items = retained
+    if (!queue.running && !queue.scheduled && queue.items.length === 0) {
+      docFanoutQueues.delete(documentId)
+    }
+  }
+}
+
+function enqueueAuthorizedDocFrame(
+  c: AuthedSocket,
+  documentId: string,
+  subRec: DocSubscriber,
+  payload: unknown,
+  byteLength: number,
+  replaySupported: boolean,
+  onDone?: () => void,
+): void {
+  if (c.closed || c.docSubs.get(documentId) !== subRec) {
+    onDone?.()
+    return
+  }
+  const serialized = JSON.stringify(payload)
+  const bytes = Math.max(1, Buffer.byteLength(serialized))
+  if (!reserveDocAuth(bytes)) {
+    const rejected: DocFanoutItem = {
+      c, documentId, subRec, payload: serialized, bytes, replaySupported, released: true, onDone,
+    }
+    onDone?.()
+    detachAndTerminate(rejected)
+    return
+  }
+  // byteLength remains an explicit argument at call sites so a future caller
+  // cannot accidentally omit payload-size admission when its binary source is
+  // not yet serialized. The serialized size is the bound used for memory.
+  void byteLength
+  const item: DocFanoutItem = {
+    c, documentId, subRec, payload: serialized, bytes, replaySupported, released: false, onDone,
+  }
+  let queue = docFanoutQueues.get(documentId)
+  if (!queue) {
+    queue = { items: [], running: false, scheduled: false }
+    docFanoutQueues.set(documentId, queue)
+  }
+  queue.items.push(item)
+  scheduleDocFanout(documentId)
 }
 
 async function withAuthorizedDocOperation(
@@ -339,36 +684,64 @@ async function withAuthorizedDocOperation(
   subRec: DocSubscriber,
   task: (companyId: string, client: import('pg').PoolClient) => Promise<void>,
 ): Promise<boolean> {
-  const client = await pool.connect()
-  try {
-    await client.query('BEGIN')
-    const { rows } = await client.query<{ company_id: string }>(
-      `SELECT d.company_id
-         FROM documents d
-         JOIN company_members cm ON cm.company_id = d.company_id AND cm.user_id = $2
-         JOIN users u ON u.id = cm.user_id AND u.deleted_at IS NULL
-         JOIN participants p
-           ON p.id = cm.user_id
-          AND p.company_id = d.company_id
-          AND p.kind = 'human'
-          AND p.departed_at IS NULL
-        WHERE d.id = $1
-        FOR SHARE OF d, cm, u, p`,
-      [documentId, c.userId],
-    )
-    if (!rows[0] || c.docSubs.get(documentId) !== subRec) {
-      await client.query('ROLLBACK')
-      detachDocSubscription(c, documentId, subRec)
-      return false
+  const replaySupported = docReplaySupport.get(subRec) === true
+  const deadline = Date.now() + (replaySupported
+    ? DOC_AUTH_RETRY_DELAY_MS * (DOC_AUTH_LOCK_RETRY_LIMIT + 1)
+    : DOC_AUTH_LEGACY_DEADLINE_MS)
+  let attempt = 0
+  while (true) {
+    if (c.closed || c.docSubs.get(documentId) !== subRec) return false
+    let taskStarted = false
+    try {
+      return await docAuthSemaphore.run(async () => {
+        if (c.closed || c.docSubs.get(documentId) !== subRec) return false
+        const client = await pool.connect()
+        try {
+          if (c.closed || c.docSubs.get(documentId) !== subRec) return false
+          await client.query('BEGIN')
+          const { rows } = await client.query<{ company_id: string }>(
+            `SELECT d.company_id
+               FROM documents d
+               JOIN company_members cm ON cm.company_id = d.company_id AND cm.user_id = $2
+               JOIN users u ON u.id = cm.user_id AND u.deleted_at IS NULL
+               JOIN participants p
+                 ON p.id = cm.user_id
+                AND p.company_id = d.company_id
+                AND p.kind = 'human'
+                AND p.departed_at IS NULL
+              WHERE d.id = $1
+              FOR SHARE OF d, cm, u, p NOWAIT`,
+            [documentId, c.userId],
+          )
+          if (!rows[0] || c.closed || c.docSubs.get(documentId) !== subRec) {
+            await client.query('ROLLBACK')
+            detachDocSubscription(c, documentId, subRec)
+            return false
+          }
+          taskStarted = true
+          await task(rows[0].company_id, client)
+          await client.query('COMMIT')
+          return true
+        } catch (error) {
+          await client.query('ROLLBACK').catch(() => {})
+          throw error
+        } finally {
+          client.release()
+        }
+      })
+    } catch (error) {
+      if (!taskStarted && isTransientDocAuthError(error)) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) throw error
+        const backoff = replaySupported
+          ? 5 * (attempt + 1)
+          : Math.min(DOC_AUTH_RETRY_DELAY_MS * (attempt + 1), 1_000)
+        await new Promise((resolve) => setTimeout(resolve, Math.min(backoff, remaining)))
+        attempt++
+        continue
+      }
+      throw error
     }
-    await task(rows[0].company_id, client)
-    await client.query('COMMIT')
-    return true
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => {})
-    throw error
-  } finally {
-    client.release()
   }
 }
 
@@ -385,6 +758,7 @@ function detachDocSubscription(
   if (c.docSubs.get(documentId) !== subRec) return
   docUnsubscribe(documentId, subRec)
   c.docSubs.delete(documentId)
+  docReplaySupport.delete(subRec)
 }
 
 async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Promise<void> {
@@ -393,20 +767,21 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
   if (!documentId) return
 
   if (type === 'doc.subscribe') {
-    if (c.docSubs.has(documentId)) return  // idempotent
+    if (c.closed || c.docSubs.has(documentId)) return  // idempotent
     const companyId = await docCompanyFor(documentId, c.userId)
+    if (c.closed) return
     if (!companyId) {
       sendJson(c.ws, { type: 'doc.error', documentId, error: 'not found' })
       return
     }
-    let outboundQueue = Promise.resolve()
+    let subRec: DocSubscriber
+    const replaySupported = msg.replaySupported === true
     let pendingOutboundBytes = 0
     let pendingOutboundFrames = 0
-    let subRec: DocSubscriber
     const enqueueAuthorizedFrame = (
       payload: unknown,
       byteLength: number,
-      pendingByteLimit: number = WS_TERMINATE_BUFFERED_BYTES,
+      pendingByteLimit = WS_TERMINATE_BUFFERED_BYTES,
     ): void => {
       const estimatedBytes = Math.max(1, Math.ceil(byteLength * 4 / 3) + 256)
       if (
@@ -417,19 +792,11 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
         try { c.ws.terminate() } catch { /* ignore */ }
         return
       }
+      pendingOutboundFrames++
       pendingOutboundBytes += estimatedBytes
-      pendingOutboundFrames += 1
-      const current = outboundQueue.catch(() => {}).then(async () => {
-        if (c.docSubs.get(documentId) !== subRec) return
-        await sendAuthorizedDocFrame(c, documentId, subRec, payload)
-      }).finally(() => {
-        pendingOutboundBytes = Math.max(0, pendingOutboundBytes - estimatedBytes)
+      enqueueAuthorizedDocFrame(c, documentId, subRec, payload, byteLength, replaySupported, () => {
         pendingOutboundFrames = Math.max(0, pendingOutboundFrames - 1)
-      })
-      outboundQueue = current
-      void current.catch((error) => {
-        console.warn(`[ws] document authorization lookup failed for ${documentId}`, error)
-        detachDocSubscription(c, documentId, subRec)
+        pendingOutboundBytes = Math.max(0, pendingOutboundBytes - estimatedBytes)
       })
     }
     subRec = {
@@ -451,8 +818,21 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
         }, update.byteLength)
       },
     }
-    const { initialState } = await docSubscribe(documentId, companyId, subRec)
     c.docSubs.set(documentId, subRec)
+    docReplaySupport.set(subRec, replaySupported)
+    let initialState: Uint8Array
+    try {
+      ({ initialState } = await docSubscribe(documentId, companyId, subRec))
+    } catch (error) {
+      detachDocSubscription(c, documentId, subRec)
+      throw error
+    }
+    if (c.closed || c.docSubs.get(documentId) !== subRec) {
+      docUnsubscribe(documentId, subRec)
+      if (c.docSubs.get(documentId) === subRec) c.docSubs.delete(documentId)
+      docReplaySupport.delete(subRec)
+      return
+    }
     if (initialState.byteLength > DOC_SYNC_MAX_BYTES) {
       detachDocSubscription(c, documentId, subRec)
       sendJson(c.ws, {
@@ -474,12 +854,12 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
   if (type === 'doc.unsubscribe') {
     const subRec = c.docSubs.get(documentId)
     if (!subRec) return
-    docUnsubscribe(documentId, subRec)
-    c.docSubs.delete(documentId)
+    detachDocSubscription(c, documentId, subRec)
     return
   }
 
   if (type === 'doc.update') {
+    if (c.closed) return
     const subRec = c.docSubs.get(documentId)
     if (!subRec) return  // must subscribe first
     const updateB64 = typeof msg.updateB64 === 'string' ? msg.updateB64 : ''
@@ -492,6 +872,7 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
   }
 
   if (type === 'doc.awareness') {
+    if (c.closed) return
     const subRec = c.docSubs.get(documentId)
     if (!subRec) return
     const updateB64 = typeof msg.updateB64 === 'string' ? msg.updateB64 : ''
@@ -504,12 +885,13 @@ async function handleDocFrame(c: AuthedSocket, msg: Record<string, unknown>): Pr
   }
 
   if (type === 'doc.mention.notify') {
+    if (c.closed) return
     const rawIds = msg.mentionedIds
     if (!Array.isArray(rawIds) || rawIds.length === 0) return
     const requestedIds = rawIds.filter((x): x is string => typeof x === 'string')
     if (requestedIds.length === 0) return
     const companyId = await docCompanyFor(documentId, c.userId)
-    if (!companyId) return
+    if (!companyId || c.closed) return
     await processDocMention({
       documentId, companyId, mentionerId: c.userId, requestedIds,
     })
@@ -829,6 +1211,14 @@ export function attachWebSocket(httpServer: Server) {
 
   wss.on('connection', async (ws, req) => {
     const ip = req.socket.remoteAddress
+    let earlyClosed = false
+    const onEarlyClose = () => { earlyClosed = true }
+    const onEarlyError = () => { earlyClosed = true }
+    // Install lifecycle observers before ticket/member lookups. A client can
+    // close during either await; otherwise hydration could finish and attach a
+    // subscription to a socket whose close event was already missed.
+    ws.once('close', onEarlyClose)
+    ws.once('error', onEarlyError)
     // The WS connect URL carries a SHORT-LIVED one-shot ticket
     // (?t=<ws-ticket>), not the session token. Tickets are minted via
     // POST /auth/ws-ticket and consumed atomically here. This keeps
@@ -845,20 +1235,42 @@ export function attachWebSocket(httpServer: Server) {
       try { ws.close(4401, 'missing ws ticket') } catch { /* ignore */ }
       return
     }
-    const session = await consumeWsTicket(ticket)
+    let session: Awaited<ReturnType<typeof consumeWsTicket>>
+    try {
+      session = await consumeWsTicket(ticket)
+    } catch (error) {
+      console.warn(`[ws] ticket lookup failed (${ip})`, error)
+      try { ws.close(1011, 'ticket lookup failed') } catch { /* ignore */ }
+      return
+    }
     if (!session) {
       console.log(`[ws] rejecting bad/expired/used ticket (${ip})`)
       try { ws.close(4401, 'invalid ws ticket') } catch { /* ignore */ }
       return
     }
 
-    const companies = await loadMemberships(session.userId)
+    if (earlyClosed) return
+    let companies: Set<string>
+    try {
+      companies = await loadMemberships(session.userId)
+    } catch (error) {
+      console.warn(`[ws] membership lookup failed (${ip})`, error)
+      try { ws.close(1011, 'membership lookup failed') } catch { /* ignore */ }
+      return
+    }
+    if (earlyClosed) return
+    ws.off('close', onEarlyClose)
+    ws.off('error', onEarlyError)
     const c: AuthedSocket = {
       ws,
       userId: session.userId,
       originId: randomUUID(),
       companies,
       docSubs: new Map(),
+      docFrameQueue: Promise.resolve(),
+      pendingDocFrames: 0,
+      pendingDocBytes: 0,
+      closed: false,
       isAlive: true,
     }
     clients.add(c)
@@ -875,7 +1287,12 @@ export function attachWebSocket(httpServer: Server) {
     const release = () => {
       if (released) return
       released = true
-      for (const [docId, subRec] of c.docSubs) docUnsubscribe(docId, subRec)
+      c.closed = true
+      removeQueuedDocItems(c)
+      for (const [docId, subRec] of c.docSubs) {
+        docUnsubscribe(docId, subRec)
+        docReplaySupport.delete(subRec)
+      }
       c.docSubs.clear()
       clients.delete(c)
       void onHumanDisconnect(session.userId)
@@ -885,15 +1302,44 @@ export function attachWebSocket(httpServer: Server) {
       ws.send(JSON.stringify({ type: 'hello', instanceId: env.INSTANCE_ID, ts: Date.now() }))
     } catch { /* ignore */ }
 
+    const enqueueInboundDocFrame = (msg: Record<string, unknown>, rawBytes: number): void => {
+      if (c.closed) return
+      const bytes = Math.max(1, rawBytes)
+      if (
+        c.pendingDocFrames >= 128
+        || c.pendingDocBytes + bytes > 4 * 1024 * 1024
+        || !reserveDocAuth(bytes)
+      ) {
+        try { c.ws.terminate() } catch { /* ignore */ }
+        return
+      }
+      c.pendingDocFrames++
+      c.pendingDocBytes += bytes
+      const current = c.docFrameQueue.catch(() => {}).then(async () => {
+        if (c.closed) return
+        await handleDocFrame(c, msg)
+      }).finally(() => {
+        c.pendingDocFrames = Math.max(0, c.pendingDocFrames - 1)
+        c.pendingDocBytes = Math.max(0, c.pendingDocBytes - bytes)
+        releaseDocAuth(bytes)
+      })
+      c.docFrameQueue = current
+      void current.catch((error) => {
+        if (c.closed) return
+        console.warn('[ws] doc frame error', error)
+        // A doc.update may be optimistic in the browser. Closing forces a
+        // fresh hello/doc.sync cycle, where yjsClient replays local state the
+        // server snapshot did not contain; a doc.error alone would strand it.
+        try { c.ws.terminate() } catch { /* ignore */ }
+      })
+    }
+
     ws.on('message', (raw) => {
       let msg: Record<string, unknown>
       try { msg = JSON.parse(raw.toString()) as Record<string, unknown> } catch { return }
       const type = typeof msg.type === 'string' ? msg.type : ''
       if (type.startsWith('doc.')) {
-        void handleDocFrame(c, msg).catch((e) => {
-          console.warn('[ws] doc frame error', e)
-          sendJson(ws, { type: 'doc.error', documentId: msg.documentId, error: 'server error' })
-        })
+        enqueueInboundDocFrame(msg, Buffer.byteLength(raw.toString()))
       }
       // Other inbound types (ping etc.) would land here later; today the
       // chat protocol is pure REST + broadcast so there's nothing else.

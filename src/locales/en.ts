@@ -377,6 +377,7 @@ export const en = {
   'docEdit.linkPrompt': 'Link URL (leave empty to unlink):',
   'docEdit.link': 'Link',
   'docEdit.syncing': 'syncing…',
+  'docEdit.syncError': 'Local edits exceed the one-frame sync limit. Copy your unsynced content before closing this document.',
   'docEdit.onlyYou': 'only you',
     // ─── image viewer overlay ─────────────────────────────────────────
     'imageView.zoomOut': 'Zoom out (−)',

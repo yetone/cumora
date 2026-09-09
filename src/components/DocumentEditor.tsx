@@ -127,6 +127,7 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
   const sessionRef = useRef<YDocSession | null>(null)
   const [session, setSession] = useState<YDocSession | null>(null)
   const [synced, setSynced] = useState(false)
+  const [syncError, setSyncError] = useState(false)
   const [titleDraft, setTitleDraft] = useState(doc?.title ?? '')
 
   useEffect(() => { setTitleDraft(doc?.title ?? '') }, [doc?.id, doc?.title])
@@ -136,16 +137,23 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
     const s = openDocument({
       documentId,
       user: { id: user.id, name: user.name, color: colorForId(user.id) },
+      onSyncState: (error) => {
+        setSyncError(Boolean(error))
+        if (error) setSynced(false)
+        else setSynced(true)
+      },
     })
     sessionRef.current = s
     setSession(s)
     setSynced(false)
+    setSyncError(false)
     void s.synced.then(() => setSynced(true))
     return () => {
       s.destroy()
       sessionRef.current = null
       setSession(null)
       setSynced(false)
+      setSyncError(false)
     }
   }, [documentId, user])
 
@@ -237,6 +245,7 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
       <CollaborativeEditor
         session={session}
         synced={synced}
+        syncError={syncError}
         userName={user.name}
         userColor={colorForId(user.id)}
         documentId={documentId}
@@ -249,13 +258,14 @@ export function DocumentEditor({ documentId, variant = 'full', onClose, onOpenFu
 interface CollaborativeEditorProps {
   session: YDocSession
   synced: boolean
+  syncError: boolean
   userName: string
   userColor: string
   documentId: string
   variant: 'full' | 'peek'
 }
 
-function CollaborativeEditor({ session, synced, userName, userColor, documentId, variant }: CollaborativeEditorProps) {
+function CollaborativeEditor({ session, synced, syncError, userName, userColor, documentId, variant }: CollaborativeEditorProps) {
   const t = useT()
   const refreshingImagesRef = useRef(new Set<string>())
   // Memoize the awareness object reference for the cursor extension —
@@ -396,6 +406,11 @@ function CollaborativeEditor({ session, synced, userName, userColor, documentId,
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
+      {syncError && (
+        <div role="alert" className="border-b border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-900">
+          {t('docEdit.syncError')}
+        </div>
+      )}
       <Toolbar editor={editor} disabled={!synced} />
       <div className="flex-1 overflow-y-auto">
         <EditorContent editor={editor} className="h-full" />
