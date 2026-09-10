@@ -521,7 +521,10 @@ test('[integration] declared assistant-text relay posts the exact draft to the d
   const tools = makeToolStub({
     bash: async (parsed) => {
       const cmd = String(parsed.command ?? '')
-      const matched = cmd.match(/^cumora\s+reply\s+(\S+)\s+'([\s\S]*)'$/)
+      // The declared relay carries `--continue` so the anti-monologue gate
+      // cannot refuse the turn's deliverable after the intent message the
+      // operating rules require. Requiring it here keeps that shape pinned.
+      const matched = cmd.match(/^cumora\s+reply\s+(\S+)\s+'([\s\S]*)'\s+--continue$/)
       if (!matched) throw new Error(`unexpected bash invocation: ${cmd}`)
       const [, convoId, body] = matched
       const messageId = `m-${randomUUID()}`

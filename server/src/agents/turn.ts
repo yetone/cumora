@@ -3231,9 +3231,31 @@ Mechanics:
         },
         stage: 'auto_relay',
       })
+      // `--continue` bypasses cmdReply's anti-monologue gate, and the relay is
+      // the one caller that must have it.
+      //
+      // The operating rules above REQUIRE an intent message before any work
+      // that keeps the asker waiting ("Drafting the email now"), posted as a
+      // SEPARATE `cumora reply`. In a group of three or more that intent
+      // message is then the room's last message and less than ten minutes old,
+      // which is exactly what the gate refuses — so the relay of the actual
+      // answer failed, `finalStatus` went to 'failed', and the room got
+      // "Agent run failed before it could finish. No result was produced."
+      // in place of the work the agent had just done.
+      //
+      // The gate exists to stop the agent DECIDING to speak again: "each
+      // wake-up is a fresh 'should I respond?' decision with no global
+      // stop-signal" (see cmdReply). The relay is not a decision. It is the
+      // runtime delivering text the model already composed and explicitly
+      // declared as this turn's reply, at most once per turn — the deliberate
+      // commitment `--continue` was documented for.
+      //
+      // The flag goes LAST on purpose. parseArgs reads `--continue <token>` as
+      // a value flag, so placing it before the body would consume the body and
+      // post an empty message.
       const relay = await executePodTool({
         agentId, name: 'bash',
-        argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped}` }),
+        argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped} --continue` }),
         ns: namespace,
       })
       if (!relay.ok) {

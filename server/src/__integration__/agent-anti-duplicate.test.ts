@@ -264,3 +264,89 @@ test('[integration] worklog blocks a duplicate heavy-tool claim from a peer', as
     scopeKey, agentId: agentA, taskType: 'web-search', subject: 'audio editor competitive analysis',
   })
 })
+
+// ─── announce-then-deliver ─────────────────────────────────────────
+//
+// The operating rules in turn.ts REQUIRE an intent message before any work
+// that keeps the asker waiting: "POST A SHORT INTENT MESSAGE first via
+// `cumora reply` … THEN do the work. THEN reply with the actual result. The
+// intent message must be a SEPARATE `cumora reply` call."
+//
+// In a group of three or more, that intent message is then the room's last
+// message and seconds old — exactly what the anti-monologue gate refuses. So
+// the product mandated a flow its own backstop rejected, and the deliverable
+// that came back was the failure notice rather than the answer.
+
+test('[integration] the gate refuses the result that the mandated intent message asked for', async () => {
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+
+  const intent = await runCli(['--as', agentA, 'reply', convoId, 'Drafting the email now — ~30s'])
+  assert.equal(intent.ok, true, `the intent message the rules require must post: ${intent.text}`)
+
+  // …30 seconds of work later, the actual answer, exactly as the relay used to
+  // send it: no flag.
+  const answer = await runCli(['--as', agentA, 'reply', convoId, 'Here is the draft: ...'])
+  assert.equal(answer.ok, false, 'this is the state being fixed — the gate refuses the deliverable')
+  assert.match(answer.text, /you already posted in/)
+})
+
+test('[integration] the relay delivers that result, body intact', async () => {
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+  await runCli(['--as', agentA, 'reply', convoId, 'Drafting the email now — ~30s'])
+
+  // The shape turn.ts's declared relay now sends: flag LAST.
+  const body = 'Here is the draft: subject line, three paragraphs, CTA.'
+  const relayed = await runCli(['--as', agentA, 'reply', convoId, body, '--continue'])
+  assert.equal(relayed.ok, true, `the relay must deliver the answer: ${relayed.text}`)
+
+  const { rows } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 ORDER BY sequence DESC LIMIT 1`,
+    [convoId],
+  )
+  assert.equal(rows[0].body, body, 'the answer must arrive whole, not empty')
+})
+
+test('[integration] the bypass flag has to come after the body', async () => {
+  // parseArgs reads `--continue <token>` as a VALUE flag, so putting the flag
+  // before the body consumes the body: the gate is bypassed and an EMPTY
+  // message is posted. Pin the ordering, because moving the flag to the front
+  // reads like a harmless tidy-up.
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+  await runCli(['--as', agentA, 'reply', convoId, 'Drafting the email now — ~30s'])
+
+  const wrongOrder = await runCli(['--as', agentA, 'reply', convoId, '--continue', 'the actual answer'])
+  const { rows } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 ORDER BY sequence DESC LIMIT 1`,
+    [convoId],
+  )
+  if (wrongOrder.ok) {
+    assert.notEqual(
+      rows[0].body, 'the actual answer',
+      'flag-before-body must not be adopted: parseArgs eats the body as the flag value',
+    )
+  }
+})
+
+test('[integration] a plain second post is still refused', async () => {
+  // The guard rail: this fix must not turn the gate off. Only the relay, which
+  // carries the flag, gets through.
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+  await runCli(['--as', agentA, 'reply', convoId, 'first'])
+  const second = await runCli(['--as', agentA, 'reply', convoId, 'monologuing on'])
+  assert.equal(second.ok, false, 'the anti-monologue gate must still hold for ordinary replies')
+})
+
+test('[unit] the declared relay carries the bypass, last', async () => {
+  // Every test above passes just as well against a relay that sends no flag —
+  // they exercise cmdReply, not the caller. Read turn.ts, because the defect
+  // was in what the relay sends.
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../agents/turn.ts', import.meta.url), 'utf8')
+  const relay = source.slice(source.indexOf('Auto-relayed assistant text as reply'))
+  const block = relay.slice(0, relay.indexOf('if (!relay.ok)'))
+
+  assert.match(
+    block, /command: `cumora reply \$\{target\.conversationId\} \$\{escaped\} --continue`/,
+    'the declared relay no longer bypasses the anti-monologue gate — after the intent message the rules require, the agent\'s answer is refused and the room gets a failure notice instead',
+  )
+})
