@@ -3510,7 +3510,25 @@ Mechanics:
     // agent would re-process them. Per-conversation: take the
     // latest message id we drained (markConversationRead picks the
     // max created_at via GREATEST(...) so out-of-order is fine).
-    if (steeredMessageIds.size > 0) {
+    //
+    // ONLY on a completed turn. This is a `finally`, so it used to run on
+    // 'failed' and 'skipped' too — and there the advance is not an
+    // optimization, it is a deletion. A steer arrived DURING the turn, so its
+    // (created_at, id) is later than every message the turn was answering, and
+    // loadInbox compares one cursor per conversation:
+    //
+    //   AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
+    //
+    // so advancing to the steer buries the turn's own unanswered inbox with
+    // it. Ask a question, add a follow-up while the agent works, let the turn
+    // die at MAX_HOPS or on a 429: the room gets a failure notice and BOTH
+    // messages are gone from every future inbox. Nothing retries them.
+    //
+    // That also contradicted the fingerprint contract twenty lines up:
+    // "Failed turns do not update the fingerprint, so they remain retryable
+    // instead of disappearing into a silent skip." Retryable work needs its
+    // inbox rows to still be there.
+    if (steeredMessageIds.size > 0 && finalStatus === 'completed') {
       // Group by conversation so we only do one upsert per convo.
       const byConvo = new Map<string, string>()
       for (const [messageId, conversationId] of steeredMessageIds) {

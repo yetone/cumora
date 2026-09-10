@@ -1019,3 +1019,129 @@ test('[integration] steer queue resets at turn boundaries (no leak across turns)
   const ev = await eventsForAgent(agentId)
   assert.equal(ev.filter((e) => e.kind === 'turn.steered').length, 0)
 })
+
+// ─── a failed turn must not bury its own inbox ─────────────────────
+//
+// The cursor advance above lives in a `finally`, so it used to run whatever
+// the turn's outcome was. A steer arrives DURING the turn, so its
+// (created_at, id) is later than every message the turn was answering, and
+// loadInbox compares ONE cursor per conversation:
+//
+//   AND ROW(mm.created_at, mm.id) > ROW(co.lr_at, co.lr_id)
+//
+// Advancing to the steer therefore buries the original question too. Ask
+// something, add a follow-up while the agent is working, let the turn die:
+// the room gets "Agent run failed … No result was produced" and BOTH messages
+// are gone from every future inbox.
+//
+// It also contradicted the fingerprint contract in the same file: "Failed
+// turns do not update the fingerprint, so they remain retryable instead of
+// disappearing into a silent skip." Retryable work needs its rows to survive.
+
+async function readCursor(agentId: string, conversationId: string): Promise<string | null> {
+  const { rows } = await pool.query<{ last_read_message_id: string | null }>(
+    `SELECT last_read_message_id FROM conversation_reads WHERE user_id = $1 AND conversation_id = $2`,
+    [agentId, conversationId],
+  )
+  return rows[0]?.last_read_message_id ?? null
+}
+
+/** Drive one turn that drains a steer and then dies on the next LLM call.
+ *  `makeLlmStub` throws once its scripted streams run out, which is a faithful
+ *  stand-in for the provider errors and MAX_HOPS exits that fail a real turn
+ *  after work has already happened. */
+async function runTurnThatDrainsASteerThenFails(): Promise<{
+  agentId: string; conversationId: string; originalId: string; steeredId: string
+}> {
+  const { companyId, agentId, humanId, conversationId } = await seedConvo()
+  const originalId = await postHumanMessage({
+    conversationId, companyId, humanId, body: 'original task: list files', sequence: 1,
+  })
+  const steeredId = await postHumanMessage({
+    conversationId, companyId, humanId, body: 'wait, also include hidden files', sequence: 2,
+  })
+
+  // One scripted hop only: the drain happens inside it, then the next call
+  // throws and the turn ends 'failed'.
+  const llm = makeLlmStub([
+    streamWithToolCall({ fcId: 'fc_ls', callId: 'call_ls', name: 'bash', argsJson: JSON.stringify({ command: 'ls' }) }),
+  ])
+  llm.install()
+  makeToolStub({
+    bash: async () => {
+      pushSteer(agentId, {
+        messageId: steeredId, conversationId, authorName: 'alice',
+        body: 'wait, also include hidden files', arrivedAt: Date.now(),
+      })
+      await new Promise((r) => setTimeout(r, DEBOUNCE_MS + 200))
+      return {
+        ok: true, output: { stdout: 'file1\n', stderr: '', exitCode: 0 }, durationMs: DEBOUNCE_MS + 200,
+        display: { name: 'bash', arg: 'ls', status: 'ok', detail: '' },
+      }
+    },
+  }).install()
+
+  await assert.rejects(runAgentTurn(agentId))
+  return { agentId, conversationId, originalId, steeredId }
+}
+
+test('[integration] a failed turn leaves both the steer and the question it interrupted unread', async () => {
+  const { agentId, conversationId, originalId, steeredId } = await runTurnThatDrainsASteerThenFails()
+
+  const { rows: runs } = await pool.query<{ status: string }>(
+    `SELECT status FROM agent_runs WHERE agent_id = $1`, [agentId],
+  )
+  assert.equal(runs[0].status, 'failed', 'the turn did fail — that is the premise, not the bug')
+
+  const cursor = await readCursor(agentId, conversationId)
+  assert.notEqual(
+    cursor, steeredId,
+    'the failed turn advanced the read cursor onto the steer, which buries the original question with it',
+  )
+
+  const { inprocClient } = await import('../agents/runtime/inproc-client.js')
+  const inbox = await inprocClient.loadInbox(agentId)
+  const ids = inbox.map((m) => m.id)
+  assert.ok(ids.includes(steeredId), 'the follow-up must still be waiting to be answered')
+  assert.ok(ids.includes(originalId), 'the question the follow-up interrupted must still be waiting too')
+})
+
+test('[integration] a completed turn still advances the cursor', async () => {
+  // The guard rail. Without the advance a completed turn re-processes its own
+  // steer on the next wake, which is exactly what that code was added for.
+  const { companyId, agentId, humanId, conversationId } = await seedConvo()
+  await postHumanMessage({ conversationId, companyId, humanId, body: 'original task', sequence: 1 })
+  const steeredId = await postHumanMessage({
+    conversationId, companyId, humanId, body: 'follow-up', sequence: 2,
+  })
+
+  const llm = makeLlmStub([
+    streamWithToolCall({ fcId: 'fc_ls', callId: 'call_ls', name: 'bash', argsJson: JSON.stringify({ command: 'ls' }) }),
+    streamSetTurnStatus(),
+  ])
+  llm.install()
+  makeToolStub({
+    bash: async () => {
+      pushSteer(agentId, {
+        messageId: steeredId, conversationId, authorName: 'alice',
+        body: 'follow-up', arrivedAt: Date.now(),
+      })
+      await new Promise((r) => setTimeout(r, DEBOUNCE_MS + 200))
+      return {
+        ok: true, output: { stdout: '', stderr: '', exitCode: 0 }, durationMs: DEBOUNCE_MS + 200,
+        display: { name: 'bash', arg: 'ls', status: 'ok', detail: '' },
+      }
+    },
+  }).install()
+
+  await runAgentTurn(agentId)
+
+  const { rows: runs } = await pool.query<{ status: string }>(
+    `SELECT status FROM agent_runs WHERE agent_id = $1`, [agentId],
+  )
+  assert.equal(runs[0].status, 'completed')
+  assert.equal(
+    await readCursor(agentId, conversationId), steeredId,
+    'a completed turn must still consume the steer it drained',
+  )
+})
