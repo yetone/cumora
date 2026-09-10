@@ -2928,6 +2928,7 @@ Mechanics:
       }).catch(() => { /* observability best-effort */ })
       try {
         const result = await executePodTool({
+          runId,
           agentId, name: tc.name, argsJson: tc.arguments, ns: namespace,
           signal: batchAbortController.signal,
         })
@@ -3254,6 +3255,7 @@ Mechanics:
       // a value flag, so placing it before the body would consume the body and
       // post an empty message.
       const relay = await executePodTool({
+        runId,
         agentId, name: 'bash',
         argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped} --continue` }),
         ns: namespace,

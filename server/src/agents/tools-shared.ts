@@ -398,6 +398,12 @@ export async function tBash(
    *  turn.ts's hop loop. Already-fired signals abort the spawn
    *  immediately so we never start a process the caller has cancelled. */
   signal?: AbortSignal,
+  /** The run this bash call belongs to. Reaches `cumora reply` as
+   *  CUMORA_RUN_ID so the anti-monologue gate can tell "I am delivering the
+   *  work I announced this turn" from "I woke up and decided to talk again".
+   *  Absent for the CLI/replay/boot paths, where the gate keeps its old
+   *  behaviour. */
+  runId?: string,
 ): Promise<ToolResult> {
   const t0 = Date.now()
   const command = String(args.command ?? '').trim()
@@ -467,6 +473,7 @@ export async function tBash(
       : {}),
     CUMORA_PERSONA_DIR: ns?.rootDir ?? '',
     CUMORA_CLI_RESULT_PATH: resultPath,
+    ...(runId ? { CUMORA_RUN_ID: runId } : {}),
   }
 
   const heavyOp = /--generate-image|web-(search|read)|skills\s+(install|search)/i.test(command)

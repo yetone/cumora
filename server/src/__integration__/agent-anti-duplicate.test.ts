@@ -306,25 +306,42 @@ test('[integration] the relay delivers that result, body intact', async () => {
   assert.equal(rows[0].body, body, 'the answer must arrive whole, not empty')
 })
 
-test('[integration] the bypass flag has to come after the body', async () => {
+test('[unit] the bypass flag has to come after the body', async () => {
   // parseArgs reads `--continue <token>` as a VALUE flag, so putting the flag
-  // before the body consumes the body: the gate is bypassed and an EMPTY
-  // message is posted. Pin the ordering, because moving the flag to the front
-  // reads like a harmless tidy-up.
+  // before the body consumes the body and posts an EMPTY message. Pin the
+  // ordering, because moving the flag to the front reads like a tidy-up.
+  //
+  // Asserted on parseArgs directly and unconditionally. The first version of
+  // this test wrapped its assertion in `if (wrongOrder.ok)`, which meant it
+  // could pass without checking anything — thanks to @yetone for catching it.
+  const { parseArgs } = await import('../agents/cli-parse.js')
+
+  const wrong = parseArgs(['reply', 'g-1', '--continue', 'the actual answer'])
+  assert.equal(wrong.flags.continue, 'the actual answer',
+    'parseArgs takes the next token as the flag VALUE')
+  assert.deepEqual(wrong.positional, ['reply', 'g-1'],
+    'so the body is gone entirely — flag-before-body posts an empty message')
+
+  const right = parseArgs(['reply', 'g-1', 'the actual answer', '--continue'])
+  assert.equal(right.flags.continue, true, 'trailing flag parses as a boolean')
+  assert.deepEqual(right.positional, ['reply', 'g-1', 'the actual answer'],
+    'and the body survives')
+})
+
+test('[integration] flag-before-body does not post the body', async () => {
+  // The same trap through the real CLI, asserted unconditionally this time.
   const { agentA, convoId } = await seedGroupWithTwoAgents()
   await runCli(['--as', agentA, 'reply', convoId, 'Drafting the email now — ~30s'])
 
-  const wrongOrder = await runCli(['--as', agentA, 'reply', convoId, '--continue', 'the actual answer'])
+  await runCli(['--as', agentA, 'reply', convoId, '--continue', 'the actual answer'])
   const { rows } = await pool.query<{ body: string }>(
     `SELECT body FROM messages WHERE conversation_id = $1 ORDER BY sequence DESC LIMIT 1`,
     [convoId],
   )
-  if (wrongOrder.ok) {
-    assert.notEqual(
-      rows[0].body, 'the actual answer',
-      'flag-before-body must not be adopted: parseArgs eats the body as the flag value',
-    )
-  }
+  assert.notEqual(
+    rows[0].body, 'the actual answer',
+    'flag-before-body must never be adopted: parseArgs eats the body as the flag value',
+  )
 })
 
 test('[integration] a plain second post is still refused', async () => {
@@ -349,4 +366,118 @@ test('[unit] the declared relay carries the bypass, last', async () => {
     block, /command: `cumora reply \$\{target\.conversationId\} \$\{escaped\} --continue`/,
     'the declared relay no longer bypasses the anti-monologue gate — after the intent message the rules require, the agent\'s answer is refused and the room gets a failure notice instead',
   )
+})
+
+// ─── announce, then deliver, in the same turn ──────────────────────
+//
+// The operating rules require an intent message before long work, posted as a
+// SEPARATE `cumora reply`, then the result "in this SAME turn". In a group of
+// three or more that intent message is the room's last message and seconds
+// old, which is exactly what the gate refuses — so the flow the product
+// mandates was the flow it rejected, and the answer was lost.
+//
+// #263 fixed the runtime's own auto-relay by giving it --continue. It could
+// not fix this one: `postedReplyViaTool` is set the moment the intent message
+// lands and never reset within a turn, and the relay branch is guarded on
+// `!postedReplyViaTool`, so once the agent announces, the relay is switched
+// off for the rest of that turn. The second post is the model calling
+// `cumora reply` itself, and it reached the gate with nothing to distinguish
+// it from a monologue.
+//
+// The run id is that distinction, and it now reaches the CLI as CUMORA_RUN_ID.
+
+async function withRunId<T>(runId: string | null, fn: () => Promise<T>): Promise<T> {
+  const previous = process.env.CUMORA_RUN_ID
+  if (runId === null) delete process.env.CUMORA_RUN_ID
+  else process.env.CUMORA_RUN_ID = runId
+  try {
+    return await fn()
+  } finally {
+    if (previous === undefined) delete process.env.CUMORA_RUN_ID
+    else process.env.CUMORA_RUN_ID = previous
+  }
+}
+
+test('[integration] the mandated announce-then-deliver flow goes through', async () => {
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+  const runId = `run-${randomUUID().slice(0, 8)}`
+
+  await withRunId(runId, async () => {
+    const intent = await runCli(['--as', agentA, 'reply', convoId, 'Drafting the email now — ~30s'])
+    assert.equal(intent.ok, true, `the intent message the rules require must post: ${intent.text}`)
+
+    // …30 seconds of work later, the result. Same turn, so same run.
+    const answer = await runCli(['--as', agentA, 'reply', convoId, 'Here is the draft: subject, three paragraphs, CTA.'])
+    assert.equal(answer.ok, true, `the answer the intent message promised must post: ${answer.text}`)
+  })
+
+  const { rows } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 AND author_id = $2 ORDER BY sequence`,
+    [convoId, agentA],
+  )
+  assert.equal(rows.length, 2, 'the room should have the intent message and the answer')
+  assert.match(rows[1].body, /Here is the draft/)
+})
+
+test('[integration] a later run is still refused — that is the gate doing its job', async () => {
+  // The whole point of the gate: "each wake-up is a fresh 'should I respond?'
+  // decision with no global stop-signal". A different run is a different
+  // decision, however recently the last message landed.
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+
+  await withRunId(`run-${randomUUID().slice(0, 8)}`, async () => {
+    const first = await runCli(['--as', agentA, 'reply', convoId, 'first'])
+    assert.equal(first.ok, true)
+  })
+  await withRunId(`run-${randomUUID().slice(0, 8)}`, async () => {
+    const second = await runCli(['--as', agentA, 'reply', convoId, 'a fresh decision to talk again'])
+    assert.equal(second.ok, false, 'a new wake-up must not inherit the previous turn\'s exemption')
+    assert.match(second.text, /you already posted in/)
+  })
+})
+
+test('[integration] a third post in one turn is monologuing again', async () => {
+  // Announce + deliver is two. The exemption is capped there on purpose.
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+  const runId = `run-${randomUUID().slice(0, 8)}`
+
+  await withRunId(runId, async () => {
+    assert.equal((await runCli(['--as', agentA, 'reply', convoId, 'on it'])).ok, true)
+    assert.equal((await runCli(['--as', agentA, 'reply', convoId, 'here it is'])).ok, true)
+    const third = await runCli(['--as', agentA, 'reply', convoId, 'and one more thought'])
+    assert.equal(third.ok, false, 'the exemption must not become an unlimited licence')
+    assert.match(third.text, /you already posted in/)
+  })
+})
+
+test('[integration] a continuation is still checked against a room that moved', async () => {
+  // The guard rail that separates this from --continue. That flag also
+  // disables the freshness preflight; this exemption must not, or an agent
+  // could deliver a stale answer a peer already gave while it was working.
+  const { agentA, agentB, convoId } = await seedGroupWithTwoAgents()
+  const runId = `run-${randomUUID().slice(0, 8)}`
+
+  await withRunId(runId, async () => {
+    assert.equal((await runCli(['--as', agentA, 'reply', convoId, 'on it — ~30s'])).ok, true)
+  })
+  // A peer delivers the same thing while A works.
+  assert.equal((await runCli(['--as', agentB, 'reply', convoId, 'The answer is 42.'])).ok, true)
+
+  await withRunId(runId, async () => {
+    const late = await runCli(['--as', agentA, 'reply', convoId, 'The answer is 42.'])
+    assert.equal(late.ok, false, 'the freshness preflight must still apply to a same-turn delivery')
+    assert.match(late.text, /HELD/)
+  })
+})
+
+test('[integration] with no run id the gate behaves exactly as before', async () => {
+  // The CLI, replay and boot paths carry no CUMORA_RUN_ID. They must not get
+  // an exemption they cannot justify.
+  const { agentA, convoId } = await seedGroupWithTwoAgents()
+  await withRunId(null, async () => {
+    assert.equal((await runCli(['--as', agentA, 'reply', convoId, 'first'])).ok, true)
+    const second = await runCli(['--as', agentA, 'reply', convoId, 'second'])
+    assert.equal(second.ok, false, 'no run id means no exemption')
+    assert.match(second.text, /you already posted in/)
+  })
 })

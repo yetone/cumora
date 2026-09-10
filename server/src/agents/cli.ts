@@ -176,7 +176,10 @@ import { resolveAs } from './cli-identity.js'
  */
 import { inprocClient as worklogClient } from './runtime/inproc-client.js'
 import type { WorkTaskType, WorklogEntry } from './runtime/client.js'
-import { recordSeen, getSeen, recordHold, consumeHold, clearHold } from './seen-boundary.js'
+import {
+  recordSeen, getSeen, recordHold, consumeHold, clearHold,
+  readTurnPost, recordTurnPost, MAX_POSTS_PER_TURN_PER_CONVERSATION,
+} from './seen-boundary.js'
 
 function tenantScopeKey(companyId: string): string {
   return `tenant:${companyId}`
@@ -1872,7 +1875,32 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // forces the agent to commit deliberately rather than absent-
   // mindedly continuing to monologue.
   const monologueBypass = Boolean(parsed.flags.continue || parsed.flags.also)
-  if (!monologueBypass && cv[0].actor_is_agent && cv[0].member_count > 2) {
+  // Announce-then-deliver. The operating rules REQUIRE an intent message
+  // before long work ("Drafting the email now"), posted as a SEPARATE
+  // `cumora reply`, then the result in the SAME turn. In a group of three or
+  // more that intent message is the room's last message and seconds old,
+  // which is exactly what the gate below refuses — so the flow the product
+  // mandates was the flow it rejected, and the answer was lost.
+  //
+  // A second post from the SAME run is that delivery. A post from a LATER run
+  // is the agent waking up and deciding to talk again, which is what the gate
+  // was built to stop ("each wake-up is a fresh 'should I respond?' decision
+  // with no global stop-signal"). The run id is the only thing that tells them
+  // apart, so it now reaches this process as CUMORA_RUN_ID.
+  //
+  // Capped at two posts per turn per conversation: announce + deliver. A third
+  // is monologuing again and still needs --continue.
+  //
+  // Deliberately NOT folded into `monologueBypass`: that flag also disables
+  // the freshness preflight further down, and a continuation must still be
+  // checked against a room that moved while we were working.
+  const turnRunId = (process.env.CUMORA_RUN_ID ?? '').trim()
+  const sameTurnDelivery = !monologueBypass && turnRunId && cv[0].actor_is_agent
+    ? await readTurnPost(me, convoId).then(
+        (rec) => Boolean(rec && rec.runId === turnRunId && rec.posts < MAX_POSTS_PER_TURN_PER_CONVERSATION),
+      )
+    : false
+  if (!monologueBypass && !sameTurnDelivery && cv[0].actor_is_agent && cv[0].member_count > 2) {
     const { rows: lastMsg } = await pool.query<{ author_id: string; created_at: string }>(
       `SELECT author_id, created_at FROM messages
          WHERE conversation_id = $1
@@ -2406,6 +2434,10 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   await recordSeen(me, convoId, sequence).catch((error) => {
     console.warn(`[reply] message ${messageId} committed but seen-boundary update failed`, error)
   })
+  // Remember which run posted this, so the announce-then-deliver exemption
+  // above can recognise the delivery that follows an intent message — and
+  // stop recognising it after the second post.
+  if (turnRunId) await recordTurnPost(me, convoId, turnRunId)
   // Drop any lingering hold token: this send committed WITHOUT the
   // override, so a hold acknowledged-but-unused must not arm a later
   // preemptive --send-anyway in this conversation.

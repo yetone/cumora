@@ -271,3 +271,88 @@ export async function clearHold(agentId: string, scope: string): Promise<void> {
     /* fail-open — TTL will reclaim it */
   }
 }
+
+// ─── same-turn continuation ────────────────────────────────────────
+//
+// The anti-monologue gate asks "is my own last message in this room something
+// I decided to post, or the intent message of the work I am doing right now?"
+// It could not tell, because nothing recorded WHICH run posted a message.
+//
+// The operating rules require an intent message before long work ("Drafting
+// the email now"), a SEPARATE `cumora reply`, then the result in the SAME
+// turn. In a group of three or more the gate refused that second call, so the
+// flow the product mandates was the flow it rejected.
+//
+// A run id plus a count is enough to separate the two: a second post from the
+// SAME run is the announced work being delivered; a post from a LATER run is
+// the agent waking up and deciding to talk again, which is what the gate was
+// built to stop. The count caps it at announce-then-deliver — a third post in
+// one turn is monologuing again, and still needs `--continue`.
+
+const TURN_POST_TTL_SECONDS = 600 // matches the gate's 10-minute window
+const TURN_POST_PREFIX = 'cumora:turnpost'
+
+function turnPostKey(agentId: string, conversationId: string): string {
+  return `${TURN_POST_PREFIX}:${agentId}:${conversationId}`
+}
+
+/** Posts this run has already made in this conversation. */
+export interface TurnPostRecord {
+  runId: string
+  posts: number
+}
+
+/** Record that `runId` just posted in `conversationId`. Increments when the
+ *  same run posts again, resets when a new run takes over. Fire-and-forget:
+ *  a failure only costs the exemption, never a message. */
+export async function recordTurnPost(
+  agentId: string, conversationId: string, runId: string,
+): Promise<void> {
+  if (!agentId || !conversationId || !runId) return
+  try {
+    const key = turnPostKey(agentId, conversationId)
+    const existing = await redis.get(key)
+    const prior = parseTurnPost(existing)
+    const posts = prior && prior.runId === runId ? prior.posts + 1 : 1
+    await redis.set(key, `${runId}:${posts}`, 'EX', TURN_POST_TTL_SECONDS)
+  } catch (err) {
+    console.warn(
+      `[seen-boundary] recordTurnPost(${agentId}, ${conversationId}) failed`,
+      err instanceof Error ? err.message : err,
+    )
+  }
+}
+
+/** What this agent last posted in this conversation, and from which run.
+ *  Returns null when unknown — the caller must then behave exactly as it did
+ *  before this existed, which for the gate means refusing. FAIL-CLOSED on a
+ *  Redis error: an infra hiccup must not hand out a monologue exemption. */
+export async function readTurnPost(
+  agentId: string, conversationId: string,
+): Promise<TurnPostRecord | null> {
+  if (!agentId || !conversationId) return null
+  try {
+    return parseTurnPost(await redis.get(turnPostKey(agentId, conversationId)))
+  } catch (err) {
+    console.warn(
+      `[seen-boundary] readTurnPost(${agentId}, ${conversationId}) failed — fail-closed`,
+      err instanceof Error ? err.message : err,
+    )
+    return null
+  }
+}
+
+/** `<runId>:<posts>`. The run id itself never contains a colon (see
+ *  createRun), so splitting on the LAST one is unambiguous either way. */
+export function parseTurnPost(raw: string | null | undefined): TurnPostRecord | null {
+  if (!raw) return null
+  const idx = raw.lastIndexOf(':')
+  if (idx <= 0) return null
+  const runId = raw.slice(0, idx)
+  const posts = Number.parseInt(raw.slice(idx + 1), 10)
+  if (!runId || !Number.isFinite(posts) || posts < 1) return null
+  return { runId, posts }
+}
+
+/** Announce-then-deliver is two posts. A third is monologuing again. */
+export const MAX_POSTS_PER_TURN_PER_CONVERSATION = 2

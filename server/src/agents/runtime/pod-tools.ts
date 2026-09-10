@@ -53,6 +53,9 @@ interface DispatchArgs {
    *  with no payoff. turn.ts uses this to interrupt a long-running
    *  bash when a user steer arrives mid-tool. */
   signal?: AbortSignal
+  /** The run this tool call belongs to. Only `bash` uses it, to reach
+   *  `cumora reply` as CUMORA_RUN_ID — see the anti-monologue gate. */
+  runId?: string
 }
 
 function noNamespace(name: string, _wanted: string): ToolResult {
@@ -83,7 +86,7 @@ export async function executePodTool(args: DispatchArgs): Promise<ToolResult> {
   switch (args.name) {
     case 'shell':
     case 'bash':
-      return tBash(parsed, args.agentId, args.ns ?? null, args.signal)
+      return tBash(parsed, args.agentId, args.ns ?? null, args.signal, args.runId)
     case 'set_turn_status':
       return tSetTurnStatus(parsed)
     case 'read_file':
