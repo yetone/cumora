@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import type { Message, ReactionEntry } from '@/types'
+import { applyReplyCountDelta } from '@/lib/replyCount'
 import { api, ApiError, ws, type WsEvent, type ApiMessage } from '@/api/client'
 import { useApp } from '@/stores/app'
 import { getMeId } from '@/stores/auth'
@@ -505,17 +506,18 @@ export const useMessages = create<MessagesState>((set, get) => ({
           const sb = (b as { sequence?: number }).sequence ?? 0
           return sa - sb
         })
-        // Live replyCount bump on the quoted-original. Server doesn't publish
-        // the new count separately; without this the "N replies" link on the
-        // root would only catch up on a full refetch. Only bump for fresh
-        // arrivals (`prior` was absent) so a server-echo of an optimistic
-        // bubble doesn't double-count.
-        if (!prior && m.quotedMessageId) {
-          const rootId = m.quotedMessageId
-          next = next.map((x) =>
-            x.id === rootId ? { ...x, replyCount: (x.replyCount ?? 0) + 1 } : x,
-          )
-        }
+        // Live replyCount bump on the quoted-original. The server doesn't
+        // publish the new count separately; without this the "N replies" link
+        // on the root would only catch up on a full refetch.
+        //
+        // Only for FRESH arrivals. A `prior` match means this is the server
+        // echo of our own optimistic bubble, and `sendUserMessage` already
+        // counted it at insert time — which it has to, because the author's
+        // echo ALWAYS matches `prior` (by real id once the POST resolves, or
+        // by clientId when the echo wins the race). Counting only here left
+        // the author's own root one short forever, and at zero that hides the
+        // only entrance to the thread they had just created.
+        if (!prior) next = applyReplyCountDelta(next, m.quotedMessageId, 1)
         const { [m.id]: _drop, ...rest } = s.streaming
         return {
           streaming: rest,
@@ -690,10 +692,19 @@ export async function sendUserMessage(
   // shouldn't shove our bubble up the timeline.
   ;(optimistic as Message & { sequence?: number }).sequence = Number.MAX_SAFE_INTEGER
 
+  // Count the reply against its root now, next to the bubble it belongs to.
+  // The author never gets a second chance: their server echo is always matched
+  // as a `prior` in applyEvent, so the bump there is skipped for them.
+  // `discardFailedMessage` takes it back if this send is thrown away, which is
+  // also what keeps a retry (discard, then send again) balanced at +1.
   useMessages.setState((s) => ({
     byConvo: {
       ...s.byConvo,
-      [convoId]: [...(s.byConvo[convoId] ?? []), optimistic],
+      [convoId]: applyReplyCountDelta(
+        [...(s.byConvo[convoId] ?? []), optimistic],
+        quotedMessageId,
+        1,
+      ),
     },
   }))
 
@@ -740,8 +751,15 @@ export function discardFailedMessage(convoId: string, tempId: string): void {
   useMessages.setState((s) => {
     const list = s.byConvo[convoId]
     if (!list) return s
-    const next = list.filter((m) => m.id !== tempId)
-    if (next.length === list.length) return s
+    const dropped = list.find((m) => m.id === tempId)
+    if (!dropped) return s
+    // Hand back the count this reply took on insert, or the root keeps a
+    // phantom reply for the rest of the session.
+    const next = applyReplyCountDelta(
+      list.filter((m) => m.id !== tempId),
+      dropped.quotedMessageId,
+      -1,
+    )
     return { byConvo: { ...s.byConvo, [convoId]: next } }
   })
 }
