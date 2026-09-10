@@ -493,6 +493,33 @@ function cleanContainerForJob(container: JsonObject): JsonObject {
   return result
 }
 
+/**
+ * A probe copied out of the Deployment may target a *named* port, but the Job's
+ * containers carry no `ports` list (cleanContainerForJob strips it), so the name
+ * has nothing to resolve against.  kubelet then falls back to parsing the name
+ * as a number, the probe errors permanently ("strconv.Atoi: parsing ..."), the
+ * native sidecar never reports `started`, and the migrate container is never
+ * launched at all — the Job silently burns its whole activeDeadlineSeconds and
+ * dies as DeadlineExceeded with no logs.  Resolve the name to its number here,
+ * while the source container's port list is still in hand, and return null when
+ * it cannot be resolved so the caller uses its own numeric probe rather than one
+ * that can never pass.
+ */
+function resolveProbePorts(probe: unknown, ports: unknown): JsonValue | null {
+  if (!isRecord(probe) || !isJsonValue(probe)) return null
+  const resolved = cloneJson(probe) as JsonObject
+  for (const key of ['httpGet', 'tcpSocket']) {
+    const target = resolved[key]
+    if (!isRecord(target) || typeof target.port !== 'string') continue
+    const declared = Array.isArray(ports)
+      ? ports.find((entry) => isRecord(entry) && entry.name === target.port && typeof entry.containerPort === 'number')
+      : undefined
+    if (!isRecord(declared)) return null
+    target.port = declared.containerPort
+  }
+  return resolved
+}
+
 function podSpecForJob(template: JsonObject): { pod: JsonObject; server: JsonObject; proxy: JsonObject; proxyStartupProbe: JsonValue } {
   const spec = asJsonObject(getObjectPath(template, ['spec'], 'pod template'), 'pod template spec')
   const allInit = Array.isArray(spec.initContainers) ? spec.initContainers : []
@@ -504,13 +531,11 @@ function podSpecForJob(template: JsonObject): { pod: JsonObject; server: JsonObj
   delete pod.containers
   delete pod.initContainers
   delete pod.ephemeralContainers
-  const proxyStartupProbe = isJsonValue(proxySource.startupProbe)
-    ? cloneJson(proxySource.startupProbe)
-    : {
-        httpGet: { path: '/readiness', port: 9090 },
-        periodSeconds: 1,
-        failureThreshold: 60,
-      }
+  const proxyStartupProbe = resolveProbePorts(proxySource.startupProbe, proxySource.ports) ?? {
+    httpGet: { path: '/readiness', port: 9090 },
+    periodSeconds: 1,
+    failureThreshold: 60,
+  }
   return { pod, server: cleanContainerForJob(server), proxy: cleanContainerForJob(proxySource), proxyStartupProbe }
 }
 
