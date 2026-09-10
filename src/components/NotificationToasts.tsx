@@ -23,6 +23,7 @@ import { useMe } from '@/stores/auth'
 import { useConversations, isMuted } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { isElectron } from '@/lib/runtime'
+import { isWindowAttentive, setNativeAppFocused } from '@/lib/windowAttention'
 import { playNotificationChime } from '@/lib/chime'
 import { Avatar } from './Avatar'
 import { ICalendar } from './icons'
@@ -62,24 +63,6 @@ interface Toast {
   count: number
 }
 
-/** Renderer-side cache of the main window's native OS focus state,
- *  updated by `cumora.app.onFocusChange`. We trust this over
- *  `document.hasFocus()` because the latter can return stale `true`
- *  values in Electron on macOS, suppressing notifications incorrectly.
- *  Seeded from `cumora.app.isFocused()` at mount; pessimistic default
- *  of `true` avoids a half-second window of spurious toasts. */
-let nativeAppFocused = true
-
-/** Quick visibility check — works in both browser and Electron renderer.
- *  In Electron we trust the native focus state populated by IPC. */
-function isWindowAttentive(): boolean {
-  if (typeof document === 'undefined') return true
-  if (document.visibilityState === 'hidden') return false
-  if (isElectron) return nativeAppFocused
-  if (typeof document.hasFocus === 'function' && !document.hasFocus()) return false
-  return true
-}
-
 export function NotificationToasts() {
   const [toasts, setToasts] = useState<Toast[]>([])
   const meId = useMe()
@@ -94,17 +77,19 @@ export function NotificationToasts() {
   useEffect(() => { meRef.current = meId }, [meId])
   useEffect(() => { focusRef.current = { selectedId, view } }, [selectedId, view])
 
-  // Keep the renderer-side `nativeAppFocused` cache in sync with the
-  // main process. This is the source of truth for `isWindowAttentive()`
-  // when running in Electron — `document.hasFocus()` can lie there.
+  // Keep the shared native-focus cache in sync with the main process. It is
+  // the source of truth for `isWindowAttentive()` in Electron, where
+  // `document.hasFocus()` can lie — and it now gates read-marking too, so this
+  // bridge is the only thing standing between a backgrounded window and a
+  // silently cleared badge.
   useEffect(() => {
     if (!isElectron) return
     const bridge = window.cumora?.app
     if (!bridge) return
     // Seed from the current main-window focus state at mount, then keep
     // in sync with the main process's 500ms focus heartbeat.
-    void bridge.isFocused().then((f) => { nativeAppFocused = f }).catch(() => { /* swallow */ })
-    return bridge.onFocusChange((focused) => { nativeAppFocused = focused })
+    void bridge.isFocused().then(setNativeAppFocused).catch(() => { /* swallow */ })
+    return bridge.onFocusChange(setNativeAppFocused)
   }, [])
 
   useEffect(() => {

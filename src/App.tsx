@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useIsMobile } from '@/lib/utils'
 import { useApp } from '@/stores/app'
+import { isWindowAttentive, subscribeWindowAttention } from '@/lib/windowAttention'
+import { isWatchingConversation } from '@/lib/watching'
 import { useAuth } from '@/stores/auth'
 import { useMessages, bootMessagesStream } from '@/stores/messages'
 import { bootParticipants, useParticipants } from '@/stores/participants'
@@ -131,16 +133,40 @@ function AuthedApp() {
     return () => window.cumora?.dock?.setUnreadDot(false)
   }, [])
 
-  // Lazy-load messages + mark conversation as read when selected
+  // Attention is a live value: the window can go behind another app at any
+  // moment, and the read decision has to follow it.
+  const mobileStack = useApp((s) => s.mobileStack)
+  const [attentive, setAttentive] = useState(() => isWindowAttentive())
+  useEffect(() => subscribeWindowAttention(setAttentive), [])
+  const watching = convoId != null && isWatchingConversation({
+    conversationId: convoId,
+    selectedConversationId: convoId,
+    view,
+    mobileStack,
+    attentive,
+  })
+
+  // Lazy-load messages when a conversation is selected. Loading is not reading:
+  // this still runs while the thread is off screen, so coming back is instant.
   useEffect(() => {
     if (!convoId || !selectedConvoExists) return
     void useMessages.getState().loadConversation(convoId)
-    // Clear the badge locally, then persist. The server response tells us
-    // nothing the client doesn't already know, so refetching the whole list
-    // to learn that one count went to zero is pure waste.
+  }, [convoId, selectedConvoExists])
+
+  // Mark read exactly when the user starts watching — by any route: selecting
+  // the conversation, returning to the conversations view, swiping back to the
+  // chat screen, or bringing the window to the front. Keying this on `watching`
+  // rather than on `convoId` is what keeps a badge earned off screen from
+  // sticking once the user is actually looking at the messages.
+  //
+  // Clear the badge locally, then persist. The server response tells us nothing
+  // the client doesn't already know, so refetching the whole list to learn that
+  // one count went to zero is pure waste.
+  useEffect(() => {
+    if (!convoId || !selectedConvoExists || !watching) return
     useConversations.getState().markLocallyRead(convoId)
     void api.markRead(convoId).catch(() => { /* swallow */ })
-  }, [convoId, selectedConvoExists])
+  }, [convoId, selectedConvoExists, watching])
 
   // Lazy-refresh whisper list when entering whispers view
   useEffect(() => {

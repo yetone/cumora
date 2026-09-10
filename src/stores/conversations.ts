@@ -6,6 +6,8 @@ import { useApp } from '@/stores/app'
 import { commitIfContextCurrent, useAuth } from '@/stores/auth'
 import { useMessages } from '@/stores/messages'
 import { useParticipants } from '@/stores/participants'
+import { isWindowAttentive } from '@/lib/windowAttention'
+import { isWatchingConversation } from '@/lib/watching'
 
 interface ConversationsState {
   list: Conversation[]
@@ -285,13 +287,23 @@ export function bootConversations() {
       // Patch the one row this message touched. The event carries the whole
       // message, so a refetch would only re-derive what we already have —
       // for every conversation in the workspace, on every online client.
-      const active = useApp.getState().selectedConversationId
-      const isActive = e.conversationId === active
-      useConversations.getState().applyIncomingMessage(e.conversationId, e.message, { read: isActive })
+      // Selected is not the same as watched — see lib/watching for the three
+      // ordinary navigations that leave a thread selected but off screen.
+      // App.tsx marks the conversation read the moment watching becomes true
+      // again, so a badge earned this way never sticks once the user is here.
+      const app = useApp.getState()
+      const watching = isWatchingConversation({
+        conversationId: e.conversationId,
+        selectedConversationId: app.selectedConversationId,
+        view: app.view,
+        mobileStack: app.mobileStack,
+        attentive: isWindowAttentive(),
+      })
+      useConversations.getState().applyIncomingMessage(e.conversationId, e.message, { read: watching })
       // Still tell the server the user has seen it, so the badge stays gone
       // across reloads and other devices. Local state is already correct, so
       // this no longer needs to be awaited before repainting.
-      if (isActive) {
+      if (watching) {
         void api.markRead(e.conversationId).catch(() => { /* retried on next view */ })
       }
       return
