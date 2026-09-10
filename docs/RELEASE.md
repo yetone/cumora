@@ -46,6 +46,13 @@ To deploy a candidate:
    bundled CLI/runtime, or the agent-computer image. Otherwise use `N`.
    Leave `repair_0002=off` unless you are clearing the migration 0002
    precondition — see below.
+   Leave `migration_deadline_seconds` at `600` for an ordinary deploy, which
+   applies at most one small migration. Raise it (ceiling 2700) only for a
+   catch-up deploy that has many pending migrations or a large backfill: a
+   Job killed by `DeadlineExceeded` reports as `job_failed`, and a deadline
+   sized for the common case is what makes that signal mean "stuck". Every
+   migration is either transactional or built to be safely rerun, so a
+   deadline kill leaves the Deployment untouched and the schema intact.
 4. Approve the protected `production` environment. The approver should not be
    the person who built the feature for high-risk changes.
 5. Verify the workflow summary contains the selected digest, a completed

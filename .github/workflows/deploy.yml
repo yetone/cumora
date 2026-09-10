@@ -22,6 +22,10 @@ on:
         default: 'off'
         type: choice
         options: ['off', 'archive-detach']
+      migration_deadline_seconds:
+        description: 'Candidate migration Job deadline in seconds (60-2700). Raise only for a large catch-up migration.'
+        required: false
+        default: '600'
       recovery_mode:
         description: 'Baseline mode (normal requires known-good baseline; forward-only never auto-restores)'
         required: false
@@ -49,10 +53,11 @@ jobs:
   deploy:
     name: Roll cumora-server
     runs-on: ubuntu-latest
-    # The candidate rollout, bounded old-image verifier, restore rollout, and
-    # two authenticated smokes fit inside this job budget.  A cancellation
-    # cannot be relied on to run cleanup, so recovery state remains protected.
-    timeout-minutes: 45
+    # The candidate migration (up to the 2700s input ceiling), candidate
+    # rollout, bounded old-image verifier, restore rollout, and two
+    # authenticated smokes fit inside this job budget.  A cancellation cannot
+    # be relied on to run cleanup, so recovery state remains protected.
+    timeout-minutes: 75
     environment:
       name: production
       url: https://api.cumora.ai
@@ -76,13 +81,29 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           INPUT_INCLUDE_AGENT: ${{ inputs.include_agent || 'Y' }}
+          INPUT_MIGRATION_DEADLINE: ${{ inputs.migration_deadline_seconds || '600' }}
         run: |
           set -euo pipefail
           TAG="$INPUT_TAG"
           INCLUDE_AGENT="$INPUT_INCLUDE_AGENT"
           case "$INCLUDE_AGENT" in Y|N) ;; *) echo "::error::include_agent must be Y or N"; exit 1 ;; esac
+          # Reject anything that is not a plain integer before it can reach
+          # activeDeadlineSeconds, where a NaN would silently become the
+          # script's 600s default and hide the operator's intent.
+          DEADLINE="$INPUT_MIGRATION_DEADLINE"
+          case "$DEADLINE" in ''|*[!0-9]*) echo "::error::migration_deadline_seconds must be an integer, got '$DEADLINE'"; exit 1 ;; esac
+          if [ "$DEADLINE" -lt 60 ] || [ "$DEADLINE" -gt 2700 ]; then
+            echo "::error::migration_deadline_seconds must be between 60 and 2700, got $DEADLINE"
+            exit 1
+          fi
+          # The poller runs at RECOVERY_POLL_MS (3s) and must outlive the Job's
+          # own deadline, or a slow migration reports job_timeout instead of the
+          # real terminal condition Kubernetes recorded.
+          POLL_ATTEMPTS=$(( DEADLINE / 3 + 20 ))
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "include_agent=$INCLUDE_AGENT" >> "$GITHUB_OUTPUT"
+          echo "migration_deadline=$DEADLINE" >> "$GITHUB_OUTPUT"
+          echo "migration_poll_attempts=$POLL_ATTEMPTS" >> "$GITHUB_OUTPUT"
 
       - uses: google-github-actions/auth@v2
         with:
@@ -144,8 +165,8 @@ jobs:
           CANDIDATE_SERVER_IMAGE: ${{ steps.digest.outputs.server }}
           CANDIDATE_AGENT_IMAGE: ${{ steps.digest.outputs.agent }}
           MIGRATION_REPAIR: ${{ inputs.repair_0002 || 'off' }}
-          MIGRATION_DEADLINE_SECONDS: '600'
-          MIGRATION_POLL_ATTEMPTS: '200'
+          MIGRATION_DEADLINE_SECONDS: ${{ steps.tag.outputs.migration_deadline }}
+          MIGRATION_POLL_ATTEMPTS: ${{ steps.tag.outputs.migration_poll_attempts }}
           VERIFIER_POLL_ATTEMPTS: '75'
           RECOVERY_POLL_MS: '3000'
           ROLLOUT_TIMEOUT_SECONDS: '600'
