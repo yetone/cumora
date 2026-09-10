@@ -276,3 +276,50 @@ test('verifier script is old-image-local, read-only, bounded, and uses strict pr
     assert.equal(parseSchemaVerifierOutput(output).status, 'unknown')
   }
 })
+
+test("a proxy probe on a named port is resolved to its number, because the Job has no port list", () => {
+  // Production's proxy declares `ports: [{containerPort: 9090, name: pg-health}]`
+  // and probes that name.  The Job strips `ports`, so shipping the name verbatim
+  // leaves kubelet parsing "pg-health" as an integer forever: the sidecar never
+  // reports `started`, the migrate container never launches, and the Job dies of
+  // DeadlineExceeded having run nothing.
+  const deployment = deploymentFixture() as any
+  const proxy = deployment.spec.template.spec.containers[0]
+  proxy.ports = [{ containerPort: 9090, name: 'pg-health', protocol: 'TCP' }]
+  proxy.startupProbe = {
+    httpGet: { path: '/readiness', port: 'pg-health', scheme: 'HTTP' },
+    periodSeconds: 2,
+    failureThreshold: 30,
+  }
+  const baseline = extractDeploymentSnapshot(deployment, { capturedAt: '2026-09-10T00:00:00.000Z' })
+  const job = buildMigrationJob(baseline, {
+    name: 'cumora-migrate-named-port',
+    image: `server@sha256:${DIGEST_CANDIDATE}`,
+    repairMode: 'off',
+  })
+
+  const jobProxy = templateSpec(job).initContainers.find((c: any) => c.name === 'cloud-sql-proxy')
+  assert.equal(jobProxy.startupProbe.httpGet.port, 9090)
+  // The rest of the operator's probe is preserved, not replaced by the default.
+  assert.equal(jobProxy.startupProbe.failureThreshold, 30)
+  assert.equal(jobProxy.startupProbe.httpGet.path, '/readiness')
+  // A Job container still carries no port declarations.
+  assert.equal(jobProxy.ports, undefined)
+})
+
+test('an unresolvable named probe port falls back to a probe that can actually pass', () => {
+  const deployment = deploymentFixture() as any
+  const proxy = deployment.spec.template.spec.containers[0]
+  // Name declared nowhere: keeping it would ship a permanently erroring probe.
+  proxy.startupProbe = { httpGet: { path: '/readiness', port: 'pg-health' }, failureThreshold: 30 }
+  const baseline = extractDeploymentSnapshot(deployment, { capturedAt: '2026-09-10T00:00:00.000Z' })
+  const job = buildMigrationJob(baseline, {
+    name: 'cumora-migrate-unresolvable-port',
+    image: `server@sha256:${DIGEST_CANDIDATE}`,
+    repairMode: 'off',
+  })
+
+  const jobProxy = templateSpec(job).initContainers.find((c: any) => c.name === 'cloud-sql-proxy')
+  assert.equal(jobProxy.startupProbe.httpGet.port, 9090)
+  assert.equal(jobProxy.startupProbe.failureThreshold, 60)
+})
