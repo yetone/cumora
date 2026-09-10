@@ -1723,8 +1723,36 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
     if (failureNoticePosted || inbox.length === 0) return
     failureNoticePosted = true
     const uniqueConvoIds = [...new Set(inbox.map((m) => m.conversation_id))]
+    // "No result was produced" has to be true where it is posted. A turn can
+    // answer in hop 3 and then die at MAX_HOPS or the token ceiling in hop 40;
+    // the room already has the reply, and a red failure line directly under it
+    // says the opposite of what the user can see.
+    //
+    // Fix the SENTENCE, not the notice. Suppressing it outright would silence
+    // the announce-then-die case, which is drawn from the same population: the
+    // rules mandate an intent message before long work (see the operating rules
+    // below), and long multi-hop turns are exactly the ones that reach MAX_HOPS
+    // or the token ceiling. There the room would get "Drafting the summary now."
+    // and then nothing — and nothing wakes an agent on an unread inbox alone,
+    // so no one retries it either. The failure line is the only thing telling
+    // the user to re-ask.
+    //
+    // `message.posted` specifically, not "any visible side effect": leave,
+    // invite, kick, topic_updated and renamed all report visibleToUser too, and
+    // an agent that renamed the room in hop 2 has not answered anybody.
+    // Per conversation, because one turn can span several and only some of them
+    // may have been answered.
+    const deliveredConvoIds = new Set(
+      cliSideEffectsThisTurn
+        .filter((e) => e.event === 'message.posted' && e.visibleToUser !== false)
+        .map((e) => e.conversationId)
+        .filter((id): id is string => typeof id === 'string'),
+    )
     const reason = agentTurnFailureNoticeReason(summary, err)
-    const noticeText = `Agent run failed before it could finish (${reason}). No result was produced.`
+    const failedText = `Agent run failed before it could finish (${reason}).`
+    const noticeTextFor = (convoId: string): string => (
+      deliveredConvoIds.has(convoId) ? failedText : `${failedText} No result was produced.`
+    )
     const withNoticeTimeout = async <T>(promise: Promise<T>, label: string): Promise<T> => {
       const timeoutMs = 5_000
       let timer: ReturnType<typeof setTimeout> | null = null
@@ -1798,7 +1826,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
           companyId: convoCompanyId,
           agentId,
           noticeKind: 'agent_turn_failed',
-          text: noticeText,
+          text: noticeTextFor(convoId),
           dedupeKey: `agent_turn_failed:${convoId}:${inputKey}`,
           dedupeTtlSec: 6 * 3600,
         }), `postSystemNotice(${convoId})`)
@@ -1812,6 +1840,7 @@ export async function runAgentTurn(agentId: string, options: AgentTurnOptions = 
             reason,
             inputMessageIds: convoInbox.map((m) => m.id),
             noticePosted: res.posted,
+            resultDelivered: deliveredConvoIds.has(convoId),
           },
           stage: 'failed',
         }).catch(() => { /* observability best-effort */ })
@@ -3260,7 +3289,26 @@ Mechanics:
         argsJson: JSON.stringify({ command: `cumora reply ${target.conversationId} ${escaped} --continue` }),
         ns: namespace,
       })
-      if (!relay.ok) {
+      // Exit 2 is HELD: cmdReply deliberately declined the write because a peer
+      // already delivered this. Nothing failed — the coordination system did
+      // its job and the room already has the answer. Reporting that as a failed
+      // run puts "Agent run failed … No result was produced" under a result
+      // that a teammate produced seconds earlier. `skipped` is the status this
+      // file already uses for a turn that intentionally does nothing.
+      const relayExit = (relay.output as { exitCode?: unknown } | null)?.exitCode
+      const relayHeld = !relay.ok && relayExit === 2
+      if (relayHeld) {
+        finalStatus = 'skipped'
+        finalSummary ||= 'Auto-relay held — a peer already delivered this'
+        await runtime.recordEvent({
+          runId, agentId, companyId: convoCompanyId,
+          kind: 'turn.auto_relay_held',
+          level: 'info',
+          title: 'Auto-relay held by a peer delivery',
+          data: { conversationId: target.conversationId, output: relay.output },
+          stage: 'auto_relay_held',
+        })
+      } else if (!relay.ok) {
         finalStatus = 'failed'
         finalError = `Auto-relay reply failed: ${relay.error ?? 'unknown error'}`
         await runtime.recordEvent({

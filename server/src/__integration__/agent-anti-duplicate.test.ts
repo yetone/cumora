@@ -481,3 +481,37 @@ test('[integration] with no run id the gate behaves exactly as before', async ()
     assert.match(second.text, /you already posted in/)
   })
 })
+
+// ─── exit 2 means HELD, and only that ──────────────────────────────
+//
+// turn.ts now reads the exit code to tell a deliberate stand-down apart from a
+// crash: a HELD relay ends the turn as `skipped` instead of posting "Agent run
+// failed … No result was produced" into a room where a peer just delivered.
+// That only works while 2 means exactly one thing.
+
+test('[integration] a HELD reply exits 2, an ordinary refusal exits 1', async () => {
+  const { agentA, agentB, convoId } = await seedGroupWithTwoAgents()
+
+  await runCli(['--as', agentB, 'reply', convoId, 'The answer is 42.'])
+  const held = await runCli(['--as', agentA, 'reply', convoId, 'The answer is 42.'])
+  assert.equal(held.ok, false)
+  assert.match(held.text, /HELD/)
+  assert.equal(held.exitCode, 2, 'HELD must be distinguishable from a crash by exit code alone')
+
+  // A refusal that is not a stand-down: nothing was deliberately declined, the
+  // caller simply asked for something impossible.
+  const usage = await runCli(['--as', agentA, 'reply'])
+  assert.equal(usage.ok, false)
+  assert.equal(usage.exitCode, 1, 'an ordinary error must not masquerade as HELD')
+})
+
+test('[unit] the top-level catch-all does not claim to be a hold', async () => {
+  // An unexpected exception is not "your write was declined, re-decide and
+  // retry" — and it used to exit 2, which is what made the code ambiguous.
+  const { readFile } = await import('node:fs/promises')
+  const source = await readFile(new URL('../agents/cli.ts', import.meta.url), 'utf8')
+  const tail = source.slice(source.lastIndexOf('} catch (e) {'))
+
+  assert.match(tail, /err\(`error: \$\{e instanceof Error \? e\.message : String\(e\)\}`, 1\)/,
+    'the catch-all exits 2 again, so turn.ts can no longer tell a deliberate stand-down from a crash')
+})
