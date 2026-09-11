@@ -38,6 +38,44 @@
  *   3. The most recent {@link KEEP_RECENT_PAIRS} pairs are NEVER
  *      dropped either — they're the immediate conversational context
  *      the model needs to continue from.
+ *
+ *   4. Everything that SURVIVES keeps its original relative POSITION.
+ *      Compaction only deletes; it never reorders. This one is not
+ *      cosmetic — it is the fix for the duplicate-reply bug below.
+ *
+ *      Stage 2 used to partition by item TYPE: every non-tool item
+ *      sitting after the first tool item went into a `tailNonTool`
+ *      bucket that both rebuilds re-appended AFTER all surviving
+ *      pairs. The only non-tool items that ever appear mid-history
+ *      are `role:'user'` items we inject ourselves — the mid-turn
+ *      steer render (turn.ts `tryDrainSteer`), the status-required
+ *      nudge, and the completion-rejection nudge. And there is no
+ *      assistant message in `history` for the model to see its own
+ *      reply in: assistant text is deliberately never added as a
+ *      history item (turn.ts: synthesizing one with no item_id /
+ *      part_id / responseId corrupts history shape — see the earlier
+ *      bug noted there). So the ONLY in-context evidence that a
+ *      steer was already handled is that the function_call /
+ *      function_call_output pairs answering it sit AFTER it.
+ *
+ *      The tail-move inverted exactly that: a steer answered in hop 5
+ *      came back as the LAST item of the hop-20 input — the
+ *      fresh-input slot — with its answer now ordered before the
+ *      question, while its own text reads as an imperative fresh
+ *      arrival ("[Mid-turn update — 1 new message received while you
+ *      were working] … Re-assess your current plan … respond to the
+ *      new message in its own conversation"). The agent did the work
+ *      a second time and posted a second reply, and turn.ts persists
+ *      the compacted array for every remaining hop, so it re-asked on
+ *      every hop after that. Same shape for the two nudges: a
+ *      satisfied nudge re-presented last is a live instruction again.
+ *
+ *      Rebuilding in order also stops compaction from re-grouping
+ *      interleaved items. One hop pushes all of its function_calls
+ *      and then all of its outputs (fc1, fc2, out1, out2); that is
+ *      the shape every UNCOMPACTED hop already puts on the wire, so
+ *      handing it back unchanged is strictly closer to known-good
+ *      than the fc1,out1,fc2,out2 the old bucket rebuild produced.
  */
 import type { ResponseInputItem } from 'openai/resources/responses/responses'
 
@@ -210,13 +248,15 @@ function groupKeyOf(item: ResponseInputItem): string | null {
   return null
 }
 
-/** Partition `history` into [leadingNonTool, pairGroups, tailNonTool].
- *  pairGroups is keyed by call_id and ordered by first appearance. */
+/** Partition `history` into [leadingNonTool, pairGroups]. pairGroups is
+ *  keyed by call_id and ordered by first appearance — it exists purely to
+ *  decide WHICH call_ids get dropped (and to measure them). It is not a
+ *  rebuild order: the rebuild walks the original array (see
+ *  {@link tailWithoutDroppedGroups}) so invariant 4 holds. */
 interface PartitionedHistory {
   leadingNonToolEnd: number
   callIdsInOrder: string[]
   pairItems: Map<string, ResponseInputItem[]>
-  tailNonTool: ResponseInputItem[]
 }
 
 function partitionHistory(history: ResponseInputItem[]): PartitionedHistory {
@@ -226,7 +266,6 @@ function partitionHistory(history: ResponseInputItem[]): PartitionedHistory {
   }
   const callIdsInOrder: string[] = []
   const pairItems = new Map<string, ResponseInputItem[]>()
-  const tailNonTool: ResponseInputItem[] = []
   for (let i = leadingNonToolEnd; i < history.length; i++) {
     const item = history[i]
     const key = groupKeyOf(item)
@@ -236,11 +275,37 @@ function partitionHistory(history: ResponseInputItem[]): PartitionedHistory {
         callIdsInOrder.push(key)
       }
       pairItems.get(key)!.push(item)
-    } else {
-      tailNonTool.push(item)
     }
+    // Non-tool items are NOT collected here. They are rebuilt from their
+    // original index — hoisting them to the tail is the duplicate-reply
+    // bug documented as invariant 4 in the module header.
   }
-  return { leadingNonToolEnd, callIdsInOrder, pairItems, tailNonTool }
+  return { leadingNonToolEnd, callIdsInOrder, pairItems }
+}
+
+/** Rebuild everything after the leading seed messages IN ORIGINAL ORDER,
+ *  skipping only the items whose call_id group was dropped. Non-tool
+ *  items (steer renders, protocol nudges) and un-pair-able items (a
+ *  malformed function_call with no call_id — `groupKeyOf` returns null,
+ *  so it is never drop-eligible) simply keep their slot.
+ *
+ *  Invariant 1 still holds by construction: membership is decided per
+ *  call_id group, so a function_call_output is kept iff its matching
+ *  function_call is kept. Nothing can be split, so upstream never sees
+ *  "No tool call found for function call output with call_id X". */
+function tailWithoutDroppedGroups(
+  history: ResponseInputItem[],
+  leadingNonToolEnd: number,
+  droppedCallIds: Set<string>,
+): ResponseInputItem[] {
+  const kept: ResponseInputItem[] = []
+  for (let i = leadingNonToolEnd; i < history.length; i++) {
+    const item = history[i]
+    const key = groupKeyOf(item)
+    if (key !== null && droppedCallIds.has(key)) continue
+    kept.push(item)
+  }
+  return kept
 }
 
 /** Build a defensive deep-ish copy of every item so callers' arrays are
@@ -296,30 +361,30 @@ function compactHistoryInternal(
     return { newHistory, truncatedOutputBytes, truncatedOutputCount, droppedPairCount: 0, droppedItemBytes: 0, usedLlmSummary: false }
   }
 
-  const { leadingNonToolEnd, callIdsInOrder, pairItems, tailNonTool } = partitionHistory(newHistory)
+  const { leadingNonToolEnd, callIdsInOrder, pairItems } = partitionHistory(newHistory)
+  // Pin the stage-1 array: every iteration rebuilds from THIS one, so the
+  // surviving items are always read at their original indices (invariant 4).
+  // `newHistory` is reassigned below and must not become the rebuild source.
+  const stage1History = newHistory
   const dropEligible = callIdsInOrder.slice(0, Math.max(0, callIdsInOrder.length - KEEP_RECENT_PAIRS))
+  const droppedCallIds = new Set<string>()
   let droppedPairCount = 0
   let droppedItemBytes = 0
   for (let idx = 0; idx < dropEligible.length; idx++) {
     const cid = dropEligible[idx]
     const items = pairItems.get(cid) ?? []
     for (const it of items) droppedItemBytes += JSON.stringify(it).length
-    pairItems.delete(cid)
+    droppedCallIds.add(cid)
     droppedPairCount += 1
-    const surviving: ResponseInputItem[] = []
-    for (let j = idx + 1; j < callIdsInOrder.length; j++) {
-      surviving.push(...(pairItems.get(callIdsInOrder[j]) ?? []))
-    }
     const marker: ResponseInputItem = {
       type: 'message',
       role: 'user',
       content: `[auto-compaction] ${droppedPairCount} earlier tool ${droppedPairCount === 1 ? 'call/output pair was' : 'call/output pairs were'} dropped from history to fit the context budget (~${droppedItemBytes} bytes). Continue from where you left off.`,
     } as unknown as ResponseInputItem
     newHistory = [
-      ...newHistory.slice(0, leadingNonToolEnd),
+      ...stage1History.slice(0, leadingNonToolEnd),
       marker,
-      ...surviving,
-      ...tailNonTool,
+      ...tailWithoutDroppedGroups(stage1History, leadingNonToolEnd, droppedCallIds),
     ]
     estimateTokensCount = estimateHistoryTokens(newHistory)
     if (!stillOverThreshold(estimateTokensCount)) break
@@ -335,7 +400,7 @@ async function summarizeAndSplice(
   stage1Counters: { truncatedOutputBytes: number; truncatedOutputCount: number },
   summarize: (itemsToDrop: ResponseInputItem[]) => Promise<string>,
 ): Promise<CompactionResult | null> {
-  const { leadingNonToolEnd, callIdsInOrder, pairItems, tailNonTool } = partitionHistory(stage1History)
+  const { leadingNonToolEnd, callIdsInOrder, pairItems } = partitionHistory(stage1History)
   const dropEligible = callIdsInOrder.slice(0, Math.max(0, callIdsInOrder.length - KEEP_RECENT_PAIRS))
   if (dropEligible.length === 0) return null
 
@@ -354,16 +419,10 @@ async function summarizeAndSplice(
     content: `[auto-compaction · ${dropEligible.length} earlier tool call/output ${dropEligible.length === 1 ? 'pair' : 'pairs'} summarized below — continue from where you left off]\n\n${cleaned}`,
   } as unknown as ResponseInputItem
 
-  const survivingTailPairs: ResponseInputItem[] = []
-  for (const cid of callIdsInOrder) {
-    if (dropEligible.includes(cid)) continue
-    survivingTailPairs.push(...(pairItems.get(cid) ?? []))
-  }
   const newHistory = [
     ...stage1History.slice(0, leadingNonToolEnd),
     summaryMarker,
-    ...survivingTailPairs,
-    ...tailNonTool,
+    ...tailWithoutDroppedGroups(stage1History, leadingNonToolEnd, new Set(dropEligible)),
   ]
   return {
     newHistory,

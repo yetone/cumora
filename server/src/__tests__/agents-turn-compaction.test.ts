@@ -776,3 +776,103 @@ test('summary: items with no call_id (legacy / bare function_call) do NOT confus
   assert.equal(last.type, 'function_call')
   assert.equal(last.name, 'orphan')
 })
+
+// ── Position preservation: an answered steer must not be re-asked ───────────
+//
+// Mid-turn steers (turn.ts `tryDrainSteer`) push the new user message into
+// `history` as a role:'user' item, and the tool calls that ANSWER it land
+// after it. That ordering is the only in-context evidence the steer was
+// handled: assistant text is deliberately never added as a history item
+// (turn.ts, "would corrupt history shape — see earlier bug"), so there is no
+// assistant message for the model to see its own reply in.
+//
+// Stage 2 used to bucket every non-tool item sitting after the first tool item
+// and re-append that bucket AFTER all surviving pairs. A steer answered in hop
+// 5 therefore reappeared as the LAST item of the hop-20 input — the fresh-input
+// slot — with its answer now ordered before the question, while its text reads
+// as an imperative fresh arrival ("Re-assess your current plan … respond to the
+// new message in its own conversation"). The agent replied to the user twice.
+
+const steerMsg = (text: string): ResponseInputItem => ({
+  type: 'message',
+  role: 'user',
+  content: text,
+}) as unknown as ResponseInputItem
+
+/** History shaped like a real steered turn: seed question, two old tool
+ *  pairs, the steer, the pair that answered the steer, one later pair. */
+const steeredHistory = (): ResponseInputItem[] => [
+  userMsg('original question'),
+  fnCall('call_old1'), fnOutput('call_old1', 'a'),
+  fnCall('call_old2'), fnOutput('call_old2', 'b'),
+  steerMsg('[Mid-turn update — 1 new message received while you were working]\n@ana (in conversation c9):\nalso check the logs\nRe-assess your current plan in light of these and continue.'),
+  fnCall('call_answer'), fnOutput('call_answer', 'posted reply to c9'),
+  fnCall('call_later'), fnOutput('call_later', 'd'),
+]
+
+const indexOfSteer = (history: ResponseInputItem[]): number =>
+  history.findIndex((it) => {
+    const r = it as unknown as { content?: unknown }
+    return typeof r.content === 'string' && r.content.startsWith('[Mid-turn update')
+  })
+
+const indexOfCallId = (history: ResponseInputItem[], callId: string): number =>
+  history.findIndex((it) => (it as unknown as { call_id?: string }).call_id === callId)
+
+test('stage 2 (drop path): an ANSWERED mid-turn steer keeps its position — never hoisted to the newest-input slot', () => {
+  const result = compactHistory(steeredHistory(), ALWAYS_OVER)
+  assert.equal(result.droppedPairCount, 2, 'the two oldest pairs go; the steer and its answer survive')
+
+  const steerAt = indexOfSteer(result.newHistory)
+  assert.ok(steerAt >= 0, 'the steer itself must never be dropped')
+  assert.notEqual(
+    steerAt, result.newHistory.length - 1,
+    'the answered steer was hoisted into the newest-input slot — the model reads it as a fresh message and answers it again',
+  )
+  assert.ok(
+    steerAt < indexOfCallId(result.newHistory, 'call_answer'),
+    'the tool call that answered the steer must still come AFTER it — that ordering is the only evidence it was handled',
+  )
+  assert.ok(
+    steerAt < indexOfCallId(result.newHistory, 'call_later'),
+    'later work must stay after the steer',
+  )
+})
+
+test('stage 2 (summary path): an ANSWERED mid-turn steer keeps its position', async () => {
+  const result = await compactHistoryWithSummary(steeredHistory(), () => true, async () => 'ran two lookups')
+  assert.equal(result.usedLlmSummary, true)
+
+  const steerAt = indexOfSteer(result.newHistory)
+  assert.ok(steerAt >= 0, 'the steer itself must never be dropped')
+  assert.notEqual(
+    steerAt, result.newHistory.length - 1,
+    'the answered steer was hoisted into the newest-input slot on the summarized path too',
+  )
+  assert.ok(
+    steerAt < indexOfCallId(result.newHistory, 'call_answer'),
+    'the tool call that answered the steer must still come AFTER it',
+  )
+})
+
+test('stage 2: surviving tool items keep their original relative order (no regrouping by call_id)', () => {
+  // One hop can emit two function_calls and then both outputs:
+  // fc1, fc2, out1, out2 — that is the exact shape every UNCOMPACTED hop
+  // already sends on the wire. Compaction must hand back the same order it
+  // was given, not a re-grouped fc1,out1,fc2,out2.
+  const history: ResponseInputItem[] = [
+    userMsg('q'),
+    fnCall('call_drop'), fnOutput('call_drop', 'x'),
+    fnCall('call_a'), fnCall('call_b'), fnOutput('call_a', 'a'), fnOutput('call_b', 'b'),
+  ]
+  const result = compactHistory(history, ALWAYS_OVER)
+  const shape = result.newHistory.map((it) => {
+    const r = it as unknown as { type?: string; call_id?: string }
+    return r.call_id ? `${r.type}:${r.call_id}` : `${r.type}`
+  })
+  assert.deepEqual(shape, [
+    'message', 'message',
+    'function_call:call_a', 'function_call:call_b',
+    'function_call_output:call_a', 'function_call_output:call_b',
+  ])
+})
