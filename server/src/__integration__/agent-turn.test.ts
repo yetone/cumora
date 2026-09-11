@@ -1650,3 +1650,215 @@ test('[integration] MAX_HOPS: model that keeps requesting tools is capped withou
   // direct one we seeded.
   assert.match(conversationId, /^direct-/)
 })
+
+// ─── "No result was produced" has to be true ───────────────────────
+//
+// postTurnFailureNotices posted that line into every conversation in the
+// inbox whenever finalStatus was 'failed', without asking whether the turn had
+// in fact produced something there. A turn can answer in hop 3 and then die at
+// MAX_HOPS, the token ceiling, or a turn-status protocol violation in hop 40 —
+// the room has the reply, and the red line lands directly under it saying the
+// opposite of what the user can see.
+//
+// The other half: a HELD relay. cmdReply exits 2 to say "declined on purpose,
+// a peer already delivered this". Treating that as a failed run reported the
+// coordination system working as a crash.
+
+test('[integration] a failure notice under a delivered answer drops the false clause', async () => {
+  const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
+  await postHumanMessage({ conversationId, companyId, humanId, body: 'what is the answer?' })
+
+  const answer = 'The answer is 42.'
+  // Answer in hop 1, then the provider dies on the next call — the stub throws
+  // once its scripted streams run out. A missing turn status alone would NOT
+  // do: a user-visible reply infers `done`, which is correct and deliberate.
+  // This is the shape that genuinely fails after an answer has landed, the same
+  // as MAX_HOPS or the hard token ceiling further into a long turn.
+  const llm = makeLlmStub([
+    streamWithToolCall({
+      fcId: 'fc_reply', callId: 'call_reply', name: 'bash',
+      argsJson: JSON.stringify({ command: `cumora reply ${conversationId} '${answer}'` }),
+    }),
+  ])
+  llm.install()
+  makeToolStub({
+    bash: async () => {
+      const messageId = `m-${randomUUID()}`
+      await pool.query(
+        `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, company_id)
+           VALUES ($1, $2, $3, 'text', $4, 2, $5)`,
+        [messageId, conversationId, agentId, answer, companyId],
+      )
+      return {
+        ok: true,
+        output: bashReplyOutput({ stdout: `sent (${messageId}, seq 2)`, conversationId, messageId }),
+        durationMs: 1,
+        display: { name: 'bash', arg: 'reply', status: 'ok', detail: '' },
+      }
+    },
+    set_turn_status: turnStatusToolResult,
+  }).install()
+
+  await assert.rejects(runAgentTurn(agentId))
+
+  const { rows: runs } = await pool.query<{ status: string }>(
+    `SELECT status FROM agent_runs WHERE agent_id = $1`, [agentId],
+  )
+  assert.equal(runs[0].status, 'failed', 'the run still genuinely failed — that is not what changed')
+
+  const posted = await messagesFromAgent(conversationId, agentId)
+  assert.equal(posted.length, 1)
+  assert.equal(posted[0].body, answer, 'the answer is in the room')
+
+  const { rows: notices } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 AND kind = 'system'`,
+    [conversationId],
+  )
+  // The notice still goes out — it is the only thing telling the user the run
+  // died and the work may be incomplete. What changes is the sentence: it must
+  // not claim the opposite of what the room can see one line above it.
+  assert.equal(notices.length, 1, 'the run failed, so the room must still be told')
+  assert.match(notices[0].body, /Agent run failed before it could finish/)
+  assert.doesNotMatch(
+    notices[0].body, /No result was produced/,
+    `a room that already has the answer was told "No result was produced": ${notices[0].body}`,
+  )
+})
+
+test('[integration] a rename is not an answer — the full sentence stays', async () => {
+  // The predicate has to be `message.posted`, not "any visible side effect".
+  // leave / invite / kick / topic_updated / renamed all report visibleToUser
+  // too, and an agent that renamed the room and then died has answered nobody:
+  // trimming the clause there would quietly drop the only prompt to re-ask.
+  const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
+  await postHumanMessage({ conversationId, companyId, humanId, body: 'what is the answer?' })
+
+  const llm = makeLlmStub([
+    streamWithToolCall({
+      fcId: 'fc_rename', callId: 'call_rename', name: 'bash',
+      argsJson: JSON.stringify({ command: `cumora rename ${conversationId} 'Q3 launch'` }),
+    }),
+  ])
+  llm.install()
+  makeToolStub({
+    bash: async () => ({
+      ok: true,
+      output: {
+        stdout: 'renamed',
+        stderr: '',
+        exitCode: 0,
+        sideEffects: [{
+          event: 'conversation.renamed',
+          command: 'rename',
+          conversationId,
+          visibleToUser: true,
+        }],
+      },
+      durationMs: 1,
+      display: { name: 'bash', arg: 'rename', status: 'ok', detail: '' },
+    }),
+    set_turn_status: turnStatusToolResult,
+  }).install()
+
+  await assert.rejects(runAgentTurn(agentId))
+
+  const { rows: notices } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 AND kind = 'system'`,
+    [conversationId],
+  )
+  assert.equal(notices.length, 1)
+  assert.match(
+    notices[0].body, /No result was produced/,
+    'a rename was mistaken for a delivered answer, so the user was never told to re-ask',
+  )
+})
+
+test('[integration] a HELD relay is a stand-down, not a failed run', async () => {
+  const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
+  await postHumanMessage({ conversationId, companyId, humanId, body: 'count please' })
+  void companyId
+
+  const llm = makeLlmStub([
+    streamWithJustText('The answer is 42.'),
+    streamWithToolCall({
+      fcId: 'fc_status', callId: 'call_status', name: 'set_turn_status',
+      argsJson: JSON.stringify({
+        status: 'done', reason: 'relay the draft', next_step: '',
+        assistant_text: 'reply', reply_conversation_id: conversationId,
+      }),
+    }),
+  ])
+  llm.install()
+  makeToolStub({
+    // Exactly what tBash returns when cmdReply exits 2: a peer already posted
+    // this, so the write was declined on purpose.
+    bash: async () => ({
+      ok: false,
+      output: { stdout: 'HELD — verbatim duplicate of the immediately-prior peer post', stderr: '', exitCode: 2 },
+      error: 'exit 2',
+      durationMs: 1,
+      display: { name: 'bash', arg: 'reply', status: 'held', detail: '' },
+    }),
+    set_turn_status: turnStatusToolResult,
+  }).install()
+
+  await runAgentTurn(agentId)
+
+  const { rows: runs } = await pool.query<{ status: string }>(
+    `SELECT status FROM agent_runs WHERE agent_id = $1`, [agentId],
+  )
+  assert.equal(runs[0].status, 'skipped', 'a deliberate decline is not a failed run')
+
+  const { rows: notices } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 AND kind = 'system'`,
+    [conversationId],
+  )
+  assert.equal(notices.length, 0, 'the coordination system working must not read as a crash')
+
+  const ev = await eventsForAgent(agentId)
+  assert.equal(ev.filter((e) => e.kind === 'turn.auto_relay_held').length, 1, 'the stand-down is still observable')
+  assert.equal(ev.filter((e) => e.kind === 'turn.auto_relay_failed').length, 0)
+})
+
+test('[integration] a relay that genuinely failed is still a failed run', async () => {
+  // The guard rail: only exit 2 means "held". Anything else is a real failure
+  // and must keep its notice, or this fix would swallow lost answers.
+  const { companyId, agentId, humanId, conversationId } = await seedConvo({ kind: 'direct' })
+  await postHumanMessage({ conversationId, companyId, humanId, body: 'count please' })
+  void companyId
+
+  const llm = makeLlmStub([
+    streamWithJustText('The answer is 42.'),
+    streamWithToolCall({
+      fcId: 'fc_status', callId: 'call_status', name: 'set_turn_status',
+      argsJson: JSON.stringify({
+        status: 'done', reason: 'relay the draft', next_step: '',
+        assistant_text: 'reply', reply_conversation_id: conversationId,
+      }),
+    }),
+  ])
+  llm.install()
+  makeToolStub({
+    bash: async () => ({
+      ok: false,
+      output: { stdout: '', stderr: 'boom', exitCode: 1 },
+      error: 'exit 1',
+      durationMs: 1,
+      display: { name: 'bash', arg: 'reply', status: 'error', detail: '' },
+    }),
+    set_turn_status: turnStatusToolResult,
+  }).install()
+
+  await runAgentTurn(agentId)
+
+  const { rows: runs } = await pool.query<{ status: string }>(
+    `SELECT status FROM agent_runs WHERE agent_id = $1`, [agentId],
+  )
+  assert.equal(runs[0].status, 'failed')
+
+  const { rows: notices } = await pool.query<{ body: string }>(
+    `SELECT body FROM messages WHERE conversation_id = $1 AND kind = 'system'`,
+    [conversationId],
+  )
+  assert.equal(notices.length, 1, 'a genuinely lost answer must still tell the room')
+})

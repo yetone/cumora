@@ -6662,7 +6662,11 @@ export async function runCli(argv: string[]): Promise<CliResult> {
         return err(`unknown subcommand: ${sub}\nrun "cumora help" for usage`)
     }
   } catch (e) {
-    return err(`error: ${e instanceof Error ? e.message : String(e)}`, 2)
+    // 1, not 2. Exit 2 means HELD — "your write was deliberately declined,
+    // re-decide and retry" — and five call sites use it that way. An
+    // unexpected exception is not that, and turn.ts now reads the code to tell
+    // a stand-down apart from a crash.
+    return err(`error: ${e instanceof Error ? e.message : String(e)}`, 1)
   }
 }
 
