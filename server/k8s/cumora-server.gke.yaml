@@ -181,6 +181,13 @@ spec:
           httpGet: { path: /api/health, port: http }
           periodSeconds: 5
           timeoutSeconds: 2
+          # /api/health races SELECT 1 against 1s, so a saturated (not dead)
+          # Postgres fails a random fraction of probes. Every replica shares
+          # that one DB, so at the default threshold (3 = 15s) they were all
+          # pulled from the NEG together and the LB answered 502 for traffic
+          # the pods could still serve, slowly. 60s of CONSECUTIVE failures
+          # still pulls a pod on a real DB outage; a flap no longer does.
+          failureThreshold: 12
         livenessProbe:
           httpGet: { path: /api/livez, port: http }
           periodSeconds: 30

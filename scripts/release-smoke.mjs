@@ -40,9 +40,36 @@ async function request(path, { authenticated = true } = {}) {
   return body
 }
 
+/** /api/health is the readiness probe: `SELECT 1` raced against a 1s timer, so
+ *  a DB under load answers 503 on some fraction of calls while every real
+ *  request still completes. One such 503 must not read as "production is
+ *  down" — it failed the pre-deploy baseline on a healthy-but-busy fleet and
+ *  would roll a good candidate back on the post-deploy check for the same
+ *  reason. A bounded retry keeps a persistent outage failing (every attempt
+ *  503s) while a transient one has to hold for the whole window to fail. */
+const HEALTH_ATTEMPTS = Number(process.env.CUMORA_SMOKE_HEALTH_ATTEMPTS || 6)
+const HEALTH_RETRY_MS = Number(process.env.CUMORA_SMOKE_HEALTH_RETRY_MS || 2_000)
+
+async function checkHealth() {
+  let lastError = null
+  for (let attempt = 1; attempt <= HEALTH_ATTEMPTS; attempt++) {
+    try {
+      const health = await request('/api/health', { authenticated: false })
+      if (health?.ok) return
+      lastError = new Error('/api/health did not report ok')
+    } catch (error) {
+      lastError = error
+    }
+    if (attempt < HEALTH_ATTEMPTS) {
+      console.log(`  /api/health attempt ${attempt}/${HEALTH_ATTEMPTS} failed: ${lastError.message} — retrying in ${HEALTH_RETRY_MS}ms`)
+      await new Promise((resolve) => setTimeout(resolve, HEALTH_RETRY_MS))
+    }
+  }
+  throw new Error(`/api/health failed ${HEALTH_ATTEMPTS} consecutive attempts: ${lastError.message}`)
+}
+
 try {
-  const health = await request('/api/health', { authenticated: false })
-  if (!health?.ok) throw new Error('/api/health did not report ok')
+  await checkHealth()
 
   const auth = await request('/api/auth/me')
   if (!Array.isArray(auth?.companies) || !auth.companies.some((company) => company.id === companyId)) {
