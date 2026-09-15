@@ -95,6 +95,24 @@ describe('message history after reconnect', () => {
         assert.equal(store.getState().byConvo.chat.at(-1), optimistic)
       })
 
+      it('backfills even when a live message arrived after the reconnect', async () => {
+        // On reconnect the store invalidates `loaded` for every conversation
+        // except the open one, so this one backfills when the user next opens
+        // it. But `applyEvent` appends live `message.new` rows to byConvo for
+        // ANY cached conversation, and that lands before the user gets there.
+        // One such row raises max(sequence) past the outage, the loop's
+        // `page[0].sequence > latest` goes false, and the whole backfill is
+        // skipped — a silent permanent hole.
+        const live = messages(300, 300)
+        const { store, sequences } = setup(300, [...messages(1, 80), ...live])
+        await store.getState()[method]('chat')
+
+        assert.deepEqual(
+          sequences(), messages(1, 300).map((m) => m.sequence),
+          'the outage was never bridged because one live message raised the watermark past it',
+        )
+      })
+
       it('keeps the cache intact on a failed backfill and fills the gap on retry', async () => {
         const { store, api, sequences } = setup(200)
         const originalCache = store.getState().byConvo.chat
@@ -113,6 +131,20 @@ describe('message history after reconnect', () => {
       })
     })
   }
+
+  it('bridges across a hole in the cache without duplicating what is held', async () => {
+    // A rolled-back INSERT leaves a real hole in `sequence`. The completeness
+    // watermark stops at it, so the bridge re-fetches rows we already hold —
+    // which is the safe direction, as long as the merge does not duplicate.
+    const holed = [...messages(1, 40), ...messages(42, 80)]
+    const { store, sequences } = setup(200, holed)
+    await store.getState().loadConversation('chat')
+
+    const got = sequences()
+    assert.deepEqual(got, [...got].sort((a, b) => a - b), 'the merge left the list out of order')
+    assert.equal(new Set(got).size, got.length, 'the bridge duplicated messages it already held')
+    assert.ok(got.includes(200) && got.includes(81), 'the gap after the hole was not bridged')
+  })
 
   it('preserves messages received while the backfill request is in flight', async () => {
     const { store, api, sequences } = setup(200)

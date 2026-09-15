@@ -328,13 +328,41 @@ function mergeFetchedMessages(current: Message[] | undefined, incoming: Message[
   return sortMessagesStable(merged)
 }
 
-async function fetchMessagesSinceCache(id: string, current: Message[] = []): Promise<ApiMessage[]> {
-  let latest: number | null = null
-  for (const message of current) {
-    const seq = sequenceOf(message)
+/** The newest sequence below which the cache is known COMPLETE — not simply
+ *  the biggest number it holds.
+ *
+ *  Those differ after an outage. On reconnect the store invalidates `loaded`
+ *  for every conversation except the open one, so a cached-but-unopened
+ *  conversation backfills when the user next opens it. `applyEvent` appends
+ *  live `message.new` rows to byConvo for ANY cached conversation though, and
+ *  those land first. Taking the max then reads that lone new row as proof the
+ *  history is caught up, the bridging loop below never runs, and the outage
+ *  stays as a hole that nothing else fills for the rest of the session.
+ *
+ *  So walk the cache oldest-first and stop at the first discontinuity: that
+ *  run is what we can actually vouch for, and a message that arrived after the
+ *  gap is the island it should be. A rolled-back sequence leaves a real hole
+ *  and truncates the answer early — which only costs an extra page, and the
+ *  merge drops what we already hold. Erring toward re-fetching is the safe
+ *  direction; erring toward "caught up" loses messages. */
+function completeThrough(current: Message[]): number | null {
+  const sequences = current
+    .map(sequenceOf)
     // Optimistic messages use MAX_SAFE_INTEGER until their WS echo arrives.
-    if (seq !== null && seq !== Number.MAX_SAFE_INTEGER && (latest === null || seq > latest)) latest = seq
+    .filter((seq): seq is number => seq !== null && seq !== Number.MAX_SAFE_INTEGER)
+    .sort((a, b) => a - b)
+  if (sequences.length === 0) return null
+  let through = sequences[0]
+  for (const seq of sequences) {
+    if (seq === through || seq === through + 1) through = seq
+    else break
   }
+  return through
+}
+
+async function fetchMessagesSinceCache(id: string, current: Message[] = []): Promise<ApiMessage[]> {
+  const latest = completeThrough(current)
+  const held = new Set(current.map((message) => message.id))
 
   let page = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
   const messages = [...page]
@@ -342,7 +370,9 @@ async function fetchMessagesSinceCache(id: string, current: Message[] = []): Pro
   while (latest !== null && page.length === MESSAGES_PAGE_SIZE && page[0].sequence > latest) {
     page = await api.getMessages(id, { before: page[0].sequence, limit: MESSAGES_PAGE_SIZE })
     // Only fill the gap; leave older history and its scroll anchor to loadOlder.
-    messages.unshift(...page.filter((message) => message.sequence > latest))
+    // By id, not by sequence: a hole in the run above means some of what comes
+    // back is already here, and re-adding it would duplicate rows.
+    messages.unshift(...page.filter((message) => !held.has(message.id) && message.sequence > latest))
   }
   return messages
 }
