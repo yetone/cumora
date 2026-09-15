@@ -46,8 +46,10 @@ async function request(path, { authenticated = true } = {}) {
  *  down" — it failed the pre-deploy baseline on a healthy-but-busy fleet and
  *  would roll a good candidate back on the post-deploy check for the same
  *  reason. A bounded retry keeps a persistent outage failing (every attempt
- *  503s) while a transient one has to hold for the whole window to fail. */
-const HEALTH_ATTEMPTS = Number(process.env.CUMORA_SMOKE_HEALTH_ATTEMPTS || 6)
+ *  503s) while a transient one has to hold for the whole window to fail.
+ *  Sized for the observed worst case (~65% of probes lost under saturation):
+ *  0.65^10 ≈ 1% per smoke, 20s worst case against the 120s smoke budget. */
+const HEALTH_ATTEMPTS = Number(process.env.CUMORA_SMOKE_HEALTH_ATTEMPTS || 10)
 const HEALTH_RETRY_MS = Number(process.env.CUMORA_SMOKE_HEALTH_RETRY_MS || 2_000)
 
 async function checkHealth() {
