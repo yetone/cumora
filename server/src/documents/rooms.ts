@@ -70,6 +70,29 @@ const evictions = new Map<string, NodeJS.Timeout>()
  *  echo-suppressed when they originated here. */
 const INSTANCE_ORIGIN = `instance:${env.INSTANCE_ID}`
 
+/** Persist one update through an explicit client, so it lands inside the
+ *  caller's transaction. `doc create --body` seeds the body while its own
+ *  `INSERT INTO documents` is still uncommitted; going out on the global pool
+ *  means a different connection, where the FK to documents(id) cannot see the
+ *  parent row and fails instantly (it does not wait — there is no row to lock).
+ *  That failure was swallowed by a console.warn while the CLI reported success,
+ *  so the body never reached the database and every later edit became a Yjs
+ *  struct whose parent is missing: appended work persisted as a row and still
+ *  rendered as nothing on the next cold load. Measured on the project's own
+ *  PG 16: 11 of 20 `doc create --body` runs lost the body this way. */
+export async function persistUpdateWith(
+  client: PoolClient,
+  documentId: string,
+  authorId: string,
+  bytes: Uint8Array,
+): Promise<void> {
+  await client.query(
+    `INSERT INTO document_updates (document_id, author_id, update_bytes)
+     VALUES ($1, $2, $3)`,
+    [documentId, authorId, Buffer.from(bytes)],
+  )
+}
+
 async function persistUpdate(documentId: string, authorId: string, bytes: Uint8Array): Promise<void> {
   await pool.query(
     `INSERT INTO document_updates (document_id, author_id, update_bytes)
@@ -161,15 +184,26 @@ async function getOrCreateRoom(
         try { s.onUpdate(update, originId) } catch (e) { console.warn('[docs] sub error', e) }
       }
 
+      // A caller editing inside its own transaction takes the update instead:
+      // it writes it on its own client so the row is atomic with whatever else
+      // that transaction is doing (see persistUpdateWith). Fan-out is unchanged.
+      const collectInto = (typeof origin === 'object' && origin !== null && 'collectInto' in origin)
+        ? (origin as { collectInto: Uint8Array[] }).collectInto
+        : null
+
       // Persist + fan-out unless this update arrived FROM another instance
       // (it's already persisted there + already on the bus).
-      if (!isRemote) {
+      if (!isRemote && collectInto) {
+        collectInto.push(update)
+      } else if (!isRemote) {
         void persistUpdate(documentId, authorId, update).then(() => {
           room.updatesSinceSnapshot += 1
           void maybeCompact(room).catch((e) => console.warn('[docs] compact failed', e))
         }).catch((e) => {
           console.warn('[docs] persistUpdate failed', e)
         })
+      }
+      if (!isRemote) {
         void publish(CH_DOC_UPDATE, {
           type: 'doc.update',
           companyId: room.companyId,
@@ -793,7 +827,14 @@ export async function applyAgentEdit(
   let imagesDeleted = 0
   let blocksReplaced = 0
   const deletedStorageKeys: string[] = []
-  const origin = { originId: `agent:${agentId}`, authorId: agentId } as never
+  // When the caller is inside a transaction, take the update out of the room's
+  // fire-and-forget persist path and write it on the caller's own client below.
+  // `doc create --body` needs this: its `INSERT INTO documents` is still
+  // uncommitted, so the global pool cannot see the parent row.
+  const collected: Uint8Array[] = []
+  const origin = (dbClient
+    ? { originId: `agent:${agentId}`, authorId: agentId, collectInto: collected }
+    : { originId: `agent:${agentId}`, authorId: agentId }) as never
   room.doc.transact(() => {
     for (const op of ops) {
       if (op.kind === 'append') {
@@ -896,6 +937,17 @@ export async function applyAgentEdit(
     }
     normalizeMarkdownImageParagraphChildren(fragment)
   }, origin)
+  // Awaited, on the caller's client, and NOT swallowed: if this write fails the
+  // command fails, instead of reporting success over a body that never landed.
+  for (const update of collected) {
+    if (!dbClient) break
+    await persistUpdateWith(dbClient, documentId, agentId, update)
+    room.updatesSinceSnapshot += 1
+  }
+  if (collected.length > 0) {
+    void maybeCompact(room).catch((e) => console.warn('[docs] compact failed', e))
+  }
+
   return { replaced, imagePlaced, imagesDeleted, blocksReplaced, deletedStorageKeys }
 }
 
