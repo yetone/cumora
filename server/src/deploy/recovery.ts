@@ -135,6 +135,10 @@ export const DEPLOYMENT_PROBE_CONTRACT = {
     httpGet: { path: '/api/health', port: 'http' },
     periodSeconds: 5,
     timeoutSeconds: 2,
+    // /api/health races SELECT 1 against 1s, so a saturated Postgres fails a
+    // random fraction of probes on every replica at once. 60s of consecutive
+    // failures still pulls a pod; a flap must not (see the manifests).
+    failureThreshold: 12,
   },
   livenessProbe: {
     httpGet: { path: '/api/livez', port: 'http' },

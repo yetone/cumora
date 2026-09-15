@@ -124,6 +124,10 @@ spec:
           httpGet: { path: /api/health, port: http }
           periodSeconds: 5
           timeoutSeconds: 2
+          # Same contract as cumora-server.gke.yaml / deploy/recovery.ts: a
+          # DB under load fails a fraction of probes; only 60s of consecutive
+          # failures should pull a pod.
+          failureThreshold: 12
         livenessProbe:
           httpGet: { path: /api/livez, port: http }
           periodSeconds: 30
