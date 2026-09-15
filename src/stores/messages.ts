@@ -328,6 +328,25 @@ function mergeFetchedMessages(current: Message[] | undefined, incoming: Message[
   return sortMessagesStable(merged)
 }
 
+async function fetchMessagesSinceCache(id: string, current: Message[] = []): Promise<ApiMessage[]> {
+  let latest: number | null = null
+  for (const message of current) {
+    const seq = sequenceOf(message)
+    // Optimistic messages use MAX_SAFE_INTEGER until their WS echo arrives.
+    if (seq !== null && seq !== Number.MAX_SAFE_INTEGER && (latest === null || seq > latest)) latest = seq
+  }
+
+  let page = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+  const messages = [...page]
+  // Bridge the disconnect before merging, otherwise loadOlder's cursor skips the gap.
+  while (latest !== null && page.length === MESSAGES_PAGE_SIZE && page[0].sequence > latest) {
+    page = await api.getMessages(id, { before: page[0].sequence, limit: MESSAGES_PAGE_SIZE })
+    // Only fill the gap; leave older history and its scroll anchor to loadOlder.
+    messages.unshift(...page.filter((message) => message.sequence > latest))
+  }
+  return messages
+}
+
 export const useMessages = create<MessagesState>((set, get) => ({
   byConvo: {},
   streaming: {},
@@ -347,7 +366,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
       return { loading: new Set(s.loading).add(id), errors: restErrors }
     })
     try {
-      const msgs = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+      const msgs = await fetchMessagesSinceCache(id, s.byConvo[id])
       const normalized = msgs.map(fromApi)
       // Fewer rows than the page cap → we've already got everything older.
       // Equal-to-cap is ambiguous (could be exactly N or N+more) so default
@@ -385,9 +404,7 @@ export const useMessages = create<MessagesState>((set, get) => ({
 
   async reloadConversation(id) {
     try {
-      // Reload pulls the same window the initial load did — last N. Older
-      // history that was already paged in stays in byConvo via the merge.
-      const msgs = await api.getMessages(id, { limit: MESSAGES_PAGE_SIZE })
+      const msgs = await fetchMessagesSinceCache(id, get().byConvo[id])
       const normalized = msgs.map(fromApi)
       const hasMore = normalized.length >= MESSAGES_PAGE_SIZE
       set((s) => ({
