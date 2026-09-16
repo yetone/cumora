@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { api } from '@/api/client'
 import { Avatar } from '@/components/Avatar'
 import { useMe } from '@/stores/auth'
 import { useApp } from '@/stores/app'
@@ -47,6 +48,9 @@ export function MobileAgents() {
   const meId = useMe()
   const [editing, setEditing] = useState<Participant | null>(null)
   const [editorOpen, setEditorOpen] = useState(false)
+  // Which agent's DM is being created right now, so a double-tap on a slow
+  // network cannot fire two openDirect calls.
+  const [opening, setOpening] = useState<string | null>(null)
 
   // Real roster, scoped to the active workspace via the participants store
   // (which is itself re-fetched on workspace switch). Drop departed agents
@@ -59,15 +63,35 @@ export function MobileAgents() {
     }
   }, [byId, meId])
 
-  /** Tap an agent → jump to the direct chat with me + them. */
-  const goChat = (agentId: string) => {
-    if (!meId) return
+  /** Tap an agent → jump to the direct chat with me + them, creating it if
+   *  this member does not have one yet.
+   *
+   *  The server seeds the agent's DM only for whoever hired it, so every other
+   *  member has no row for any agent added after they joined. Without the
+   *  fallback the card was a dead tap for them — no navigation, no error — while
+   *  the same tap on desktop worked. `openDirect` is the idempotent create-or-
+   *  find the desktop card and MobileParticipantInfo already use. */
+  const goChat = async (agentId: string) => {
+    if (!meId || opening) return
     const direct = convoList.find((c) =>
       c.kind === 'direct' && c.members.includes(meId) && c.members.includes(agentId),
     )
     if (direct) {
       setView('conversations')
       select(direct.id)
+      return
+    }
+    setOpening(agentId)
+    try {
+      const { id } = await api.openDirect(agentId)
+      // Refresh so the brand-new DM is in the store before we navigate into it.
+      await useConversations.getState().reload()
+      setView('conversations')
+      select(id)
+    } catch (err) {
+      console.warn('[MobileAgents] openDirect failed', err)
+    } finally {
+      setOpening(null)
     }
   }
 
@@ -112,7 +136,8 @@ export function MobileAgents() {
               type="button"
               className="w-full text-left bg-cloud rounded-[14px] p-3.5 active:scale-[0.99] transition"
               style={{ border: '1px solid var(--ink-100)' }}
-              onClick={() => goChat(p.id)}
+              onClick={() => { void goChat(p.id) }}
+              disabled={opening === p.id}
             >
               <div className="flex items-start gap-3 mb-2.5">
                 <Avatar p={p} size={48} />
