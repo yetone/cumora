@@ -4329,11 +4329,47 @@ async function tailLogs(): Promise<void> {
 
 // ─── doctor ─────────────────────────────────────────────────────────────
 
+/** Which engines could actually carry a wake right now.
+ *
+ *  Brain health is necessary but not sufficient. `requireLocalEngine` also
+ *  refuses to start the daemon when no installed engine can enforce the BYOA
+ *  boundary — an unsandboxed engine without the opt-in, or a secure one below
+ *  its version floor. Scoring the doctor on brain health alone printed a green
+ *  verdict and exit 0 on machines where `--pair` exits 70.
+ *
+ *  `runnable` is null when the gate could not be evaluated at all (PATH scan
+ *  failed). The diagnostic must not become a crash, so that degrades to the
+ *  older brain-only answer rather than declaring everything unusable. */
+export function doctorUsableEngines(
+  results: ReadonlyArray<{
+    id: EngineId
+    installed: boolean
+    big?: { ok: boolean } | null
+    small?: { ok: boolean } | null
+  }>,
+  runnable: { runnable: readonly EngineId[] } | null,
+): EngineId[] {
+  return results
+    .filter((r) => r.installed && r.big?.ok === true && r.small?.ok === true)
+    .map((r) => r.id)
+    .filter((id) => runnable === null || runnable.runnable.includes(id))
+}
+
 /** `cumora agent computer --doctor`: diagnose every local engine on this
  *  machine — is it installed, and are its BIG brain (main reasoning) and SMALL
  *  brain (the triage cerebellum) reachable + authed? Each tier gets a trivial
- *  one-shot probe over the SAME spawn path real wakes use, so green here means
- *  real wakes will work. Pure local: no cloud, no DB, no pairing required. */
+ *  one-shot probe over the SAME spawn path real wakes use. Pure local: no
+ *  cloud, no DB, no pairing required.
+ *
+ *  Brain health is necessary but NOT sufficient, and the verdict used to be
+ *  drawn from it alone. `requireLocalEngine` also refuses to start the daemon
+ *  when no installed engine can enforce the BYOA boundary — an unsandboxed
+ *  engine without the opt-in, or a secure one below its version floor. On a
+ *  machine in that state the doctor printed a green verdict and exit 0 while
+ *  `--pair` exited 70, which is the worst possible advice for the person who
+ *  ran the diagnostic precisely because something was already wrong. So the
+ *  verdict now asks the same gate the daemon does, and an engine only counts
+ *  when it is both healthy AND runnable. */
 async function runDoctor(providerId?: string): Promise<void> {
   const provider = providerId !== undefined
     ? readProviderProfiles(join(CONFIG_DIR, 'providers.json')).find((p) => p.id === providerId) : undefined
@@ -4353,11 +4389,28 @@ async function runDoctor(providerId?: string): Promise<void> {
   }
   console.log('')
 
+  // Ask the same gate the daemon does. A healthy brain on an engine this
+  // machine is not allowed to run is not a machine that can run an agent.
+  const runnable = await (async () => {
+    try {
+      const detected = await detectEnginesWithStatus()
+      if (!detected.reliable || detected.engines.length === 0) return null
+      return await evaluateRunnableEngines(detected.engines)
+    } catch {
+      // The gate is advisory HERE — never let it turn a diagnostic into a
+      // crash. Falling back to null keeps the old brain-only verdict.
+      return null
+    }
+  })()
+
   let anyUsable = false
   for (const r of results) {
     if (!r.installed) {
       console.log(`✖ ${r.id} — not found on PATH`)
-      console.log(`    install the \`${r.id}\` CLI and run it once to sign in, then re-run --doctor\n`)
+      // The binary is not always the engine id — cursor ships `cursor-agent`,
+      // antigravity ships `agy`. missingEngineMessage() in this file gets that
+      // right; this line used to contradict it.
+      console.log(`    install the \`${getAdapter(r.id)?.bin ?? r.id}\` CLI and run it once to sign in, then re-run --doctor\n`)
       continue
     }
     console.log(`● ${r.id} — ${r.path}`)
@@ -4383,17 +4436,31 @@ async function runDoctor(providerId?: string): Promise<void> {
         console.log(`        → persistent-session path unavailable; agents will fall back to one-shot exec`)
       }
     }
-    if (r.big?.ok && r.small?.ok) anyUsable = true
+    const blockedReason = runnable?.blocked.find((b) => b.id === r.id)?.reason
+    if (blockedReason) {
+      console.log(`    ✖ not runnable  ${blockedReason}`)
+      console.log('        → healthy brains, but the daemon will refuse to start on this engine')
+    }
     console.log('')
   }
+  anyUsable = doctorUsableEngines(results, runnable).length > 0
 
   if (!anyUsable) {
-    console.log('✖ no engine has BOTH brains healthy — this machine cannot currently run a BYOA agent.')
+    console.log('✖ no engine is both healthy and runnable — this machine cannot currently run a BYOA agent.')
+    if (runnable && runnable.runnable.length === 0) {
+      // Print exactly what `--pair` would print, so the two never disagree.
+      const why = runnable.blocked.length > 0
+        ? incapableEngineMessage(runnable.blocked)
+        : sandboxedEngineMessage(ENGINE_IDS.filter((id) => results.some((r) => r.id === id && r.installed)))
+      console.log('')
+      for (const line of why.split('\n')) console.log(`  ${line}`)
+      console.log('')
+    }
     console.log('  fix the failures above (usually: open the engine\'s app and sign in / refresh quota), then re-run:')
     console.log('    cumora agent computer --doctor')
     process.exitCode = 1
   } else {
-    console.log('✓ at least one engine is fully healthy — BYOA agents on this machine can wake their brains.')
+    console.log('✓ at least one engine is healthy and runnable — BYOA agents on this machine can wake their brains.')
   }
 }
 
