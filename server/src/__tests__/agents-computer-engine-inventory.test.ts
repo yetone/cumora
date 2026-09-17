@@ -7,6 +7,7 @@ import assert from 'node:assert/strict'
 import {
   EngineInventoryStabilizer,
   replaceEngineInventory,
+  reportEngineSnapshot,
   resolveAvailableEngine,
   shouldReportEngineSnapshot,
   type EngineInventory,
@@ -40,6 +41,41 @@ test('a requested refresh reports an unchanged engine snapshot', () => {
 
   assert.equal(shouldReportEngineSnapshot(snapshot, snapshot), false)
   assert.equal(shouldReportEngineSnapshot(snapshot, snapshot, true), true)
+})
+
+test('a failed snapshot report leaves the watermark where it was, so the next scan retries', async () => {
+  const before = JSON.stringify([{ id: 'codex', version: '1.2.3' }])
+  // The operator installed the dependency `claude` was blocked on, so the
+  // rescan computes a new fingerprint — and the POST 502s mid-deploy.
+  const after = JSON.stringify([{ id: 'claude', version: '2.0.0' }, { id: 'codex', version: '1.2.3' }])
+  let posts = 0
+  const failing = async (): Promise<never> => {
+    posts += 1
+    throw new Error('POST /api/computers/me/engines → HTTP 502')
+  }
+
+  assert.equal(await reportEngineSnapshot(after, before, false, failing), before)
+  assert.equal(posts, 1)
+
+  // Five minutes later the same scan produces the same fingerprint. Committing
+  // the watermark before the POST would make this a no-op and freeze the card
+  // on "missing dependency" for the daemon's lifetime.
+  const settled: string[] = []
+  const ok = async (): Promise<void> => { settled.push(after) }
+  assert.equal(await reportEngineSnapshot(after, before, false, ok), after)
+  assert.deepEqual(settled, [after])
+})
+
+test('a delivered snapshot is not reported again, and a forced rescan is', async () => {
+  const snapshot = JSON.stringify([{ id: 'codex', version: '1.2.3' }])
+  let posts = 0
+  const ok = async (): Promise<void> => { posts += 1 }
+
+  assert.equal(await reportEngineSnapshot(snapshot, snapshot, false, ok), snapshot)
+  assert.equal(posts, 0, 'an unchanged snapshot must not hit the network')
+
+  assert.equal(await reportEngineSnapshot(snapshot, snapshot, true, ok), snapshot)
+  assert.equal(posts, 1, 'Rescan has to report even an unchanged snapshot to clear the request')
 })
 
 test('a transient version failure retains a previously runnable engine', () => {

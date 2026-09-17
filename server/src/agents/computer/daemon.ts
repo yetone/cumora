@@ -999,6 +999,40 @@ export function shouldReportEngineSnapshot(fingerprint: string, previous: string
   return force || fingerprint !== previous
 }
 
+/**
+ * Report the engine snapshot and return the fingerprint the daemon should
+ * remember — which is the OLD one whenever the report did not land.
+ *
+ * The predicate above is `force || fingerprint !== previous`, so the remembered
+ * fingerprint is a delivery watermark, not a "what did I last compute" note.
+ * Advancing it before the POST resolves makes a failure indistinguishable from
+ * a success: every later rescan re-derives the same fingerprint, skips the
+ * report, and the machine's card stays frozen at whatever the server last saw.
+ * An operator who installs the missing dependency an engine was blocked on
+ * would watch the card keep saying it is missing until they either hit Rescan
+ * (the only caller that passes `force`) or restart the daemon.
+ *
+ * Separate from the scan loop so this rule is testable without a daemon.
+ */
+export async function reportEngineSnapshot(
+  fingerprint: string,
+  previous: string,
+  force: boolean,
+  post: () => Promise<unknown>,
+): Promise<string> {
+  if (!shouldReportEngineSnapshot(fingerprint, previous, force)) return previous
+  try {
+    await post()
+    return fingerprint
+  } catch (err) {
+    console.warn(
+      '[computer] engine snapshot report failed; retrying on the next scan:',
+      err instanceof Error ? err.message : err,
+    )
+    return previous
+  }
+}
+
 // ─── config ─────────────────────────────────────────────────────────────
 
 async function loadConfig(): Promise<DaemonConfig | null> {
@@ -3474,20 +3508,25 @@ async function doRun(serverOverride?: string): Promise<void> {
       const advertisedSnapshot = snapshot.map((entry) => entry.id === 'claude'
         ? { ...entry, providerProfiles: allowUnsandboxedByoa() ? [] : profiles.map(providerProfileMetadata) } : entry)
       const fingerprint = JSON.stringify(advertisedSnapshot)
-      if (shouldReportEngineSnapshot(fingerprint, lastEngineSnapshot, forceReport)) {
-        lastEngineSnapshot = fingerprint
-        await api(cfg.serverUrl, '/api/computers/me/engines', {
+      lastEngineSnapshot = await reportEngineSnapshot(
+        fingerprint,
+        lastEngineSnapshot,
+        forceReport,
+        () => api(cfg.serverUrl, '/api/computers/me/engines', {
           method: 'POST',
           headers: { Authorization: `Bearer ${cfg.deviceToken}` },
           body: JSON.stringify({ engines: next, detected: advertisedSnapshot, blocked: blockedIds }),
-        }).catch((err) => {
-          console.warn('[computer] engine snapshot report failed', err instanceof Error ? err.message : err)
-        })
-      }
+        }),
+      )
       // This is the same live inventory sync() uses to choose an agent's
       // adapter. Updating only a heartbeat cache would advertise a newly
       // installed engine while silently running that agent on the old default.
-    } catch { /* transient — the next tick retries */ }
+    } catch (err) {
+      // Transient — the next tick retries, and that is now true of the report
+      // above too. Say so anyway: a scan failing every five minutes for a
+      // non-transient reason used to leave no trace anywhere.
+      console.warn('[computer] engine scan failed:', err instanceof Error ? err.message : err)
+    }
   }
 
   // Timer/startup/requested scans can land together. Share an in-flight scan;
