@@ -46,6 +46,11 @@ import { Semaphore } from '../concurrency.js'
  *  pg pool and tripping the triage fail-open amplification loop. */
 const wakeFanoutSem = new Semaphore(env.WAKE_FANOUT_CONCURRENCY)
 
+/** Test handle on the semaphore above. Exported so a test can prove the retry
+ *  drain queues behind the SAME permits as live fan-out, not just behind some
+ *  bound of its own. */
+export const _wakeFanoutSem = wakeFanoutSem
+
 /** Optional payload attached to a wake that the busy-agent path should
  *  also publish as a `steer` event so the running turn can react
  *  mid-flight (instead of waiting until the next wake). Built by the
@@ -86,9 +91,27 @@ const WAKE_RETRY_JOB_KEY = 'cumora:wake-retry:jobs'
 const WAKE_RETRY_MAX_ATTEMPTS = 60
 const WAKE_RETRY_BATCH_SIZE = 25
 
-export function _wakeRetryDelayMs(attempt: number): number {
+/** 5s, 10s, 20s, 40s, then 60s for every attempt after that. */
+function wakeRetryBaseDelayMs(attempt: number): number {
   const n = Math.max(0, Math.min(4, attempt))
   return Math.min(60_000, 5_000 * 2 ** n)
+}
+
+/**
+ * Backoff with decorrelating jitter (0.5x–1.5x of the base delay).
+ *
+ * The base curve flattens at 60s from attempt 4 on, so without jitter every job
+ * that failed in the same blip is handed the SAME delay forever: they come due
+ * in the same second, every minute, for all `WAKE_RETRY_MAX_ATTEMPTS`
+ * attempts — an hour-long synchronized herd hitting a database that is
+ * probably still recovering from whatever knocked them out. Jitter is what
+ * turns that into a spread-out trickle.
+ *
+ * `random` is injectable so the spread is testable rather than asserted by
+ * eyeball.
+ */
+export function _wakeRetryDelayMs(attempt: number, random: () => number = Math.random): number {
+  return Math.floor(wakeRetryBaseDelayMs(attempt) * (0.5 + random()))
 }
 
 export function _shouldRetryEnsurePodFailure(reason: WakeReason, ensureReason: string): boolean {
@@ -160,47 +183,93 @@ async function scheduleWakeRetry(
   console.warn(`[scheduler] ${agentId} ${reason} wake retry scheduled in ${Math.round((dueAt - Date.now()) / 1000)}s after ${failureClass}: ${failureReason}`)
 }
 
-async function pollWakeRetriesOnce(): Promise<void> {
-  const ids = await redis.zrangebyscore(WAKE_RETRY_DUE_KEY, 0, Date.now(), 'LIMIT', 0, WAKE_RETRY_BATCH_SIZE)
-  for (const id of ids) {
-    const claimed = await redis.zrem(WAKE_RETRY_DUE_KEY, id)
-    if (claimed !== 1) continue
+/** The Redis side of the retry queue, behind an interface so the drain loop can
+ *  be driven by a test without a live Redis or a live agent fleet. */
+export interface WakeRetryQueue {
+  /** Retry ids that are due, oldest first, capped at the batch size. */
+  due(now: number): Promise<string[]>
+  /** Atomically take ownership of one id. `null` means another replica won it,
+   *  or the job body is gone or unreadable. */
+  claim(id: string): Promise<WakeRetryJob | null>
+  run(job: WakeRetryJob): Promise<void>
+  reschedule(job: WakeRetryJob, failure: string): Promise<void>
+}
+
+const redisWakeRetryQueue: WakeRetryQueue = {
+  due: (now) => redis.zrangebyscore(WAKE_RETRY_DUE_KEY, 0, now, 'LIMIT', 0, WAKE_RETRY_BATCH_SIZE),
+  claim: async (id) => {
+    // zrem is the claim: exactly one replica gets 1 back for a given id.
+    if (await redis.zrem(WAKE_RETRY_DUE_KEY, id) !== 1) return null
     const raw = await redis.hget(WAKE_RETRY_JOB_KEY, id)
-    if (!raw) continue
+    if (!raw) return null
     await redis.hdel(WAKE_RETRY_JOB_KEY, id).catch(() => { /* ignore */ })
-    let job: WakeRetryJob
     try {
-      job = JSON.parse(raw) as WakeRetryJob
+      return JSON.parse(raw) as WakeRetryJob
     } catch {
-      continue
+      return null
     }
-    wakeOne(
-      job.agentId,
-      job.reason,
-      job.conversationId,
-      job.steerPayload,
-      job.options,
-      job.attempt,
-    ).catch((err) => {
-      console.error(`[scheduler] wake retry ${job.id} failed:`, err instanceof Error ? err.message : err)
-      scheduleWakeRetry(
-        job.agentId,
-        job.reason,
-        job.conversationId,
-        job.steerPayload,
-        job.options,
-        job.attempt + 1,
-        err instanceof Error ? err.message : String(err),
-      ).catch(() => { /* ignore */ })
-    })
-  }
+  },
+  // wakeOne's boolean says whether it woke anything; the retry loop has never
+  // branched on it (its own failure paths already re-enqueue through
+  // scheduleWakeRetry), so drop it rather than invent a new policy here.
+  run: async (job) => {
+    await wakeOne(job.agentId, job.reason, job.conversationId, job.steerPayload, job.options, job.attempt)
+  },
+  reschedule: (job, failure) => scheduleWakeRetry(
+    job.agentId, job.reason, job.conversationId, job.steerPayload, job.options, job.attempt + 1, failure,
+  ),
+}
+
+/**
+ * Drain one batch of due wake retries — through `wakeFanoutSem`, the same
+ * semaphore the live fan-out uses.
+ *
+ * This loop used to call `wakeOne(...)` without awaiting it, so a tick fired up
+ * to `WAKE_RETRY_BATCH_SIZE` (25) wakes fully in parallel, every 5 seconds, and
+ * none of them passed through the semaphore. Each wake costs a host-resolution
+ * query, and for a managed agent a triage pass on top: persona + inbox +
+ * context loads and a model call. Twenty-five of those at once is ~100
+ * concurrent queries against a 20-slot pool.
+ *
+ * That matters most in exactly the situation this queue exists for. Any DB
+ * error in `resolveAgentHost` maps to `lookup_failed`, which
+ * `_shouldRetryWakeFailure` treats as retryable for every wake reason, so a
+ * 30-second database blip enqueues a retry for every recipient of every message
+ * sent during it. The recovery burst then oversubscribes the pool that is still
+ * recovering, more wakes time out, and each timeout re-enqueues itself — the
+ * triage fail-open amplification loop the semaphore was introduced for after
+ * the 2026-05-27 connection-exhaustion outage. Recovery traffic has to obey the
+ * same backpressure as live traffic; it is the traffic most likely to arrive
+ * all at once.
+ */
+export async function _drainWakeRetries(queue: WakeRetryQueue = redisWakeRetryQueue): Promise<void> {
+  const ids = await queue.due(Date.now())
+  await Promise.all(ids.map((id) => wakeFanoutSem.run(async () => {
+    const job = await queue.claim(id)
+    if (!job) return
+    try {
+      await queue.run(job)
+    } catch (err) {
+      const failure = err instanceof Error ? err.message : String(err)
+      console.error(`[scheduler] wake retry ${job.id} failed:`, failure)
+      await queue.reschedule(job, failure).catch(() => { /* ignore */ })
+    }
+  })))
 }
 
 function startWakeRetryWorker(intervalMs: number = 5_000): NodeJS.Timeout {
+  // One batch at a time. The drain now awaits its wakes, so a slow recovery
+  // would otherwise stack a fresh 25-id batch on the semaphore queue every 5s
+  // — bounded work, but an ever-growing backlog of claims that mostly lose
+  // their zrem race and do nothing.
+  let inFlight: Promise<void> | null = null
   const tick = (): void => {
-    pollWakeRetriesOnce().catch((err) =>
-      console.error('[scheduler] wake retry worker failed:', err instanceof Error ? err.message : err),
-    )
+    if (inFlight) return
+    inFlight = _drainWakeRetries()
+      .catch((err) =>
+        console.error('[scheduler] wake retry worker failed:', err instanceof Error ? err.message : err),
+      )
+      .finally(() => { inFlight = null })
   }
   setImmediate(tick)
   const t = setInterval(tick, intervalMs)

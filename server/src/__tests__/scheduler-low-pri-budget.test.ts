@@ -70,12 +70,37 @@ test('many rejections in a window are absorbed, then the next window is fresh', 
 })
 
 test('wake retry delay backs off and caps at 60s', () => {
-  assert.equal(_wakeRetryDelayMs(0), 5_000)
-  assert.equal(_wakeRetryDelayMs(1), 10_000)
-  assert.equal(_wakeRetryDelayMs(2), 20_000)
-  assert.equal(_wakeRetryDelayMs(3), 40_000)
-  assert.equal(_wakeRetryDelayMs(4), 60_000)
-  assert.equal(_wakeRetryDelayMs(50), 60_000)
+  // random() = 0.5 is the midpoint of the 0.5x–1.5x jitter band, i.e. the bare
+  // base curve.
+  const mid = (attempt: number): number => _wakeRetryDelayMs(attempt, () => 0.5)
+  assert.equal(mid(0), 5_000)
+  assert.equal(mid(1), 10_000)
+  assert.equal(mid(2), 20_000)
+  assert.equal(mid(3), 40_000)
+  assert.equal(mid(4), 60_000)
+  assert.equal(mid(50), 60_000)
+})
+
+test('wake retry delay is jittered, so a batch that failed together does not stay phase-locked', () => {
+  // Past attempt 4 the base delay is a flat 60s. Without jitter every job from
+  // the same outage gets exactly 60_000 ms on every one of its 60 attempts and
+  // the whole herd comes due in the same second, once a minute, for an hour.
+  assert.equal(_wakeRetryDelayMs(9, () => 0), 30_000)
+  assert.equal(_wakeRetryDelayMs(9, () => 0.999999), 89_999)
+
+  const spread = new Set<number>()
+  for (let i = 0; i < 200; i++) {
+    const delay = _wakeRetryDelayMs(9)
+    assert.ok(delay >= 30_000 && delay < 90_000, `delay ${delay} outside the 0.5x–1.5x band`)
+    spread.add(delay)
+  }
+  assert.ok(spread.size > 100, `expected the herd to spread out, saw ${spread.size} distinct delays in 200 draws`)
+
+  // Early attempts are jittered too, and never negative or zero.
+  for (let attempt = 0; attempt <= 4; attempt++) {
+    const low = _wakeRetryDelayMs(attempt, () => 0)
+    assert.ok(low > 0, `attempt ${attempt} floor must stay positive, got ${low}`)
+  }
 })
 
 test('ensurePod retry is only for manual wakes — message.new is durable via DB inbox', () => {
