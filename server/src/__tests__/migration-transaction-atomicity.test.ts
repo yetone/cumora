@@ -153,3 +153,127 @@ test('rollback failure still preserves original migration error', async () => {
     /primary migration error/,
   )
 })
+
+/** A PostgreSQL error as node-postgres surfaces it: the SQLSTATE is on `code`. */
+function pgError(code: string, message: string): Error & { code: string } {
+  return Object.assign(new Error(message), { code })
+}
+
+test('a migration that loses a lock race is retried after a clean rollback', async () => {
+  const { client, calls } = fakeClient()
+  let attempts = 0
+  const slept: number[] = []
+
+  const migration: VersionedMigration = {
+    version: 4,
+    name: '0004-lock-contention',
+    checksum: 'f'.repeat(64),
+    sourceChecksum: 'f'.repeat(64),
+    transactional: true,
+    up: async () => {
+      attempts += 1
+      calls.push({ sql: `ALTER TABLE participants ADD COLUMN x TEXT -- attempt ${attempts}` })
+      // `ensureSchema` pins lock_timeout at 5s, so DDL on a hot table under
+      // live traffic aborts with 55P03 long before it does any work.
+      if (attempts < 3) throw pgError('55P03', 'canceling statement due to lock timeout')
+    },
+  }
+
+  await applyPendingMigration(client, migration, { sleep: async (ms) => { slept.push(ms) } })
+
+  assert.equal(attempts, 3)
+  const statements = calls.map((c) => c.sql)
+  // Each failed attempt rolls back completely, so attempt N+1 starts from
+  // exactly the state attempt N saw. No partial schema, no partial ledger.
+  assert.equal(statements.filter((s) => s === 'BEGIN').length, 3)
+  assert.equal(statements.filter((s) => s === 'ROLLBACK').length, 2)
+  assert.equal(statements.filter((s) => s === 'COMMIT').length, 1)
+  assert.equal(statements.filter((s) => s.startsWith('INSERT INTO schema_migrations')).length, 1)
+  assert.equal(slept.length, 2, 'each retry must back off')
+  assert.ok(slept[1] > slept[0], `backoff must grow, got ${slept.join(', ')}`)
+})
+
+test('deadlock and serialization failures retry too; a real error never does', async () => {
+  for (const code of ['40P01', '55P03', '40001']) {
+    const { client } = fakeClient()
+    let attempts = 0
+    const migration: VersionedMigration = {
+      version: 4,
+      name: `0004-${code}`,
+      checksum: 'f'.repeat(64),
+      sourceChecksum: 'f'.repeat(64),
+      transactional: true,
+      up: async () => {
+        attempts += 1
+        if (attempts < 2) throw pgError(code, `transient ${code}`)
+      },
+    }
+    await applyPendingMigration(client, migration, { sleep: async () => {} })
+    assert.equal(attempts, 2, `${code} should have been retried once`)
+  }
+
+  // A missing relation, a failed precheck, a constraint violation: the deploy
+  // has to stop on the first attempt and say so.
+  const { client } = fakeClient()
+  let realAttempts = 0
+  await assert.rejects(
+    () => applyPendingMigration(client, {
+      version: 4,
+      name: '0004-real-error',
+      checksum: 'f'.repeat(64),
+      sourceChecksum: 'f'.repeat(64),
+      transactional: true,
+      up: async () => {
+        realAttempts += 1
+        throw pgError('42P01', 'relation "nope" does not exist')
+      },
+    }, { sleep: async () => {} }),
+    /relation "nope" does not exist/,
+  )
+  assert.equal(realAttempts, 1, 'a real error must not be retried')
+})
+
+test('sustained lock contention gives up and fails the deploy', async () => {
+  const { client } = fakeClient()
+  let attempts = 0
+
+  await assert.rejects(
+    () => applyPendingMigration(client, {
+      version: 4,
+      name: '0004-always-locked',
+      checksum: 'f'.repeat(64),
+      sourceChecksum: 'f'.repeat(64),
+      transactional: true,
+      up: async () => {
+        attempts += 1
+        throw pgError('55P03', 'canceling statement due to lock timeout')
+      },
+    }, { sleep: async () => {}, maxAttempts: 4 }),
+    /lock timeout/,
+  )
+  assert.equal(attempts, 4, 'the budget is finite — a wedged table must not hang the Job forever')
+})
+
+test('a non-transactional migration is never retried wholesale', async () => {
+  // 0001 retries per statement internally and 0005/0006 build indexes
+  // CONCURRENTLY; re-running either from here could re-execute work that
+  // already committed, because there is no transaction to roll back.
+  const { client } = fakeClient()
+  let attempts = 0
+
+  await assert.rejects(
+    () => applyPendingMigration(client, {
+      version: 5,
+      name: '0005-concurrent',
+      checksum: 'f'.repeat(64),
+      sourceChecksum: 'f'.repeat(64),
+      transactional: false,
+      up: async () => {
+        attempts += 1
+        throw pgError('55P03', 'canceling statement due to lock timeout')
+      },
+    }, { sleep: async () => {} }),
+    /lock timeout/,
+  )
+  assert.equal(attempts, 1)
+})

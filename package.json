@@ -31,6 +31,7 @@
     "guard:big-brain": "node scripts/guard-big-brain.mjs",
     "guard:llm-tracked": "node scripts/guard-llm-tracked.mjs",
     "guard:engine-registry": "node scripts/guard-engine-registry.mjs",
+    "guard:migration-locks": "node scripts/guard-migration-locks.mjs",
     "lint": "biome lint .",
     "lint:fix": "biome lint --write .",
     "test": "node --import tsx --test \"server/src/__tests__/**/*.test.ts\" \"tests/**/*.test.ts\" \"workers/**/*.test.ts\"",

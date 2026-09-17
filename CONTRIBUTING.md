@@ -48,6 +48,7 @@ npm run test:integration       # integration suite, see the env var below
 npm run guard:big-brain        # architecture guard, see below
 npm run guard:llm-tracked      # architecture guard, see below
 npm run guard:engine-registry  # architecture guard, see below
+npm run guard:migration-locks  # schema guard, see below
 ```
 
 `npm run test:integration` needs a **dedicated** database and does nothing
@@ -92,6 +93,33 @@ guard script will fail your build if you break them:
    half-wired engine does not error — `normalizeByoaSource()` maps anything
    unknown to `byoa-claude`, so its runs quietly bill to the wrong engine.
    `npm run guard:engine-registry` checks this.
+
+## Writing a schema migration
+
+Migrations run from a pre-deploy Job, against production, **while the old Pods
+are still serving traffic**, and `ensureSchema` pins that session at
+`lock_timeout = '5s'`. DDL that needs an `ACCESS EXCLUSIVE` lock on a hot table
+has five seconds to get it before the statement aborts with `55P03`; even when
+it does get the lock, every query behind it waits for the whole statement.
+
+Once a migration has been applied its SQL is checksum-pinned and can never be
+rewritten — so a lock-taking migration cannot be fixed afterwards, only worked
+around. `npm run guard:migration-locks` rejects the two patterns that have cost
+this project production time:
+
+- **`ADD COLUMN … DEFAULT <volatile>`.** PostgreSQL's metadata-only fast path
+  applies only to non-volatile defaults; `gen_random_uuid()`, `random()`,
+  `nextval()` and friends force a full table and index rewrite. Write it as
+  nullable column → batched backfill → `SET DEFAULT` →
+  `CHECK (… IS NOT NULL) NOT VALID` → `VALIDATE CONSTRAINT`. `now()` is
+  `STABLE`, not volatile, and is fine.
+- **`CREATE INDEX` without `CONCURRENTLY` on an existing table.** It blocks
+  writes for the whole build and deadlocks against live writers. Use
+  `CREATE INDEX CONCURRENTLY` with `transactional: false`, as migrations 0005
+  and 0006 do. Indexing a table the same migration creates is fine.
+
+Transactional migrations that still lose a lock race are retried with backoff
+before the Job fails, so a brief contention spike does not need a redeploy.
 
 The multi-agent coordination model (how N agents share a room without
 colliding, and why the prompt is kept deliberately minimal) is documented in

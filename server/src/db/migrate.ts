@@ -2618,25 +2618,77 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   },
 ]
 
+/** How many times a transactional migration may lose a lock race before the
+ *  deploy gives up. Matches the frozen baseline's per-statement budget. */
+const MIGRATION_LOCK_ATTEMPTS = 6
+
+/** `true` for the transient lock-contention SQLSTATEs — the ones where the
+ *  migration never started, so a clean retry is the same as a first attempt. */
+function isTransientLockError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === 'string' && BASELINE_STATEMENT_LOCK_CODES.has(code)
+}
+
+/**
+ * Apply one migration, retrying a transactional one that loses a lock race.
+ *
+ * `ensureSchema` pins the migration session at `lock_timeout = '5s'` — the
+ * right call, since a migration that queues indefinitely for an
+ * AccessExclusiveLock parks every later query behind it — but it means DDL that
+ * cannot get its lock within five seconds aborts with `55P03` and, without
+ * this loop, takes the whole pre-deploy Job down with it. The Job runs while
+ * the old Pods are still serving, so on a busy table that is not an unlikely
+ * outcome; it is the normal one, and it repeats on every rerun.
+ *
+ * Migration 0004 is the standing example. `ALTER TABLE participants ADD COLUMN
+ * runtime_assignment_id TEXT NOT NULL DEFAULT gen_random_uuid()::text` takes
+ * AccessExclusiveLock on `participants`, which sits on the hot path of nearly
+ * every query in the product. Its SQL is checksum-pinned and cannot be edited
+ * — see scripts/guard-migration-locks.mjs for the authoring rule that keeps the
+ * next one from being written the same way.
+ *
+ * Only `transactional` migrations retry. A failed transaction has rolled back
+ * completely, so attempt two starts from exactly the state attempt one saw. The
+ * `transactional: false` ones (the frozen baseline and the CONCURRENTLY index
+ * builds) manage their own idempotence and their own retries, and re-running
+ * them wholesale from here could re-execute work that already committed.
+ *
+ * Only the transient lock SQLSTATEs retry: a real error — a missing relation, a
+ * constraint violation, a failed precheck — still fails the deploy on its first
+ * attempt, loudly, which is the point of the pre-deploy Job.
+ */
 export async function applyPendingMigration(
   client: import('pg').PoolClient,
   migration: VersionedMigration,
+  opts: { sleep?: (ms: number) => Promise<void>; maxAttempts?: number } = {},
 ): Promise<void> {
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
+  const maxAttempts = opts.maxAttempts ?? MIGRATION_LOCK_ATTEMPTS
   const started = Date.now()
   console.log(`[db] applying migration ${migration.version} ${migration.name}`)
   if (migration.transactional !== false) {
-    await client.query('BEGIN')
-    try {
-      await migration.up(client)
-      await client.query(
-        `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
-         VALUES ($1, $2, $3, $4)`,
-        [migration.version, migration.name, migration.checksum, Date.now() - started],
-      )
-      await client.query('COMMIT')
-    } catch (err) {
-      await client.query('ROLLBACK').catch(() => { /* swallow rollback err */ })
-      throw err
+    for (let attempt = 1; ; attempt++) {
+      const attemptStarted = Date.now()
+      await client.query('BEGIN')
+      try {
+        await migration.up(client)
+        await client.query(
+          `INSERT INTO schema_migrations (version, name, checksum, execution_ms)
+           VALUES ($1, $2, $3, $4)`,
+          [migration.version, migration.name, migration.checksum, Date.now() - attemptStarted],
+        )
+        await client.query('COMMIT')
+        break
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => { /* swallow rollback err */ })
+        if (!isTransientLockError(err) || attempt >= maxAttempts) throw err
+        const backoffMs = Math.min(8_000, 500 * 2 ** (attempt - 1)) + Math.floor(Math.random() * 250)
+        console.warn(
+          `[db] migration ${migration.version} ${migration.name} hit ${(err as { code: string }).code} ` +
+          `(attempt ${attempt}/${maxAttempts}) — retrying in ${backoffMs}ms`,
+        )
+        await sleep(backoffMs)
+      }
     }
   } else {
     await migration.up(client)
