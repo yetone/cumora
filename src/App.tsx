@@ -200,8 +200,15 @@ export function App() {
   // with a `#notifications` hash. Bypass everything else (auth, stores,
   // routing) and just render the toast stack — it receives payloads over
   // IPC from the main window.
-  if (isNotificationWindow) return <NotificationWindow />
+  //
+  // This lives in its own component rather than as an early return inside
+  // `MainApp` so the bypass stays a *total* bypass: none of MainApp's hooks
+  // or its three URL-consuming state initializers run in the notification
+  // window, and neither shell can inherit the other's hook sequence.
+  return isNotificationWindow ? <NotificationWindow /> : <MainApp />
+}
 
+function MainApp() {
   // Waitlist landing — handleCallback redirects here with `#waitlist=1`
   // when a brand-new OAuth visitor hit the gate. Consume the fragment
   // once so refresh doesn't pin them on this screen forever. State is

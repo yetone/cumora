@@ -1062,8 +1062,15 @@ function AttachmentCard({ msg }: { msg: Message }) {
  * When the message has a richer HTML version, the "html" chip becomes a
  * toggle that opens the rendered HTML inside a sandboxed iframe — the
  * server sanitizes and the sandbox forbids scripts, so even residual
- * hostile markup can't escape. */
-function _EmailCard({ msg }: { msg: Message }) {
+ * hostile markup can't escape.
+ *
+ * Dormant: nothing renders it today (email rows fall through to the ordinary
+ * text bubble). Kept under its real PascalCase name rather than an `_` prefix
+ * so `useHookAtTopLevel` still sees a component and keeps checking its six
+ * hooks — an underscore-prefixed function reads as a plain function to the
+ * rule, which is how it went unchecked before. */
+// biome-ignore lint/correctness/noUnusedVariables: dormant email renderer — see above
+function EmailCard({ msg }: { msg: Message }) {
   const t = useT()
   const openComposeReply = useApp((s) => s.openComposeReply)
   const [showHtml, setShowHtml] = useState(false)
@@ -1708,6 +1715,18 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
   const openThreadView = useApp((s) => s.openThreadView)
   const meId = useMe()
   const split = useChatLayoutStore((s) => s.layout === 'bubble')
+  // Hoisted ABOVE the branches below on purpose. `MessageRow` is memoized and
+  // both lists key rows by `m.clientId ?? m.id`, so a props change re-renders
+  // the SAME fiber: a message that starts out author-less and gains its author
+  // on the next store patch would go from five hooks to six on one fiber and
+  // React would throw "Rendered more hooks than during the previous render",
+  // taking the whole list to the error boundary. Every call site currently
+  // pre-guards that case, which is the only reason this has never fired — the
+  // duplicated caller-side guard is not the invariant, this hoist is.
+  const artifactRefs = useMemo(
+    () => artifactRefsForMessage(msg),
+    [msg.body, msg.tool?.arg, msg.tool?.detail],
+  )
   // System / whisper rows don't need a resolved author — handle them before
   // touching `author` so a synthetic-author system message (the calendar-fired
   // notice, authored by CALENDAR_SYSTEM_AUTHOR_ID) renders instead of being
@@ -1722,10 +1741,6 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
   const isAttachOnly = Boolean(msg.attachment) && !msg.body
   const _isEmail = msg.kind === 'email'
   const isPoll = msg.kind === 'poll'
-  const artifactRefs = useMemo(
-    () => artifactRefsForMessage(msg),
-    [msg.body, msg.tool?.arg, msg.tool?.detail],
-  )
   // Avatar click opens InfoPane for both kinds — humans now have profile
   // cards (their auth email is the most useful new piece). The "yourself"
   // case is gated below via the disabled prop.

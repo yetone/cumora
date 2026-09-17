@@ -89,7 +89,7 @@
       },
       "correctness": {
         "useExhaustiveDependencies": "off",
-        "useHookAtTopLevel": "off",
+        "useHookAtTopLevel": "error",
         "noUnusedFunctionParameters": "off"
       }
     }
