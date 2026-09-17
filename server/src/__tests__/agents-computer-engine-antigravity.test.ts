@@ -49,6 +49,17 @@ rl.on('line', (line) => {
     } })
     return
   }
+  // Turn 2 fails before the CLI has anything to account for, so its result
+  // envelope omits \`usage\` entirely — the protocol marks the field optional
+  // and this is the common way it shows up. Turn 3 goes back to reporting the
+  // cumulative session total.
+  if (process.env.FAKE_AGY_SCENARIO === 'usage-gap' && turn === 2) {
+    out({ event: 'result', result: {
+      conversation_id: 'agy-conversation-1', status: 'ERROR', response: '',
+      error: 'upstream model unavailable', duration_seconds: 0.1, num_turns: turn,
+    } })
+    return
+  }
   out({ event: 'step_update', step_update: {
     conversation_id: 'agy-conversation-1', step_index: turn, state: 'DONE', step_type: 'tool',
     tool_info: { name: 'run_command' },
@@ -138,6 +149,42 @@ test('antigravity persistent session uses sandboxed stream-json and bills per-tu
   assert.equal(start.cwd, await realpath(f.home))
   const prompts = records.filter((record) => record.type === 'prompt') as Array<{ event: { event: string; message: { content: string } } }>
   assert.deepEqual(prompts.map((record) => record.event.message.content), ['first prompt', 'second prompt'])
+})
+
+test('antigravity keeps its usage baseline across a result that reports no usage', { skip: IS_WIN }, async () => {
+  const f = await fixture('usage-gap')
+  const hops: EngineHopReport[] = []
+  const session = getAdapter('antigravity').startSession?.({
+    home: f.home,
+    env: f.env,
+    model: 'Gemini 3.5 Flash (High)',
+    onLog: () => {},
+    onHopUsage: (hop) => hops.push(hop),
+  })
+  assert.ok(session)
+
+  const first = await session.send('first prompt')
+  const second = await session.send('second prompt')
+  const third = await session.send('third prompt')
+  await session.stop()
+
+  assert.deepEqual(first.usage, { input_tokens: 60, output_tokens: 10, cache_read_input_tokens: 40 })
+
+  // Turn 2 failed without reporting usage. Nothing to bill — and, critically,
+  // nothing to forget: the 100/10/40 baseline from turn 1 has to survive it.
+  assert.equal(second.exitCode, 1)
+  assert.match(second.error ?? '', /upstream model unavailable/)
+  assert.equal(second.usage, undefined)
+
+  // Turn 3's envelope is the cumulative session total (160/16/70). Only the
+  // 60/6/30 delta over turn 1 is new, and cache is a subset of input, so 30
+  // tokens are fresh input. Dropping the baseline on turn 2 would bill the
+  // whole cumulative counter here — 90/16/70 — charging turn 1 a second time.
+  assert.deepEqual(third.usage, { input_tokens: 30, output_tokens: 6, cache_read_input_tokens: 30 })
+
+  // The ledger sees the same two hops and never the phantom third charge.
+  assert.equal(hops.length, 2)
+  assert.deepEqual(hops.map((hop) => hop.usage), [first.usage, third.usage])
 })
 
 test('antigravity triage uses plan mode and returns the current reply', { skip: IS_WIN }, async () => {

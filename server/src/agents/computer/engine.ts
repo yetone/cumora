@@ -5484,7 +5484,14 @@ class AntigravityTurnTracker {
         : `antigravity turn ended with status ${result.status || 'UNKNOWN'}`
     }
     const delta = antigravityUsageDelta(result.usage, this.previousUsage)
-    this.previousUsage = result.usage
+    // Only a result that CARRIES usage moves the baseline. `usage` is optional
+    // in the protocol and an errored turn routinely omits it — overwriting the
+    // baseline with `undefined` there bills the next turn's whole cumulative
+    // session counter as one turn, which is the exact double-billing this
+    // tracker exists to prevent. Keeping the last known total means a
+    // usage-less turn bills nothing (correct: the CLI reported no spend) and
+    // the turn after it still bills only its own delta.
+    if (result.usage) this.previousUsage = result.usage
     this.usage = antigravityUsage(delta)
     if (this.usage && this.onHopUsage) {
       this.hopIndex += 1
