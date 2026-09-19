@@ -3850,10 +3850,15 @@ export function renderWindowsSupervisor(
   logPath: string,
   disabledPath = windowsSupervisorDisabledPath(),
   path = process.env.PATH ?? '',
+  // Carried only when the machine has nothing runnable without it — see
+  // _needsUnsandboxedOptIn. Dropping it makes the supervised daemon exit 70 on
+  // every start, and this loop restarts it every 5 seconds forever.
+  carryUnsandboxed = false,
 ): string {
   return [
     "$ErrorActionPreference = 'Continue'",
     "$env:CUMORA_SUPERVISED = '1'",
+    ...(carryUnsandboxed ? ["$env:CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'"] : []),
     `$env:PATH = ${quotePowerShell(path)}`,
     '$utf8 = New-Object System.Text.UTF8Encoding($false)',
     `while (-not (Test-Path -LiteralPath ${quotePowerShell(disabledPath)})) {`,
@@ -3925,6 +3930,36 @@ async function isWindowsTaskInstalled(taskName = windowsTaskName()): Promise<boo
  *  `npx -y cumora@latest agent computer --server <url>` with auto-restart +
  *  start-at-login. `@latest` + restart-on-update is what makes the daemon
  *  self-update (see checkForUpdate). Must be paired first. */
+/** Does the supervised daemon need the unsandboxed compatibility opt-in to
+ *  start at all?
+ *
+ *  The service definitions carry only PATH and CUMORA_SUPERVISED, so an opt-in
+ *  that was set in the shell is dropped at install time. For a user whose only
+ *  engine is a compatibility one (grok, cursor, gemini, qwen, opencode, pi,
+ *  antigravity) that is fatal and silent: pairing succeeds in the foreground,
+ *  the daemon then prints "run --install-service to keep this running", and the
+ *  service it installs starts with an empty runnable set, exits 70, and is
+ *  restarted forever by KeepAlive / Restart=always / Task Scheduler.
+ *
+ *  Answered by asking the real gate with the flag removed, so the flag is only
+ *  ever persisted when dropping it would actually break the service — not
+ *  baked into a background service because it happened to be set in the shell
+ *  of someone whose secure engines were fine all along. */
+export async function _needsUnsandboxedOptIn(env: NodeJS.ProcessEnv = process.env): Promise<boolean> {
+  if (!allowUnsandboxedByoa(env)) return false
+  try {
+    const detected = await detectEnginesWithStatus()
+    if (!detected.reliable || detected.engines.length === 0) return false
+    const without = { ...env, CUMORA_BYOA_ALLOW_UNSANDBOXED: '' }
+    const evaluated = await evaluateRunnableEngines(detected.engines, without)
+    return evaluated.runnable.length === 0
+  } catch {
+    // Never let the probe stop an install. Not carrying the flag is the
+    // status quo, and --status/--logs will show the exit 70 if it matters.
+    return false
+  }
+}
+
 async function installService(serverUrl: string): Promise<void> {
   if (!(await loadConfig())) {
     throw new Error('pair this computer first: cumora agent computer --pair <code>')
@@ -3932,6 +3967,13 @@ async function installService(serverUrl: string): Promise<void> {
   const npx = resolveNpx()
   const logPath = join(CONFIG_DIR, 'daemon.log')
   await mkdir(CONFIG_DIR, { recursive: true })
+  const carryUnsandboxed = await _needsUnsandboxedOptIn()
+  if (carryUnsandboxed) {
+    console.warn('[computer] this machine has no secure engine, so the background service will')
+    console.warn('[computer] carry CUMORA_BYOA_ALLOW_UNSANDBOXED=1 — without it the service exits 70')
+    console.warn('[computer] on every start. Local engines may read host files and use the network.')
+    console.warn('[computer] To undo: cumora agent computer --uninstall-service')
+  }
 
   if (process.platform === 'darwin') {
     const dir = join(homedir(), 'Library', 'LaunchAgents')
@@ -3949,7 +3991,7 @@ async function installService(serverUrl: string): Promise<void> {
   <key>StandardErrorPath</key><string>${logPath}</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>${process.env.PATH ?? ''}</string>
-    <key>CUMORA_SUPERVISED</key><string>1</string>
+    <key>CUMORA_SUPERVISED</key><string>1</string>${carryUnsandboxed ? '\n    <key>CUMORA_BYOA_ALLOW_UNSANDBOXED</key><string>1</string>' : ''}
   </dict>
 </dict></plist>
 `
@@ -3974,7 +4016,7 @@ ExecStart=${npx} -y cumora@latest agent computer --server ${serverUrl}
 Restart=always
 RestartSec=5
 Environment=PATH=${process.env.PATH ?? ''}
-Environment=CUMORA_SUPERVISED=1
+Environment=CUMORA_SUPERVISED=1${carryUnsandboxed ? '\nEnvironment=CUMORA_BYOA_ALLOW_UNSANDBOXED=1' : ''}
 
 [Install]
 WantedBy=default.target
@@ -3992,7 +4034,7 @@ WantedBy=default.target
     const disabledPath = windowsSupervisorDisabledPath()
     const taskName = windowsTaskName()
     const replacing = await isWindowsTaskInstalled(taskName)
-    await writeFile(scriptPath, renderWindowsSupervisor(npx, serverUrl, logPath, disabledPath), 'utf8')
+    await writeFile(scriptPath, renderWindowsSupervisor(npx, serverUrl, logPath, disabledPath, process.env.PATH ?? '', carryUnsandboxed), 'utf8')
     await writeFile(launcherPath, renderWindowsSupervisorLauncher(scriptPath), 'utf8')
     try {
       // Always recreate with /F: an existing task may still point at the old
