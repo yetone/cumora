@@ -505,6 +505,8 @@ function Stat({ n, l, tone }: { n: number; l: MessageKey; tone: 'good' | 'warn' 
 function ProjectsTab() {
   const t = useT()
   const [projects, setProjects] = useState<ApiProject[]>([])
+  const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const [showArchived, setShowArchived] = useState(false)
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
@@ -536,6 +538,20 @@ function ProjectsTab() {
     catch (e) { console.warn('[projects] archive failed', e) }
   }
 
+  const remove = async (project: ApiProject) => {
+    if (deletingId || !confirm(t('me.deleteProjectConfirm', { name: project.name }))) return
+    setDeletingId(project.id)
+    setDeleteError(null)
+    try {
+      await api.deleteProject(project.id)
+      setProjects((current) => current.filter((p) => p.id !== project.id))
+    } catch (e) {
+      setDeleteError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
   const visible = showArchived ? projects : projects.filter((p) => p.status === 'active')
   const archivedCount = projects.filter((p) => p.status === 'archived').length
 
@@ -546,6 +562,7 @@ function ProjectsTab() {
           {t('me.projectsIntro')}
         </div>
 
+        {deleteError && <div role="alert" className="mb-3 text-[12px] text-coral-deep">{deleteError}</div>}
         <div className="space-y-2">
           {visible.length === 0 && !creating && (
             <div className="bg-cloud rounded-[12px] p-6 text-center text-[13px] text-ink-500 italic font-display"
@@ -557,7 +574,7 @@ function ProjectsTab() {
             const count = p.conversationCount
             return (
               <div key={p.id} className="bg-cloud rounded-[12px] p-4 flex items-center gap-4"
-                style={{ border: '1px solid var(--ink-100)', opacity: p.status === 'archived' ? 0.55 : 1 }}>
+                style={{ border: '1px solid var(--ink-100)' }}>
                 <div className="w-3 h-10 rounded-full shrink-0" style={{ background: p.color ?? 'var(--ink-200)' }} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -571,9 +588,18 @@ function ProjectsTab() {
                 <button
                   type="button"
                   onClick={() => archive(p.id, p.status !== 'archived')}
+                  disabled={deletingId === p.id}
                   className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-ink-700 bg-paper hover:bg-sky2-50 transition"
                   style={{ border: '1px solid var(--ink-100)' }}
                 >{p.status === 'archived' ? t('me.restore') : t('me.archive')}</button>
+                {p.status === 'archived' && (
+                  <button
+                    type="button"
+                    onClick={() => remove(p)}
+                    disabled={deletingId !== null}
+                    className="shrink-0 px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-white bg-coral-deep hover:opacity-90 disabled:opacity-50 transition"
+                  >{deletingId === p.id ? t('me.deleteProjectBusy') : t('common.delete')}</button>
+                )}
               </div>
             )
           })}

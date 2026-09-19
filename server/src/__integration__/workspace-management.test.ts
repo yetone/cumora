@@ -89,6 +89,99 @@ function companyHeaders(companyId: string): Record<string, string> {
   return { 'content-type': 'application/json', 'x-company-id': companyId }
 }
 
+test('[integration] archived projects can be permanently deleted without deleting conversations', async () => {
+  await seedOwnedWorkspace()
+  await pool.query(
+    `INSERT INTO projects (id, company_id, name, status)
+     VALUES ('p-delete', 'co-managed', 'Archived project', 'archived')`,
+  )
+  await pool.query(
+    `INSERT INTO conversations (id, kind, title, members, company_id, project_id)
+     VALUES ('room-project', 'group', 'Project room', $1::jsonb, 'co-managed', 'p-delete')`,
+    [JSON.stringify([OWNER_ID])],
+  )
+  const response = await fetch(`${ownerBase}/api/projects/p-delete`, {
+    method: 'DELETE', headers: companyHeaders('co-managed'),
+  })
+  assert.equal(response.status, 200)
+  assert.equal((await pool.query(`SELECT 1 FROM projects WHERE id = 'p-delete'`)).rowCount, 0)
+  const conversation = await pool.query(`SELECT project_id FROM conversations WHERE id = 'room-project'`)
+  assert.deepEqual(conversation.rows, [{ project_id: null }])
+  const list = await fetch(`${ownerBase}/api/projects`, { headers: companyHeaders('co-managed') })
+  assert.deepEqual(await list.json(), [])
+})
+
+test('[integration] project deletion requires an archived project in an administered workspace', async () => {
+  await seedOwnedWorkspace()
+  await seedMember('co-managed', TARGET_ID, 'member')
+  await seedCompany('co-other-project', OWNER_ID)
+  await pool.query(
+    `INSERT INTO projects (id, company_id, name, status) VALUES
+     ('p-archived', 'co-managed', 'Archived', 'archived'),
+     ('p-active', 'co-managed', 'Active', 'active'),
+     ('p-other', 'co-other-project', 'Other', 'archived')`,
+  )
+  const denied = await fetch(`${targetBase}/api/projects/p-archived`, {
+    method: 'DELETE', headers: companyHeaders('co-managed'),
+  })
+  assert.equal(denied.status, 403)
+  for (const id of ['p-active', 'p-other', 'p-missing']) {
+    const response = await fetch(`${ownerBase}/api/projects/${id}`, {
+      method: 'DELETE', headers: companyHeaders('co-managed'),
+    })
+    assert.equal(response.status, 404)
+  }
+  assert.equal((await pool.query(`SELECT 1 FROM projects`)).rowCount, 3)
+  await pool.query(`UPDATE company_members SET role = 'admin' WHERE company_id = 'co-managed' AND user_id = $1`, [TARGET_ID])
+  const allowed = await fetch(`${targetBase}/api/projects/p-archived`, {
+    method: 'DELETE', headers: companyHeaders('co-managed'),
+  })
+  assert.equal(allowed.status, 200)
+})
+
+test('[integration] archive preserves memory; delete clears scoped and pinned memory while keeping global and other tenants', async () => {
+  await seedOwnedWorkspace()
+  await seedCompany('co-memory-other', OWNER_ID)
+  await pool.query(`INSERT INTO participants (id, company_id, kind, name, initial, avatar_bg, status)
+                    VALUES ('a-local', 'co-managed', 'agent', 'Local agent', 'L', '#abcdef', 'avail')`)
+  await pool.query(`INSERT INTO projects (id, company_id, name) VALUES ('p-memory', 'co-managed', 'Memory project')`)
+  const entries = [
+    ['a-local', 'co-managed', 'memory/projects/p-memory/MEMORY.md', null],
+    ['a-local', 'co-managed', 'memory/note/scoped.md', { source: { projectId: 'p-memory' } }],
+    ['a-local', 'co-managed', 'memory/note/pinned.md', { pinned: true, source: { projectId: 'p-memory' } }],
+    ['a-local', 'co-managed', 'memory/note/global.md', { pinned: true }],
+    ['a-local', 'co-managed', 'memory/projects/p-memory-other/MEMORY.md', null],
+    ['a-local', 'co-managed', 'skills/skill.md', { source: { projectId: 'p-memory' } }],
+    ['a-other', 'co-memory-other', 'memory/projects/p-memory/MEMORY.md', null],
+  ] as const
+  for (const [agentId, tenant, path, meta] of entries) {
+    await pool.query(`INSERT INTO agent_workspace (agent_id, company_id, path, body, meta) VALUES ($1, $2, $3, 'memory', $4::jsonb)`,
+      [agentId, tenant, path, JSON.stringify(meta)])
+  }
+  const archive = await fetch(`${ownerBase}/api/projects/p-memory/archive`, {
+    method: 'POST', headers: companyHeaders('co-managed'), body: JSON.stringify({ archive: true }),
+  })
+  assert.equal(archive.status, 200)
+  assert.equal((await pool.query('SELECT 1 FROM agent_workspace')).rowCount, entries.length)
+  const response = await fetch(`${ownerBase}/api/projects/p-memory`, {
+    method: 'DELETE', headers: companyHeaders('co-managed'),
+  })
+  assert.equal(response.status, 200)
+  const remaining = await pool.query(`SELECT agent_id, path FROM agent_workspace ORDER BY agent_id, path`)
+  assert.deepEqual(remaining.rows, entries.slice(3).map(([agent_id, , path]) => ({ agent_id, path })))
+  assert.deepEqual((await pool.query(`SELECT agent_ids FROM project_memory_deletions WHERE company_id = 'co-managed' AND project_id = 'p-memory'`)).rows,
+    [{ agent_ids: ['a-local'] }])
+  for (const [path, meta] of [
+    ['memory/projects/p-memory/late.md', null],
+    ['memory/note/late.md', { pinned: true, source: { projectId: 'p-memory' } }],
+  ] as const) {
+    await assert.rejects(pool.query(
+      `INSERT INTO agent_workspace (agent_id, company_id, path, body, meta) VALUES ('a-local', 'co-managed', $1, 'late', $2::jsonb)`,
+      [path, JSON.stringify(meta)],
+    ), { code: '23514' })
+  }
+})
+
 test('[integration] owner lists members and changes a member role', async () => {
   await seedOwnedWorkspace()
   await seedMember('co-managed', TARGET_ID, 'member')

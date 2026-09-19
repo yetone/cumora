@@ -6,6 +6,7 @@
  * schema-version.ts and never execute DDL while starting.
  */
 import { AGENT_PROVIDER_PROFILE_SQL, agentProviderProfileChecksum } from './migrations/0008-agent-provider-profile.js'
+import { PROJECT_MEMORY_DELETION_SQL, projectMemoryDeletionChecksum } from './migrations/0010-project-memory-deletion.js'
 import { createHash } from 'node:crypto'
 import { pool } from './pool.js'
 import {
@@ -2615,6 +2616,12 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: agentRoutingClaimsChecksum(),
     transactional: true,
     up: applyAgentRoutingClaims,
+  },
+  {
+    ...SCHEMA_MIGRATIONS[9],
+    sourceChecksum: projectMemoryDeletionChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(PROJECT_MEMORY_DELETION_SQL) },
   },
 ]
 

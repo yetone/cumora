@@ -34,6 +34,8 @@ export const en = {
   'common.save': 'Save',
   'common.saving': 'Saving…',
   'common.delete': 'Delete',
+  'me.deleteProjectConfirm': 'Permanently delete project “{name}” and its dedicated memories (including pinned project memories)? This cannot be undone. Linked conversations and global memories will be kept. Offline computers will clean up local project memories after reconnecting.',
+  'me.deleteProjectBusy': 'Deleting…',
   'common.you': 'You',
   'common.idle': 'idle',
   'common.human': 'human',

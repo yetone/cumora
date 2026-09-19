@@ -21,6 +21,7 @@ const { emailMessagesCompanySmtpIdChecksum } = await import('../db/migrations/00
 const { engineDefaultsChecksum } = await import('../db/migrations/0007-engine-defaults.js')
 const { agentProviderProfileChecksum } = await import('../db/migrations/0008-agent-provider-profile.js')
 const { agentRoutingClaimsChecksum } = await import('../db/migrations/0009-agent-routing-claims.js')
+const { projectMemoryDeletionChecksum } = await import('../db/migrations/0010-project-memory-deletion.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -60,6 +61,10 @@ test('the agent provider profile migration matches its immutable manifest checks
 
 test('the agent routing claims migration matches its immutable manifest checksum', () => {
   assert.equal(agentRoutingClaimsChecksum(), SCHEMA_MIGRATIONS[8].checksum)
+})
+
+test('the project memory deletion migration matches its immutable manifest checksum', () => {
+  assert.equal(projectMemoryDeletionChecksum(), SCHEMA_MIGRATIONS[9].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

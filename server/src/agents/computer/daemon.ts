@@ -51,6 +51,7 @@ import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
+import { cleanupDeletedProjectMemories, type DeletedProjectMemory } from './project-memory-cleanup.js'
 import { runWithSessionRecovery } from './session-recovery.js'
 
 export { conversationHeader }
@@ -3667,8 +3668,14 @@ async function doRun(serverOverride?: string): Promise<void> {
         body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, engines: engineInventory.current }),
       })
       if (!response.ok) return
-      const heartbeatResult = await response.json().catch(() => null) as { detectRequested?: boolean } | null
+      const heartbeatResult = await response.json().catch(() => null) as {
+        detectRequested?: boolean; deletedProjectMemories?: DeletedProjectMemory[]
+      } | null
       if (heartbeatResult?.detectRequested) void rescanEngines(true)
+      if (Array.isArray(heartbeatResult?.deletedProjectMemories)) {
+        await cleanupDeletedProjectMemories(AGENTS_ROOT, heartbeatResult.deletedProjectMemories)
+          .catch((error) => console.warn('[computer] project memory cleanup:', error))
+      }
     } catch { /* transient — next tick retries */ }
   }
 
