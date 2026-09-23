@@ -165,6 +165,11 @@ export function MobileChat() {
   // Re-snapshot on convo switch so the new convo gets the same
   // "fresh messages only animate" treatment.
   const convoOpenedAtRef = useRef<number>(Date.now())
+  // Tracks the conversation that was active when upload() was called so the
+  // async callbacks can be dropped if the user switches conversations mid-upload
+  // (same scope-capture pattern as desktop's `targetScope` in ChatPane.tsx).
+  const convoIdRef = useRef(convoId)
+  useEffect(() => { convoIdRef.current = convoId }, [convoId])
   useEffect(() => {
     convoOpenedAtRef.current = Date.now()
   }, [convoId])
@@ -343,16 +348,19 @@ export function MobileChat() {
   }
 
   const upload = async (file: File) => {
+    const targetConvoId = convoId
     setUploading(true); setUploadError(null)
     try {
       const a = await api.uploadFile(file)
-      setAttachment(a)
+      if (convoIdRef.current === targetConvoId) setAttachment(a)
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      setUploadError(msg)
-      window.setTimeout(() => setUploadError(null), 4500)
+      if (convoIdRef.current === targetConvoId) {
+        setUploadError(msg)
+        window.setTimeout(() => setUploadError(null), 4500)
+      }
     } finally {
-      setUploading(false)
+      if (convoIdRef.current === targetConvoId) setUploading(false)
     }
   }
   const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
