@@ -16,6 +16,7 @@
  * tally shape stay consistent across actors.
  */
 import { randomUUID } from 'node:crypto'
+import { dispatchMessagePush } from './push.js'
 import { pool } from './db/pool.js'
 import { CH_MESSAGE_NEW, CH_POLLS, type PollUpdatedEvent } from './redis.js'
 import {
@@ -174,6 +175,29 @@ export async function createPoll(input: CreatePollInput): Promise<CreatedPoll> {
   } finally {
     client.release()
   }
+
+  // The row is durable now, so the phone can be told. Fire-and-forget for the
+  // same reason the other four dispatches are: a push must never hold up the
+  // write.
+  //
+  // A poll was the one human-visible message kind that never reached a phone.
+  // It is not a missing feature, it is an asymmetry: NotificationToasts skips
+  // only `kind === 'system'`, so a poll already toasts on desktop and in the
+  // Electron notification window, and Message.tsx renders the poll bubble on
+  // both shells — so a phone-only member could see and vote on a poll nobody
+  // ever told them about. The body built above says what it is for in its own
+  // comment: "notifications, search index, plain-text logs".
+  //
+  // Recipients need no new filtering: computeMessageRecipients joins `users`,
+  // so agents are never notified, and the mute / "currently looking at the app"
+  // filters apply unchanged.
+  void dispatchMessagePush({
+    conversationId: input.conversationId,
+    authorId: input.authorId,
+    messageId,
+    body,
+    companyId: input.companyId,
+  })
 
   return { messageId, sequence, poll: payload }
 }
