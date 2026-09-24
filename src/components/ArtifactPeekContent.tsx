@@ -9,7 +9,9 @@ import { IBoard, ICalendar, IClock, IRepeat } from '@/components/icons'
 import { cn } from '@/lib/utils'
 import { useT, type MessageKey } from '@/lib/i18n'
 import { EventEditor } from '@/components/EventEditor'
-import type { BoardCard, CalendarEvent, RecurrenceRule } from '@/types'
+import { DateTimePicker } from '@/components/DateTimePicker'
+import { boardDueStatus, localCalendarDay } from '@/lib/board-due-date'
+import type { BoardCard, BoardColumn, CalendarEvent, RecurrenceRule } from '@/types'
 
 const RECURRING_KEYS: Record<RecurrenceRule['freq'], MessageKey> = {
   daily: 'peek.recurringDaily',
@@ -207,6 +209,12 @@ export function BoardPeekContent({
   const summary = list.find((b) => b.id === boardId) ?? null
   const didRequestList = useRef(false)
   const requestedBoardId = useRef<string | null>(null)
+  const [asOf, setAsOf] = useState(localCalendarDay)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setAsOf(localCalendarDay()), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   useEffect(() => {
     if (!summary && !loadingList && !didRequestList.current) {
@@ -287,7 +295,7 @@ export function BoardPeekContent({
                     </div>
                   )}
                   {cards.map((card) => (
-                    <BoardPeekCard key={card.id} card={card} focused={card.id === focusCardId} />
+                    <BoardPeekCard key={card.id} boardId={boardId} card={card} columnKind={col.kind} asOf={asOf} focused={card.id === focusCardId} />
                   ))}
                 </div>
               </section>
@@ -299,11 +307,31 @@ export function BoardPeekContent({
   )
 }
 
-function BoardPeekCard({ card, focused }: { card: BoardCard; focused: boolean }) {
+function BoardPeekCard({ boardId, card, columnKind, asOf, focused }: {
+  boardId: string; card: BoardCard; columnKind: BoardColumn['kind']; asOf: string; focused: boolean
+}) {
   const t = useT()
   const byId = useParticipants((s) => s.byId)
+  const patchCard = useBoards((s) => s.patchCard)
   const assignee = card.assigneeId ? byId[card.assigneeId] : null
   const ref = useRef<HTMLElement | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState(false)
+  const dueStatus = boardDueStatus(card.dueOn, columnKind, asOf)
+
+  async function saveDueOn(value: string) {
+    if (saving) return
+    setSaving(true)
+    setSaveError(false)
+    try {
+      await patchCard(boardId, card.id, { dueOn: value ? value.slice(0, 10) : null })
+    } catch (error) {
+      console.warn('[boards] due date update failed', error)
+      setSaveError(true)
+    } finally {
+      setSaving(false)
+    }
+  }
 
   useEffect(() => {
     if (!focused) return
@@ -329,6 +357,23 @@ function BoardPeekCard({ card, focused }: { card: BoardCard; focused: boolean })
         </div>
       )}
       <div className="text-[12.5px] font-medium leading-snug text-ink-800 line-clamp-3">{card.title}</div>
+      <div className={card.dueOn ? 'mt-2' : 'mt-1'} onClick={(event) => event.stopPropagation()}>
+        {card.dueOn && (
+          <div className={cn('mb-1 text-[11px]', dueStatus === 'overdue' ? 'font-semibold text-coral-deep' : dueStatus === 'unclassified' ? 'font-semibold text-gold-deep' : dueStatus === 'today' ? 'font-semibold text-skype-deep' : 'text-ink-500')}>
+            {dueStatus === 'overdue' ? t('boards.overdue') : dueStatus === 'unclassified' ? t('boards.pastDueUnclassified') : dueStatus === 'today' ? t('boards.dueToday') : t('boards.dueDate')}: {card.dueOn}
+          </div>
+        )}
+        <DateTimePicker
+          mode="date"
+          value={card.dueOn ? `${card.dueOn}T00:00` : ''}
+          onChange={(value) => { void saveDueOn(value) }}
+          placeholder={card.dueOn ? t('boards.noDueDate') : t('boards.addDueDate')}
+          allowClear
+          disabled={saving}
+          compact={!card.dueOn}
+        />
+        {saveError && <div role="alert" className="mt-1 text-[11px] text-coral-deep">{t('boards.dueSaveFailed')}</div>}
+      </div>
       {(assignee || card.commentCount > 0 || card.mentions.length > 0) && (
         <div className="mt-2 flex items-center gap-2 text-[11px] text-ink-500">
           {assignee && (

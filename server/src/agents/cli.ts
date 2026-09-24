@@ -25,6 +25,7 @@ import {
 } from './memory-scope.js'
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
 import { wakeKanbanAgents } from './kanban-wake.js'
+import { isBoardDueOn } from './board-due-date.js'
 import {
   enqueueBroadcast,
   nudgeRealtimeOutbox,
@@ -364,8 +365,9 @@ KANBAN  (shared boards — the same ones humans see in the Boards view):
        [--description "..."]
   kanban columns <board_id>                          list column ids — needed for \`card add --column\`
   kanban add-column <board_id> "<title>"             append a new column to a board
+       [--kind todo|doing|done]
   kanban edit-column <board_id> <column_id>          rename / reorder a column
-       [--title "..."] [--position N]
+       [--title "..."] [--position N] [--kind todo|doing|done|clear]
   kanban delete-column <board_id> <column_id>        delete a column and its cards
   kanban delete <board_id>                           drop the board (and its columns + cards)
   kanban mentions [--peek] [--json]                  list NEW cards/comments where someone @ed YOU since
@@ -373,10 +375,13 @@ KANBAN  (shared boards — the same ones humans see in the Boards view):
                                                      inbox is empty — you may have been pinged here.
                                                      Advances a read cursor unless --peek is passed.
 
-  card ls <board_id>                                list every card in a board
+  card ls <board_id> [--due-before YYYY-MM-DD]      list cards (date filter is exclusive)
+       [--overdue-as-of YYYY-MM-DD]                 overdue todo/doing work + passed-date cards in unclassified columns
+                                                     (JSON due_status distinguishes them)
   card show <card_id>                               full card detail + comments
   card add <board_id> "<title>" --column <col_id>   create a card
-       [--description "..."] [--assign <id>]
+       [--description "..."] [--assign <id>] [--due YYYY-MM-DD]
+  card due <card_id> <YYYY-MM-DD|clear>             set or clear a date-only deadline
   card move <card_id> --to <column_id>              move a card between columns (the way "done" happens)
   card claim <card_id>                              ATOMICALLY claim a card before working it (exclusive;
                                                      fails if someone else already holds it → move on)
@@ -5152,9 +5157,9 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     }>(`SELECT id, title, position, kind FROM board_columns WHERE board_id = $1 ORDER BY position ASC`, [boardId])
     const cards = await pool.query<{
       id: string; column_id: string; title: string; assignee_id: string | null
-      mentions: string[]; position: number
+      mentions: string[]; position: number; due_on: string | null
     }>(
-      `SELECT id, column_id, title, assignee_id, mentions, position
+      `SELECT id, column_id, title, assignee_id, mentions, position, due_on::text AS due_on
          FROM board_cards WHERE board_id = $1 ORDER BY column_id, position ASC`,
       [boardId],
     )
@@ -5181,7 +5186,7 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
         const mentions = Array.isArray(c.mentions) && c.mentions.length > 0
           ? `  · mentions: ${c.mentions.map((m) => '@' + m).join(' ')}`
           : ''
-        lines.push(`  - ${c.id.padEnd(20)} ${who.padEnd(16)} ${c.title}${mentions}`)
+        lines.push(`  - ${c.id.padEnd(20)} ${who.padEnd(16)} ${c.title}${c.due_on ? `  (due ${c.due_on})` : ''}${mentions}`)
       }
     }
     return ok(lines.join('\n'))
@@ -5278,18 +5283,20 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
       `SELECT company_id FROM boards WHERE id = $1 LIMIT 1`, [boardId],
     )
     if (b.rows.length === 0 || b.rows[0].company_id !== companyId) return err(`board ${boardId} not found`)
-    const { rows } = await pool.query<{ id: string; title: string }>(
-      `SELECT id, title FROM board_columns WHERE board_id = $1 ORDER BY position ASC`,
+    const { rows } = await pool.query<{ id: string; title: string; kind: string | null }>(
+      `SELECT id, title, kind FROM board_columns WHERE board_id = $1 ORDER BY position ASC`,
       [boardId],
     )
     if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
-    return ok(rows.map((c) => `  ${c.id.padEnd(20)} ${c.title}`).join('\n') || '(no columns)')
+    return ok(rows.map((c) => `  ${c.id.padEnd(20)} ${c.title}${c.kind ? ` [${c.kind}]` : ''}`).join('\n') || '(no columns)')
   }
 
   if (op === 'add-column' || op === 'add-col') {
     const boardId = parsed.positional[1]
     const title = parsed.positional.slice(2).join(' ').trim()
     if (!boardId || !title) return err('usage: kanban add-column <board_id> "<title>"')
+    const kind = parsed.flags.kind === undefined ? null : parsed.flags.kind
+    if (kind !== null && !['todo', 'doing', 'done'].includes(kind as string)) return err('--kind must be todo, doing, or done')
     const b = await pool.query<{ company_id: string }>(
       `SELECT company_id FROM boards WHERE id = $1 LIMIT 1`, [boardId],
     )
@@ -5301,8 +5308,8 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     const id = `col-${randomUUID().slice(0, 12)}`
     await withOutboxTransaction(async (client) => {
       await client.query(
-        `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-        [id, boardId, title.slice(0, 100), position],
+        `INSERT INTO board_columns (id, board_id, title, position, kind) VALUES ($1, $2, $3, $4, $5)`,
+        [id, boardId, title.slice(0, 100), position, kind],
       )
       await enqueueBoardCli(client, { companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
     })
@@ -5322,7 +5329,7 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
     const boardId = parsed.positional[1]
     const columnId = parsed.positional[2]
     if (!boardId || !columnId) {
-      return err(`usage: kanban ${op} <board_id> <column_id> [--title "..."] [--position N]`)
+      return err(`usage: kanban ${op} <board_id> <column_id> [--title "..."] [--position N] [--kind todo|doing|done|clear]`)
     }
     const b = await pool.query<{ company_id: string }>(
       `SELECT company_id FROM boards WHERE id = $1 LIMIT 1`,
@@ -5343,7 +5350,12 @@ async function cmdBoard(parsed: ParsedArgs): Promise<CliResult> {
       if (!Number.isFinite(position)) return err(`invalid --position: ${parsed.flags.position}`)
       params.push(position); sets.push(`position = $${params.length}`)
     }
-    if (sets.length === 0) return err('nothing to update — pass --title or --position')
+    if (parsed.flags.kind !== undefined) {
+      const kind = parsed.flags.kind === 'clear' ? null : parsed.flags.kind
+      if (kind !== null && !['todo', 'doing', 'done'].includes(kind as string)) return err('--kind must be todo, doing, done, or clear')
+      params.push(kind); sets.push(`kind = $${params.length}`)
+    }
+    if (sets.length === 0) return err('nothing to update — pass --title, --position, or --kind')
     params.push(columnId, boardId)
     const rows = await withOutboxTransaction(async (client) => {
       const updated = await client.query<{ title: string; position: number }>(
@@ -5566,23 +5578,43 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
   if (op === 'ls' || op === 'list') {
     const boardId = parsed.positional[1]
     if (!boardId) return err('usage: card ls <board_id>')
+    const dueBefore = parsed.flags['due-before']
+    if (dueBefore !== undefined && !isBoardDueOn(dueBefore)) {
+      return err('--due-before must be a valid YYYY-MM-DD date (exclusive)')
+    }
+    const overdueAsOf = parsed.flags['overdue-as-of']
+    if (overdueAsOf !== undefined && !isBoardDueOn(overdueAsOf)) {
+      return err('--overdue-as-of must be a valid YYYY-MM-DD date')
+    }
     const b = await pool.query<{ company_id: string }>(
       `SELECT company_id FROM boards WHERE id = $1 LIMIT 1`, [boardId],
     )
     if (b.rows.length === 0 || b.rows[0].company_id !== companyId) return err(`board ${boardId} not found`)
     const { rows } = await pool.query<{
       id: string; column_id: string; title: string; assignee_id: string | null
-      mentions: string[]
+      mentions: string[]; due_on: string | null; column_kind: string | null
+      due_status: 'overdue' | 'status_unknown' | null
     }>(
-      `SELECT id, column_id, title, assignee_id, mentions
-         FROM board_cards WHERE board_id = $1 ORDER BY column_id, position ASC`,
-      [boardId],
+      `SELECT c.id, c.column_id, c.title, c.assignee_id, c.mentions,
+              c.due_on::text AS due_on, col.kind AS column_kind,
+              CASE WHEN $3::date IS NULL THEN NULL
+                   WHEN col.kind IS NULL THEN 'status_unknown'
+                   ELSE 'overdue' END AS due_status
+         FROM board_cards c JOIN board_columns col ON col.id = c.column_id
+        WHERE c.board_id = $1
+          AND ($2::date IS NULL OR c.due_on < $2::date)
+          AND ($3::date IS NULL OR (c.due_on < $3::date AND (col.kind IN ('todo', 'doing') OR col.kind IS NULL)))
+        ORDER BY c.column_id, c.position ASC`,
+      [boardId, dueBefore ?? null, overdueAsOf ?? null],
     )
     if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
     if (rows.length === 0) return ok('(no cards)')
     return ok(rows.map((c) => {
       const who = c.assignee_id ? `@${c.assignee_id}` : '(unassigned)'
-      return `  ${c.id.padEnd(20)} [${c.column_id.slice(0, 16).padEnd(16)}] ${who.padEnd(16)} ${c.title}`
+      const due = c.due_on
+        ? `  (due ${c.due_on}${c.due_status === 'status_unknown' ? '; column status unknown' : c.due_status === 'overdue' ? '; overdue' : ''})`
+        : ''
+      return `  ${c.id.padEnd(20)} [${c.column_id.slice(0, 16).padEnd(16)}${c.column_kind ? `:${c.column_kind}` : ''}] ${who.padEnd(16)} ${c.title}${due}`
     }).join('\n'))
   }
 
@@ -5591,11 +5623,11 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     if (!cardId) return err('usage: card show <card_id>')
     const r = await pool.query<{
       id: string; board_id: string; column_id: string; title: string
-      description: string | null; assignee_id: string | null; mentions: string[]
+      description: string | null; assignee_id: string | null; mentions: string[]; due_on: string | null
       created_by: string; created_at: string; updated_at: string; company_id: string
     }>(
       `SELECT c.id, c.board_id, c.column_id, c.title, c.description,
-              c.assignee_id, c.mentions, c.created_by, c.created_at, c.updated_at,
+              c.assignee_id, c.due_on::text AS due_on, c.mentions, c.created_by, c.created_at, c.updated_at,
               b.company_id
          FROM board_cards c JOIN boards b ON b.id = c.board_id
         WHERE c.id = $1 LIMIT 1`,
@@ -5616,6 +5648,7 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       `  board:    ${c.board_id}`,
       `  column:   ${c.column_id}`,
       `  assignee: ${c.assignee_id ?? '(unassigned)'}`,
+      `  due:      ${c.due_on ?? '(none)'}`,
       `  created:  ${c.created_at}  by ${c.created_by}`,
     ]
     if (Array.isArray(c.mentions) && c.mentions.length > 0) {
@@ -5636,7 +5669,7 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     const title = parsed.positional.slice(2).join(' ').trim()
       || (typeof parsed.flags.title === 'string' ? parsed.flags.title : '')
     if (!boardId || !title) {
-      return err('usage: card add <board_id> "<title>" --column <col_id> [--description "..."] [--assign <id>]')
+      return err('usage: card add <board_id> "<title>" --column <col_id> [--description "..."] [--assign <id>] [--due YYYY-MM-DD]')
     }
     const columnId = String(parsed.flags.column ?? parsed.flags.col ?? '').trim()
     if (!columnId) return err('--column <col_id> required (run `cumora kanban columns <board_id>` to list)')
@@ -5653,6 +5686,8 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       ? unescapeChat(parsed.flags.description).slice(0, 8000) : null
     const assignee = typeof parsed.flags.assign === 'string'
       ? String(parsed.flags.assign).trim() : null
+    const dueOn = parsed.flags.due === undefined ? null : parsed.flags.due
+    if (dueOn !== null && !isBoardDueOn(dueOn)) return err('--due must be a valid YYYY-MM-DD date')
     const { rows: posRows } = await pool.query<{ max: number | null }>(
       `SELECT MAX(position) AS max FROM board_cards WHERE column_id = $1`, [columnId],
     )
@@ -5662,9 +5697,9 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
     await withOutboxTransaction(async (client) => {
       await client.query(
         `INSERT INTO board_cards
-           (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
-        [id, boardId, columnId, title.slice(0, 200), description, position, assignee, JSON.stringify(mentions), me],
+           (id, board_id, column_id, title, description, position, assignee_id, due_on, mentions, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::jsonb, $10)`,
+        [id, boardId, columnId, title.slice(0, 200), description, position, assignee, dueOn, JSON.stringify(mentions), me],
       )
       await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
       await enqueueBoardCli(client, {
@@ -5698,6 +5733,36 @@ async function cmdCard(parsed: ParsedArgs): Promise<CliResult> {
       assigneeId: assignee,
       mentions,
       title,
+      visibleToUser: true,
+    }])
+  }
+
+  if (op === 'due') {
+    const cardId = parsed.positional[1]
+    const value = parsed.positional[2]
+    if (!cardId || !value) return err('usage: card due <card_id> <YYYY-MM-DD|clear>')
+    const dueOn = value === 'clear' ? null : value
+    if (dueOn !== null && !isBoardDueOn(dueOn)) return err('due date must be a valid YYYY-MM-DD date or clear')
+    const home = await resolveCardBoard(cardId)
+    if (!home) return err(`card ${cardId} not found`)
+    await withOutboxTransaction(async (client) => {
+      await client.query(
+        `UPDATE board_cards SET due_on = $1::date, updated_at = NOW() WHERE id = $2`,
+        [dueOn, cardId],
+      )
+      await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [home.boardId])
+      await enqueueBoardCli(client, {
+        companyId, kind: 'card.updated', boardId: home.boardId, cardId, actorId: me,
+      })
+    })
+    return ok(dueOn ? `card ${cardId} due ${dueOn}` : `cleared due date on card ${cardId}`, [{
+      event: 'kanban.card_updated',
+      command: 'card due',
+      boardId: home.boardId,
+      cardId,
+      actorId: me,
+      companyId,
+      dueOn,
       visibleToUser: true,
     }])
   }

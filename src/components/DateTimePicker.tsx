@@ -21,6 +21,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from 'react-dom'
 import { ICalendar } from '@/components/icons'
 import { useT } from '@/lib/i18n'
+import { formatPickerDateTime, pickerCalendarDate } from '@/lib/picker-calendar-date'
 import { cn } from '@/lib/utils'
 
 interface Props {
@@ -34,6 +35,8 @@ interface Props {
   /** When true, the popover gets a "Clear" affordance that emits ''. */
   allowClear?: boolean
   disabled?: boolean
+  /** Render a small text trigger when the picker is an optional card action. */
+  compact?: boolean
   /** Forwarded to the trigger for layout; defaults to full-width. */
   className?: string
 }
@@ -55,14 +58,10 @@ function parseValue(s: string): { date: Date | null; hour: number; minute: numbe
   const m = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?/.exec(s)
   if (!m) return { date: null, hour: 9, minute: 0 }
   return {
-    date: new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])),
+    date: pickerCalendarDate(Number(m[1]), Number(m[2]) - 1, Number(m[3])),
     hour: m[4] ? Number(m[4]) : 0,
     minute: m[5] ? Number(m[5]) : 0,
   }
-}
-
-function formatValue(date: Date, hour: number, minute: number): string {
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(hour)}:${pad(minute)}`
 }
 
 /** Render the trigger text. macOS-style: "May 18, 2026  09:30". */
@@ -77,7 +76,7 @@ function formatDisplay(s: string, mode: 'datetime' | 'date', placeholder: string
 export function DateTimePicker({
   value, onChange, mode,
   placeholder = '—',
-  allowClear, disabled,
+  allowClear, disabled, compact,
   className,
 }: Props) {
   const t = useT()
@@ -144,7 +143,7 @@ export function DateTimePicker({
     setCursorMonth((c) => (
       c.getFullYear() === date.getFullYear() && c.getMonth() === date.getMonth()
         ? c
-        : new Date(date.getFullYear(), date.getMonth(), 1)
+        : pickerCalendarDate(date.getFullYear(), date.getMonth())
     ))
   }, [value])
 
@@ -168,12 +167,12 @@ export function DateTimePicker({
   }, [open, updatePopoverPosition])
 
   const days = useMemo<Date[]>(() => {
-    const monthStart = new Date(cursorMonth.getFullYear(), cursorMonth.getMonth(), 1)
+    const monthStart = pickerCalendarDate(cursorMonth.getFullYear(), cursorMonth.getMonth())
     const gridStart = new Date(monthStart)
     gridStart.setDate(1 - monthStart.getDay())
     const out: Date[] = []
     for (let i = 0; i < 42; i++) {
-      out.push(new Date(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i))
+      out.push(pickerCalendarDate(gridStart.getFullYear(), gridStart.getMonth(), gridStart.getDate() + i))
     }
     return out
   }, [cursorMonth])
@@ -184,19 +183,19 @@ export function DateTimePicker({
 
   const pickDate = (d: Date) => {
     if (mode === 'date') {
-      onChange(formatValue(d, 0, 0))
+      onChange(formatPickerDateTime(d, 0, 0))
       setOpen(false)
     } else {
-      onChange(formatValue(d, hour, minute))
+      onChange(formatPickerDateTime(d, hour, minute))
     }
   }
   const pickHour = (h: number) => {
     const anchor = selected ?? new Date()
-    onChange(formatValue(anchor, h, minute))
+    onChange(formatPickerDateTime(anchor, h, minute))
   }
   const pickMinute = (m: number) => {
     const anchor = selected ?? new Date()
-    onChange(formatValue(anchor, hour, m))
+    onChange(formatPickerDateTime(anchor, hour, m))
   }
 
   const display = formatDisplay(value, mode, placeholder)
@@ -220,7 +219,8 @@ export function DateTimePicker({
             <div className="flex items-center gap-0.5">
               <button
                 type="button"
-                onClick={() => setCursorMonth(new Date(cursorMonth.getFullYear(), cursorMonth.getMonth() - 1, 1))}
+                onClick={() => setCursorMonth(pickerCalendarDate(cursorMonth.getFullYear(), cursorMonth.getMonth() - 1))}
+                disabled={cursorMonth.getFullYear() <= 1 && cursorMonth.getMonth() === 0}
                 className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100 transition"
                 aria-label={t('dtpicker.prevMonth')}
               >‹</button>
@@ -229,7 +229,8 @@ export function DateTimePicker({
               </span>
               <button
                 type="button"
-                onClick={() => setCursorMonth(new Date(cursorMonth.getFullYear(), cursorMonth.getMonth() + 1, 1))}
+                onClick={() => setCursorMonth(pickerCalendarDate(cursorMonth.getFullYear(), cursorMonth.getMonth() + 1))}
+                disabled={cursorMonth.getFullYear() >= 9999 && cursorMonth.getMonth() === 11}
                 className="w-7 h-7 rounded-md grid place-items-center text-ink-500 hover:bg-ink-100 transition"
                 aria-label={t('dtpicker.nextMonth')}
               >›</button>
@@ -239,12 +240,12 @@ export function DateTimePicker({
                 type="button"
                 onClick={() => {
                   const now = new Date()
-                  setCursorMonth(new Date(now.getFullYear(), now.getMonth(), 1))
+                  setCursorMonth(pickerCalendarDate(now.getFullYear(), now.getMonth()))
                   if (mode === 'date') {
-                    onChange(formatValue(now, 0, 0))
+                    onChange(formatPickerDateTime(now, 0, 0))
                     setOpen(false)
                   } else {
-                    onChange(formatValue(now, hour, minute))
+                    onChange(formatPickerDateTime(now, hour, minute))
                   }
                 }}
                 className="text-[11.5px] font-medium text-skype-deep hover:underline px-1"
@@ -274,14 +275,18 @@ export function DateTimePicker({
                   const isCur = d.getMonth() === cursorMonth.getMonth()
                   const isSelected = sameYMD(selected, d)
                   const isToday = sameYMD(today, d)
+                  const outOfRange = d.getFullYear() < 1 || d.getFullYear() > 9999
                   return (
                     <button
                       type="button"
                       key={i}
+                      disabled={outOfRange}
                       onClick={() => pickDate(d)}
                       className={cn(
                         'w-9 h-8 rounded-md text-[12.5px] font-medium tabular-nums transition',
-                        isSelected
+                        outOfRange
+                          ? 'text-ink-200 cursor-not-allowed'
+                          : isSelected
                           ? 'bg-skype text-white shadow-soft'
                           : isToday
                             ? 'text-skype-deep font-bold ring-1 ring-sky2-300'
@@ -330,18 +335,20 @@ export function DateTimePicker({
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
         className={cn(
-          'w-full flex items-center justify-between px-3 h-[38px] text-[13.5px] rounded-[10px] transition outline-none',
-          'border-[1.5px]',
-          value ? 'text-ink-900' : 'text-ink-300',
-          open
+          'w-full flex items-center justify-between transition outline-none',
+          compact
+            ? 'h-6 text-[11px] font-medium text-skype-deep hover:underline'
+            : 'px-3 h-[38px] text-[13.5px] rounded-[10px] border-[1.5px]',
+          !compact && (value ? 'text-ink-900' : 'text-ink-300'),
+          !compact && (open
             ? 'border-sky2-300 shadow-[0_0_0_3px_var(--sky-50)]'
-            : 'border-ink-100 hover:border-ink-200',
+            : 'border-ink-100 hover:border-ink-200'),
           disabled && 'opacity-50 cursor-not-allowed',
         )}
-        style={{ background: 'var(--paper)' }}
+        style={compact ? undefined : { background: 'var(--paper)' }}
       >
         <span className="font-medium tabular-nums truncate">{display}</span>
-        <ICalendar className="w-4 h-4 text-ink-400 shrink-0 ml-2" />
+        <ICalendar className={cn('text-ink-400 shrink-0 ml-2', compact ? 'w-3.5 h-3.5' : 'w-4 h-4')} />
       </button>
 
       {popover}

@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import { api, ws } from '@/api/client'
 import type {
-  BoardSummary, BoardSnapshot, BoardCard, BoardCardComment, BoardCardLookup,
+  BoardSummary, BoardSnapshot, BoardCard, BoardCardComment, BoardCardLookup, BoardColumn,
 } from '@/types'
 import { pendingCreateRequestId } from '@/lib/create-idempotency'
 import { commitIfContextCurrent, useAuth } from '@/stores/auth'
@@ -42,14 +42,15 @@ interface BoardsState {
 
   addColumn: (boardId: string, title: string) => Promise<void>
   renameColumn: (boardId: string, columnId: string, title: string) => Promise<void>
+  setColumnKind: (boardId: string, columnId: string, kind: BoardColumn['kind']) => Promise<void>
   deleteColumn: (boardId: string, columnId: string) => Promise<void>
 
   addCard: (boardId: string, input: {
-    columnId: string; title: string; description?: string; assigneeId?: string | null
+    columnId: string; title: string; description?: string; assigneeId?: string | null; dueOn?: string | null
   }) => Promise<void>
   patchCard: (boardId: string, cardId: string, input: {
     title?: string; description?: string; columnId?: string; position?: number
-    assigneeId?: string | null
+    assigneeId?: string | null; dueOn?: string | null
   }) => Promise<void>
   /** Optimistic move — patches the in-memory snapshot immediately, fires
    *  the PATCH in the background, refetches on failure. */
@@ -231,6 +232,10 @@ export const useBoards = create<BoardsState>((set, get) => ({
   },
   renameColumn: async (boardId, columnId, title) => {
     await api.updateBoardColumn(boardId, columnId, { title })
+    await get().refreshBoard(boardId)
+  },
+  setColumnKind: async (boardId, columnId, kind) => {
+    await api.updateBoardColumn(boardId, columnId, { kind })
     await get().refreshBoard(boardId)
   },
   deleteColumn: async (boardId, columnId) => {

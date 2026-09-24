@@ -46,6 +46,12 @@ import {
   AGENT_ROUTING_CLAIMS_SQL,
   agentRoutingClaimsChecksum,
 } from './migrations/0009-agent-routing-claims.js'
+import {
+  BOARD_CARD_DUE_ON_SQL,
+  BOARD_CARD_DUE_ON_INDEX_NAME,
+  BOARD_CARD_DUE_ON_INDEX_SQL,
+  boardCardDueOnChecksum,
+} from './migrations/0010-board-card-due-on.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2616,6 +2622,16 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     transactional: true,
     up: applyAgentRoutingClaims,
   },
+  {
+    ...SCHEMA_MIGRATIONS[9],
+    sourceChecksum: boardCardDueOnChecksum(),
+    // The index build is concurrent; both steps can be retried safely.
+    transactional: false,
+    up: async (client) => {
+      await client.query(BOARD_CARD_DUE_ON_SQL)
+      await ensureConcurrentIndex(client, BOARD_CARD_DUE_ON_INDEX_NAME, BOARD_CARD_DUE_ON_INDEX_SQL)
+    },
+  },
 ]
 
 /** How many times a transactional migration may lose a lock race before the
@@ -2978,6 +2994,7 @@ export const REQUIRED_SCHEMA_INDEXES = [
   'idx_conversation_members_participant',
   SEARCH_TRIGRAM_INDEX_NAME,
   EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+  BOARD_CARD_DUE_ON_INDEX_NAME,
 ] as const
 
 /** Promotion gate: every required index must exist and be valid, ready, and
