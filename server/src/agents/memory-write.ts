@@ -12,8 +12,20 @@ import { getThinkingConversations } from './thinking-convos.js'
 import {
   buildMemoryMeta,
   pickWriteProvenance,
+  projectIdFromMemoryPath,
   type MemorySource,
 } from './memory-scope.js'
+
+/** Check only project-scoped writes, immediately before INSERT. No trigger or lock.
+ * A write racing deletion is removed by the delayed project cleanup job. */
+export async function assertMemoryProjectExists(companyId: string | null | undefined, path: string, meta: Record<string, unknown> | null): Promise<void> {
+  if (!path.startsWith('memory/')) return
+  const source = meta?.source as { projectId?: string | null } | null | undefined
+  const ids = [...new Set([projectIdFromMemoryPath(path), source?.projectId].filter((id): id is string => Boolean(id)))]
+  if (!ids.length) return
+  const { rows } = await pool.query<{ id: string }>(`SELECT id FROM projects WHERE company_id = $1 AND id = ANY($2::text[])`, [companyId, ids])
+  if (rows.length !== ids.length) throw new Error('Cannot write memory for a deleted or unknown project')
+}
 
 export async function resolveMemoryWriteSource(
   agentId: string,

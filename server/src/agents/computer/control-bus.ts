@@ -69,9 +69,13 @@ function installRedisSubscriber(): void {
 /** Publish an immediate engine-detection nudge. A zero return means no daemon
  * stream is connected; the persisted heartbeat request remains the fallback. */
 export async function deliverEngineDetect(computerId: string): Promise<number> {
+  return deliverComputerControl(computerId, 'engine.detect')
+}
+
+export async function deliverComputerControl(computerId: string, kind: ComputerControlEvent['kind']): Promise<number> {
   const event: ComputerControlEvent = {
-    kind: 'engine.detect',
-    id: `engine.detect-${randomUUID()}`,
+    kind,
+    id: `${kind}-${randomUUID()}`,
     at: Date.now(),
   }
   return redis.publish(CH_COMPUTER_CONTROL_PREFIX + computerId, JSON.stringify(event))

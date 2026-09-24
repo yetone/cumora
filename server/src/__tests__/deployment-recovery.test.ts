@@ -181,6 +181,7 @@ test('migration and verifier Jobs preserve pod identity, mounts, volumes, and se
     name: 'cumora-migrate-test',
     image: `server@sha256:${DIGEST_CANDIDATE}`,
     repairMode: 'off',
+    schemaTargetVersion: 9,
   })
   const verifier = buildSchemaVerifierJob(baseline, {
     name: 'cumora-verify-test',
@@ -209,6 +210,7 @@ test('migration and verifier Jobs preserve pod identity, mounts, volumes, and se
   }
 
   const migrationServer = templateSpec(migration).containers[0]
+  assert.ok(migrationServer.env.some((entry: any) => entry.name === 'SCHEMA_MIGRATION_TARGET_VERSION' && entry.value === '9'))
   assert.equal(migrationServer.name, 'migrate')
   assert.deepEqual(migrationServer.envFrom, [{ secretRef: { name: 'cumora' } }])
   assert.deepEqual(migrationServer.command, ['npm', 'run', 'migrate'])

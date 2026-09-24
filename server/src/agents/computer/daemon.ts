@@ -51,6 +51,8 @@ import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
 import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
+import { cleanupDeletedProjectMemories, localProjectMemoryTargets } from './project-memory-cleanup.js'
+import { createProjectMemorySync } from './project-memory-sync.js'
 import { runWithSessionRecovery } from './session-recovery.js'
 
 export { conversationHeader }
@@ -1751,6 +1753,8 @@ export class AgentRunner {
   private readonly engine: EngineId
   private readonly sessionStore: EngineSessionStore
   private busy = false
+  private activeProjectIds: string[] = []
+  private readonly deletedProjectIds = new Set<string>()
   private pendingRerun = false
   // Triage-trouble backoff: when the small-brain triage is rate-limited OR
   // fails (fail-open), we skip whole turns until this time, doubling each
@@ -2113,6 +2117,12 @@ export class AgentRunner {
     if (this.pollTimer) { clearInterval(this.pollTimer); this.pollTimer = undefined }
     this.streamAbort?.abort()
     if (this.wakeDebounceTimer) { clearTimeout(this.wakeDebounceTimer); this.wakeDebounceTimer = null }
+  }
+
+  /** Also catches a project whose current turn has not created its directory yet. */
+  invalidateProject(projectId: string): boolean {
+    this.deletedProjectIds.add(projectId)
+    return this.activeProjectIds.includes(projectId)
   }
 
   async stop(options: { forceEngine?: boolean } = {}): Promise<void> {
@@ -3034,6 +3044,8 @@ export class AgentRunner {
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
         const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token)
+        if (projectIds.some((id) => this.deletedProjectIds.has(id))) return
+        this.activeProjectIds = projectIds
         // Which conversation should show "<agent> is typing…"? Prefer the one the
         // wake named, but fall back to the unread we just snapshotted, because a
         // wake often carries no conversation at all:
@@ -3326,6 +3338,7 @@ export class AgentRunner {
         err instanceof Error ? err.message : err)
     } finally {
       this.busy = false
+      this.activeProjectIds = []
     }
   }
 
@@ -3556,7 +3569,9 @@ async function doRun(serverOverride?: string): Promise<void> {
   // pass cannot create a replacement while the prior pass is still awaiting
   // termination of that Agent's old process tree.
   let syncInFlight: Promise<void> | null = null
+  let cleaningProjectMemory = false
   const sync = (): Promise<void> => {
+    if (cleaningProjectMemory) return syncInFlight ?? Promise.resolve()
     if (syncInFlight) return syncInFlight
     const running = syncOnce().finally(() => {
       if (syncInFlight === running) syncInFlight = null
@@ -3673,6 +3688,38 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
 
   let shuttingDown = false
+  const projectMemorySync = createProjectMemorySync({
+    fetchPending: () => api<Array<{ projectId: string }>>(cfg.serverUrl, '/api/computers/deleted-project-memories', {
+      headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+    }),
+    cleanup: async (projectId) => {
+      cleaningProjectMemory = true
+      try {
+        await syncInFlight
+        const target = await localProjectMemoryTargets(AGENTS_ROOT, projectId)
+        for (const [id, runner] of runners) {
+          if (runner.invalidateProject(projectId) && !target.agentIds.includes(id)) target.agentIds.push(id)
+        }
+        // Stop affected engines before erasing files so the active turn cannot
+        // recreate them after acknowledgement. Normal sync restarts runners.
+        for (const id of target.agentIds) {
+          const runner = runners.get(id)
+          if (runner) {
+            await runner.stop({ forceEngine: true })
+            runners.delete(id)
+          }
+        }
+        await cleanupDeletedProjectMemories(AGENTS_ROOT, [target])
+      } finally { cleaningProjectMemory = false }
+    },
+    acknowledge: async (projectId) => {
+      await api(cfg.serverUrl, `/api/computers/deleted-project-memories/${encodeURIComponent(projectId)}/ack`, {
+        method: 'POST', headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+      })
+      if (!shuttingDown) await sync()
+    },
+    onError: (error) => console.warn('[computer] project memory cleanup:', error),
+  })
   const controlStreamAbort = new AbortController()
   const controlStreamLoop = async (): Promise<void> => {
     let backoff = 1000
@@ -3692,10 +3739,13 @@ async function doRun(serverOverride?: string): Promise<void> {
             // Pick up a durable request that may have been persisted while this
             // stream was disconnected, without waiting for the next 30s tick.
             void heartbeat()
+            void projectMemorySync.request()
             continue
           }
-          if (event.event === 'engine.detect' && event.data && parseComputerControlEvent(event.data)) {
-            void rescanEngines(true)
+          const control = event.data ? parseComputerControlEvent(event.data) : null
+          if (control && event.event === control.kind) {
+            if (control.kind === 'engine.detect') void rescanEngines(true)
+            if (control.kind === 'project.deleted') void projectMemorySync.request()
           }
         }
         if (!shuttingDown) console.warn(`[computer] control-stream closed by server · retry in ${backoff}ms`)
@@ -3741,6 +3791,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   const shutdown = async (why: string): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
+    projectMemorySync.stop()
     controlStreamAbort.abort()
     clearInterval(poll); clearInterval(beat); clearInterval(logrot); clearInterval(rescan)
     if (upd) clearInterval(upd)

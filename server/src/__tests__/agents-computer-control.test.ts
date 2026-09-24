@@ -24,6 +24,11 @@ test('malformed and unknown control events are ignored', () => {
   assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'daemon.stop', id: 'x', at: Date.now() })), null)
 })
 
+test('project deletion uses the existing authenticated computer control stream', () => {
+  assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'project.deleted', id: 'delete-1', at: 123 }))?.kind, 'project.deleted')
+  assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'project.deleted', id: '' })), null)
+})
+
 test('an immediate forced refresh arriving during a scan gets a forced follow-up', async () => {
   let releaseFirst!: () => void
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })

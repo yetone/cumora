@@ -27,6 +27,7 @@ import { inboundEmailRouter } from './api/inbound-email.js'
 import { startEmailRetryWorker } from './email-retry.js'
 import { startEmailGcWorker } from './email-gc.js'
 import { startDbGcWorker } from './db-gc.js'
+import { startProjectMemoryCleanupWorker } from './project-deletion.js'
 import { startCalendarScheduler } from './calendar.js'
 import { startPollExpirationSweeper } from './polls.js'
 import { startLlmRollupRefresher } from './agents/llm-rollup.js'
@@ -287,6 +288,7 @@ async function main() {
   // touch object storage on its own). Disabled with EMAIL_GC_INTERVAL_MS=0.
   startEmailGcWorker()
   startDbGcWorker()
+  await startProjectMemoryCleanupWorker()
 
   // Mobile Pro-trial expiry — hourly sweep that downgrades lapsed trials
   // back to free (mirrors sub2api via the same path the admin UI uses).

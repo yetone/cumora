@@ -23,7 +23,7 @@ import {
   memoryWritePath,
   parseMemoryPath,
 } from './memory-scope.js'
-import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
+import { assertMemoryProjectExists, memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
 import { wakeKanbanAgents } from './kanban-wake.js'
 import {
   enqueueBroadcast,
@@ -4172,6 +4172,7 @@ async function cmdMemory(parsed: ParsedArgs): Promise<CliResult> {
     // memory isn't lost; the next background backfill will fill it in.
     const { embedText } = await import('./embeddings.js')
     const embedding = await embedText(body)
+    await assertMemoryProjectExists(tenant, path, meta)
     if (embedding) {
       await pool.query(
         `INSERT INTO agent_workspace (agent_id, path, body, meta, embedding, company_id, updated_at)
@@ -4423,6 +4424,7 @@ async function cmdWorkspace(parsed: ParsedArgs): Promise<CliResult> {
     const memMeta = path.startsWith('memory/')
       ? await memoryMetaForWrite(me, { path })
       : null
+    await assertMemoryProjectExists(tenant, path, memMeta)
     await pool.query(
       `INSERT INTO agent_workspace (agent_id, path, body, meta, company_id, updated_at)
          VALUES ($1, $2, $3, $4::jsonb, $5, NOW())

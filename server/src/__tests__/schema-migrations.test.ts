@@ -6,13 +6,15 @@ import {
   MAX_SUPPORTED_SCHEMA_VERSION,
   MigrationHistoryError,
   SCHEMA_MIGRATIONS,
+  schemaMigrationTarget,
   validateMigrationHistory,
 } from '../db/migrations/manifest.js'
 
 process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
-const { computedBaselineMigrationChecksum } = await import('../db/migrate.js')
+const { computedBaselineMigrationChecksum, ensureSchema, REQUIRED_SCHEMA_INDEXES } = await import('../db/migrate.js')
+const { pool } = await import('../db/pool.js')
 const { normalizedConversationMembersChecksum } = await import('../db/migrations/0002-normalized-conversation-members.js')
 const { workspaceCleanupJobsChecksum } = await import('../db/migrations/0003-workspace-cleanup-jobs.js')
 const { agentRuntimeAssignmentChecksum } = await import('../db/migrations/0004-agent-runtime-assignment.js')
@@ -21,6 +23,7 @@ const { emailMessagesCompanySmtpIdChecksum } = await import('../db/migrations/00
 const { engineDefaultsChecksum } = await import('../db/migrations/0007-engine-defaults.js')
 const { agentProviderProfileChecksum } = await import('../db/migrations/0008-agent-provider-profile.js')
 const { agentRoutingClaimsChecksum } = await import('../db/migrations/0009-agent-routing-claims.js')
+const { projectMemoryDeletionChecksum } = await import('../db/migrations/0010-project-memory-deletion.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -60,6 +63,40 @@ test('the agent provider profile migration matches its immutable manifest checks
 
 test('the agent routing claims migration matches its immutable manifest checksum', () => {
   assert.equal(agentRoutingClaimsChecksum(), SCHEMA_MIGRATIONS[8].checksum)
+})
+
+test('the project memory deletion migration matches its immutable manifest checksum', () => {
+  assert.equal(projectMemoryDeletionChecksum(), SCHEMA_MIGRATIONS[9].checksum)
+})
+
+test('compatibility rollout accepts schema 9 and 10, with an explicit migration target', () => {
+  assert.equal(validateMigrationHistory(current().slice(0, 9)).currentVersion, 9)
+  assert.equal(validateMigrationHistory(current()).currentVersion, 10)
+  assert.equal(schemaMigrationTarget('9'), 9)
+  assert.equal(schemaMigrationTarget('10'), 10)
+  assert.equal(schemaMigrationTarget(), 10)
+  for (const raw of ['8', '11', 'NaN', '9.5', '-1']) assert.throws(() => schemaMigrationTarget(raw))
+})
+
+test('migration target 9 leaves 0010 unapplied, and a second run can promote to 10', async (t) => {
+  const ledger = current().slice(0, 9)
+  const statements: string[] = []
+  t.mock.method(pool, 'connect', async () => ({
+    query: async (sql: string, params?: unknown[]) => {
+      statements.push(sql)
+      if (sql.includes('FROM schema_migrations')) return { rows: [...ledger] }
+      if (sql.includes('FROM pg_class')) return { rows: REQUIRED_SCHEMA_INDEXES.map((name) => ({ name, indisvalid: true, indisready: true, indislive: true })) }
+      if (sql.includes('INSERT INTO schema_migrations')) ledger.push({ version: params![0] as number, name: params![1] as string, checksum: params![2] as string })
+      return { rows: [] }
+    },
+    release() {},
+  }) as any)
+  await ensureSchema(9)
+  assert.equal(ledger.length, 9)
+  assert.ok(!statements.some((sql) => sql.includes('CREATE TABLE project_memory_deletions')))
+  await ensureSchema(10)
+  assert.equal(ledger.length, 10)
+  assert.equal(statements.filter((sql) => sql.includes('CREATE TABLE project_memory_deletions')).length, 1)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

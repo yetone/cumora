@@ -26,6 +26,12 @@ on:
         description: 'Candidate migration Job deadline in seconds (60-2700). Raise only for a large catch-up migration.'
         required: false
         default: '600'
+      schema_target_version:
+        description: 'Schema target: deploy compatibility code on 9 first; choose 10 only after that version is the known-good rollback baseline.'
+        required: false
+        default: '9'
+        type: choice
+        options: ['9', '10']
       recovery_mode:
         description: 'Baseline mode (normal requires known-good baseline; forward-only never auto-restores)'
         required: false
@@ -165,6 +171,7 @@ jobs:
           CANDIDATE_SERVER_IMAGE: ${{ steps.digest.outputs.server }}
           CANDIDATE_AGENT_IMAGE: ${{ steps.digest.outputs.agent }}
           MIGRATION_REPAIR: ${{ inputs.repair_0002 || 'off' }}
+          SCHEMA_MIGRATION_TARGET_VERSION: ${{ inputs.schema_target_version || '9' }}
           MIGRATION_DEADLINE_SECONDS: ${{ steps.tag.outputs.migration_deadline }}
           MIGRATION_POLL_ATTEMPTS: ${{ steps.tag.outputs.migration_poll_attempts }}
           VERIFIER_POLL_ATTEMPTS: '75'

@@ -254,6 +254,7 @@ async function runMigration(paths, baseline) {
     name,
     image: envRequired('CANDIDATE_SERVER_IMAGE'),
     repairMode: process.env.MIGRATION_REPAIR === 'archive-detach' ? 'archive-detach' : 'off',
+    schemaTargetVersion: process.env.SCHEMA_MIGRATION_TARGET_VERSION ? Number(process.env.SCHEMA_MIGRATION_TARGET_VERSION) : undefined,
     activeDeadlineSeconds: Number(process.env.MIGRATION_DEADLINE_SECONDS || DEFAULT_JOB_TIMEOUT_SECONDS),
   })
   await kubectl(['apply', '-f', '-'], { input: JSON.stringify(job) })

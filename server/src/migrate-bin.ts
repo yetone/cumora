@@ -32,6 +32,7 @@
  */
 import { pool } from './db/pool.js'
 import { ensureSchema } from './db/migrate.js'
+import { schemaMigrationTarget } from './db/migrations/manifest.js'
 
 // Postgres SQLSTATE codes for transient lock contention. ensureSchema records
 // only completed immutable versions and is advisory-lock serialized, so a
@@ -51,7 +52,7 @@ async function main(): Promise<void> {
   const started = Date.now()
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      await ensureSchema()
+      await ensureSchema(schemaMigrationTarget(process.env.SCHEMA_MIGRATION_TARGET_VERSION))
       console.log(`[migrate-bin] ok · ${Date.now() - started}ms${attempt > 1 ? ` (attempt ${attempt})` : ''}`)
       await pool.end().catch(() => { /* swallow */ })
       process.exit(0)
