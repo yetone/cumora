@@ -6,6 +6,7 @@
 import { create } from 'zustand'
 import type { ServerCapabilities } from '@/api/client'
 import { commitIfEpochCurrent } from './contextEpoch'
+import { usePairingCodes } from './pairing-codes'
 
 export interface AuthCompany {
   id: string
@@ -71,6 +72,8 @@ export const useAuth = create<AuthState>((set) => ({
   ready: false,
   serverCapabilities: null,
   setSession(token, user, companyId) {
+    // A fresh session must never inherit a code revealed by the previous one.
+    usePairingCodes.getState().clear()
     localStorage.setItem(TOKEN_KEY, token)
     if (companyId) localStorage.setItem(COMPANY_KEY, companyId)
     set((s) => ({ token, user, activeCompanyId: companyId, ready: true, contextEpoch: s.contextEpoch + 1 }))
@@ -89,7 +92,11 @@ export const useAuth = create<AuthState>((set) => ({
       : (activeCompanyId && memberIds.has(activeCompanyId) ? activeCompanyId : (companies[0]?.id ?? null))
     if (resolved) localStorage.setItem(COMPANY_KEY, resolved)
     else localStorage.removeItem(COMPANY_KEY)
-    const previous = useAuth.getState().activeCompanyId
+    const previousState = useAuth.getState()
+    const previous = previousState.activeCompanyId
+    if (previousState.user?.id !== user.id || previous !== resolved) {
+      usePairingCodes.getState().clear()
+    }
     set((s) => ({
       user,
       companies,
@@ -105,6 +112,7 @@ export const useAuth = create<AuthState>((set) => ({
   },
   setActiveCompany(id) {
     if (useAuth.getState().activeCompanyId === id) return
+    usePairingCodes.getState().clear()
     localStorage.setItem(COMPANY_KEY, id)
     set((s) => ({ activeCompanyId: id, contextEpoch: s.contextEpoch + 1 }))
     // Force the WS connection to re-handshake. The bridge filters events
@@ -122,6 +130,7 @@ export const useAuth = create<AuthState>((set) => ({
   /** Append a freshly-created company to the user's set and switch to it. */
   addCompany(c) {
     const prevId = useAuth.getState().activeCompanyId
+    if (prevId !== c.id) usePairingCodes.getState().clear()
     set((s) => ({
       companies: [...s.companies, c],
       activeCompanyId: c.id,
@@ -146,6 +155,7 @@ export const useAuth = create<AuthState>((set) => ({
     const resolved = nextCompanyId && memberIds.has(nextCompanyId)
       ? nextCompanyId
       : (companies[0]?.id ?? null)
+    usePairingCodes.getState().clear()
     if (resolved) localStorage.setItem(COMPANY_KEY, resolved)
     else localStorage.removeItem(COMPANY_KEY)
     set((state) => ({
@@ -157,6 +167,7 @@ export const useAuth = create<AuthState>((set) => ({
     return true
   },
   clear() {
+    usePairingCodes.getState().clear()
     localStorage.removeItem(TOKEN_KEY)
     localStorage.removeItem(COMPANY_KEY)
     set((s) => ({

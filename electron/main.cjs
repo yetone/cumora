@@ -1,5 +1,5 @@
 /* eslint-env node */
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, nativeTheme, screen, ipcMain, globalShortcut, protocol, net } = require('electron')
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, nativeTheme, screen, ipcMain, globalShortcut, protocol, net, clipboard } = require('electron')
 const path = require('node:path')
 const fs = require('node:fs')
 const http = require('node:http')
@@ -1415,6 +1415,19 @@ ipcMain.on('notification:dismiss', (_event, id) => {
 // (e.g. at boot, before the first focus/blur event has fired).
 ipcMain.handle('app:is-focused', () => {
   return !!(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused())
+})
+
+// Pairing commands must copy even immediately after a native confirmation
+// dialog, when Chromium can still consider the renderer document unfocused.
+ipcMain.handle('clipboard:write-text', (event, value) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    throw new Error('clipboard write is only available to the main window')
+  }
+  if (typeof value !== 'string' || value.length > 8192) {
+    throw new Error('invalid clipboard text')
+  }
+  clipboard.writeText(value)
+  if (clipboard.readText() !== value) throw new Error('clipboard write failed')
 })
 
 ipcMain.on('theme:set', (_event, source) => {

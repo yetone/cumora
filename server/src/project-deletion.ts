@@ -99,7 +99,7 @@ export async function drainProjectMemoryDeletions(): Promise<void> {
 }
 
 export async function startProjectMemoryCleanupWorker(): Promise<void> {
-  if (!await projectDeletionAvailable()) return // compatibility rollout on schema 9
+  if (!await projectDeletionAvailable()) return // compatibility rollout on schema 10
   let running = false
   const tick = async () => {
     if (running) return

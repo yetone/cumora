@@ -26,7 +26,7 @@
  *   • already_member — they already belong; just route them in.
  *   • not_found — bad link.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useState, useRef } from 'react'
 import { api, type ApiInvitationPreview } from '@/api/client'
 import { useAuth } from '@/stores/auth'
 import { isElectron, isWebAppHost } from '@/lib/runtime'
@@ -183,11 +183,24 @@ export function InviteAcceptScreen({ token, onDone }: Props) {
   // Auto-accept the moment we have a session AND the preview is `valid`.
   // Saves a redundant click when the user just signed in to redeem the
   // invite — the page goes preview → busy → into the workspace fluidly.
+  //
+  // Fires at most ONCE per token. The only guard used to be `joinedCompany`,
+  // which is set on success — so a REFUSED accept re-fired forever: the catch
+  // sets acceptErr, `finally` puts `busy` back to false, `preview.status` is
+  // still 'valid' and `joinedCompany` is still null, which is exactly the
+  // condition to run again. The refusals are not hypothetical; the free-plan
+  // seat and agent caps return 403 here and loadInvitation does not pre-check
+  // them, so the first invite past the cap hammered the endpoint and the user
+  // only ever saw "Joining…" — the error text below never got a frame to
+  // itself. The manual button stays available for a deliberate retry.
+  const autoAcceptedFor = useRef<string | null>(null)
   useEffect(() => {
     if (!tokenStr) return
     if (preview?.status !== 'valid') return
     if (busy) return
     if (joinedCompany) return  // already redeemed — don't re-POST in a loop
+    if (autoAcceptedFor.current === tokenStr) return  // tried once; the rest is the user's call
+    autoAcceptedFor.current = tokenStr
     void accept()
   }, [tokenStr, preview, busy, accept, joinedCompany])
 

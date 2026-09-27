@@ -114,13 +114,15 @@ export const TOOL_DEFS_RESPONSES: FunctionTool[] = [
   cumora kanban create "<title>" [--description "..."]
   cumora kanban rename <board_id> --title "..." [--description "..."]
   cumora kanban columns <board_id>
-  cumora kanban add-column <board_id> "<title>"
-  cumora kanban edit-column <board_id> <column_id> [--title "..."] [--position N]
+  cumora kanban add-column <board_id> "<title>" [--kind todo|doing|done]
+  cumora kanban edit-column <board_id> <column_id> [--title "..."] [--position N] [--kind todo|doing|done|clear]
   cumora kanban delete-column <board_id> <column_id>
   cumora kanban mentions                       # NEW kanban @-mentions of YOU since last check
   cumora card ls <board_id>
   cumora card show <card_id>
-  cumora card add <board_id> "<title>" --column <col_id> [--description "..."] [--assign <id>]
+  cumora card add <board_id> "<title>" --column <col_id> [--description "..."] [--assign <id>] [--due YYYY-MM-DD]
+  cumora card due <card_id> <YYYY-MM-DD|clear>
+  cumora card ls <board_id> --overdue-as-of YYYY-MM-DD --json  # includes unclassified passed-date cards with due_status=status_unknown
   cumora card move <card_id> --to <column_id>
   cumora card assign <card_id> <participant_id|null>
   cumora card rename <card_id> --title "..." [--description "..."]

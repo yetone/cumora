@@ -232,7 +232,7 @@ test('[integration] project cleanup survives offline devices and scopes acknowle
   assert.equal((await pool.query(`SELECT 1 FROM project_memory_deletions WHERE project_id = 'p-offline'`)).rowCount, 0)
 })
 
-test('[integration] compatibility rollout disables project deletion safely before migration 0010', async () => {
+test('[integration] compatibility rollout disables project deletion safely before migration 0011', async () => {
   await seedOwnedWorkspace()
   await pool.query(`INSERT INTO projects (id, company_id, name, status) VALUES ('p-before-migration', 'co-managed', 'Before migration', 'archived')`)
   await pool.query(`ALTER TABLE project_memory_deletions RENAME TO project_memory_deletions_test_hidden`)

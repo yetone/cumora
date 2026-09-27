@@ -395,6 +395,7 @@ export interface BoardSummary {
 export interface BoardColumn {
   id: string
   title: string
+  kind: 'todo' | 'doing' | 'done' | null
   position: number
   createdAt: string
 }
@@ -407,6 +408,7 @@ export interface BoardCard {
   description: string | null
   position: number
   assigneeId: string | null
+  dueOn: string | null
   mentions: string[]
   commentCount: number
   createdBy: string

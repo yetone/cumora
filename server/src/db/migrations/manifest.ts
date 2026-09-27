@@ -64,14 +64,19 @@ export const SCHEMA_MIGRATIONS = [
   },
   {
     version: 10,
-    name: '0010_project_memory_deletion',
+    name: '0010_board_card_due_on',
+    checksum: 'd07af706ca94ea26c789f7103d94bf8af00b174034f2fd9b817c8bde3e45560a',
+  },
+  {
+    version: 11,
+    name: '0011_project_memory_deletion',
     checksum: 'ca7c50470f26f555843e106a6a2a02d4729f1fbef2edac03d3cb21ee039fcec3',
   },
 ] as const satisfies readonly MigrationMetadata[]
 
-/** Deploy compatibility code on 9 before enabling the additive migration to 10. */
-export const MIN_SUPPORTED_SCHEMA_VERSION = 9
-export const MAX_SUPPORTED_SCHEMA_VERSION = 10
+/** Deploy compatibility code on 10 before enabling the additive migration to 11. */
+export const MIN_SUPPORTED_SCHEMA_VERSION = 10
+export const MAX_SUPPORTED_SCHEMA_VERSION = 11
 
 export function schemaMigrationTarget(raw?: string): number {
   if (raw === undefined || raw === '') return MAX_SUPPORTED_SCHEMA_VERSION

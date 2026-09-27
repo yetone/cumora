@@ -17,6 +17,7 @@
 import { type ProviderProfileMetadata, isProviderProfileId, sanitizeProviderProfiles } from './provider-profiles.js'
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import { pool } from '../../db/pool.js'
+import { audit } from '../../auth.js'
 import { CH_STATUS, publish } from '../../redis.js'
 import { normalizeTier, type Tier } from '../../tier.js'
 import { signAgentToken } from '../runtime/jwt.js'
@@ -380,6 +381,41 @@ export async function issuePairingCode(args: {
   return { code: token, expiresInSeconds: null }
 }
 
+/** Rotate the workspace's add-computer token. Owner authorization is enforced
+ *  by the route before this data-access operation. Existing computer
+ *  credentials and computer-specific reconnect tokens remain valid. */
+export async function rotateCompanyPairingCode(args: {
+  companyId: string
+  ownerUserId: string
+  ip?: string | null
+  userAgent?: string | null
+}): Promise<{ code: string; expiresInSeconds: null } | { error: 'not_found' }> {
+  const code = randomBytes(24).toString('base64url')
+  let updated: { rows: { id: string }[] }
+  try {
+    updated = await pool.query<{ id: string }>(
+      `UPDATE companies SET pair_token = $1 WHERE id = $2 RETURNING id`,
+      [code, args.companyId],
+    )
+  } catch {
+    // PostgreSQL unique-violation details can include the conflicting value.
+    // Never propagate or log an exception that might contain the fresh code.
+    throw new Error('workspace pairing code rotation failed')
+  }
+  if (!updated.rows[0]) return { error: 'not_found' }
+
+  // Audit is deliberately best-effort: the UPDATE has already invalidated
+  // the previous code, and audit availability must not restore it.
+  await audit({
+    kind: 'company_pair_token_rotated',
+    userId: args.ownerUserId,
+    companyId: args.companyId,
+    ip: args.ip,
+    userAgent: args.userAgent,
+  })
+  return { code, expiresInSeconds: null }
+}
+
 /** Return a persistent reconnect token for one existing non-cloud computer.
  *  Unlike the company add token, this token is bound to the computer row itself,
  *  so running the command from the Computer detail view re-attaches that exact
@@ -472,48 +508,67 @@ export async function pairComputer(args: {
     return { computerId: id, companyId, deviceToken }
   }
 
-  const { rows } = await pool.query<{ company_id: string; owner_user_id: string | null }>(
-    `SELECT id AS company_id, owner_user_id FROM companies WHERE pair_token = $1 LIMIT 1`,
-    [args.code],
-  )
-  if (!rows[0]) return null
-  const companyId = rows[0].company_id
-  const ownerUserId = rows[0].owner_user_id
-
-  // Re-attach if a non-cloud computer with this hostname already exists in the
-  // company — a re-run of the (now persistent) command from the same machine.
-  // Re-mint the device token + refresh engines/status; never create a duplicate.
-  const existing = await pool.query<{ id: string }>(
-    `SELECT id FROM computers
-       WHERE company_id = $1 AND kind <> 'cloud' AND revoked_at IS NULL AND name = $2
-       ORDER BY paired_at DESC NULLS LAST LIMIT 1`,
-    [companyId, name],
-  )
-  if (existing.rows[0]) {
-    const id = existing.rows[0].id
-    await pool.query(
-      `UPDATE computers
-          SET credential_hash = $1, available_engines = $2::jsonb,
-              daemon_version = COALESCE($4, daemon_version),
-              daemon_supervised = COALESCE($5, daemon_supervised),
-              detected_engines = $6::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
-              status = 'online', last_seen_at = NOW(), paired_at = NOW(), revoked_at = NULL
-        WHERE id = $3`,
-      [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised, detectedJson],
+  // A workspace token is read and redeemed under one row lock. Rotation's
+  // UPDATE waits for this transaction, so after a rotation returns no pairing
+  // that started with the old code can still commit. Reconnect tokens above
+  // remain computer-scoped and keep their existing path and semantics.
+  const client = await pool.connect()
+  let paired: { computerId: string; companyId: string; deviceToken: string } | null = null
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query<{ id: string; owner_user_id: string | null }>(
+      `SELECT id, owner_user_id FROM companies WHERE pair_token = $1 FOR SHARE`,
+      [args.code],
     )
-    if (!args.deferBroadcast) await broadcastComputerStatus(id, companyId, 'online')
-    return { computerId: id, companyId, deviceToken }
-  }
+    if (!rows[0]) {
+      await client.query('ROLLBACK')
+      return null
+    }
+    const companyId = rows[0].id
+    const ownerUserId = rows[0].owner_user_id
 
-  const computerId = `comp-${randomUUID().slice(0, 12)}`
-  await pool.query(
-    `INSERT INTO computers
-       (id, company_id, owner_user_id, name, kind, available_engines, status, credential_hash, paired_at, last_seen_at, daemon_version, daemon_supervised, detected_engines, engines_detected_at)
-     VALUES ($1, $2, $3, $4, 'local', $5::jsonb, 'online', $6, NOW(), NOW(), $7, $8, $9::jsonb, NOW())`,
-    [computerId, companyId, ownerUserId, name, JSON.stringify(engines), hashToken(deviceToken), version, supervised, detectedJson],
-  )
-  if (!args.deferBroadcast) await broadcastComputerStatus(computerId, companyId, 'online')
-  return { computerId, companyId, deviceToken }
+    // Re-attach if a non-cloud computer with this hostname already exists in
+    // the company — a re-run of the persistent command from the same machine.
+    // Re-mint the device token + refresh engines/status; never create a duplicate.
+    const existing = await client.query<{ id: string }>(
+      `SELECT id FROM computers
+         WHERE company_id = $1 AND kind <> 'cloud' AND revoked_at IS NULL AND name = $2
+         ORDER BY paired_at DESC NULLS LAST LIMIT 1`,
+      [companyId, name],
+    )
+    if (existing.rows[0]) {
+      const id = existing.rows[0].id
+      await client.query(
+        `UPDATE computers
+            SET credential_hash = $1, available_engines = $2::jsonb,
+                daemon_version = COALESCE($4, daemon_version),
+                daemon_supervised = COALESCE($5, daemon_supervised),
+                detected_engines = $6::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
+                status = 'online', last_seen_at = NOW(), paired_at = NOW(), revoked_at = NULL
+          WHERE id = $3`,
+        [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised, detectedJson],
+      )
+      paired = { computerId: id, companyId, deviceToken }
+    } else {
+      const computerId = `comp-${randomUUID().slice(0, 12)}`
+      await client.query(
+        `INSERT INTO computers
+           (id, company_id, owner_user_id, name, kind, available_engines, status, credential_hash, paired_at, last_seen_at, daemon_version, daemon_supervised, detected_engines, engines_detected_at)
+         VALUES ($1, $2, $3, $4, 'local', $5::jsonb, 'online', $6, NOW(), NOW(), $7, $8, $9::jsonb, NOW())`,
+        [computerId, companyId, ownerUserId, name, JSON.stringify(engines), hashToken(deviceToken), version, supervised, detectedJson],
+      )
+      paired = { computerId, companyId, deviceToken }
+    }
+    await client.query('COMMIT')
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+  if (!paired) return null
+  if (!args.deferBroadcast) await broadcastComputerStatus(paired.computerId, paired.companyId, 'online')
+  return paired
 }
 
 /** Daemon liveness ping. Bumps last_seen_at + the reported version; flips

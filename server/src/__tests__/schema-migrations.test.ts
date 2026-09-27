@@ -23,7 +23,8 @@ const { emailMessagesCompanySmtpIdChecksum } = await import('../db/migrations/00
 const { engineDefaultsChecksum } = await import('../db/migrations/0007-engine-defaults.js')
 const { agentProviderProfileChecksum } = await import('../db/migrations/0008-agent-provider-profile.js')
 const { agentRoutingClaimsChecksum } = await import('../db/migrations/0009-agent-routing-claims.js')
-const { projectMemoryDeletionChecksum } = await import('../db/migrations/0010-project-memory-deletion.js')
+const { boardCardDueOnChecksum } = await import('../db/migrations/0010-board-card-due-on.js')
+const { projectMemoryDeletionChecksum } = await import('../db/migrations/0011-project-memory-deletion.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -65,21 +66,25 @@ test('the agent routing claims migration matches its immutable manifest checksum
   assert.equal(agentRoutingClaimsChecksum(), SCHEMA_MIGRATIONS[8].checksum)
 })
 
+test('the board card due date migration matches its immutable manifest checksum', () => {
+  assert.equal(boardCardDueOnChecksum(), SCHEMA_MIGRATIONS[9].checksum)
+})
+
 test('the project memory deletion migration matches its immutable manifest checksum', () => {
-  assert.equal(projectMemoryDeletionChecksum(), SCHEMA_MIGRATIONS[9].checksum)
+  assert.equal(projectMemoryDeletionChecksum(), SCHEMA_MIGRATIONS[10].checksum)
 })
 
-test('compatibility rollout accepts schema 9 and 10, with an explicit migration target', () => {
-  assert.equal(validateMigrationHistory(current().slice(0, 9)).currentVersion, 9)
-  assert.equal(validateMigrationHistory(current()).currentVersion, 10)
-  assert.equal(schemaMigrationTarget('9'), 9)
+test('compatibility rollout accepts schema 10 and 11, with an explicit migration target', () => {
+  assert.equal(validateMigrationHistory(current().slice(0, 10)).currentVersion, 10)
+  assert.equal(validateMigrationHistory(current()).currentVersion, 11)
   assert.equal(schemaMigrationTarget('10'), 10)
-  assert.equal(schemaMigrationTarget(), 10)
-  for (const raw of ['8', '11', 'NaN', '9.5', '-1']) assert.throws(() => schemaMigrationTarget(raw))
+  assert.equal(schemaMigrationTarget('11'), 11)
+  assert.equal(schemaMigrationTarget(), 11)
+  for (const raw of ['9', '12', 'NaN', '10.5', '-1']) assert.throws(() => schemaMigrationTarget(raw))
 })
 
-test('migration target 9 leaves 0010 unapplied, and a second run can promote to 10', async (t) => {
-  const ledger = current().slice(0, 9)
+test('migration target 10 leaves 0011 unapplied, and a second run can promote to 11', async (t) => {
+  const ledger = current().slice(0, 10)
   const statements: string[] = []
   t.mock.method(pool, 'connect', async () => ({
     query: async (sql: string, params?: unknown[]) => {
@@ -91,11 +96,11 @@ test('migration target 9 leaves 0010 unapplied, and a second run can promote to 
     },
     release() {},
   }) as any)
-  await ensureSchema(9)
-  assert.equal(ledger.length, 9)
-  assert.ok(!statements.some((sql) => sql.includes('CREATE TABLE project_memory_deletions')))
   await ensureSchema(10)
   assert.equal(ledger.length, 10)
+  assert.ok(!statements.some((sql) => sql.includes('CREATE TABLE project_memory_deletions')))
+  await ensureSchema(11)
+  assert.equal(ledger.length, 11)
   assert.equal(statements.filter((sql) => sql.includes('CREATE TABLE project_memory_deletions')).length, 1)
 })
 

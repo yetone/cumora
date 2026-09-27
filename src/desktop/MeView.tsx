@@ -5,6 +5,8 @@ import { usePrefs } from '@/stores/preferences'
 import { useSoundStore } from '@/stores/sound'
 import { useDevtools } from '@/stores/devtools'
 import { useAuth } from '@/stores/auth'
+import { usePairingCodes } from '@/stores/pairing-codes'
+import { copyText } from '@/lib/clipboard'
 import { Avatar } from '@/components/Avatar'
 import { DeleteProjectDialog } from '@/components/DeleteProjectDialog'
 import { Checkbox } from '@/components/Checkbox'
@@ -842,12 +844,16 @@ function asRunnableEngine(id: string): EngineId | null {
 
 function ComputersTab() {
   const t = useT()
+  const companyId = useAuth((s) => s.activeCompanyId)
+  const code = usePairingCodes((s) => s.companyId === companyId ? s.code : null)
+  // Onboarding and workspace settings share this code; only this tab's Add
+  // action should reveal a command here.
+  const [showPairCommand, setShowPairCommand] = useState(false)
   const byId = useComputers((s) => s.byId)
   const loaded = useComputers((s) => s.loaded)
   const participants = useParticipants((s) => s.byId)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
-  const [code, setCode] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   // Engine for a NEWLY added computer's starter/assigned agents. Claude is the
   // default (no flag → daemon auto-detects); every other pick is named
@@ -914,6 +920,8 @@ function ComputersTab() {
   }, [])
   useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
   useEffect(() => { if (!copiedCli) return; const id = window.setTimeout(() => setCopiedCli(null), 1600); return () => window.clearTimeout(id) }, [copiedCli])
+  useEffect(() => { setCopied(false) }, [code, companyId])
+  useEffect(() => { setShowPairCommand(false) }, [companyId])
 
   async function toggleRepair(id: string) {
     if (repairFor === id) { setRepairFor(null); setRepairCode(null); return }
@@ -928,9 +936,26 @@ function ComputersTab() {
   }
   useEffect(() => { if (!copied) return; const id = window.setTimeout(() => setCopied(false), 1600); return () => window.clearTimeout(id) }, [copied])
 
-  function copyCommand() {
-    void navigator.clipboard?.writeText(pairCommand)
-    setCopied(true)
+  async function copyCommand() {
+    setErr(null)
+    setCopied(false)
+    try {
+      await copyText(pairCommand)
+      setCopied(true)
+    } catch {
+      setErr(t('me.copyFailed'))
+    }
+  }
+
+  async function copyRepairCommand(command: string) {
+    setErr(null)
+    setRepairCopied(false)
+    try {
+      await copyText(command)
+      setRepairCopied(true)
+    } catch {
+      setErr(t('me.copyFailed'))
+    }
   }
 
   const origin = getPairingServerOrigin()
@@ -946,15 +971,24 @@ function ComputersTab() {
       (p.computerId === computerId || (isCloud && !p.computerId))).length
   }
 
-  // Clicking "Add a computer" just mints a pairing token and shows the command.
+  // Clicking "Add a computer" reads the current pairing token and shows the command.
   // The computer itself is created server-side only when the daemon pairs and
   // reports the machine's real hostname — so no placeholder row, and it shows
   // up here (named after the machine) once paired, via the WS status event.
   async function addComputer() {
-    setErr(null); setBusy(true)
+    const targetCompanyId = useAuth.getState().activeCompanyId
+    if (!targetCompanyId) return
+    setErr(null); setBusy(true); setCopied(false); setShowPairCommand(false)
     try {
+      // Another screen may have left a code in the shared store. Always read
+      // the active code before revealing this tab's command.
+      const version = usePairingCodes.getState().beginRequest(targetCompanyId, true)
       const res = await api.requestPairingCode()
-      setCode(res.code)
+      usePairingCodes.getState().setCodeIfCurrent(targetCompanyId, version, res.code)
+      const state = usePairingCodes.getState()
+      if (state.companyId === targetCompanyId && state.requestVersion === version) {
+        setShowPairCommand(true)
+      }
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e))
     } finally { setBusy(false) }
@@ -1315,7 +1349,7 @@ function ComputersTab() {
                     ) : (
                       <>
                         <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{repairCmd}</pre>
-                        <button type="button" onClick={(e) => { e.stopPropagation(); void navigator.clipboard?.writeText(repairCmd); setRepairCopied(true) }}
+                        <button type="button" onClick={(e) => { e.stopPropagation(); void copyRepairCommand(repairCmd) }}
                           className="mt-2 inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                           style={{ background: repairCopied ? '#3BB273' : 'var(--skype)' }}>
                           {repairCopied ? t('me.copied') : t('me.copyCommand')}
@@ -1329,7 +1363,7 @@ function ComputersTab() {
           })}
         </div>
 
-        {code ? (
+        {showPairCommand && code ? (
           <div className="mt-4 bg-sky2-50 rounded-[14px] p-4" style={{ border: '1px solid var(--sky-100)' }}>
             <div className="text-[13px] font-semibold text-ink-900 mb-1">
               {t('me.runOnHost')}
@@ -1377,7 +1411,7 @@ function ComputersTab() {
                   </>
                 ) : t('me.copyCommand')}
               </button>
-              <button type="button" onClick={() => setCode(null)}
+              <button type="button" onClick={() => { setShowPairCommand(false); usePairingCodes.getState().clear() }}
                 className="text-[12px] font-semibold px-3 py-1.5 rounded-[9px] border border-ink-100 text-ink-600">{t('me.done')}</button>
             </div>
             <style>{`
@@ -1493,7 +1527,7 @@ export function MeView() {
       <div className="max-w-[1100px] mx-auto">
         <div className="mb-6">
           <h1 className="font-display font-medium text-[36px] tracking-tight text-ink-900 mb-1" style={{ letterSpacing: '-0.025em' }}>
-            {t('me.headline')} <em className="italic text-coral-deep" style={{ fontStyle: 'italic', fontWeight: 400 }}>{t('me.headlineEm')}</em>
+            {t('me.headline')}
           </h1>
           <div className="font-display italic font-normal text-[15px] text-ink-500">
             {t('me.subtitle')}

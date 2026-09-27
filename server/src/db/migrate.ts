@@ -6,7 +6,7 @@
  * schema-version.ts and never execute DDL while starting.
  */
 import { AGENT_PROVIDER_PROFILE_SQL, agentProviderProfileChecksum } from './migrations/0008-agent-provider-profile.js'
-import { PROJECT_MEMORY_DELETION_SQL, projectMemoryDeletionChecksum } from './migrations/0010-project-memory-deletion.js'
+import { PROJECT_MEMORY_DELETION_SQL, projectMemoryDeletionChecksum } from './migrations/0011-project-memory-deletion.js'
 import { createHash } from 'node:crypto'
 import { pool } from './pool.js'
 import {
@@ -49,6 +49,12 @@ import {
   AGENT_ROUTING_CLAIMS_SQL,
   agentRoutingClaimsChecksum,
 } from './migrations/0009-agent-routing-claims.js'
+import {
+  BOARD_CARD_DUE_ON_SQL,
+  BOARD_CARD_DUE_ON_INDEX_NAME,
+  BOARD_CARD_DUE_ON_INDEX_SQL,
+  boardCardDueOnChecksum,
+} from './migrations/0010-board-card-due-on.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2621,6 +2627,16 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
   },
   {
     ...SCHEMA_MIGRATIONS[9],
+    sourceChecksum: boardCardDueOnChecksum(),
+    // The index build is concurrent; both steps can be retried safely.
+    transactional: false,
+    up: async (client) => {
+      await client.query(BOARD_CARD_DUE_ON_SQL)
+      await ensureConcurrentIndex(client, BOARD_CARD_DUE_ON_INDEX_NAME, BOARD_CARD_DUE_ON_INDEX_SQL)
+    },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[10],
     sourceChecksum: projectMemoryDeletionChecksum(),
     transactional: true,
     up: async (client) => { await client.query(PROJECT_MEMORY_DELETION_SQL) },
@@ -2989,6 +3005,7 @@ export const REQUIRED_SCHEMA_INDEXES = [
   'idx_conversation_members_participant',
   SEARCH_TRIGRAM_INDEX_NAME,
   EMAIL_MESSAGES_COMPANY_SMTP_ID_INDEX_NAME,
+  BOARD_CARD_DUE_ON_INDEX_NAME,
 ] as const
 
 /** Promotion gate: every required index must exist and be valid, ready, and

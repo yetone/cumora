@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { type ApiWorkspaceMember, api, ws } from '@/api/client'
 import { useT } from '@/lib/i18n'
 import { type AuthCompany, useAuth } from '@/stores/auth'
+import { usePairingCodes } from '@/stores/pairing-codes'
 
 interface Props {
   company: AuthCompany
@@ -14,6 +15,7 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
   const t = useT()
   const meId = useAuth((s) => s.user?.id)
   const removeCompany = useAuth((s) => s.removeCompany)
+  const pairingCode = usePairingCodes((s) => s.companyId === company.id ? s.code : null)
   const [members, setMembers] = useState<ApiWorkspaceMember[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -21,7 +23,17 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
   const [deleteConfirmation, setDeleteConfirmation] = useState('')
   const [deleting, setDeleting] = useState(false)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  const [pairingBusy, setPairingBusy] = useState(false)
+  const [pairingError, setPairingError] = useState<string | null>(null)
+  const [pairingCodeRevealed, setPairingCodeRevealed] = useState(false)
   const memberLoadGeneration = useRef(0)
+
+  useEffect(() => {
+    setPairingCodeRevealed(false)
+    // Closing settings also invalidates an in-flight response, so the code
+    // cannot reappear in the shared store after the modal has gone away.
+    return () => { usePairingCodes.getState().clear() }
+  }, [company.id])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -56,6 +68,46 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
     if (event.type !== 'workspace.membership' || event.companyId !== company.id) return
     void loadMembers(false)
   }), [company.id, loadMembers])
+
+  const showCurrentPairingCode = async () => {
+    if (useAuth.getState().activeCompanyId !== company.id) {
+      setPairingError(t('workspace.pairingCodeWrongWorkspace'))
+      return
+    }
+    setPairingError(null); setPairingBusy(true); setPairingCodeRevealed(false)
+    try {
+      const version = usePairingCodes.getState().beginRequest(company.id, true)
+      const result = await api.requestPairingCode()
+      usePairingCodes.getState().setCodeIfCurrent(company.id, version, result.code)
+      setPairingCodeRevealed(true)
+    } catch (reason) {
+      setPairingError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setPairingBusy(false)
+    }
+  }
+
+  const rotatePairingCode = async () => {
+    if (!window.confirm(t('workspace.rotatePairingCodeConfirm'))) return
+    if (useAuth.getState().activeCompanyId !== company.id) {
+      setPairingError(t('workspace.pairingCodeWrongWorkspace'))
+      return
+    }
+    setPairingError(null); setPairingBusy(true); setPairingCodeRevealed(false)
+    // The server may commit even if the response is lost. Clear the old code
+    // immediately; the explicit "Show current code" action safely reads back
+    // the active one without performing another rotation.
+    const version = usePairingCodes.getState().beginRequest(company.id, true)
+    try {
+      const result = await api.rotatePairingCode()
+      usePairingCodes.getState().setCodeIfCurrent(company.id, version, result.code)
+      setPairingCodeRevealed(true)
+    } catch (reason) {
+      setPairingError(reason instanceof Error ? reason.message : String(reason))
+    } finally {
+      setPairingBusy(false)
+    }
+  }
 
   const changeRole = async (member: ApiWorkspaceMember, role: 'member' | 'admin') => {
     if (member.role === role) return
@@ -186,12 +238,41 @@ export function WorkspaceSettingsModal({ company, companyCount, onInvite, onClos
         </section>
 
         {company.role === 'owner' && (
+          <section className="mx-5 mb-4 rounded-[12px] border border-ink-100 bg-cloud p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h3 className="text-[13px] font-semibold text-ink-800">{t('workspace.pairingCodeTitle')}</h3>
+                <p className="mt-1 text-[11.5px] leading-relaxed text-ink-500">{t('workspace.pairingCodeHelp')}</p>
+              </div>
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button type="button" onClick={() => void showCurrentPairingCode()} disabled={pairingBusy}
+                className="rounded-[8px] border border-ink-200 bg-paper px-3 py-1.5 text-[11.5px] font-semibold text-ink-700 hover:bg-cloud disabled:opacity-50">
+                {pairingBusy ? t('workspace.pairingCodeLoading') : t('workspace.showPairingCode')}
+              </button>
+              <button type="button" onClick={() => void rotatePairingCode()} disabled={pairingBusy}
+                className="rounded-[8px] border border-coral/35 bg-paper px-3 py-1.5 text-[11.5px] font-semibold text-coral-deep hover:bg-coral-soft/25 disabled:opacity-50">
+                {pairingBusy ? t('workspace.rotatingPairingCode') : t('workspace.rotatePairingCode')}
+              </button>
+            </div>
+            {pairingError && <div className="mt-2 text-[11.5px] text-coral-deep">{pairingError}</div>}
+            {pairingCodeRevealed && pairingCode && (
+              <div className="mt-3 rounded-[9px] bg-paper border border-ink-100 p-3">
+                <div className="text-[10.5px] font-semibold text-ink-500">{t('workspace.currentPairingCode')}</div>
+                <code className="mt-1 block break-all select-all text-[12px] text-ink-800">{pairingCode}</code>
+                <p className="mt-2 text-[11px] leading-relaxed text-ink-500">{t('workspace.pairingCodeUseFlow')}</p>
+              </div>
+            )}
+          </section>
+        )}
+
+        {company.role === 'owner' && (
           <section className="m-5 mt-1 rounded-[12px] border border-coral/35 bg-coral-soft/15 p-4">
             <h3 className="text-[13px] font-semibold text-coral-deep">{t('workspace.dangerTitle')}</h3>
             <p className="mt-1 text-[11.5px] leading-relaxed text-ink-500">
               {companyCount <= 1 ? t('workspace.onlyWorkspace') : t('workspace.deleteHelp')}
             </p>
-            <label className="block mt-3 text-[10.5px] font-semibold uppercase tracking-wide text-ink-400">
+            <label className="block mt-3 text-[10.5px] font-semibold tracking-wide text-ink-400">
               {t('workspace.typeName', { name: company.name })}
             </label>
             <div className="mt-1.5 flex gap-2">

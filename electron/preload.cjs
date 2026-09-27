@@ -24,6 +24,11 @@ contextBridge.exposeInMainWorld('cumora', {
     },
   },
 
+  /** OS clipboard write, independent of Chromium document focus. */
+  clipboard: {
+    writeText: (value) => ipcRenderer.invoke('clipboard:write-text', value),
+  },
+
   /** Native Dock affordances. macOS-only in main; no-op elsewhere. */
   dock: {
     setUnreadDot: (visible) => ipcRenderer.send('dock:set-unread-dot', !!visible),

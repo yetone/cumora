@@ -992,6 +992,13 @@ export function Composer({
     lastSyncedScopeRef.current = scopeKey
     setMention(null)
     setEmojiOpen(false)
+    // The poll composer is an overlay over the composer like the two above, and
+    // it has to close for the same reason — except the cost of leaving it open
+    // is higher. PollComposer keeps question/options in its own state and reads
+    // `conversationId` from its props at submit time, so a half-filled poll that
+    // survives the switch posts the OLD room's question into the NEW room, and
+    // notifies everyone there.
+    setPollComposerOpen(false)
     // Pull the just-loaded draft text for this scope (read via ref so
     // the effect doesn't re-fire on every keystroke) and hydrate the
     // contenteditable DOM.
@@ -1017,6 +1024,10 @@ export function Composer({
       )}
       {pollComposerOpen && !isThread && (
         <PollComposer
+          // Keyed so the draft can never straddle a conversation switch even if
+          // another entry point forgets to close it: React remounts instead of
+          // reconciling, and the internal question/options go with it.
+          key={convoId}
           conversationId={convoId}
           onSubmitted={closePollComposer}
           onCancel={closePollComposer}

@@ -4,6 +4,9 @@ import { useComputers } from '@/stores/computers'
 import { TitleBar } from '@/desktop/TitleBar'
 import { useT } from '@/lib/i18n'
 import { RUNNABLE_ENGINES, engineLabel, type RunnableEngineId } from '@/lib/engines'
+import { useAuth } from '@/stores/auth'
+import { usePairingCodes } from '@/stores/pairing-codes'
+import { copyText } from '@/lib/clipboard'
 
 /**
  * First-run gate for free-tier users: their agents run on their own machine
@@ -14,8 +17,10 @@ import { RUNNABLE_ENGINES, engineLabel, type RunnableEngineId } from '@/lib/engi
  */
 export function Onboarding() {
   const t = useT()
+  const companyId = useAuth((s) => s.activeCompanyId)
+  const companyRole = useAuth((s) => s.companies.find((company) => company.id === s.activeCompanyId)?.role)
+  const code = usePairingCodes((s) => s.companyId === companyId ? s.code : null)
   const [busy, setBusy] = useState(false)
-  const [code, setCode] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
   // The engine the starter team (and agents later assigned here) will run on.
@@ -34,6 +39,7 @@ export function Onboarding() {
     const t = window.setTimeout(() => setCopied(false), 1600)
     return () => window.clearTimeout(t)
   }, [copied])
+  useEffect(() => { setCopied(false) }, [code, companyId])
 
   const origin = getPairingServerOrigin()
   // Every non-default engine, not just Codex: without the flag the daemon
@@ -44,10 +50,42 @@ export function Onboarding() {
   const cmd = code ? `npx cumora@latest agent computer --pair ${code}${origin ? ` --server ${origin}` : ''}${engineFlag}${serviceFlag}` : ''
 
   async function getCode() {
+    const targetCompanyId = useAuth.getState().activeCompanyId
+    if (!targetCompanyId) return
     setErr(null); setBusy(true)
-    try { setCode((await api.requestPairingCode()).code) }
+    try {
+      const version = usePairingCodes.getState().beginRequest(targetCompanyId)
+      const result = await api.requestPairingCode()
+      usePairingCodes.getState().setCodeIfCurrent(targetCompanyId, version, result.code)
+    }
     catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
     finally { setBusy(false) }
+  }
+
+  async function rotateCode() {
+    const targetCompanyId = useAuth.getState().activeCompanyId
+    if (!targetCompanyId || !window.confirm(t('onboard.rotateConfirm'))) return
+    setErr(null); setBusy(true); setCopied(false)
+    // A lost response may follow a successful commit, so never leave an old
+    // command visible while the outcome is unknown. "Add a computer" rereads
+    // the active code without rotating it again.
+    const version = usePairingCodes.getState().beginRequest(targetCompanyId, true)
+    try {
+      const result = await api.rotatePairingCode()
+      usePairingCodes.getState().setCodeIfCurrent(targetCompanyId, version, result.code)
+    } catch (e) { setErr(e instanceof Error ? e.message : String(e)) }
+    finally { setBusy(false) }
+  }
+
+  async function copyCommand() {
+    setErr(null)
+    setCopied(false)
+    try {
+      await copyText(cmd)
+      setCopied(true)
+    } catch {
+      setErr(t('onboard.copyFailed'))
+    }
   }
 
   return (
@@ -82,6 +120,7 @@ export function Onboarding() {
             ) : (
               <>
                 <div className="text-[13px] font-semibold text-ink-900 mb-1">{t('onboard.runThis')}</div>
+                {err && <div className="text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2 mb-3">{err}</div>}
                 <div className="text-[11.5px] text-ink-500 mb-2.5 italic font-display">
                   {t('onboard.tokenHint')}
                 </div>
@@ -112,7 +151,7 @@ export function Onboarding() {
                 </label>
                 <pre className="bg-ink-900 text-cloud rounded-[10px] p-3 text-[12px] overflow-x-auto whitespace-pre-wrap break-all font-mono select-all">{cmd}</pre>
                 <div className="flex items-center gap-3 mt-3">
-                  <button type="button" onClick={() => { void navigator.clipboard?.writeText(cmd); setCopied(true) }}
+                  <button type="button" onClick={() => { void copyCommand() }}
                     className="inline-flex items-center justify-center min-w-[120px] text-[12px] font-semibold px-3 py-1.5 rounded-[9px] text-white transition-colors duration-200"
                     style={{ background: copied ? '#3BB273' : 'var(--skype)' }}>
                     {copied ? t('onboard.copied') : t('onboard.copy')}
@@ -125,6 +164,17 @@ export function Onboarding() {
               </>
             )}
           </div>
+
+          {companyRole === 'owner' && (
+            <section className="mt-4 rounded-[12px] border border-ink-100 bg-paper p-4">
+              <h2 className="text-[12.5px] font-semibold text-ink-800">{t('onboard.securityTitle')}</h2>
+              <p className="mt-1 text-[11.5px] leading-relaxed text-ink-500">{t('onboard.securityHelp')}</p>
+              <button type="button" onClick={() => void rotateCode()} disabled={busy}
+                className="mt-3 rounded-[8px] border border-ink-200 px-3 py-1.5 text-[11.5px] font-semibold text-ink-700 hover:bg-cloud disabled:opacity-50">
+                {busy ? t('onboard.rotating') : t('onboard.rotate')}
+              </button>
+            </section>
+          )}
 
           <p className="text-[12px] text-ink-400 mt-4">
             {t('onboard.cloudCta')} <span className="text-skype-deep">{t('onboard.upgradePro')}</span> {t('onboard.cloudRun')}

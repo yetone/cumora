@@ -19,6 +19,7 @@ import { ensureDirectConversation } from '../agents/private_chat.js'
 import { fetchImageBytes } from '../agents/image-fetcher.js'
 import { getTriageEconomics, getWakeEconomics } from '../agents/observability.js'
 import { resolveKanbanAssigneeChange, wakeKanbanAgents } from '../agents/kanban-wake.js'
+import { isBoardDueOn } from '../agents/board-due-date.js'
 import { AgentCreationError, createAgentRecord } from '../agents/create.js'
 import { BUSY_STATUS_LEASE_MS } from '../status.js'
 import { dispatchMessagePush } from '../push.js'
@@ -43,7 +44,7 @@ import {
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
   setComputerDefaultEngine, updateEngineDefaults, getEngineDefaults,
-  PAIRABLE_ENGINES, type EngineId,
+  rotateCompanyPairingCode, PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
 import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
 import { companyTier } from '../tier.js'
@@ -1184,13 +1185,34 @@ api.get('/computers', safe(async (req, res) => {
 // No computer row is created here — pairComputer creates it once the daemon
 // pairs and reports the machine's real hostname.
 api.post('/computers', safe(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
   const { userId: uid, companyId } = await requireCompanyRole(req)
   res.status(201).json(await issuePairingCode({ companyId, ownerUserId: uid }))
+}))
+
+// Replace the active workspace add-computer token (owner only). Existing
+// paired device credentials and their computer-specific reconnect tokens stay
+// valid. Removing a computer only revokes that device; it does not rotate this
+// workspace token.
+api.post('/computers/pairing-code/rotate', safe(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
+  const { userId, companyId } = await requireCompanyRole(req, OWNER_ONLY)
+  const result = await rotateCompanyPairingCode({
+    companyId,
+    ownerUserId: userId,
+    ip: req.ip,
+    userAgent: req.get('user-agent'),
+  })
+  if ('error' in result) {
+    throw new HttpError(404, 'workspace not found')
+  }
+  res.json(result)
 }))
 
 // Issue a persistent re-pair token for an existing computer — reconnect it (and its
 // agents) by running the daemon again with this code (owner/admin).
 api.post('/computers/:id/repair', safe(async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store')
   const { userId: uid, companyId } = await requireCompanyRole(req)
   const out = await issueRepairCode({ companyId, ownerUserId: uid, computerId: String(req.params.id) })
   if (!out) throw new HttpError(404, 'computer not found or not re-pairable')
@@ -2428,7 +2450,7 @@ api.post('/projects/:id/archive', async (req, res) => {
 api.delete('/projects/:id', async (req, res) => {
   const { companyId: tenant } = await requireCompanyRole(req)
   if (!await projectDeletionAvailable()) {
-    res.status(503).json({ error: 'Project deletion requires schema migration 0010.' })
+    res.status(503).json({ error: 'Project deletion requires schema migration 0011.' })
     return
   }
   if (typeof req.body?.confirmation !== 'string') {
@@ -5959,6 +5981,7 @@ api.get('/cards/:id', async (req, res) => {
     description: string | null
     position: number
     assignee_id: string | null
+    due_on: string | null
     mentions: string[]
     created_by: string
     created_at: string
@@ -5969,16 +5992,17 @@ api.get('/cards/:id', async (req, res) => {
     board_created_at: string
     board_updated_at: string
     column_title: string
+    column_kind: 'todo' | 'doing' | 'done' | null
     column_position: number
     column_created_at: string
     comment_count: number
   }>(
     `SELECT c.id, c.board_id, c.column_id, c.title, c.description, c.position,
-            c.assignee_id, c.mentions, c.created_by, c.created_at, c.updated_at,
+            c.assignee_id, c.due_on::text AS due_on, c.mentions, c.created_by, c.created_at, c.updated_at,
             b.title AS board_title, b.description AS board_description,
             b.created_by AS board_created_by, b.created_at AS board_created_at,
             b.updated_at AS board_updated_at,
-            col.title AS column_title, col.position AS column_position,
+            col.title AS column_title, col.kind AS column_kind, col.position AS column_position,
             col.created_at AS column_created_at,
             (SELECT COUNT(*)::int FROM board_card_comments cc WHERE cc.card_id = c.id) AS comment_count
        FROM board_cards c
@@ -6002,6 +6026,7 @@ api.get('/cards/:id', async (req, res) => {
     column: {
       id: r.column_id,
       title: r.column_title,
+      kind: r.column_kind,
       position: Number(r.column_position),
       createdAt: r.column_created_at,
     },
@@ -6013,6 +6038,7 @@ api.get('/cards/:id', async (req, res) => {
       description: r.description,
       position: Number(r.position),
       assigneeId: r.assignee_id,
+      dueOn: r.due_on,
       mentions: Array.isArray(r.mentions) ? r.mentions : [],
       commentCount: r.comment_count,
       createdBy: r.created_by,
@@ -6083,12 +6109,12 @@ api.get('/boards/:id', async (req, res) => {
   )
   const cards = await pool.query<{
     id: string; column_id: string; title: string; description: string | null
-    position: number; assignee_id: string | null; mentions: string[]
+    position: number; assignee_id: string | null; due_on: string | null; mentions: string[]
     created_by: string; created_at: string; updated_at: string
     comment_count: number
   }>(
     `SELECT c.id, c.column_id, c.title, c.description, c.position,
-            c.assignee_id, c.mentions, c.created_by, c.created_at, c.updated_at,
+            c.assignee_id, c.due_on::text AS due_on, c.mentions, c.created_by, c.created_at, c.updated_at,
             (SELECT COUNT(*)::int FROM board_card_comments cc WHERE cc.card_id = c.id) AS comment_count
        FROM board_cards c
       WHERE c.board_id = $1
@@ -6106,6 +6132,7 @@ api.get('/boards/:id', async (req, res) => {
     columns: cols.rows.map((c) => ({
       id: c.id,
       title: c.title,
+      kind: c.kind,
       position: Number(c.position),
       createdAt: c.created_at,
     })),
@@ -6117,6 +6144,7 @@ api.get('/boards/:id', async (req, res) => {
       description: c.description,
       position: Number(c.position),
       assigneeId: c.assignee_id,
+      dueOn: c.due_on,
       mentions: Array.isArray(c.mentions) ? c.mentions : [],
       commentCount: c.comment_count,
       createdBy: c.created_by,
@@ -6167,6 +6195,8 @@ api.post('/boards/:id/columns', async (req, res) => {
   const { userId: me, companyId } = await requireBoardAccess(req, boardId)
   const title = String(req.body?.title ?? '').trim().slice(0, 100)
   if (!title) throw new HttpError(400, 'title required')
+  const kind = req.body?.kind ?? null
+  if (kind !== null && !['todo', 'doing', 'done'].includes(kind)) throw new HttpError(400, 'invalid column kind')
   const { rows: posRows } = await pool.query<{ max: number | null }>(
     `SELECT MAX(position) AS max FROM board_columns WHERE board_id = $1`, [boardId],
   )
@@ -6174,8 +6204,8 @@ api.post('/boards/:id/columns', async (req, res) => {
   const id = `col-${randomUUID().slice(0, 12)}`
   await withOutboxTransaction(async (client) => {
     await client.query(
-      `INSERT INTO board_columns (id, board_id, title, position) VALUES ($1, $2, $3, $4)`,
-      [id, boardId, title, position],
+      `INSERT INTO board_columns (id, board_id, title, position, kind) VALUES ($1, $2, $3, $4, $5)`,
+      [id, boardId, title, position, kind],
     )
     await enqueueBoardEvent(client, { companyId, kind: 'column.created', boardId, columnId: id, actorId: me })
   })
@@ -6194,6 +6224,11 @@ api.patch('/boards/:bid/columns/:cid', async (req, res) => {
   }
   if (typeof req.body?.position === 'number') {
     params.push(req.body.position); sets.push(`position = $${params.length}`)
+  }
+  if (req.body && Object.hasOwn(req.body, 'kind')) {
+    const kind = req.body.kind
+    if (kind !== null && !['todo', 'doing', 'done'].includes(kind)) throw new HttpError(400, 'invalid column kind')
+    params.push(kind); sets.push(`kind = $${params.length}`)
   }
   if (sets.length === 0) { res.json({ ok: true }); return }
   params.push(columnId); params.push(boardId)
@@ -6233,6 +6268,8 @@ api.post('/boards/:id/cards', async (req, res) => {
   const description = String(req.body?.description ?? '').trim().slice(0, 8000) || null
   const columnId = String(req.body?.columnId ?? '').trim()
   const assigneeId = req.body?.assigneeId ? String(req.body.assigneeId).trim() : null
+  const dueOn = req.body?.dueOn === undefined ? null : req.body.dueOn
+  if (dueOn !== null && !isBoardDueOn(dueOn)) throw new HttpError(400, 'dueOn must be YYYY-MM-DD or null')
   if (!title) throw new HttpError(400, 'title required')
   if (!columnId) throw new HttpError(400, 'columnId required')
   // Confirm column lives in the board we're touching — otherwise a client
@@ -6251,9 +6288,9 @@ api.post('/boards/:id/cards', async (req, res) => {
   await withOutboxTransaction(async (client) => {
     await client.query(
       `INSERT INTO board_cards
-         (id, board_id, column_id, title, description, position, assignee_id, mentions, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)`,
-      [id, boardId, columnId, title, description, position, assigneeId, JSON.stringify(mentions), me],
+         (id, board_id, column_id, title, description, position, assignee_id, due_on, mentions, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date, $9::jsonb, $10)`,
+      [id, boardId, columnId, title, description, position, assigneeId, dueOn, JSON.stringify(mentions), me],
     )
     await client.query(`UPDATE boards SET updated_at = NOW() WHERE id = $1`, [boardId])
     await enqueueBoardEvent(client, {
@@ -6312,6 +6349,12 @@ api.patch('/boards/:bid/cards/:cid', async (req, res) => {
   }
   if (assigneeChange.changed) {
     params.push(assigneeChange.nextAssigneeId); sets.push(`assignee_id = $${params.length}`)
+  }
+  if (req.body && Object.hasOwn(req.body, 'dueOn')) {
+    if (req.body.dueOn !== null && !isBoardDueOn(req.body.dueOn)) {
+      throw new HttpError(400, 'dueOn must be YYYY-MM-DD or null')
+    }
+    params.push(req.body.dueOn); sets.push(`due_on = $${params.length}::date`)
   }
   if (typeof req.body?.columnId === 'string') {
     const newCol = req.body.columnId.trim()

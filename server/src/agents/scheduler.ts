@@ -183,6 +183,38 @@ async function scheduleWakeRetry(
   console.warn(`[scheduler] ${agentId} ${reason} wake retry scheduled in ${Math.round((dueAt - Date.now()) / 1000)}s after ${failureClass}: ${failureReason}`)
 }
 
+/** Drop a queued retry whose job has already been done.
+ *
+ *  The post-spawn health check and the inline replay loop at the end of
+ *  `wakeOne` are two mechanisms for one thing: make sure a freshly-spawned pod
+ *  actually receives this wake. Only the loop can CONFIRM it — it re-delivers
+ *  until a subscriber answers. Leaving the queued job behind after that
+ *  confirmation delivers the same wake a second time.
+ *
+ *  For a durable `message.new` that was harmless, which is why it went
+ *  unnoticed: the pod's cold-start drain reads the inbox and the fingerprint
+ *  absorbs the repeat. But `message.new` never enters this queue —
+ *  `_shouldRetryEnsurePodFailure` admits `manual` and nothing else, the only
+ *  producer of `manual` in the product is a board card wake, and that always
+ *  carries a `backgroundBrief` whose fingerprint embeds `new Date()`
+ *  (turn.ts). So the one wake class that reaches the queue is exactly the one
+ *  the "fingerprint makes the turn no-op" premise does not hold for: every
+ *  board action on a resting agent ran the whole turn twice, re-claiming the
+ *  card, re-commenting, and billing a second time.
+ *
+ *  The id is deterministic and `scheduleWakeRetry` hsets it, so there is at
+ *  most one job per (agent, reason, conversation) and this removes exactly the
+ *  one whose work just completed. */
+export async function _cancelWakeRetry(
+  agentId: string,
+  reason: WakeReason,
+  conversationId: string | null,
+): Promise<void> {
+  const id = wakeRetryId(agentId, reason, conversationId)
+  await redis.zrem(WAKE_RETRY_DUE_KEY, id).catch(() => { /* best effort */ })
+  await redis.hdel(WAKE_RETRY_JOB_KEY, id).catch(() => { /* best effort */ })
+}
+
 /** The Redis side of the retry queue, behind an interface so the drain loop can
  *  be driven by a test without a live Redis or a live agent fleet. */
 export interface WakeRetryQueue {
@@ -622,7 +654,13 @@ async function wakeOne(
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 500))
       const replayed = await deliverWake(agentId, wakePayload).catch(() => 0)
-      if (replayed > 0) return true
+      if (replayed > 0) {
+        // Confirmed: the pod attached and took this wake. The health-check
+        // retry was the net for "it never attached" — drop it before it
+        // delivers the same brief again.
+        await _cancelWakeRetry(agentId, reason, conversationId)
+        return true
+      }
     }
     console.warn(`[scheduler] ${agentId} synthetic wake (${reason}) was not delivered after pod start`)
     return false

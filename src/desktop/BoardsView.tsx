@@ -9,10 +9,12 @@ import { CalendarLink } from '@/components/CalendarLink'
 import { DocumentLink } from '@/components/DocumentLink'
 import { ResizeHandle } from '@/components/ResizeHandle'
 import { Select } from '@/components/Select'
+import { DateTimePicker } from '@/components/DateTimePicker'
 import { useResizableWidth } from '@/lib/useResizableWidth'
 import { useT } from '@/lib/i18n'
 import { IBoard, IPlus, IAt, ITrash, IMore } from '@/components/icons'
 import { cn } from '@/lib/utils'
+import { boardDueStatus, localCalendarDay } from '@/lib/board-due-date'
 import type { BoardCard, BoardCardComment, BoardColumn, Participant } from '@/types'
 
 /**
@@ -169,6 +171,12 @@ function BoardCanvas({ boardId }: { boardId: string }) {
   const [openCardId, setOpenCardId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState(false)
   const [titleDraft, setTitleDraft] = useState('')
+  const [asOf, setAsOf] = useState(localCalendarDay)
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setAsOf(localCalendarDay()), 60_000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   // Hooks must run on every render in the same order — keep useMemo
   // above any conditional early return. When the snapshot hasn't
@@ -266,6 +274,7 @@ function BoardCanvas({ boardId }: { boardId: string }) {
               boardId={boardId}
               column={col}
               cards={cardsByColumn.get(col.id) ?? []}
+              asOf={asOf}
               onOpenCard={setOpenCardId}
             />
           ))}
@@ -310,14 +319,15 @@ function BoardCanvas({ boardId }: { boardId: string }) {
 
 /* ============== Column ============== */
 
-function ColumnView({ boardId, column, cards, onOpenCard }: {
-  boardId: string; column: BoardColumn; cards: BoardCard[]
+function ColumnView({ boardId, column, cards, asOf, onOpenCard }: {
+  boardId: string; column: BoardColumn; cards: BoardCard[]; asOf: string
   onOpenCard: (id: string) => void
 }) {
   const t = useT()
   const addCard = useBoards((s) => s.addCard)
   const moveCardOptimistic = useBoards((s) => s.moveCardOptimistic)
   const renameColumn = useBoards((s) => s.renameColumn)
+  const setColumnKind = useBoards((s) => s.setColumnKind)
   const deleteColumn = useBoards((s) => s.deleteColumn)
   const [adding, setAdding] = useState(false)
   const [draft, setDraft] = useState('')
@@ -384,6 +394,18 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
           </button>
         )}
         <span className="text-xs text-ink-400">{cards.length}</span>
+        <select
+          value={column.kind ?? ''}
+          onChange={(e) => void setColumnKind(boardId, column.id, (e.target.value || null) as BoardColumn['kind']).catch(console.warn)}
+          aria-label={t('boards.columnKind')}
+          title={t('boards.columnKind')}
+          className="max-w-20 bg-transparent text-[11px] text-ink-500"
+        >
+          <option value="">{t('boards.kindOther')}</option>
+          <option value="todo">{t('boards.kindTodo')}</option>
+          <option value="doing">{t('boards.kindDoing')}</option>
+          <option value="done">{t('boards.kindDone')}</option>
+        </select>
         <button
           type="button"
           onClick={async () => {
@@ -399,7 +421,7 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
       </div>
       <div className="flex-1 overflow-y-auto px-2 pb-2 space-y-2">
         {cards.map((c) => (
-          <CardTile key={c.id} card={c} onOpen={() => onOpenCard(c.id)} />
+          <CardTile key={c.id} card={c} columnKind={column.kind} asOf={asOf} onOpen={() => onOpenCard(c.id)} />
         ))}
         {adding ? (
           <MentionInput
@@ -431,9 +453,13 @@ function ColumnView({ boardId, column, cards, onOpenCard }: {
 
 /* ============== Card tile ============== */
 
-function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
+function CardTile({ card, columnKind, asOf, onOpen }: {
+  card: BoardCard; columnKind: BoardColumn['kind']; asOf: string; onOpen: () => void
+}) {
+  const t = useT()
   const byId = useParticipants((s) => s.byId)
   const assignee = card.assigneeId ? byId[card.assigneeId] : null
+  const dueStatus = boardDueStatus(card.dueOn, columnKind, asOf)
   return (
     <div
       role="button"
@@ -450,6 +476,11 @@ function CardTile({ card, onOpen }: { card: BoardCard; onOpen: () => void }) {
       <div className="text-sm text-ink-800 leading-snug">
         <MentionedText text={card.title} byId={byId} />
       </div>
+      {card.dueOn && (
+        <div className={cn('mt-1.5 text-[11px]', dueStatus === 'overdue' ? 'font-semibold text-coral-deep' : dueStatus === 'unclassified' ? 'font-semibold text-gold-deep' : dueStatus === 'today' ? 'font-semibold text-skype-deep' : 'text-ink-500')}>
+          {dueStatus === 'overdue' ? t('boards.overdue') : dueStatus === 'unclassified' ? t('boards.pastDueUnclassified') : dueStatus === 'today' ? t('boards.dueToday') : t('boards.dueDate')}: {card.dueOn}
+        </div>
+      )}
       {(card.assigneeId || card.mentions.length > 0 || card.commentCount > 0) && (
         <div className="mt-2 flex items-center gap-2">
           {assignee && (
@@ -820,6 +851,8 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
   const [description, setDescription] = useState(card.description ?? '')
   const [draftComment, setDraftComment] = useState('')
   const [posting, setPosting] = useState(false)
+  const [dueSaving, setDueSaving] = useState(false)
+  const [dueSaveError, setDueSaveError] = useState(false)
 
   useEffect(() => {
     setTitle(card.title)
@@ -846,6 +879,18 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
   }
   async function setAssignee(id: string | null) {
     try { await patchCard(boardId, card.id, { assigneeId: id }) } catch (e) { console.warn(e) }
+  }
+  async function saveDueOn(value: string) {
+    setDueSaving(true)
+    setDueSaveError(false)
+    try {
+      await patchCard(boardId, card.id, { dueOn: value ? value.slice(0, 10) : null })
+    } catch (error) {
+      console.warn('[boards] due date update failed', error)
+      setDueSaveError(true)
+    } finally {
+      setDueSaving(false)
+    }
   }
   async function postComment() {
     const body = draftComment.trim()
@@ -903,6 +948,19 @@ function CardDetailModal({ boardId, card, columns, onClose }: {
                 meId={meId ?? null}
               />
             </div>
+          </section>
+
+          <section>
+            <div className="text-[11px] uppercase tracking-wide text-ink-400 mb-1">{t('boards.dueDate')}</div>
+            <DateTimePicker
+              mode="date"
+              value={card.dueOn ? `${card.dueOn}T00:00` : ''}
+              onChange={(value) => { void saveDueOn(value) }}
+              placeholder={t('boards.noDueDate')}
+              allowClear
+              disabled={dueSaving}
+            />
+            {dueSaveError && <div role="alert" className="mt-1 text-xs text-coral-deep">{t('boards.dueSaveFailed')}</div>}
           </section>
 
           <section>

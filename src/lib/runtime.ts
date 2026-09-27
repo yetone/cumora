@@ -37,6 +37,10 @@ interface CumoraBridge {
     isFocused: () => Promise<boolean>
     onFocusChange: (handler: (focused: boolean) => void) => () => void
   }
+  /** Native clipboard write for desktop commands; works while the renderer is unfocused. */
+  clipboard?: {
+    writeText: (value: string) => Promise<void>
+  }
   /** Native Dock affordances. Currently only meaningful on macOS. */
   dock?: {
     setUnreadDot: (visible: boolean) => void

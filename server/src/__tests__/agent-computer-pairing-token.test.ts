@@ -13,23 +13,28 @@ const registry = await import('../agents/computer/registry.js')
 const { pool } = await import('../db/pool.js')
 
 const originalQuery = pool.query.bind(pool)
+const originalConnect = pool.connect.bind(pool)
 
 type QueryCall = { sql: string; params: unknown[] }
 
 function installPoolMock(handler: (call: QueryCall) => { rows?: unknown[]; rowCount?: number }) {
   const calls: QueryCall[] = []
+  const query = async (sql: string, params: unknown[] = []) => {
+    const call = { sql, params }
+    calls.push(call)
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql.trim())) return { rows: [], rowCount: 0 }
+    const out = handler(call)
+    return { rows: out.rows ?? [], rowCount: out.rowCount ?? (out.rows?.length ?? 0) }
+  }
   ;(pool as unknown as { query: (sql: string, params?: unknown[]) => Promise<{ rows: unknown[]; rowCount: number }> }).query =
-    async (sql: string, params: unknown[] = []) => {
-      const call = { sql, params }
-      calls.push(call)
-      const out = handler(call)
-      return { rows: out.rows ?? [], rowCount: out.rowCount ?? (out.rows?.length ?? 0) }
-    }
+    query
+  ;(pool as unknown as { connect: () => Promise<unknown> }).connect = async () => ({ query, release() {} })
   return calls
 }
 
 afterEach(() => {
   ;(pool as unknown as { query: typeof originalQuery }).query = originalQuery
+  ;(pool as unknown as { connect: typeof originalConnect }).connect = originalConnect
 })
 
 after(async () => {
@@ -53,8 +58,8 @@ test('company add token is persistent and reattaches an existing host by name', 
     }
     if (/UPDATE companies SET pair_token/.test(sql)) return { rowCount: 1 }
     if (/SELECT id, company_id/.test(sql)) return { rows: [] }
-    if (/SELECT id AS company_id, owner_user_id FROM companies/.test(sql)) {
-      return { rows: [{ company_id: 'co-1', owner_user_id: 'u-1' }] }
+    if (/SELECT id, owner_user_id FROM companies/.test(sql)) {
+      return { rows: [{ id: 'co-1', owner_user_id: 'u-1' }] }
     }
     if (/SELECT id FROM computers/.test(sql)) return { rows: [{ id: 'comp-existing' }] }
     if (/UPDATE computers\s+SET credential_hash/.test(sql)) return { rowCount: 1 }
@@ -154,8 +159,8 @@ test('pairComputer accepts antigravity engine as primary and stores it in availa
   const calls = installPoolMock(({ sql }) => {
     if (/SELECT pair_token FROM companies/.test(sql)) return { rows: [{ pair_token: 'company-token' }] }
     if (/SELECT id, company_id/.test(sql)) return { rows: [] }
-    if (/SELECT id AS company_id, owner_user_id FROM companies/.test(sql)) {
-      return { rows: [{ company_id: 'co-1', owner_user_id: 'u-1' }] }
+    if (/SELECT id, owner_user_id FROM companies/.test(sql)) {
+      return { rows: [{ id: 'co-1', owner_user_id: 'u-1' }] }
     }
     if (/SELECT id FROM computers/.test(sql)) return { rows: [{ id: 'comp-antigravity' }] }
     if (/UPDATE computers\s+SET credential_hash/.test(sql)) return { rowCount: 1 }

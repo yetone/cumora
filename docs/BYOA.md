@@ -498,17 +498,19 @@ CREATE TABLE computers (
 
 Every company gets a `kind='cloud'` "Cumora Cloud" row; `computers.kind`
 is what the scheduler branches on. Companies also hold a persistent
-pairing token (`companies.pair_token`) shown in the Add-Computer UI.
+workspace pairing code (`companies.pair_token`) shown in the Add-Computer UI.
+Each paired computer has a separate reconnect code (`computers.pair_token`).
 
 ---
 
 ## Auth & pairing
 
 A Computer is a **registered device** with its own revocable credential —
-not the user's session. "Remove Computer" is a real kill switch.
+not the user's session. "Remove Computer" is a real kill switch for that
+device; it does not rotate the workspace pairing code.
 
 ```
-1. UI "Add Computer" ─► the company's persistent pairing token
+1. UI "Add Computer" ─► the company's persistent workspace pairing code
 2. user runs:  npx cumora agent computer --pair <code> --server <url>
 3. daemon ─► POST /api/computers/pair { code, hostName, engines, version, supervised }
            ◄── { computerId, deviceToken }   (stored in ~/.cumora/computer.json;
@@ -519,17 +521,57 @@ not the user's session. "Remove Computer" is a real kill switch.
    used for that agent's wake-stream SSE and daemon-side `/runtime/cli` calls.
 5. heartbeat: POST /api/computers/heartbeat every 30s; a computer with no
    heartbeat for 90s shows offline and its agents show sleeping.
-6. UI "Remove" ─► sets revoked_at; the device token and all derived agent
-   JWTs are rejected → its agents go offline.
+6. UI "Remove" ─► sets revoked_at; that device's token, reconnect code, and
+   all derived agent JWTs are rejected → its agents go offline. The workspace
+   pairing code remains valid.
 ```
 
 Management endpoints: `GET/POST /api/computers`,
 `POST /api/computers/:id/repair` (re-pair an existing computer),
+`POST /api/computers/pairing-code/rotate` (owner-only workspace-code rotation),
 `DELETE /api/computers/:id`, and `POST /api/agents/:id/computer`
 (assign an agent to a computer + engine). The device token only
 authorizes minting JWTs for agents whose `computer_id` matches this
 computer; issuing pairing tokens and managing computers require the
 owning user's session.
+
+### Rotate a workspace pairing code
+
+In **Workspace settings → Computer pairing code**, an owner can generate a
+new workspace code without deleting the workspace. This code is for adding
+computers; it is different from the reconnect code shown for one computer.
+Rotation invalidates the old workspace code and leaves already-paired device
+credentials and per-computer reconnect codes active, so connected computers
+continue running. The new code is available from this settings section and the
+Add-Computer command UI.
+
+If a rotation request times out or its response is lost, use **Show current
+code** or **Add a computer** to read the active code. Those actions do not
+rotate it again. A pairing code must not be put in a URL, public issue, log, or
+screenshot.
+
+If the workspace code may have leaked:
+
+1. An owner rotates it in Workspace settings.
+2. Check the computer list for devices you do not recognize.
+3. Remove each suspicious computer. Removal revokes that device and its
+   credentials, including its reconnect code; removing a device alone never
+   rotates the workspace code.
+4. Share details through the private channel in the
+   [security policy](../SECURITY.md), without posting a code or workspace
+   identifier publicly.
+
+| Operation | Workspace pairing code | Paired device credential | Per-computer reconnect code |
+| --- | --- | --- | --- |
+| Rotate workspace code | Old code stops working; new code is active | Remains valid | Remains valid |
+| Remove one computer | Remains valid | That device is revoked | That device's code can no longer pair because it is revoked |
+
+**Security follow-up:** a workspace code can currently re-attach an existing
+computer when the daemon reports the same hostname, replacing that computer's
+device credential. A hostname is not a reliable identity check. A separate,
+compatibility-reviewed change should require an existing computer's own
+reconnect code for that re-attachment. Rotation should therefore be followed
+by a review of the computer list and removal of any device that is not trusted.
 
 ---
 
