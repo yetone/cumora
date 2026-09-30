@@ -83,6 +83,7 @@ export interface MigrationJobOptions {
   name: string
   image: string
   repairMode: 'off' | 'archive-detach'
+  schemaTargetVersion?: number
   activeDeadlineSeconds?: number
   ttlSecondsAfterFinished?: number
 }
@@ -606,6 +607,10 @@ export function buildMigrationJob(
   result.spec.activeDeadlineSeconds = options.activeDeadlineSeconds ?? 600
   result.spec.ttlSecondsAfterFinished = options.ttlSecondsAfterFinished ?? 600
   upsertEnv(result.server, 'MIGRATION_0002_REPAIR', options.repairMode)
+  if (options.schemaTargetVersion !== undefined) {
+    if (!Number.isSafeInteger(options.schemaTargetVersion) || options.schemaTargetVersion < 1) throw new Error('invalid schema migration target')
+    upsertEnv(result.server, 'SCHEMA_MIGRATION_TARGET_VERSION', String(options.schemaTargetVersion))
+  }
   return {
     apiVersion: 'batch/v1',
     kind: 'Job',

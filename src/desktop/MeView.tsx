@@ -8,6 +8,7 @@ import { useAuth } from '@/stores/auth'
 import { usePairingCodes } from '@/stores/pairing-codes'
 import { copyText } from '@/lib/clipboard'
 import { Avatar } from '@/components/Avatar'
+import { DeleteProjectDialog } from '@/components/DeleteProjectDialog'
 import { Checkbox } from '@/components/Checkbox'
 import { AppearancePicker, ChatLayoutPicker } from '@/components/AppearancePicker'
 import { LanguagePicker } from '@/components/LanguagePicker'
@@ -507,6 +508,7 @@ function Stat({ n, l, tone }: { n: number; l: MessageKey; tone: 'good' | 'warn' 
 function ProjectsTab() {
   const t = useT()
   const [projects, setProjects] = useState<ApiProject[]>([])
+  const [deletingProject, setDeletingProject] = useState<ApiProject | null>(null)
   const [showArchived, setShowArchived] = useState(false)
   const [creating, setCreating] = useState(false)
   const [name, setName] = useState('')
@@ -544,6 +546,12 @@ function ProjectsTab() {
   return (
     <div className="space-y-6">
       <Section title={t('me.sectionProjects')}>
+        {deletingProject && <DeleteProjectDialog project={deletingProject}
+          onClose={() => setDeletingProject(null)}
+          onDeleted={() => {
+            setProjects((current) => current.filter((p) => p.id !== deletingProject.id))
+            setDeletingProject(null)
+          }} />}
         <div className="text-[13px] text-ink-500 leading-[1.55] mb-4 max-w-2xl font-display italic">
           {t('me.projectsIntro')}
         </div>
@@ -559,7 +567,7 @@ function ProjectsTab() {
             const count = p.conversationCount
             return (
               <div key={p.id} className="bg-cloud rounded-[12px] p-4 flex items-center gap-4"
-                style={{ border: '1px solid var(--ink-100)', opacity: p.status === 'archived' ? 0.55 : 1 }}>
+                style={{ border: '1px solid var(--ink-100)' }}>
                 <div className="w-3 h-10 rounded-full shrink-0" style={{ background: p.color ?? 'var(--ink-200)' }} />
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
@@ -573,9 +581,17 @@ function ProjectsTab() {
                 <button
                   type="button"
                   onClick={() => archive(p.id, p.status !== 'archived')}
+                  disabled={deletingProject?.id === p.id}
                   className="px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-ink-700 bg-paper hover:bg-sky2-50 transition"
                   style={{ border: '1px solid var(--ink-100)' }}
                 >{p.status === 'archived' ? t('me.restore') : t('me.archive')}</button>
+                {p.status === 'archived' && (
+                  <button
+                    type="button"
+                    onClick={() => setDeletingProject(p)}
+                    className="shrink-0 px-3 py-1.5 rounded-[8px] text-[11.5px] font-semibold text-white bg-coral-deep hover:opacity-90 disabled:opacity-50 transition"
+                  >{t('common.delete')}</button>
+                )}
               </div>
             )
           })}

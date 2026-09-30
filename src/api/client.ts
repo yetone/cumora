@@ -907,6 +907,8 @@ export const api = {
     http<{ ok: boolean; status: string }>(`/projects/${encodeURIComponent(id)}/archive`, {
       method: 'POST', body: JSON.stringify({ archive }),
     }),
+  deleteProject: (id: string, confirmation: string) =>
+    http<{ ok: boolean }>(`/projects/${encodeURIComponent(id)}`, { method: 'DELETE', body: JSON.stringify({ confirmation }) }),
   attachProject: (conversationId: string, projectId: string | null) =>
     http<{ ok: boolean; projectId: string | null }>(`/conversations/${encodeURIComponent(conversationId)}/project`, {
       method: 'POST', body: JSON.stringify({ projectId }),

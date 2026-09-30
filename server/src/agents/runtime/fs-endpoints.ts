@@ -28,7 +28,7 @@ import { pool } from '../../db/pool.js'
 import { isSafePath, likeEscape } from './fs-namespace.js'
 import type { AgentRuntimeClaims } from './jwt.js'
 import { buildMemoryMeta } from '../memory-scope.js'
-import { memoryMetaForWrite } from '../memory-write.js'
+import { assertMemoryProjectExists, memoryMetaForWrite } from '../memory-write.js'
 
 function badRequest(res: Response, msg: string): void {
   res.status(400).json({ error: msg })
@@ -126,6 +126,7 @@ export function attachFsEndpoints(
     const meta = p.startsWith('memory/')
       ? await memoryMetaForWrite(c.sub, { path: p, conversationId: body?.conversationId ?? null })
       : metaForPath(p)
+    await assertMemoryProjectExists(c.companyId, p, meta)
     await pool.query(
       `INSERT INTO agent_workspace (agent_id, path, body, meta, company_id, updated_at)
          VALUES ($1, $2, $3, $4::jsonb, $5, NOW())

@@ -67,12 +67,26 @@ export const SCHEMA_MIGRATIONS = [
     name: '0010_board_card_due_on',
     checksum: 'd07af706ca94ea26c789f7103d94bf8af00b174034f2fd9b817c8bde3e45560a',
   },
+  {
+    version: 11,
+    name: '0011_project_memory_deletion',
+    checksum: 'ca7c50470f26f555843e106a6a2a02d4729f1fbef2edac03d3cb21ee039fcec3',
+  },
 ] as const satisfies readonly MigrationMetadata[]
 
-/** This build intentionally supports one exact schema range. Expand/contract
- * releases may widen the range, but both bounds must remain explicit. */
+/** Deploy compatibility code on 10 before enabling the additive migration to 11. */
 export const MIN_SUPPORTED_SCHEMA_VERSION = 10
-export const MAX_SUPPORTED_SCHEMA_VERSION = 10
+export const MAX_SUPPORTED_SCHEMA_VERSION = 11
+
+export function schemaMigrationTarget(raw?: string): number {
+  if (raw === undefined || raw === '') return MAX_SUPPORTED_SCHEMA_VERSION
+  const target = Number(raw)
+  if (!/^\d+$/.test(raw) || !Number.isInteger(target)
+    || target < MIN_SUPPORTED_SCHEMA_VERSION || target > MAX_SUPPORTED_SCHEMA_VERSION) {
+    throw new Error(`schema migration target must be ${MIN_SUPPORTED_SCHEMA_VERSION}..${MAX_SUPPORTED_SCHEMA_VERSION}`)
+  }
+  return target
+}
 
 function assertManifestShape(): void {
   for (let i = 0; i < SCHEMA_MIGRATIONS.length; i++) {

@@ -31,6 +31,7 @@ export function ensureSchemaOnce(): Promise<void> {
  *  keeps the intent visible + lets us spot-check leakage. */
 const TABLES_TO_WIPE: readonly string[] = [
   'workspace_cleanup_jobs',
+  'project_memory_deletions',
   'realtime_outbox',
   'audit_events',
   'llm_calls_rollup',
