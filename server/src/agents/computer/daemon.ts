@@ -2541,8 +2541,12 @@ export class AgentRunner {
   }
 
   private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
-    this.lastInboxDrainAt = Date.now()
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
+    // Only advance the drain anchor when the fetch actually landed. A failed
+    // GET returns null, and advancing anyway makes fallbackPollDue believe
+    // the drain succeeded — suppressing retries for INBOX_POLL_STREAM_HEALTHY_MS
+    // (2 min) while messages sit unread on the server.
+    if (inbox) this.lastInboxDrainAt = Date.now()
     const seen = new Map<string, string>()
     // Unread grouped BY CONVERSATION (first-seen order), each with the header
     // (title + topic) the cloud agent's context also carries — so a BYOA agent
