@@ -36,6 +36,7 @@ import { notifyAlert } from './alerting.js'
 import { startShippingMaintenance } from './shipping-maintenance.js'
 import { startRealtimeOutboxWorker, stopRealtimeOutboxWorker } from './realtime-outbox.js'
 import { startWorkspaceCleanupWorker, stopWorkspaceCleanupWorker } from './workspace-cleanup.js'
+import { refreshLiteLLMCatalog } from './litellm.js'
 
 async function main() {
   const schemaVersion = await verifySchemaWithBootRetry()
@@ -233,6 +234,10 @@ async function main() {
   server.listen(env.PORT, () => {
     console.log(`[boot] cumora server :${env.PORT} · instance ${env.INSTANCE_ID} · model ${env.OPENAI_MODEL}`)
   })
+
+  // Warm the LiteLLM price/context-window catalog so the first `litellm/*`
+  // hop is already priced. No-op when LITELLM_BASE_URL is unset; never throws.
+  void refreshLiteLLMCatalog()
 
   // Demote any 'avail' humans left over from the previous run; real
   // presence will be re-asserted as WS clients reconnect. Run AFTER
