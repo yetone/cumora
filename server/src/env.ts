@@ -80,6 +80,17 @@ export const env = {
    *  base-URL swap (no Chat-Completions translation, unlike Novita). */
   ORCAROUTER_BASE_URL: (process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, ''),
   /**
+   * LiteLLM proxy URL (e.g. `http://localhost:4000`, with or without `/v1`).
+   * Optional — this is the opt-in: when unset, agents configured with a
+   * `litellm/<model>` model id (see server/src/litellm.ts) fall back to the
+   * legacy/sub2api client instead, so an unconfigured deployment doesn't
+   * break the run. No default, because the proxy is self-hosted.
+   */
+  LITELLM_BASE_URL: (process.env.LITELLM_BASE_URL ?? '').trim().replace(/\/+$/, ''),
+  /** LiteLLM master or virtual key. Optional — a proxy started without a
+   *  master key accepts unauthenticated requests. */
+  LITELLM_API_KEY: process.env.LITELLM_API_KEY ?? '',
+  /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
    * `{ content: "..." }` JSON payload. When unset, alerts are still

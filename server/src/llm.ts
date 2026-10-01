@@ -36,6 +36,9 @@
  *                              pure base-URL swap (server/src/orcarouter.ts),
  *                              since OrcaRouter speaks the Responses API
  *                              natively — no translation needed.
+ *   - `litellm/<model>`      → a self-hosted LiteLLM proxy via a base-URL
+ *                              swap (server/src/litellm.ts); the proxy speaks
+ *                              the Responses API natively.
  * Everything else about the returned client (chat.completions, images,
  * embeddings, non-prefixed responses.create calls) is the same object
  * callers already know.
@@ -45,6 +48,8 @@ import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
 import { isOrcaRouterModel, orcarouterResponsesCreate } from './orcarouter.js'
+import { isLiteLLMModel, liteLLMConfigured, litellmResponsesCreate } from './litellm.js'
+import { SDK_MAX_RETRIES, SDK_TIMEOUT_MS } from './llm-sdk-options.js'
 import { sub2apiConfigured, sub2apiOpenAIBaseURL } from './sub2api.js'
 
 interface CachedClient {
@@ -59,19 +64,6 @@ interface CachedClient {
 
 const CACHE_TTL_MS = 5 * 60_000
 const cache = new Map<string, CachedClient>()
-
-/** Tolerance settings for both the sub2api-routed client AND the legacy
- *  fallback. Production has surfaced "all four agents 502'd at once →
- *  every run failed → fingerprint locks them out" sequences caused by
- *  brief upstream flakiness on sub2api / the model provider. The OpenAI
- *  SDK retries on 5xx + 408 + 429 + network errors out of the box, but
- *  its default ceiling (2) is too thin for the bursty 502 windows we
- *  see; 5 absorbs short outages without making the wall-clock pathological.
- *  Timeout is 5 min — model responses (especially with reasoning) can
- *  legitimately take a couple minutes; the SDK aborts and retries within
- *  this budget. */
-const SDK_MAX_RETRIES = 5
-const SDK_TIMEOUT_MS = 5 * 60_000
 
 /** Test-only override. When set, every {@link getLlmClient} call returns
  *  whatever this function produces. Production code never sets this; it
@@ -92,6 +84,8 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *    - `orcarouter/<model>` → OrcaRouter (server/src/orcarouter.ts), a pure
  *                             base-URL swap — OrcaRouter speaks the Responses
  *                             API natively.
+ *    - `litellm/<model>`    → a LiteLLM proxy (server/src/litellm.ts), a
+ *                             base-URL swap like OrcaRouter.
  *
  *  Model, not tenant, decides the provider: `getLlmClient` is resolved
  *  once per tenant/hop before the model for that specific call is even
@@ -102,13 +96,20 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *  images, embeddings) passes through to the real client untouched. */
 let novitaUnconfiguredWarned = false
 let orcarouterUnconfiguredWarned = false
+let litellmUnconfiguredWarned = false
 /** One log line per provider, not one per call — this fires on every hop of
  *  every turn of an agent whose model names an unconfigured provider. */
-function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter', model: string | undefined): void {
+function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter' | 'LiteLLM', model: string | undefined): void {
   if (provider === 'Novita') {
     if (novitaUnconfiguredWarned) return
     novitaUnconfiguredWarned = true
     console.warn(`[llm] model "${model}" requests Novita but NOVITA_API_KEY is unset — using the tenant's normal client instead`)
+    return
+  }
+  if (provider === 'LiteLLM') {
+    if (litellmUnconfiguredWarned) return
+    litellmUnconfiguredWarned = true
+    console.warn(`[llm] model "${model}" requests LiteLLM but LITELLM_BASE_URL is unset — using the tenant's normal client instead`)
     return
   }
   if (orcarouterUnconfiguredWarned) return
@@ -143,6 +144,13 @@ function withProviderRouting(client: OpenAI): OpenAI {
                 return orcarouterResponsesCreate(args, opts)
               }
               warnProviderUnconfiguredOnce('OrcaRouter', args.model)
+            } else if (isLiteLLMModel(args.model)) {
+              // Same degrade-not-die guard, keyed on the proxy URL rather
+              // than a key: a self-hosted proxy may run without auth.
+              if (liteLLMConfigured()) {
+                return litellmResponsesCreate(args, opts)
+              }
+              warnProviderUnconfiguredOnce('LiteLLM', args.model)
             }
             return (real.create as (a: unknown, o?: unknown) => unknown)(args, opts)
           }

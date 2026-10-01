@@ -14,7 +14,12 @@
  * honest basis for "is this triage worth it". Override real contracted rates via
  * the CUMORA_MODEL_PRICES_JSON env (a JSON map of modelId → price); only those
  * count as `verified` — every seeded default is reported as an estimate.
+ *
+ * `litellm/<model>` ids are priced from the LiteLLM proxy's own per-model
+ * rates (server/src/litellm-catalog.ts) when it has reported them, since the
+ * seeded table can't know what an arbitrary gateway alias maps to.
  */
+import { liteLLMModelEntry } from '../litellm-catalog.js'
 
 /** A cache-aware token breakdown for one model call. All counts are the RAW
  *  (uncached) counts as the provider reports them: `inputTokens` excludes the
@@ -90,7 +95,8 @@ function overrides(): Record<string, ModelPrice> {
   return envOverrides
 }
 
-/** Resolve the price for a model id: env override (exact) → seeded exact → seeded
+/** Resolve the price for a model id: env override (exact) → env override
+ *  substring → LiteLLM proxy rate (for `litellm/` ids) → seeded exact → seeded
  *  family substring → fallback. */
 export function priceFor(model: string | null | undefined): ModelPrice {
   const id = (model ?? '').toLowerCase().trim()
@@ -103,6 +109,10 @@ export function priceFor(model: string | null | undefined): ModelPrice {
   const ov = overrides()
   if (ov[id]) return ov[id]
   for (const [key, price] of Object.entries(ov)) if (matches(key)) return price
+  // A gateway alias like `litellm/gemini-2.5-flash` would otherwise land on the
+  // Sonnet-rate fallback; the proxy's reported rate is the better estimate.
+  const viaLiteLLM = liteLLMModelEntry(id)?.price
+  if (viaLiteLLM) return viaLiteLLM
   if (SEED_PRICES[id]) return SEED_PRICES[id]
   for (const [key, price] of Object.entries(SEED_PRICES)) if (matches(key)) return price
   return FALLBACK_PRICE

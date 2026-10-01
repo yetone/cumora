@@ -120,6 +120,7 @@ import {
   renderBriefedManualWakeContext,
 } from './turn-wake.js'
 import { mentionedAgentIds } from './scheduler.js'
+import { liteLLMModelEntry } from '../litellm-catalog.js'
 
 export interface AgentTurnOptions {
   /** Why this turn was started. Message-driven turns remain the default. */
@@ -914,6 +915,10 @@ function modelToolOutputPayload(value: unknown): string {
  *  tokens that follow the prompt. */
 function contextWindowFor(model: string | null): number {
   const m = (model ?? '').toLowerCase()
+  // `litellm/<model>` can be any provider's model; the proxy reports its real
+  // window (a 32K/128K model must not be fed up to the 200K default below).
+  const viaLiteLLM = liteLLMModelEntry(m)?.maxInputTokens
+  if (viaLiteLLM) return viaLiteLLM
   if (m.includes('gpt-5.4-mini')) return 128_000
   if (m.includes('gpt-5.4-nano')) return 64_000
   if (m.includes('gpt-5')) return 200_000             // gpt-5.5, 5.4, 5.3, 5.2 — all ~200K input
