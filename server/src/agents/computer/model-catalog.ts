@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process'
 import type { EngineId } from './engine.js'
 import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { versionCommandInvocation } from './cli-version.js'
+import { codexRuntimeEnv } from './codex-runtime.js'
 
 export type ModelCatalogSource = 'protocol' | 'cli' | 'presets'
 export type FastModelScope = 'agent' | 'computer' | 'unsupported'
@@ -320,12 +321,13 @@ interface CodexListItem {
   isDefault?: unknown
 }
 
-function discoverCodex(command: string): Promise<{ models: EngineModelOption[]; defaultModel: string | null } | null> {
+function discoverCodex(command: string, env: NodeJS.ProcessEnv): Promise<{ models: EngineModelOption[]; defaultModel: string | null } | null> {
   return new Promise((resolve) => {
     const invocation = versionCommandInvocation(command, ['app-server', '--listen', 'stdio://'])
     let child: ReturnType<typeof spawn>
     try {
       child = spawn(invocation.command, invocation.args, {
+        env: codexRuntimeEnv(env),
         stdio: ['pipe', 'pipe', 'ignore'],
         windowsHide: true,
         windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
@@ -428,7 +430,7 @@ export async function discoverEngineModelCatalog(
       }
     }
   } else if (id === 'codex') {
-    const result = await discoverCodex(binPath)
+    const result = await discoverCodex(binPath, env)
     if (result?.models.length) catalog = withPreset(id, result.models, 'protocol', result.defaultModel)
   } else if (id === 'cursor') {
     const models = parseListedModels(await runText(binPath, ['models']), 'cursor')

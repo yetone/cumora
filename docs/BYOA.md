@@ -35,6 +35,64 @@ model-generated commands.
 
 ---
 
+## Codex login and state isolation
+
+Cumora runs Codex with `CODEX_HOME` and `CODEX_SQLITE_HOME` set to
+`~/.cumora/codex-runtime/`. Agent turns, triage, doctor, and model discovery
+all use this directory, including in unsandboxed compatibility mode. Personal
+Codex config, credentials, memories, and unrelated sessions are not copied or shared.
+Sign in once for Cumora (the same account is fine):
+
+```sh
+cumora agent computer --codex-login
+```
+
+This runs `codex login` with the isolated environment on Windows, macOS, and
+Linux. Authentication errors and `--doctor` point to this command. Account
+quota is still shared when you use the same account. Codex's secure `exec`
+path continues to ignore user config; the persistent app-server reads the
+dedicated runtime's config instead of your personal config.
+
+On macOS/Linux, main agent threads remain persistent and resume after daemon
+restarts. Windows retains its existing one-shot `exec` path. Triage and doctor
+use ephemeral sessions, so they do not accumulate resumable conversations.
+
+**Upgrading existing Codex agents:** the daemon automatically migrates each
+agent's saved Codex thread before starting its runner. No migration command or
+daemon restart is needed. Sign in once to the isolated runtime if you have not
+already done so:
+
+```sh
+cumora agent computer --codex-login
+```
+
+The migration reads the old `CODEX_HOME` (or `~/.codex`), copies only rollouts
+referenced by `~/.cumora/sessions/<agent-id>/codex.session`, and preserves their
+thread IDs. It writes `codex.runtime.session` and keeps the old pointer as
+`codex.session.migrated`. Already migrated agents and new users have no migration
+prompt. If a rollout is unavailable, only that agent is paused and its original
+pointer is preserved; the daemon and other agents keep running. The next agent
+sync retries migration, logging the same error only once per daemon process
+unless the error changes. Restoring the rollout lets that agent start automatically.
+
+If the old home was customized and is no longer in the daemon's environment,
+you can retry manually using that original directory:
+
+```sh
+CODEX_HOME=/path/to/original/codex-home cumora agent computer --migrate-codex-sessions
+```
+
+The command also works without `CODEX_HOME` when the old home is `~/.codex`.
+Re-running it leaves migrated agents' current sessions alone. Signing in and
+waking the agent again clears authentication failures; credentials are not migrated.
+
+The migration leaves personal Codex history and previously generated memories
+in place. Review and remove those through personal Codex separately if desired.
+It does not copy personal credentials, configuration, memories, or unrelated
+threads, and it does not edit Codex's databases. To deliberately start an old
+agent fresh instead of migrating, move its `codex.session` pointer aside while
+the daemon is stopped. Cumora's own memory files remain unchanged.
+
 ## The Computer — the unifying host concept
 
 Rather than bolt BYOA on as a special case, **Computer** is a first-class
@@ -164,8 +222,9 @@ selected engine's sandbox.
    roster. The invariant scaffold (CLI usage, the shared
    `GLANCE_YIELD_RULES`, memory rules, privacy boundary) is delivered
    once per persistent session out-of-band — `--append-system-prompt-file`
-   for Claude. Secure-default Codex uses a one-shot `exec` because its
-   app-server currently cannot exclude user config, MCP, hook, and rule layers.
+   for Claude and `developerInstructions` for Codex's persistent app-server.
+   Codex uses a dedicated state directory; Windows and explicit opt-outs use
+   the one-shot `exec` fallback.
    Compatibility engines retain their native standing-prompt behavior only
    after the operator explicitly enables unsandboxed BYOA.
 6. The engine reads its home (`CLAUDE.md` / `AGENTS.md`, skills,
@@ -304,7 +363,8 @@ fail-closed host boundary:
   `ANTHROPIC_BASE_URL` that won't parse is (it fails toward "custom"). Claude
   Code 2.1.248 or newer is required. Linux/WSL2 also requires `bubblewrap` and
   `socat`; a missing dependency fails the turn.
-- Codex runs one-shot with user config and exec-policy rules ignored. A custom
+- Codex uses an isolated runtime home. Its one-shot fallback ignores user
+  config and exec-policy rules. A custom
   permission profile permits minimal runtime reads and writes only under the
   agent home, disables command network, and gives model-spawned commands only
   an explicit non-secret environment. Hooks, apps, remote plugins, multi-agent
@@ -325,8 +385,8 @@ server assignment cannot make one execute accidentally.
 CUMORA_BYOA_ALLOW_UNSANDBOXED=1 cumora agent computer
 ```
 
-This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides and Codex's
-persistent app-server path. Without it, opaque engine arguments are ignored
+This opt-in also re-enables `CUMORA_*_ARGS` whole-argv overrides.
+Without it, opaque engine arguments are ignored
 because the daemon cannot prove that they preserve the sandbox.
 
 ### Claude reasoning and response preferences
