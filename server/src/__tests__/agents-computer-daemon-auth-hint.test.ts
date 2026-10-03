@@ -26,6 +26,10 @@ test('authFailureHint correctly mentions the relevant CLI/tool for each engine',
   assert.match(authFailureHint('antigravity', 'quota exceeded'), /agy/)
 })
 
+test('Codex authentication guidance signs in to the isolated runtime', () => {
+  assert.match(authFailureHint('codex', 'Not logged in'), /cumora agent computer --codex-login/)
+})
+
 test('authFailureHint handles context overflow and poisoned body sentinels', () => {
   assert.match(authFailureHint('gemini', 'context window overflowed max tokens'), /context window/)
   assert.match(authFailureHint('qwen', 'lone surrogate split emoji poisoned'), /poisoned/)
