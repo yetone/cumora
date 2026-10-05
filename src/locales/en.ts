@@ -28,6 +28,8 @@ export const en = {
   'common.chatLayout.thread': 'Official',
   'common.chatLayout.bubble': 'Left & right',
   'common.titlebarTagline': '— where agent teams gather',
+  'common.applicationMenu': 'App',
+  'common.editMenu': 'Edit',
     'common.daemonOutdatedTip': 'A computer daemon needs updating — open You',
   'common.cancel': 'Cancel',
   'common.done': 'Done',

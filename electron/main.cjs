@@ -606,6 +606,63 @@ let appIsQuitting = false
 
 /** The "real" app window. */
 let mainWindow = null
+
+function windowsTitleBarOverlay() {
+  const dark = nativeTheme.shouldUseDarkColors
+  return {
+    height: 44,
+    color: dark ? '#21252b' : '#FAFCFE',
+    symbolColor: dark ? '#abb2bf' : '#233A53',
+  }
+}
+
+function syncMainWindowTheme() {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  mainWindow.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#21252b' : '#E6F3FB')
+  if (process.platform === 'win32') mainWindow.setTitleBarOverlay(windowsTitleBarOverlay())
+}
+
+function buildWindowsMenu(locale) {
+  const zh = locale === 'zh-CN'
+  return Menu.buildFromTemplate([
+    {
+      id: 'app',
+      label: zh ? '应用' : 'App',
+      submenu: [
+        { label: zh ? '关于 Cumora' : 'About Cumora', click: () => app.showAboutPanel() },
+        { type: 'separator' },
+        { role: 'reload', label: zh ? '重新加载' : 'Reload' },
+        { role: 'forceReload', label: zh ? '强制重新加载' : 'Force Reload' },
+        { role: 'toggleDevTools', label: zh ? '开发者工具' : 'Developer Tools' },
+        { type: 'separator' },
+        { role: 'resetZoom', label: zh ? '实际大小' : 'Actual Size' },
+        { role: 'zoomIn', label: zh ? '放大' : 'Zoom In' },
+        { role: 'zoomOut', label: zh ? '缩小' : 'Zoom Out' },
+        { role: 'togglefullscreen', label: zh ? '切换全屏' : 'Toggle Full Screen' },
+        { type: 'separator' },
+        { role: 'minimize', label: zh ? '最小化' : 'Minimize' },
+        { role: 'close', label: zh ? '关闭窗口' : 'Close Window' },
+        { role: 'quit', label: zh ? '退出 Cumora' : 'Quit Cumora' },
+      ],
+    },
+    {
+      id: 'edit',
+      label: zh ? '编辑' : 'Edit',
+      submenu: [
+        { role: 'undo', label: zh ? '撤销' : 'Undo' },
+        { role: 'redo', label: zh ? '重做' : 'Redo' },
+        { type: 'separator' },
+        { role: 'cut', label: zh ? '剪切' : 'Cut' },
+        { role: 'copy', label: zh ? '复制' : 'Copy' },
+        { role: 'paste', label: zh ? '粘贴' : 'Paste' },
+        { role: 'pasteAndMatchStyle', label: zh ? '粘贴为纯文本' : 'Paste as Plain Text' },
+        { role: 'delete', label: zh ? '删除' : 'Delete' },
+        { type: 'separator' },
+        { role: 'selectAll', label: zh ? '全选' : 'Select All' },
+      ],
+    },
+  ])
+}
 /** Frameless transparent always-on-top window pinned to the top-right
  *  of the primary display. Renders the same React bundle with the
  *  `#notifications` hash so it shows only the toast stack. Hidden when
@@ -1143,7 +1200,8 @@ function createWindow() {
     show: false,
     backgroundColor: '#E6F3FB',
     icon: ICON_PATH,
-    titleBarStyle: process.platform === 'darwin' ? 'hidden' : 'default',
+    titleBarStyle: process.platform === 'darwin' || process.platform === 'win32' ? 'hidden' : 'default',
+    ...(process.platform === 'win32' ? { titleBarOverlay: windowsTitleBarOverlay() } : {}),
     trafficLightPosition: { x: 16, y: 15 },
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
@@ -1156,6 +1214,12 @@ function createWindow() {
       backgroundThrottling: false,
     },
   })
+
+  if (process.platform === 'win32') {
+    // Keep native menu accelerators registered without reserving a menu-bar row.
+    Menu.setApplicationMenu(buildWindowsMenu(app.getLocale().startsWith('zh') ? 'zh-CN' : 'en'))
+    mainWindow.setMenuBarVisibility(false)
+  }
 
   // Forward native OS-level focus state to the renderer. We can't rely on
   // `document.hasFocus()` from inside the renderer — in Electron on macOS
@@ -1431,20 +1495,29 @@ ipcMain.handle('clipboard:write-text', (event, value) => {
   if (clipboard.readText() !== value) throw new Error('clipboard write failed')
 })
 
+ipcMain.handle('window:show-menu', (event, options) => {
+  if (process.platform !== 'win32' || !mainWindow || mainWindow.isDestroyed()
+      || event.sender !== mainWindow.webContents) return
+  const { menu, locale, x, y } = options ?? {}
+  if ((menu !== 'app' && menu !== 'edit') || !Number.isFinite(x) || !Number.isFinite(y)) return
+  const [width, height] = mainWindow.getContentSize()
+  const zoom = mainWindow.webContents.getZoomFactor()
+  buildWindowsMenu(locale).getMenuItemById(menu).submenu.popup({
+    window: mainWindow,
+    x: Math.max(0, Math.min(width - 1, Math.round(x * zoom))),
+    y: Math.max(0, Math.min(height - 1, Math.round(y * zoom))),
+  })
+})
+
 ipcMain.on('theme:set', (_event, source) => {
   if (source !== 'system' && source !== 'light' && source !== 'dark') return
   nativeTheme.themeSource = source
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    const dark = source === 'dark' || (source === 'system' && nativeTheme.shouldUseDarkColors)
-    mainWindow.setBackgroundColor(dark ? '#21252b' : '#E6F3FB')
-  }
+  syncMainWindowTheme()
 })
 
 nativeTheme.on('updated', () => {
   if (nativeTheme.themeSource !== 'system') return
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.setBackgroundColor(nativeTheme.shouldUseDarkColors ? '#21252b' : '#E6F3FB')
-  }
+  syncMainWindowTheme()
 })
 
 // Renderer asks main to open a URL in the user's default browser

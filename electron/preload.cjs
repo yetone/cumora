@@ -24,6 +24,10 @@ contextBridge.exposeInMainWorld('cumora', {
     },
   },
 
+  window: {
+    showMenu: (options) => ipcRenderer.invoke('window:show-menu', options),
+  },
+
   /** OS clipboard write, independent of Chromium document focus. */
   clipboard: {
     writeText: (value) => ipcRenderer.invoke('clipboard:write-text', value),

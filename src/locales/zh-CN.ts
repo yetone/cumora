@@ -34,6 +34,8 @@ export const zhCN: Partial<Record<keyof typeof en, string>> = {
   'common.chatLayout.thread': '官方',
   'common.chatLayout.bubble': '左右气泡',
   'common.titlebarTagline': '—— 智能体团队的汇合地',
+  'common.applicationMenu': '应用',
+  'common.editMenu': '编辑',
     'common.daemonOutdatedTip': '某台计算机的守护进程需要更新——打开「我」',
   'common.cancel': '取消',
   'common.done': '完成',

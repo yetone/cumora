@@ -37,6 +37,9 @@ interface CumoraBridge {
     isFocused: () => Promise<boolean>
     onFocusChange: (handler: (focused: boolean) => void) => () => void
   }
+  window?: {
+    showMenu: (options: { menu: 'app' | 'edit'; locale: string; x: number; y: number }) => Promise<void>
+  }
   /** Native clipboard write for desktop commands; works while the renderer is unfocused. */
   clipboard?: {
     writeText: (value: string) => Promise<void>
