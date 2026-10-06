@@ -59,6 +59,15 @@ function useFakeCliPath(binDir: string): void {
   process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`
 }
 
+/** Poll until a log line matches — a fixed sleep races a loaded machine. */
+async function waitForLog(logs: string[], pattern: RegExp, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!logs.some((line) => pattern.test(line))) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for log ${pattern}; got ${JSON.stringify(logs)}`)
+    await delay(10)
+  }
+}
+
 test('engine subprocesses always suppress Windows console windows', () => {
   assert.deepEqual(headlessSpawnOptions({ shell: true, cwd: 'C:\\agent home', windowsHide: false }), {
     shell: true,
@@ -435,7 +444,9 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   })
 
   assert.ok(session)
-  await delay(50)
+  // Wait for the death itself rather than a fixed delay: under full-suite load
+  // a short sleep could end before the fake CLI exited.
+  await waitForLog(logs, /\[session\] engine process died/)
   const result = await session.send('wake')
 
   assert.equal(result.exitCode, 1)
@@ -447,6 +458,41 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   assert.equal(logs.length, 2)
   assert.match(logs[1] ?? '', /\[session\] engine process died .*exit 1/)
   })
+
+test('persistent Claude startup failure keeps stderr when the process exits after the first send', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-engine-session-late-exit-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir)
+  await mkdir(home)
+  // Prints the reason at startup, then lingers long enough for send() to find
+  // the process still alive — the ordering that used to lose the reason.
+  await writeFakeCli(
+    binDir,
+    'claude',
+    "process.stderr.write('Claude Code error: subscription expired\\n')\nsetTimeout(() => process.exit(1), 300)\n",
+  )
+  useFakeCliPath(binDir)
+
+  const logs: string[] = []
+  const session = getAdapter('claude').startSession?.({
+    home,
+    env: secureClaudeEnv(root),
+    model: null,
+    fastModel: null,
+    onLog: (line) => logs.push(line),
+  })
+
+  assert.ok(session)
+  await waitForLog(logs, /subscription expired/)
+  assert.equal(session.alive, true)
+  const result = await session.send('wake')
+
+  assert.equal(result.exitCode, 1)
+  assert.match(result.error ?? '', /subscription expired/i)
+  assert.match(logs.at(-1) ?? '', /\[session\] engine process died MID-TURN: .*exit 1/)
+})
 
 test('persistent Claude classifies a rejected resume from its result event', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-stale-resume-'))

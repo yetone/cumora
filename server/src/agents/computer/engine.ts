@@ -1316,6 +1316,7 @@ class ClaudeSession implements EngineSession {
   private stdoutTail: string[] = []
   private pendingTimer: ReturnType<typeof setTimeout> | null = null
   private steerQueue: string[] = []
+  private sentFirstTurn = false
   readonly carriesStandingPrompt: boolean
 
   constructor(bin: string, args: string[], opts: EngineSessionArgs, carriesStandingPrompt: boolean) {
@@ -1349,7 +1350,14 @@ class ClaudeSession implements EngineSession {
       return Promise.resolve(classifyEngineResult({ exitCode, error: detail || 'engine session is not alive (process gone)', sessionId: this.sid }, this.resumePending))
     }
     return new Promise<EngineRunResult>((resolve) => {
-      this.pending = { resolve, stderr: [], stdout: [] }
+      // A CLI that fails at startup (expired auth, bad config) prints its reason
+      // before the first turn is sent, then exits. When the exit lands after
+      // send(), die() only sees this turn's output, so the first turn inherits
+      // whatever the process printed before it — otherwise the reason is lost
+      // and the turn fails as a bare "process exited with code 1".
+      const inherit = !this.sentFirstTurn
+      this.sentFirstTurn = true
+      this.pending = { resolve, stderr: inherit ? [...this.stderrTail] : [], stdout: inherit ? [...this.stdoutTail] : [] }
       // Opt-in runaway backstop only (CUMORA_TURN_TIMEOUT_MS); OFF by default so a
       // legit long task (e.g. a multi-hour Bash) is never killed mid-work. When set,
       // abort + respawn past the cap.
