@@ -107,7 +107,19 @@ export async function resetAllTables(): Promise<void> {
   if (rows.length > 0) {
     // One transaction avoids repeatedly truncating the same FK descendants
     // and syncing dozens of separate commits before every test.
-    await pool.query(`TRUNCATE TABLE ${rows.map(({ name }) => name).join(', ')} CASCADE`)
+    const truncate = `TRUNCATE TABLE ${rows.map(({ name }) => name).join(', ')} CASCADE`
+    // Work a previous test left running (a socket's authorization or hydration
+    // query) can still hold row locks that TRUNCATE's ACCESS EXCLUSIVE locks
+    // collide with. Postgres resolves that by aborting the TRUNCATE as the
+    // deadlock victim, so retrying is safe: only the reset itself is redone.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await pool.query(truncate)
+        break
+      } catch (error) {
+        if ((error as { code?: string }).code !== '40P01' || attempt >= 5) throw error
+      }
+    }
   }
 }
 
