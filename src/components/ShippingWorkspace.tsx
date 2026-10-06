@@ -128,7 +128,7 @@ export function ShippingWorkspace({ compact = false }: { compact?: boolean }) {
       {showDetail && (
         <main className={cn('h-full min-w-0 overflow-y-auto bg-[var(--ship-canvas)]', compact && 'absolute inset-0')}>
           {compact && <button type="button" onClick={() => void select(null)} className="sticky top-0 z-20 flex h-11 w-full items-center gap-1 border-b border-ink-100 bg-cloud/95 px-3 text-[12px] font-semibold text-skype-deep backdrop-blur"><IBack className="h-4 w-4" /> {t('ship.allFeatures')}</button>}
-          {loadingFeatureId === selectedId && !detail ? <Centered title={t('ship.openingContract')} /> : detail ? <FeatureDetail feature={detail} /> : <Centered title={t('ship.pickOne')} />}
+          {selectedId && loadingFeatureId === selectedId && !detail ? <Centered title={t('ship.openingContract')} /> : detail ? <FeatureDetail feature={detail} /> : <Centered title={t('ship.pickOne')} />}
         </main>
       )}
     </div>
