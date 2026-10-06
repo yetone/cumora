@@ -36,11 +36,16 @@
  *                              pure base-URL swap (server/src/orcarouter.ts),
  *                              since OrcaRouter speaks the Responses API
  *                              natively — no translation needed.
+ *   - `cheaperinference/<model>` → Cheaper Inference
+ *                              (https://cheaperinference.com) via the same
+ *                              pure base-URL swap
+ *                              (server/src/cheaperinference.ts).
  * Everything else about the returned client (chat.completions, images,
  * embeddings, non-prefixed responses.create calls) is the same object
  * callers already know.
  */
 import OpenAI from 'openai'
+import { cheaperinferenceResponsesCreate, isCheaperInferenceModel } from './cheaperinference.js'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
@@ -92,6 +97,9 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *    - `orcarouter/<model>` → OrcaRouter (server/src/orcarouter.ts), a pure
  *                             base-URL swap — OrcaRouter speaks the Responses
  *                             API natively.
+ *    - `cheaperinference/<model>` → Cheaper Inference
+ *                             (server/src/cheaperinference.ts), the same pure
+ *                             base-URL swap.
  *
  *  Model, not tenant, decides the provider: `getLlmClient` is resolved
  *  once per tenant/hop before the model for that specific call is even
@@ -102,13 +110,20 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *  images, embeddings) passes through to the real client untouched. */
 let novitaUnconfiguredWarned = false
 let orcarouterUnconfiguredWarned = false
+let cheaperinferenceUnconfiguredWarned = false
 /** One log line per provider, not one per call — this fires on every hop of
  *  every turn of an agent whose model names an unconfigured provider. */
-function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter', model: string | undefined): void {
+function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter' | 'Cheaper Inference', model: string | undefined): void {
   if (provider === 'Novita') {
     if (novitaUnconfiguredWarned) return
     novitaUnconfiguredWarned = true
     console.warn(`[llm] model "${model}" requests Novita but NOVITA_API_KEY is unset — using the tenant's normal client instead`)
+    return
+  }
+  if (provider === 'Cheaper Inference') {
+    if (cheaperinferenceUnconfiguredWarned) return
+    cheaperinferenceUnconfiguredWarned = true
+    console.warn(`[llm] model "${model}" requests Cheaper Inference but CHEAPER_INFERENCE_API_KEY is unset — using the tenant's normal client instead`)
     return
   }
   if (orcarouterUnconfiguredWarned) return
@@ -143,6 +158,14 @@ function withProviderRouting(client: OpenAI): OpenAI {
                 return orcarouterResponsesCreate(args, opts)
               }
               warnProviderUnconfiguredOnce('OrcaRouter', args.model)
+            } else if (isCheaperInferenceModel(args.model)) {
+              // Same degrade-not-die guard for Cheaper Inference: an unset key
+              // must fall through to the tenant's normal client, not send a
+              // bare bearer to api.cheaperinference.com.
+              if (env.CHEAPER_INFERENCE_API_KEY) {
+                return cheaperinferenceResponsesCreate(args, opts)
+              }
+              warnProviderUnconfiguredOnce('Cheaper Inference', args.model)
             }
             return (real.create as (a: unknown, o?: unknown) => unknown)(args, opts)
           }
