@@ -1,6 +1,5 @@
-// Bundle the BYOA daemon into a single standalone, dependency-free Node
-// executable for the public `cumora` npm package. The daemon only uses Node
-// builtins + global fetch, so the output needs nothing installed beyond Node.
+// Bundle the BYOA daemon and its pure-JS helpers into a standalone Node
+// executable. The output needs nothing installed beyond Node.
 import { build } from 'esbuild'
 import { existsSync, chmodSync, readFileSync } from 'node:fs'
 import { resolve, dirname } from 'node:path'

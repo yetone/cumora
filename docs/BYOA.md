@@ -52,6 +52,9 @@ Linux. Authentication errors and `--doctor` point to this command. Account
 quota is still shared when you use the same account. Codex's secure `exec`
 path continues to ignore user config; the persistent app-server reads the
 dedicated runtime's config instead of your personal config.
+Personal `model` and `model_providers` settings therefore do not carry over to
+that app-server or model discovery. Configure them in the runtime's `config.toml`
+if needed.
 
 On macOS/Linux, main agent threads remain persistent and resume after daemon
 restarts. Windows retains its existing one-shot `exec` path. Triage and doctor
@@ -59,21 +62,23 @@ use ephemeral sessions, so they do not accumulate resumable conversations.
 
 **Upgrading existing Codex agents:** the daemon automatically migrates each
 agent's saved Codex thread before starting its runner. No migration command or
-daemon restart is needed. Sign in once to the isolated runtime if you have not
-already done so:
-
-```sh
-cumora agent computer --codex-login
-```
+daemon restart is needed. Sign in to the isolated runtime using the command above.
 
 The migration reads the old `CODEX_HOME` (or `~/.codex`), copies only rollouts
 referenced by `~/.cumora/sessions/<agent-id>/codex.session`, and preserves their
-thread IDs. It writes `codex.runtime.session` and keeps the old pointer as
+thread IDs. Revised and compressed rollouts are supported, including their
+referenced paginated history in `sessions` or `archived_sessions`.
+When an old state database exists, migration reads its selected rollout path
+without copying the database. This one-time lookup requires Node.js 22.13 or newer;
+older Node.js versions preserve the pointer and report how to retry.
+An archived thread must be unarchived in the original Codex home before migration.
+It writes `codex.runtime.session` and keeps the old pointer as
 `codex.session.migrated`. Already migrated agents and new users have no migration
 prompt. If a rollout is unavailable, only that agent is paused and its original
 pointer is preserved; the daemon and other agents keep running. The next agent
 sync retries migration, logging the same error only once per daemon process
-unless the error changes. Restoring the rollout lets that agent start automatically.
+unless the error changes. Conversations with pending messages also receive a
+failure notice. Restoring the rollout lets that agent start automatically.
 
 If the old home was customized and is no longer in the daemon's environment,
 you can retry manually using that original directory:
@@ -82,16 +87,26 @@ you can retry manually using that original directory:
 CODEX_HOME=/path/to/original/codex-home cumora agent computer --migrate-codex-sessions
 ```
 
+In PowerShell:
+
+```powershell
+$env:CODEX_HOME = 'C:\path\to\original\codex-home'
+cumora agent computer --migrate-codex-sessions
+```
+
+Use the original personal home as the source, not `~/.cumora/codex-runtime`.
+One failed agent does not stop the manual command from migrating others; a
+partial failure reports both the migrated agents and the errors, and exits nonzero.
+
 The command also works without `CODEX_HOME` when the old home is `~/.codex`.
 Re-running it leaves migrated agents' current sessions alone. Signing in and
 waking the agent again clears authentication failures; credentials are not migrated.
 
 The migration leaves personal Codex history and previously generated memories
 in place. Review and remove those through personal Codex separately if desired.
-It does not copy personal credentials, configuration, memories, or unrelated
-threads, and it does not edit Codex's databases. To deliberately start an old
-agent fresh instead of migrating, move its `codex.session` pointer aside while
-the daemon is stopped. Cumora's own memory files remain unchanged.
+To deliberately start an old agent fresh instead of migrating, move its
+`codex.session` pointer aside while the daemon is stopped.
+Cumora's own memory files remain unchanged.
 
 ## The Computer — the unifying host concept
 

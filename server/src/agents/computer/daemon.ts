@@ -50,7 +50,7 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 import { CODEX_LOGIN_COMMAND, CODEX_MIGRATE_COMMAND, CODEX_SESSION_SCOPE, codexRuntimeHome } from './codex-runtime.js'
 import { migrateCodexSession, migrateCodexSessions } from './codex-session-migration.js'
@@ -673,6 +673,18 @@ async function runtimeGet<T>(
   } catch { return null }
 }
 
+async function failureConversationIds(serverUrl: string, token: string, conversationId: string | null): Promise<string[]> {
+  if (conversationId) return [conversationId]
+  // A diagnostic lookup must not advance the agent's inbox freshness baseline.
+  const inbox = await runtimeGet<RuntimeInboxResponse>(serverUrl, '/inbox?probe=1', token)
+  const ids = new Set<string>()
+  for (const row of inbox?.rows ?? []) {
+    if (typeof row.conversation_id === 'string' && row.conversation_id) ids.add(row.conversation_id)
+    if (ids.size >= 5) break
+  }
+  return [...ids]
+}
+
 /** Should this 20s fallback tick actually drain the inbox?
  *
  *  Yes when the wake-stream is not provably alive: never connected, or silent
@@ -806,7 +818,7 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (POISONED_BODY_RE.test(detail)) {
     return 'A malformed character (a split emoji) had poisoned the agent\'s session. It has been reset automatically — just wake the agent again.'
   }
-  if (!/(auth|login|logged in|sign.?in|token|quota|credit|billing|subscription|rate limit|usage limit|api key)/i.test(detail)) {
+  if (classifyEngineFailure(detail) !== 'authentication' && !/(auth|login|token|quota|credit|billing|subscription|rate limit|usage limit|api key)/i.test(detail)) {
     return 'Check the daemon terminal for details, then wake the agent again.'
   }
   if (engine === 'claude') {
@@ -2332,7 +2344,7 @@ export class AgentRunner {
       })
     }
     const hint = authFailureHint(this.adapter.id, args.error)
-    const conversationIds = await this.failureConversationIds(args.token, args.conversationId)
+    const conversationIds = await failureConversationIds(this.cfg.serverUrl, args.token, args.conversationId)
     await Promise.all(conversationIds.map((conversationId) => runtimeBest(this.cfg.serverUrl, '/notices', args.token, {
       conversationId,
       agentId: this.agent.id,
@@ -2341,20 +2353,6 @@ export class AgentRunner {
       dedupeKey: `byoa_engine_failed:${this.agent.id}:${conversationId}:${hashText(args.error)}`,
       dedupeTtlSec: 900,
     })))
-  }
-
-  private async failureConversationIds(token: string, conversationId: string | null): Promise<string[]> {
-    if (conversationId) return [conversationId]
-    // PROBE: we're only looking up convo ids to notify of an engine failure —
-    // we don't show these messages to the agent. Use ?probe=1 so the server
-    // does NOT advance the freshness-preflight baseline for this read.
-    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', token)
-    const ids = new Set<string>()
-    for (const row of inbox?.rows ?? []) {
-      if (typeof row.conversation_id === 'string' && row.conversation_id) ids.add(row.conversation_id)
-      if (ids.size >= 5) break
-    }
-    return [...ids]
   }
 
   /** Preload global + current-project memory indexes. Existing
@@ -3503,7 +3501,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
 
   const runners = new Map<string, AgentRunner>()
-  const codexMigrationFailures = new Map<string, string>()
+  const codexMigrationFailures = new Map<string, { message: string; reported: Set<string>; token: string; tokenExpiresAt: number }>()
   const engineInventoryStabilizer = new EngineInventoryStabilizer()
 
   const syncOnce = async (): Promise<void> => {
@@ -3556,10 +3554,36 @@ async function doRun(serverOverride?: string): Promise<void> {
           codexMigrationFailures.delete(agent.id)
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err)
-          if (codexMigrationFailures.get(agent.id) !== message) {
-            codexMigrationFailures.set(agent.id, message)
-            console.error(`[computer] ${agent.id} paused: ${message} Restore the rollout in the original Codex home, or run \`${CODEX_MIGRATE_COMMAND}\` with CODEX_HOME set to that home. Migration will be retried automatically.`)
+          const remedy = `Restore the rollout in the original Codex home, or run \`${CODEX_MIGRATE_COMMAND}\` with CODEX_HOME set to that home. Migration retries automatically.`
+          let failure = codexMigrationFailures.get(agent.id)
+          if (!failure || failure.message !== message) {
+            failure = { message, reported: new Set(), token: '', tokenExpiresAt: 0 }
+            codexMigrationFailures.set(agent.id, failure)
+            console.error(`[computer] ${agent.id} paused: ${message} ${remedy}`)
           }
+          try {
+            if (!failure.token || Date.now() >= failure.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) {
+              const { token, expiresInSeconds } = await api<{ token: string; expiresInSeconds: number }>(cfg.serverUrl, `/api/agents/${agent.id}/runtime-token`, {
+                method: 'POST', headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+                body: JSON.stringify({ providerProfile: agent.providerProfile ?? null }),
+              })
+              failure.token = token
+              failure.tokenExpiresAt = Date.now() + expiresInSeconds * 1000
+            }
+            const token = failure.token
+            const reported = failure.reported
+            const conversationIds = await failureConversationIds(cfg.serverUrl, token, null)
+            await Promise.all(conversationIds.filter(id => !reported.has(id)).map(async conversationId => {
+              const result = await runtimeBest(cfg.serverUrl, '/notices', token, {
+                conversationId,
+                noticeKind: 'byoa_engine_failed',
+                text: `${agent.name} is paused because its Codex session could not be migrated: ${conciseError(message).split(homedir()).join('~')}\n${remedy}`,
+                dedupeKey: `codex_migration_failed:${agent.id}:${conversationId}:${hashText(message)}`,
+                dedupeTtlSec: 900,
+              })
+              if (result !== null) reported.add(conversationId)
+            }))
+          } catch { /* Retry notification on the next sync without blocking other agents. */ }
           continue
         }
       }

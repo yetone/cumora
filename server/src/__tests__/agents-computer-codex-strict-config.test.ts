@@ -28,10 +28,16 @@ import { getAdapter } from '../agents/computer/engine.js'
 
 const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
+const ORIGINAL_HOME = process.env.HOME
+const ORIGINAL_USERPROFILE = process.env.USERPROFILE
 const tempDirs: string[] = []
 
 afterEach(async () => {
   process.env.PATH = ORIGINAL_PATH
+  if (ORIGINAL_HOME === undefined) delete process.env.HOME
+  else process.env.HOME = ORIGINAL_HOME
+  if (ORIGINAL_USERPROFILE === undefined) delete process.env.USERPROFILE
+  else process.env.USERPROFILE = ORIGINAL_USERPROFILE
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
@@ -46,6 +52,8 @@ interface Fixture { root: string; home: string; env: NodeJS.ProcessEnv }
 async function fixture(homeName: string): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-cfg-'))
   tempDirs.push(root)
+  process.env.HOME = root
+  process.env.USERPROFILE = root
   const binDir = join(root, 'bin')
   // The reporter asked specifically for a home with ordinary separators and
   // spaces: that is where the quoting in the override has to hold up.

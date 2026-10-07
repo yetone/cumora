@@ -383,7 +383,13 @@ function resolveCodexSpawn(): CodexSpawn {
 }
 
 /** Interactive setup uses exactly the same home as every background call. */
-export function loginCodexRuntime(): Promise<void> {
+export async function loginCodexRuntime(): Promise<void> {
+  const bin = await resolveBinPath('codex')
+  if (!bin || !await probeLocalEngineVersionWithRetry('codex', bin)) {
+    throw new Error(bin
+      ? 'Codex CLI was found on PATH, but its version could not be verified. Check `codex --version`, then rerun `cumora agent computer --codex-login`.'
+      : 'Codex CLI is unavailable on PATH. Install it with `npm install -g @openai/codex`, then rerun `cumora agent computer --codex-login`.')
+  }
   const { command, shell, argsPrefix } = resolveCodexSpawn()
   return new Promise((resolve, reject) => {
     const child = spawn(command, [...argsPrefix, 'login'], {
@@ -609,7 +615,7 @@ const RESUME_NOT_FOUND_RE = new RegExp([
 
 const ENGINE_CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceeded|maximum context|reached its context|prompt is too long|input is too long|too many tokens/i
 const ENGINE_RATE_LIMIT_RE = /rate.?limit|usage limit|quota|too many requests|overloaded|over capacity|credit balance is too low/i
-const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?:please )?(?:sign|log) ?in|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
+const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?<![\w./\\-])(?:sign|log)[ -]?in(?![\w/\\-]|\.\w)|\brun \/login(?![\w/\\-]|\.\w)|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
 const ENGINE_TRANSPORT_RE = /ECONN(?:RESET|REFUSED)|EPIPE|socket hang up|network|connection (?:closed|lost|terminated|timed out)|transport|process (?:exited|terminated)|failed to (?:spawn|write)/i
 
 export function classifyEngineFailure(diagnostic: string, hadResume = false): EngineFailureKind {

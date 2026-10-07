@@ -7,7 +7,7 @@ import assert from 'node:assert/strict'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
-import { afterEach, test } from 'node:test'
+import { afterEach, beforeEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
 import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
@@ -17,6 +17,8 @@ const IS_WIN = process.platform === 'win32'
 const ORIGINAL_PATH = process.env.PATH
 const ORIGINAL_PATHEXT = process.env.PATHEXT
 const ORIGINAL_UNSANDBOXED = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+const ORIGINAL_HOME = process.env.HOME
+const ORIGINAL_USERPROFILE = process.env.USERPROFILE
 const tempDirs: string[] = []
 // Sessions spawn a child process. Track them so a FAILING assertion still tears
 // the child down — otherwise it outlives the test and the runner never exits.
@@ -67,6 +69,13 @@ test('engine subprocesses always suppress Windows console windows', () => {
   })
 })
 
+beforeEach(async () => {
+  const home = await mkdtemp(join(tmpdir(), 'cumora-engine-test-home-'))
+  tempDirs.push(home)
+  process.env.HOME = home
+  process.env.USERPROFILE = home
+})
+
 afterEach(async () => {
   for (const s of liveSessions.splice(0)) { try { await s.stop() } catch { /* already gone */ } }
   if (ORIGINAL_PATH === undefined) delete process.env.PATH
@@ -75,6 +84,10 @@ afterEach(async () => {
   else process.env.PATHEXT = ORIGINAL_PATHEXT
   if (ORIGINAL_UNSANDBOXED === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
   else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = ORIGINAL_UNSANDBOXED
+  if (ORIGINAL_HOME === undefined) delete process.env.HOME
+  else process.env.HOME = ORIGINAL_HOME
+  if (ORIGINAL_USERPROFILE === undefined) delete process.env.USERPROFILE
+  else process.env.USERPROFILE = ORIGINAL_USERPROFILE
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
