@@ -50,8 +50,10 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
+import { CODEX_LOGIN_COMMAND, CODEX_MIGRATE_COMMAND, CODEX_SESSION_SCOPE, codexRuntimeHome } from './codex-runtime.js'
+import { migrateCodexSession, migrateCodexSessions } from './codex-session-migration.js'
 import { runWithSessionRecovery } from './session-recovery.js'
 
 export { conversationHeader }
@@ -582,6 +584,7 @@ function parseArgs(argv: string[]): {
   pair?: string; server?: string; engine?: string; provider?: string
   installService?: boolean; uninstallService?: boolean; restart?: boolean; stop?: boolean
   status?: boolean; logs?: boolean; version?: boolean; doctor?: boolean; help?: boolean
+  codexLogin?: boolean; migrateCodexSessions?: boolean
 } {
   const out: ReturnType<typeof parseArgs> = {}
   for (let i = 0; i < argv.length; i++) {
@@ -601,6 +604,8 @@ function parseArgs(argv: string[]): {
     else if (argv[i] === '--status') out.status = true
     else if (argv[i] === '--logs') out.logs = true
     else if (argv[i] === '--doctor' || argv[i] === 'doctor') out.doctor = true
+    else if (argv[i] === '--codex-login') out.codexLogin = true
+    else if (argv[i] === '--migrate-codex-sessions') out.migrateCodexSessions = true
     else if (argv[i] === '--version' || argv[i] === '-v') out.version = true
   }
   return out
@@ -666,6 +671,18 @@ async function runtimeGet<T>(
     })
     return res.ok ? await res.json().catch(() => null) as T | null : null
   } catch { return null }
+}
+
+async function failureConversationIds(serverUrl: string, token: string, conversationId: string | null): Promise<string[]> {
+  if (conversationId) return [conversationId]
+  // A diagnostic lookup must not advance the agent's inbox freshness baseline.
+  const inbox = await runtimeGet<RuntimeInboxResponse>(serverUrl, '/inbox?probe=1', token)
+  const ids = new Set<string>()
+  for (const row of inbox?.rows ?? []) {
+    if (typeof row.conversation_id === 'string' && row.conversation_id) ids.add(row.conversation_id)
+    if (ids.size >= 5) break
+  }
+  return [...ids]
 }
 
 /** Should this 20s fallback tick actually drain the inbox?
@@ -801,14 +818,14 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (POISONED_BODY_RE.test(detail)) {
     return 'A malformed character (a split emoji) had poisoned the agent\'s session. It has been reset automatically — just wake the agent again.'
   }
-  if (!/(auth|login|token|quota|credit|billing|subscription|rate limit|usage limit|api key)/i.test(detail)) {
+  if (classifyEngineFailure(detail) !== 'authentication' && !/(auth|login|token|quota|credit|billing|subscription|rate limit|usage limit|api key)/i.test(detail)) {
     return 'Check the daemon terminal for details, then wake the agent again.'
   }
   if (engine === 'claude') {
     return 'Open Claude Code on that computer and sign in, refresh quota, or add credits, then wake the agent again.'
   }
   if (engine === 'codex') {
-    return 'Open Codex on that computer and refresh its login or quota, then wake the agent again.'
+    return `Run \`${CODEX_LOGIN_COMMAND}\` on that computer to sign in to Cumora's isolated Codex runtime (or check the account quota), then wake the agent again.`
   }
   if (engine === 'grok') {
     return 'Open Grok Build on that computer and run `grok login`, or set XAI_API_KEY, then wake the agent again.'
@@ -843,7 +860,7 @@ function missingEngineMessage(): string {
     '',
     'Secure default — install and sign in to at least one of:',
     '  - Claude Code: install the `claude` CLI, then run `claude` once to sign in',
-    '  - Codex: install the `codex` CLI, then run `codex` once to sign in',
+    `  - Codex: install the \`codex\` CLI, then run \`${CODEX_LOGIN_COMMAND}\``,
     '',
     'Unsandboxed compatibility engines (explicit opt-in required):',
     '  - Grok Build: install the `grok` CLI, then run `grok login` once',
@@ -917,6 +934,8 @@ function helpText(): string {
     '                       Cumora -> You -> Computers -> Add a computer)',
     '  --server <url>       Cumora server URL (default: ' + DEFAULT_SERVER + ')',
     '  --engine <id>        force an engine: ' + ENGINE_IDS.join(' | ') + '',
+    '  --codex-login        sign in to Cumora\'s isolated Codex runtime',
+    '  --migrate-codex-sessions  copy existing Cumora Codex threads into that runtime',
     '',
     'Background service:',
     '  --install-service    install + start the background supervisor',
@@ -1860,7 +1879,8 @@ export class AgentRunner {
     // The profile is a third dimension of session identity alongside agent and
     // engine: a different endpoint/account owns a different transcript, so its
     // session id must never be offered to another profile's provider.
-    this.sessionStore = new EngineSessionStore(SESSIONS_DIR, agent.id, engine, providerProfileFingerprint(provider) || undefined)
+    this.sessionStore = new EngineSessionStore(SESSIONS_DIR, agent.id, engine,
+      engine === 'codex' ? CODEX_SESSION_SCOPE : providerProfileFingerprint(provider) || undefined)
     this.adapter = getAdapter(engine)
   }
 
@@ -2324,7 +2344,7 @@ export class AgentRunner {
       })
     }
     const hint = authFailureHint(this.adapter.id, args.error)
-    const conversationIds = await this.failureConversationIds(args.token, args.conversationId)
+    const conversationIds = await failureConversationIds(this.cfg.serverUrl, args.token, args.conversationId)
     await Promise.all(conversationIds.map((conversationId) => runtimeBest(this.cfg.serverUrl, '/notices', args.token, {
       conversationId,
       agentId: this.agent.id,
@@ -2333,20 +2353,6 @@ export class AgentRunner {
       dedupeKey: `byoa_engine_failed:${this.agent.id}:${conversationId}:${hashText(args.error)}`,
       dedupeTtlSec: 900,
     })))
-  }
-
-  private async failureConversationIds(token: string, conversationId: string | null): Promise<string[]> {
-    if (conversationId) return [conversationId]
-    // PROBE: we're only looking up convo ids to notify of an engine failure —
-    // we don't show these messages to the agent. Use ?probe=1 so the server
-    // does NOT advance the freshness-preflight baseline for this read.
-    const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox?probe=1', token)
-    const ids = new Set<string>()
-    for (const row of inbox?.rows ?? []) {
-      if (typeof row.conversation_id === 'string' && row.conversation_id) ids.add(row.conversation_id)
-      if (ids.size >= 5) break
-    }
-    return [...ids]
   }
 
   /** Preload global + current-project memory indexes. Existing
@@ -3496,6 +3502,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
 
   const runners = new Map<string, AgentRunner>()
+  const codexMigrationFailures = new Map<string, { message: string; reported: Set<string>; token: string; tokenExpiresAt: number }>()
   const engineInventoryStabilizer = new EngineInventoryStabilizer()
 
   const syncOnce = async (): Promise<void> => {
@@ -3540,6 +3547,47 @@ async function doRun(serverOverride?: string): Promise<void> {
         runners.delete(agent.id)
         await existing.stop({ forceEngine: true })
       }
+      if (engine === 'codex') {
+        try {
+          // Migrate before creating a runner or broker. A missing transcript
+          // pauses only this agent; retry on the next sync without log spam.
+          await migrateCodexSession(agent.id)
+          codexMigrationFailures.delete(agent.id)
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err)
+          const remedy = `Restore the rollout in the original Codex home, or run \`${CODEX_MIGRATE_COMMAND}\` with CODEX_HOME set to that home. Migration retries automatically.`
+          let failure = codexMigrationFailures.get(agent.id)
+          if (!failure || failure.message !== message) {
+            failure = { message, reported: new Set(), token: '', tokenExpiresAt: 0 }
+            codexMigrationFailures.set(agent.id, failure)
+            console.error(`[computer] ${agent.id} paused: ${message} ${remedy}`)
+          }
+          try {
+            if (!failure.token || Date.now() >= failure.tokenExpiresAt - TOKEN_REFRESH_SKEW_MS) {
+              const { token, expiresInSeconds } = await api<{ token: string; expiresInSeconds: number }>(cfg.serverUrl, `/api/agents/${agent.id}/runtime-token`, {
+                method: 'POST', headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+                body: JSON.stringify({ providerProfile: agent.providerProfile ?? null }),
+              })
+              failure.token = token
+              failure.tokenExpiresAt = Date.now() + expiresInSeconds * 1000
+            }
+            const token = failure.token
+            const reported = failure.reported
+            const conversationIds = await failureConversationIds(cfg.serverUrl, token, null)
+            await Promise.all(conversationIds.filter(id => !reported.has(id)).map(async conversationId => {
+              const result = await runtimeBest(cfg.serverUrl, '/notices', token, {
+                conversationId,
+                noticeKind: 'byoa_engine_failed',
+                text: `${agent.name} is paused because its Codex session could not be migrated: ${conciseError(message).split(homedir()).join('~')}\n${remedy}`,
+                dedupeKey: `codex_migration_failed:${agent.id}:${conversationId}:${hashText(message)}`,
+                dedupeTtlSec: 900,
+              })
+              if (result !== null) reported.add(conversationId)
+            }))
+          } catch { /* Retry notification on the next sync without blocking other agents. */ }
+          continue
+        }
+      }
       const runner = new AgentRunner(cfg, agent, engine, provider)
       runners.set(agent.id, runner)
       console.log(`[computer] hosting agent ${agent.name} (${agent.id}) on ${engine}`)
@@ -3547,6 +3595,9 @@ async function doRun(serverOverride?: string): Promise<void> {
     }
     // Agents removed from this computer: stop their runners.
     const live = new Set(agents.map((a) => a.id))
+    for (const id of codexMigrationFailures.keys()) {
+      if (!live.has(id)) codexMigrationFailures.delete(id)
+    }
     for (const [id, runner] of runners) {
       if (!live.has(id)) {
         runners.delete(id)
@@ -4211,6 +4262,7 @@ export async function restartService(hooks: RestartServiceHooks = {}): Promise<v
 export const ONE_SHOT_FLAGS = [
   'stop', 'status', 'restart', 'logs', 'version', 'install-service',
   'uninstall-service', 'pair', 'doctor', 'provider', 'help',
+  'codex-login', 'migrate-codex-sessions',
 ] as const
 const ONE_SHOT_FLAG_RE = new RegExp(`--(?:${ONE_SHOT_FLAGS.join('|')})\\b`)
 
@@ -4613,7 +4665,9 @@ async function runDoctor(providerId?: string): Promise<void> {
       // The binary is not always the engine id — cursor ships `cursor-agent`,
       // antigravity ships `agy`. missingEngineMessage() in this file gets that
       // right; this line used to contradict it.
-      console.log(`    install the \`${getAdapter(r.id)?.bin ?? r.id}\` CLI and run it once to sign in, then re-run --doctor\n`)
+      console.log(r.id === 'codex'
+        ? `    install the \`codex\` CLI, run \`${CODEX_LOGIN_COMMAND}\`, then re-run --doctor\n`
+        : `    install the \`${getAdapter(r.id)?.bin ?? r.id}\` CLI and run it once to sign in, then re-run --doctor\n`)
       continue
     }
     console.log(`● ${r.id} — ${r.path}`)
@@ -4675,6 +4729,12 @@ export async function runComputerDaemon(argv: string[]): Promise<void> {
   const serverUrl = (args.server || DEFAULT_SERVER).replace(/\/+$/, '')
   if (args.help) { console.log(helpText()); return }
   if (args.version) { console.log(CURRENT_VERSION); return }
+  if (args.codexLogin) { await loginCodexRuntime(); return }
+  if (args.migrateCodexSessions) {
+    const agents = await migrateCodexSessions()
+    console.log(`Migrated ${agents.length} Codex session(s) to ${codexRuntimeHome()}${agents.length ? `: ${agents.join(', ')}` : ''}. Personal Codex data was left in place.`)
+    return
+  }
   if (args.doctor) { await runDoctor(args.provider); return }
   if (args.restart) { await restartService(); return }
   if (args.stop) { await stopService(); return }

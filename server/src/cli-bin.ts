@@ -13,8 +13,13 @@ async function main() {
   // BEFORE importing runCli / the DB + Redis clients so it never loads them
   // (the daemon host has no DB/Redis access).
   if (argv[0] === 'agent' && argv[1] === 'computer') {
-    const { runComputerDaemon } = await import('./agents/computer/daemon.js')
-    await runComputerDaemon(argv.slice(2))
+    try {
+      const { runComputerDaemon } = await import('./agents/computer/daemon.js')
+      await runComputerDaemon(argv.slice(2))
+    } catch (err) {
+      process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`)
+      process.exitCode = 2
+    }
     return
   }
 

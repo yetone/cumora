@@ -11,7 +11,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=18.17"
   },
   "homepage": "https://cumora.ai",
   "keywords": [
