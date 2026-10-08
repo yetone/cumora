@@ -33,6 +33,17 @@ test('the reported zip is now visible to the agent', () => {
   assert.match(note, /https:\/\/cdn\.cumora\.ai\/a\/abc\?sig=1/)
 })
 
+test('a local image attachment resolves against the connected server URL', () => {
+  const note = attachmentNote({
+    name: 'image.png',
+    kind: 'img',
+    mime: 'image/png',
+    size: 971 * 1024,
+    url: '/uploads/attachments/screenshot.png',
+  }, 'https://agents.example.test')
+  assert.match(note, /https:\/\/agents\.example\.test\/uploads\/attachments\/screenshot\.png/)
+})
+
 test('a message with no attachment gains nothing', () => {
   assert.equal(attachmentNote(null), '')
   assert.equal(attachmentNote(undefined), '')

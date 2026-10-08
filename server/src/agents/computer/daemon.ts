@@ -467,6 +467,7 @@ interface AgentInfo {
  *  digest's line budget with the message bodies. */
 export function attachmentNote(
   att: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null | undefined,
+  serverUrl?: string,
 ): string {
   if (!att || typeof att !== 'object') return ''
   const name = typeof att.name === 'string' && att.name.trim() ? att.name.trim().slice(0, 120) : 'file'
@@ -476,8 +477,17 @@ export function attachmentNote(
   const size = typeof att.size === 'number' && Number.isFinite(att.size) && att.size > 0
     ? ` ${att.size >= 1024 * 1024 ? `${(att.size / 1024 / 1024).toFixed(1)}MB` : `${Math.max(1, Math.round(att.size / 1024))}KB`}`
     : ''
-  const url = typeof att.url === 'string' && /^https?:\/\//.test(att.url) ? ` ${att.url}` : ''
-  return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size}${url}]`
+  let url = typeof att.url === 'string' && /^https?:\/\//.test(att.url) ? att.url : ''
+  if (!url && typeof att.url === 'string' && att.url.startsWith('/uploads/') && serverUrl) {
+    try {
+      const origin = new URL(serverUrl)
+      if (['http:', 'https:'].includes(origin.protocol) && !origin.username && !origin.password) {
+        const resolved = new URL(att.url, origin)
+        if (resolved.origin === origin.origin && resolved.pathname.startsWith('/uploads/')) url = resolved.href
+      }
+    } catch {}
+  }
+  return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size}${url ? ` ${url}` : ''}]`
 }
 
 interface RuntimeInboxResponse {
@@ -2590,7 +2600,7 @@ export class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachment)}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachment, this.cfg.serverUrl)}`)
     }
     const projectIds = uniqueProjectIds(
       (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
