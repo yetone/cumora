@@ -66,6 +66,12 @@ test('an unexplained failure stays transient and keeps retrying', () => {
   }
 })
 
+test('a sandbox startup failure does not become a provider throttle because of its path', () => {
+  const error = 'process exited with code 1\nbwrap: execvp /home/quota/codex: No such file or directory'
+  assert.equal(classifyTurnOutcome(error), 'transient')
+  assert.equal(backoffUntilFor(classifyTurnOutcome(error), 1_000), null)
+})
+
 test('a throttle outranks an operator fix, exactly as the old chat path did', () => {
   // The old order was `!rateLimited && needsOperatorFix(...)`, so a message
   // matching both took the short cooldown and stayed out of the user's chat.

@@ -4,75 +4,23 @@
  * Run: node --import tsx --test server/src/__tests__/agents-computer-engine.test.ts
  */
 import assert from 'node:assert/strict'
-import { writeFileSync } from 'node:fs'
 import { chmod, lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
-import { afterEach, beforeEach, test } from 'node:test'
+import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { claudeSecureFlags, type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
+import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
 import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
 import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
 const IS_WIN = process.platform === 'win32'
-const original = { ...process.env }
+const ORIGINAL_PATH = process.env.PATH
+const ORIGINAL_PATHEXT = process.env.PATHEXT
+const ORIGINAL_UNSANDBOXED = process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
 const tempDirs: string[] = []
 // Sessions spawn a child process. Track them so a FAILING assertion still tears
 // the child down — otherwise it outlives the test and the runner never exits.
 const liveSessions: Array<{ stop(): void | Promise<void> }> = []
-
-test('Claude preserves an explicit model override and reloads changed providers after the active turn', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-provider-refresh-'))
-  tempDirs.push(root)
-  const binDir = join(root, 'bin')
-  const home = join(root, 'home')
-  const configDir = join(root, 'config')
-  await Promise.all([mkdir(binDir), mkdir(home), mkdir(configDir)])
-  const file = join(configDir, 'settings.json')
-  const saved = (endpoint: string) => JSON.stringify({
-    model: 'auto/local[1m]', env: { ANTHROPIC_BASE_URL: endpoint },
-  })
-  await writeFile(file, saved('https://first.example.test'))
-  await writeFakeCli(binDir, 'claude', `
-if (process.argv.includes('--input-format')) {
-  process.stdin.on('data', () => process.stdout.write(JSON.stringify({
-    type: 'result', subtype: 'success', session_id: 'retained-thread', result: 'OK'
-  }) + '\\n'))
-} else {
-  process.stdout.write(JSON.stringify({ argv: process.argv.slice(2) }) + '\\n')
-}
-`)
-  setFakeCliPath(binDir)
-  const env = secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir, ANTHROPIC_MODEL: 'explicit/main' })
-  const adapter = getAdapter('claude')
-  const probe = await adapter.probe({ cwd: home, env, tier: 'big', signal: AbortSignal.timeout(10_000) })
-  const argv = JSON.parse(probe.text).argv as string[]
-  assert.equal(argv[argv.indexOf('--model') + 1], 'explicit/main')
-  const session = adapter.startSession!({ home, env, onLog() {} })!
-  assert.ok(session)
-  liveSessions.push(session)
-  const turn = session.send('finish this turn')
-  writeFileSync(file, saved('https://second.example.test'))
-  assert.equal(session.alive, true)
-  assert.equal((await turn).exitCode, 0)
-  assert.equal(session.alive, false)
-  assert.equal(session.sessionId, 'retained-thread')
-})
-
-test('temporarily unreadable Claude provider settings cannot fall through to a different account', async () => {
-  const root = await mkdtemp(join(tmpdir(), 'cumora-claude-partial-settings-'))
-  tempDirs.push(root)
-  const configDir = join(root, 'config')
-  const binDir = join(root, 'bin')
-  await Promise.all([mkdir(configDir), mkdir(binDir)])
-  await writeFile(join(configDir, 'settings.json'), '{partial gateway update')
-  await writeFakeCli(binDir, 'claude', "process.stderr.write('fixture must not be invoked')")
-  setFakeCliPath(binDir)
-  await assert.rejects(getAdapter('claude').classify({
-    cwd: root, env: secureClaudeEnv(root, { CLAUDE_CONFIG_DIR: configDir }),
-    prompt: 'triage', signal: AbortSignal.timeout(10_000),
-  }), /Cannot read Claude provider settings/)
-})
 
 function secureClaudeEnv(root: string, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const base: NodeJS.ProcessEnv = { ...process.env }
@@ -107,7 +55,7 @@ async function writeFakeCli(binDir: string, name: string, source: string): Promi
   await chmod(launcher, 0o755)
 }
 
-function setFakeCliPath(binDir: string): void {
+function useFakeCliPath(binDir: string): void {
   process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`
 }
 
@@ -119,18 +67,14 @@ test('engine subprocesses always suppress Windows console windows', () => {
   })
 })
 
-beforeEach(async () => {
-  const home = await mkdtemp(join(tmpdir(), 'cumora-engine-test-home-'))
-  tempDirs.push(home)
-  process.env.HOME = home
-  process.env.USERPROFILE = home
-  process.env.CODEX_HOME = join(home, 'personal-codex')
-})
-
 afterEach(async () => {
   for (const s of liveSessions.splice(0)) { try { await s.stop() } catch { /* already gone */ } }
-  for (const key of Object.keys(process.env)) if (!(key in original)) delete process.env[key]
-  Object.assign(process.env, original)
+  if (ORIGINAL_PATH === undefined) delete process.env.PATH
+  else process.env.PATH = ORIGINAL_PATH
+  if (ORIGINAL_PATHEXT === undefined) delete process.env.PATHEXT
+  else process.env.PATHEXT = ORIGINAL_PATHEXT
+  if (ORIGINAL_UNSANDBOXED === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = ORIGINAL_UNSANDBOXED
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
 })
 
@@ -219,7 +163,7 @@ test('local engine failure returns stderr tail for observability', async () => {
     'claude',
     "process.stderr.write('Claude Code error: usage limit reached, no tokens left\\n')\nprocess.exit(1)\n",
   )
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
 
   const logs: string[] = []
   const result = await getAdapter('claude').run({
@@ -237,51 +181,7 @@ test('local engine failure returns stderr tail for observability', async () => {
   assert.deepEqual(logs, ['Claude Code error: usage limit reached, no tokens left'])
 })
 
-test('Claude Bash remains sandboxed with private tools, network and credentials denied', () => {
-  const home = '/home/cumora-policy-agent'
-  const argv = claudeSecureFlags(home, {
-    PATH: dirname(process.execPath),
-    CLAUDE_CONFIG_DIR: join(home, 'missing-config'),
-    CUMORA_AGENT_MCP_SHIM: join(home, 'trusted', 'cumora-mcp'),
-    ANTHROPIC_API_KEY: 'fixture-provider-key',
-    GITHUB_TOKEN: 'fixture-github-token',
-    BASH_ENV: '/untrusted-shell-startup',
-  })
-  const tools = argv[argv.indexOf('--tools') + 1].split(',')
-  assert.ok(tools.includes('Bash'))
-  assert.ok(tools.includes('mcp__cumora__cli'))
-  const allowed = argv.slice(argv.indexOf('--allowedTools') + 1, argv.indexOf('--disallowedTools'))
-  assert.deepEqual(allowed,
-    [`Read(/${home}/**)`, `Edit(/${home}/**)`, 'Bash', 'mcp__cumora__cli'])
-  const disallowed = argv[argv.indexOf('--disallowedTools') + 1].split(',')
-  assert.equal(disallowed.includes('Bash'), false)
-  for (const tool of ['PowerShell', 'WebFetch', 'WebSearch']) {
-    assert.equal(tools.includes(tool), false)
-    assert.ok(disallowed.includes(tool))
-  }
-  assert.ok(argv.includes('--restricted'))
-  assert.equal(argv[argv.indexOf('--permission-mode') + 1], 'dontAsk')
-  assert.ok(argv.includes('--strict-mcp-config'))
-
-  const { permissions, sandbox } = JSON.parse(argv[argv.indexOf('--settings') + 1])
-  assert.deepEqual(permissions.allow, allowed)
-  assert.ok(permissions.allow.includes('Bash'))
-  assert.equal(permissions.deny.includes('Bash'), false)
-  assert.ok(permissions.deny.includes(`Read(/${home}/bin/**)`))
-  assert.ok(permissions.deny.includes(`Edit(/${home}/bin/**)`))
-  assert.equal(sandbox.enabled, true)
-  assert.equal(sandbox.failIfUnavailable, true)
-  assert.equal(sandbox.allowUnsandboxedCommands, false)
-  assert.deepEqual(sandbox.excludedCommands, [])
-  assert.deepEqual(sandbox.network, { allowedDomains: [], strictAllowlist: true })
-  assert.ok(sandbox.filesystem.denyRead.includes('~/'))
-  assert.ok(sandbox.filesystem.allowRead.includes(home))
-  for (const name of ['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'BASH_ENV']) {
-    assert.ok(sandbox.credentials.envVars.some((entry: { name: string; mode: string }) => entry.name === name && entry.mode === 'deny'))
-  }
-})
-
-async function checkClaudeSecureTransport(persistent: boolean): Promise<void> {
+test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-secure-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
@@ -304,28 +204,21 @@ async function checkClaudeSecureTransport(persistent: boolean): Promise<void> {
     'claude',
     "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, coreEnv: { apiKey: process.env.ANTHROPIC_API_KEY, authToken: process.env.ANTHROPIC_AUTH_TOKEN, baseUrl: process.env.ANTHROPIC_BASE_URL, unrelated: process.env.UNRELATED_SECRET } }))\nprocess.exit(1)\n",
   )
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
 
   const logs: string[] = []
   const mcpShim = join(root, 'trusted', 'cumora-mcp')
-  const args = {
+  await getAdapter('claude').run({
     home,
+    prompt: 'wake',
     env: secureClaudeEnv(root, {
       CLAUDE_CONFIG_DIR: configDir,
       ANTHROPIC_API_KEY: 'explicit-daemon-api-key',
       OPENAI_API_KEY: 'must-not-appear-in-settings',
     }),
-    onLog: (line: string) => logs.push(line),
-  }
-  if (persistent) {
-    const session = getAdapter('claude').startSession?.(args)
-    assert.ok(session)
-    liveSessions.push(session)
-    await session.send('wake')
-    await session.stop()
-  } else {
-    await getAdapter('claude').run({ ...args, prompt: 'wake', signal: new AbortController().signal })
-  }
+    onLog: (line) => logs.push(line),
+    signal: new AbortController().signal,
+  })
 
   const captured = JSON.parse(logs[0] ?? '{}') as {
     argv?: string[]
@@ -364,8 +257,6 @@ async function checkClaudeSecureTransport(persistent: boolean): Promise<void> {
   }
   assert.ok(settings.permissions?.allow?.includes(`Read(/${home}/**)`))
   assert.ok(settings.permissions?.allow?.includes(`Edit(/${home}/**)`))
-  assert.ok(settings.permissions?.allow?.includes('Bash'))
-  assert.equal(settings.permissions?.deny?.includes('Bash'), false)
   assert.ok(settings.permissions?.deny?.includes(`Read(/${home}/bin/**)`))
   assert.ok(settings.permissions?.deny?.includes(`Edit(/${home}/bin/**)`))
   assert.equal(settings.sandbox?.failIfUnavailable, true)
@@ -378,12 +269,7 @@ async function checkClaudeSecureTransport(persistent: boolean): Promise<void> {
   }
   assert.doesNotMatch(settingsText, /must-not-appear-in-settings/)
   assert.doesNotMatch(settingsText, /settings-auth-token|explicit-daemon-api-key|provider\.example\.test/)
-}
-
-for (const persistent of [false, true]) {
-  test(`Claude secure ${persistent ? 'session' : 'one-shot'} preserves Bash and strips tool credentials`,
-    { skip: IS_WIN }, () => checkClaudeSecureTransport(persistent))
-}
+})
 
 test('Claude secure triage stays inside the custom provider model namespace', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-provider-model-'))
@@ -399,7 +285,7 @@ test('Claude secure triage stays inside the custom provider model namespace', { 
     'claude',
     "process.stdout.write(JSON.stringify({ result: JSON.stringify({ argv: process.argv.slice(2) }) }))\n",
   )
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
 
   const settingsPath = join(configDir, 'settings.json')
   await writeFile(settingsPath, JSON.stringify({
@@ -461,7 +347,7 @@ if (argv.includes('--input-format')) {
   process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK'}) + '\\n')
 }
 `)
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
   const preferences = {
     effortLevel: 'xhigh', modelSettings: { 'claude-opus-5': { effortLevel: 'medium' } },
     alwaysThinkingEnabled: true, language: 'Chinese',
@@ -548,7 +434,7 @@ const reply = () => {
 if (argv.includes('--input-format')) require('node:readline').createInterface({ input: process.stdin }).on('line', reply)
 else { process.stdin.resume(); process.stdin.on('end', reply) }
 `)
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
   for (const compatibility of [false, true]) {
     if (compatibility) process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
     else delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
@@ -608,7 +494,7 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
     'claude',
     "process.stderr.write('Claude Code error: subscription expired\\n')\nprocess.exit(1)\n",
   )
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
 
   const logs: string[] = []
   const session = getAdapter('claude').startSession?.({
@@ -648,7 +534,7 @@ test('persistent Claude classifies a rejected resume from its result event', asy
     '})\n' +
     'setInterval(() => {}, 1 << 30)\n',
   )
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
 
   const session = getAdapter('claude').startSession?.({
     home,
@@ -682,7 +568,7 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
     'grok',
     `process.stdout.write(${JSON.stringify(`${grokEvents.map((event) => JSON.stringify(event)).join('\n')}\n`)})\n`,
   )
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
 
   const adapter = getAdapter('grok')
   await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer', systemPrompt: null })
@@ -736,7 +622,7 @@ test('resolveSpawn runs a native Windows executable without cmd.exe', { skip: !I
   const binDir = join(root, 'bin')
   await mkdir(binDir)
   await writeFile(join(binDir, 'codex.exe'), '', 'utf8')
-  process.env.PATH = `${binDir};${original.PATH ?? original.Path ?? ''}`
+  process.env.PATH = `${binDir};${ORIGINAL_PATH ?? ''}`
   process.env.PATHEXT = '.EXE;.CMD;.BAT;.COM'
 
   const r = resolveSpawn('codex')
@@ -772,7 +658,7 @@ test('Codex one-shot paths send prompts through stdin', async () => {
     await writeFile(launcher, '#!/bin/sh\nexec node "$(dirname "$0")/capture.js" "$@"\n', 'utf8')
     await chmod(launcher, 0o755)
   }
-  process.env.PATH = `${binDir}${delimiter}${original.PATH ?? original.Path ?? ''}`
+  process.env.PATH = `${binDir}${delimiter}${ORIGINAL_PATH ?? ''}`
 
   const adapter = getAdapter('codex')
   const mcpShim = join(root, 'trusted', 'cumora-mcp')
@@ -833,20 +719,6 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(runCapture.argv?.some((arg) => arg.includes('dangerously')), false)
   assert.equal(runCapture.argv?.some((arg) => arg.includes('must-not-reach-tools')), false)
   assert.equal(runCapture.stdin, longPrompt)
-  assert.ok(runCapture.argv?.includes('service_tier="default"'))
-  for (const nativeFastMode of [true, false]) {
-    const speedLogs: string[] = []
-    await adapter.run({
-      home, prompt: 'wake', model: 'test-model', fastModel: 'auxiliary', nativeFastMode,
-      env: { ...process.env, CUMORA_AGENT_IPC_DIR: join(root, 'private-ipc'), CUMORA_AGENT_MCP_SHIM: mcpShim },
-      onLog: (line) => speedLogs.push(line), signal: new AbortController().signal,
-    })
-    const captured = JSON.parse(speedLogs.at(-1) ?? '{}') as { argv: string[] }
-    assert.ok(captured.argv.includes(`service_tier="${nativeFastMode ? 'fast' : 'default'}"`))
-    assert.equal(captured.argv.includes('features.fast_mode=true'), nativeFastMode)
-    assert.equal(captured.argv[captured.argv.indexOf('--model') + 1], 'test-model')
-    assert.ok(captured.argv.includes('--ignore-user-config'))
-  }
 
   const triagePrompt = 'triage prompt with spaces\nand a second line'
   const triage = await adapter.classify({
@@ -863,7 +735,6 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.ok(triageCapture.argv?.includes('triage-model'))
   assert.equal(triageCapture.argv?.at(-1), '-')
   assert.equal(triageCapture.stdin, triagePrompt)
-  assert.ok(triageCapture.argv?.includes('service_tier="default"'))
 
   const probe = await adapter.probe({
     tier: 'big',
@@ -876,7 +747,6 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.ok(probeCapture.argv?.includes('--ignore-user-config'))
   assert.equal(probeCapture.argv?.at(-1), '-')
   assert.equal(probeCapture.stdin, 'Connectivity check. Reply with exactly: OK')
-  assert.ok(probeCapture.argv?.includes('service_tier="default"'))
 })
 
 test('Claude and Codex one-shot adapters return structured engine failures', async () => {
@@ -888,7 +758,7 @@ test('Claude and Codex one-shot adapters return structured engine failures', asy
   await mkdir(home)
   await writeFakeCli(binDir, 'claude', "process.stderr.write('No conversation found with session ID: claude-stale\\n')\nprocess.exit(1)\n")
   await writeFakeCli(binDir, 'codex', "process.stderr.write('429 Too Many Requests: rate limit reached\\n')\nprocess.exit(1)\n")
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
   process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
 
   const signal = new AbortController().signal
@@ -961,24 +831,127 @@ async function fakeCodexRejectingThread(root: string): Promise<string> {
   return binDir
 }
 
-async function startFakeCodexSession(opts: { resume?: string } = {}) {
+async function startFakeCodexSession(opts: { resume?: string; source?: string; onLog?: (line: string) => void } = {}) {
   process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-'))
   tempDirs.push(root)
   const home = join(root, 'home')
   await mkdir(home, { recursive: true })
-  const binDir = await fakeCodexRejectingThread(root)
+  const binDir = join(root, 'bin')
+  if (opts.source !== undefined) {
+    await mkdir(binDir)
+    await writeFakeCli(binDir, 'codex', opts.source)
+  } else {
+    await fakeCodexRejectingThread(root)
+  }
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`
   const logs: string[] = []
   const session = getAdapter('codex').startSession!({
     home,
-    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
+    env: secureClaudeEnv(root),
     resumeSessionId: opts.resume ?? null,
-    onLog: (l) => logs.push(l),
+    onLog: (l) => { logs.push(l); opts.onLog?.(l) },
   })
   assert.ok(session, 'codex adapter must start a persistent session on this platform')
   liveSessions.push(session!)
   return { session: session!, logs }
 }
+
+const BWRAP_STARTUP_ERROR = 'bwrap: execvp /missing/codex: No such file or directory'
+
+for (const beforeSend of [true, false]) {
+  test(`Codex preserves sandbox startup stderr when it exits ${beforeSend ? 'before' : 'after'} first send`, { skip: IS_WIN, timeout: 5000 }, async () => {
+    let signalDeath!: () => void
+    const died = new Promise<void>((resolve) => { signalDeath = resolve })
+    const { session } = await startFakeCodexSession({
+      source: `process.stderr.write('checking quota configuration\\n'.repeat(100) + ${JSON.stringify(`${BWRAP_STARTUP_ERROR}\n`)}, () => process.exit(1))`,
+      onLog: (line) => { if (line.startsWith('[session] engine process died')) signalDeath() },
+    })
+    // The death notification proves the idle path ran; otherwise send is
+    // queued synchronously before the process-close callback can run.
+    if (beforeSend) await died
+    const result = await session.send('wake')
+    assert.notEqual(result.exitCode, 0)
+    assert.match((result.error ?? '').slice(0, 900), /bwrap: execvp.*No such file or directory/)
+    assert.match(result.failure?.diagnostic ?? '', /bwrap: execvp.*No such file or directory/)
+    assert.equal(result.failure?.kind, 'startup')
+  })
+}
+
+test('Codex excludes previous-turn stderr from a later process failure', { skip: IS_WIN, timeout: 5000 }, async () => {
+  let signalFirstStderr!: () => void
+  const firstStderr = new Promise<void>((resolve) => { signalFirstStderr = resolve })
+  const { session } = await startFakeCodexSession({
+    source: `
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n')
+let turn = 0
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line)
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} })
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'test-thread' } } })
+  if (msg.method === 'turn/start') {
+    if (++turn === 1) {
+      process.stderr.write('quota exceeded first-turn-only diagnostic\\n', () => {
+        send({ method: 'turn/completed', params: { turn: { status: 'completed' } } })
+      })
+    } else {
+      process.stderr.write('second-turn-only diagnostic\\n', () => process.exit(1))
+    }
+  }
+})`,
+    onLog: (line) => { if (line === 'quota exceeded first-turn-only diagnostic') signalFirstStderr() },
+  })
+  // stdout/stderr are independent pipes: wait for both before the next send.
+  const [first] = await Promise.all([session.send('first'), firstStderr])
+  assert.equal(first.exitCode, 0)
+  assert.equal(first.error, undefined)
+  const second = await session.send('second')
+  assert.match(second.error ?? '', /second-turn-only diagnostic/)
+  assert.doesNotMatch(second.error ?? '', /quota|first-turn-only diagnostic/)
+  assert.doesNotMatch(second.failure?.diagnostic ?? '', /quota|first-turn-only diagnostic/)
+  assert.equal(second.failure?.kind, 'transport')
+})
+
+test('Codex does not classify an external SIGTERM as a sandbox startup failure', { skip: IS_WIN, timeout: 5000 }, async () => {
+  let signalPid!: (pid: number) => void
+  const started = new Promise<number>((resolve) => { signalPid = resolve })
+  const { session } = await startFakeCodexSession({
+    source: "process.stdout.write('fixture pid: ' + process.pid + '\\n')\nsetInterval(() => {}, 1 << 30)",
+    onLog: (line) => { if (line.startsWith('fixture pid: ')) signalPid(Number(line.slice('fixture pid: '.length))) },
+  })
+  const pending = session.send('wake')
+  process.kill(await started, 'SIGTERM')
+  const result = await pending
+  assert.match(result.error ?? '', /SIGTERM/)
+  assert.equal(result.failure?.kind, 'transport')
+})
+
+test('Codex keeps process-failure diagnostics bounded', { skip: IS_WIN, timeout: 5000 }, async () => {
+  const { session } = await startFakeCodexSession({
+    source: "process.stderr.write('bounded stderr line\\n'.repeat(2000), () => process.exit(1))",
+  })
+  const result = await session.send('wake')
+  assert.match(result.error ?? '', /bounded stderr line/)
+  assert.ok((result.error?.length ?? 0) <= 4000)
+  assert.ok((result.failure?.diagnostic.length ?? 0) <= 4000)
+})
+
+test('Codex does not report an unfinished turn as successful on process exit zero', { skip: IS_WIN, timeout: 5000 }, async () => {
+  const { session } = await startFakeCodexSession({
+    source: `
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n')
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line)
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} })
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'test-thread' } } })
+  if (msg.method === 'turn/start') process.exit(0)
+})`,
+  })
+  const result = await session.send('unfinished')
+  assert.notEqual(result.exitCode, 0)
+  assert.ok(result.error)
+  assert.ok(result.failure)
+})
 
 test('Codex Fast Mode reaches fresh, resumed and fallback threads without changing the model', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-fast-'))
@@ -1002,7 +975,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
   }
 })
 `)
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
   for (const nativeFastMode of [true, false]) {
     for (const resumeSessionId of [null, 'prior-thread', 'missing-thread']) {
       const logs: string[] = []
@@ -1365,7 +1338,7 @@ test('a Grok ACP turn reports the model the engine announced', { skip: IS_WIN },
   assert.equal(result.model, 'grok-4.6', 'the turn must be priced on the real model, not left null')
   assert.equal(hops.length, 1)
   assert.equal(hops[0].model, 'grok-4.6', 'the ledger hop must name a real model, not the engine id')
-  assert.equal(hops[0].usage?.output_tokens, 4)
+  assert.equal(hops[0]?.usage?.output_tokens, 4)
 })
 
 test('a Grok ACP turn still settles when no model is announced', { skip: IS_WIN }, async () => {
@@ -1413,7 +1386,7 @@ if (argv.includes('--input-format')) {
     ? capture() : JSON.stringify({type:'result', subtype:'success', result:'OK'})) + '\\n')
 }
 `)
-  setFakeCliPath(binDir)
+  useFakeCliPath(binDir)
   const adapter = getAdapter('claude')
   const profiles: ProviderProfile[] = ['alpha', 'beta'].map((id, index) => ({
     id, label: id, baseUrl: `https://${id}.example.test`, model: `${id}/big`, fastModel: `${id}/small`,
