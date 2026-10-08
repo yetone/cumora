@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 
-import { classifyEngineFailure, engineDiagnosticText, engineFailureOf } from '../agents/computer/engine.js'
+import { classifyEngineFailure, engineDiagnosticText, engineFailureOf, failurePreview } from '../agents/computer/engine.js'
 
 test('engine failures are classified into stable machine-readable kinds', () => {
   assert.equal(classifyEngineFailure('No conversation found with session ID: abc', true), 'resume-not-found')
@@ -15,6 +15,30 @@ test('engine failures are classified into stable machine-readable kinds', () => 
 test('a missing-session phrase is stale only when resume was attempted', () => {
   assert.equal(classifyEngineFailure('session not found', false), 'unknown')
   assert.equal(classifyEngineFailure('session not found', true), 'resume-not-found')
+})
+
+test('local startup failures are distinct from provider and transport failures', () => {
+  for (const diagnostic of [
+    'bwrap: execvp /opt/codex: No such file or directory',
+    'process terminated by SIGTERM\nbwrap: execvp /home/quota/token/codex: Permission denied',
+    'spawn /opt/codex ENOENT',
+    'spawn /opt/my tools/codex EACCES',
+  ]) assert.equal(classifyEngineFailure(diagnostic), 'startup', diagnostic)
+
+  assert.equal(classifyEngineFailure('No such file or directory: notes.txt'), 'unknown')
+  assert.equal(classifyEngineFailure('process terminated by SIGTERM'), 'transport')
+  assert.equal(classifyEngineFailure('connection timed out'), 'transport')
+})
+
+test('one-shot startup diagnostics survive the shorter operator notice', () => {
+  const error = failurePreview({
+    exitCode: 1,
+    signalName: null,
+    stderr: ['checking quota configuration\n'.repeat(100), 'bwrap: execvp /opt/codex: No such file or directory'],
+    stdout: [],
+  }).slice(0, 900)
+  assert.match(error, /bwrap: execvp.*No such file or directory/)
+  assert.equal(classifyEngineFailure(error), 'startup')
 })
 
 test('diagnostic extraction keeps engine errors but drops successful model prose', () => {

@@ -760,24 +760,127 @@ async function fakeCodexRejectingThread(root: string): Promise<string> {
   return binDir
 }
 
-async function startFakeCodexSession(opts: { resume?: string } = {}) {
+async function startFakeCodexSession(opts: { resume?: string; source?: string; onLog?: (line: string) => void } = {}) {
   process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-'))
   tempDirs.push(root)
   const home = join(root, 'home')
   await mkdir(home, { recursive: true })
-  const binDir = await fakeCodexRejectingThread(root)
+  const binDir = join(root, 'bin')
+  if (opts.source !== undefined) {
+    await mkdir(binDir)
+    await writeFakeCli(binDir, 'codex', opts.source)
+  } else {
+    await fakeCodexRejectingThread(root)
+  }
+  process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`
   const logs: string[] = []
   const session = getAdapter('codex').startSession!({
     home,
-    env: secureClaudeEnv(root, { PATH: `${binDir}:${process.env.PATH ?? ''}` }),
+    env: secureClaudeEnv(root),
     resumeSessionId: opts.resume ?? null,
-    onLog: (l) => logs.push(l),
+    onLog: (l) => { logs.push(l); opts.onLog?.(l) },
   })
   assert.ok(session, 'codex adapter must start a persistent session on this platform')
   liveSessions.push(session!)
   return { session: session!, logs }
 }
+
+const BWRAP_STARTUP_ERROR = 'bwrap: execvp /missing/codex: No such file or directory'
+
+for (const beforeSend of [true, false]) {
+  test(`Codex preserves sandbox startup stderr when it exits ${beforeSend ? 'before' : 'after'} first send`, { skip: IS_WIN, timeout: 5000 }, async () => {
+    let signalDeath!: () => void
+    const died = new Promise<void>((resolve) => { signalDeath = resolve })
+    const { session } = await startFakeCodexSession({
+      source: `process.stderr.write('checking quota configuration\\n'.repeat(100) + ${JSON.stringify(`${BWRAP_STARTUP_ERROR}\n`)}, () => process.exit(1))`,
+      onLog: (line) => { if (line.startsWith('[session] engine process died')) signalDeath() },
+    })
+    // The death notification proves the idle path ran; otherwise send is
+    // queued synchronously before the process-close callback can run.
+    if (beforeSend) await died
+    const result = await session.send('wake')
+    assert.notEqual(result.exitCode, 0)
+    assert.match((result.error ?? '').slice(0, 900), /bwrap: execvp.*No such file or directory/)
+    assert.match(result.failure?.diagnostic ?? '', /bwrap: execvp.*No such file or directory/)
+    assert.equal(result.failure?.kind, 'startup')
+  })
+}
+
+test('Codex excludes previous-turn stderr from a later process failure', { skip: IS_WIN, timeout: 5000 }, async () => {
+  let signalFirstStderr!: () => void
+  const firstStderr = new Promise<void>((resolve) => { signalFirstStderr = resolve })
+  const { session } = await startFakeCodexSession({
+    source: `
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n')
+let turn = 0
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line)
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} })
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'test-thread' } } })
+  if (msg.method === 'turn/start') {
+    if (++turn === 1) {
+      process.stderr.write('quota exceeded first-turn-only diagnostic\\n', () => {
+        send({ method: 'turn/completed', params: { turn: { status: 'completed' } } })
+      })
+    } else {
+      process.stderr.write('second-turn-only diagnostic\\n', () => process.exit(1))
+    }
+  }
+})`,
+    onLog: (line) => { if (line === 'quota exceeded first-turn-only diagnostic') signalFirstStderr() },
+  })
+  // stdout/stderr are independent pipes: wait for both before the next send.
+  const [first] = await Promise.all([session.send('first'), firstStderr])
+  assert.equal(first.exitCode, 0)
+  assert.equal(first.error, undefined)
+  const second = await session.send('second')
+  assert.match(second.error ?? '', /second-turn-only diagnostic/)
+  assert.doesNotMatch(second.error ?? '', /quota|first-turn-only diagnostic/)
+  assert.doesNotMatch(second.failure?.diagnostic ?? '', /quota|first-turn-only diagnostic/)
+  assert.equal(second.failure?.kind, 'transport')
+})
+
+test('Codex does not classify an external SIGTERM as a sandbox startup failure', { skip: IS_WIN, timeout: 5000 }, async () => {
+  let signalPid!: (pid: number) => void
+  const started = new Promise<number>((resolve) => { signalPid = resolve })
+  const { session } = await startFakeCodexSession({
+    source: "process.stdout.write('fixture pid: ' + process.pid + '\\n')\nsetInterval(() => {}, 1 << 30)",
+    onLog: (line) => { if (line.startsWith('fixture pid: ')) signalPid(Number(line.slice('fixture pid: '.length))) },
+  })
+  const pending = session.send('wake')
+  process.kill(await started, 'SIGTERM')
+  const result = await pending
+  assert.match(result.error ?? '', /SIGTERM/)
+  assert.equal(result.failure?.kind, 'transport')
+})
+
+test('Codex keeps process-failure diagnostics bounded', { skip: IS_WIN, timeout: 5000 }, async () => {
+  const { session } = await startFakeCodexSession({
+    source: "process.stderr.write('bounded stderr line\\n'.repeat(2000), () => process.exit(1))",
+  })
+  const result = await session.send('wake')
+  assert.match(result.error ?? '', /bounded stderr line/)
+  assert.ok((result.error?.length ?? 0) <= 4000)
+  assert.ok((result.failure?.diagnostic.length ?? 0) <= 4000)
+})
+
+test('Codex does not report an unfinished turn as successful on process exit zero', { skip: IS_WIN, timeout: 5000 }, async () => {
+  const { session } = await startFakeCodexSession({
+    source: `
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n')
+require('node:readline').createInterface({ input: process.stdin }).on('line', (line) => {
+  const msg = JSON.parse(line)
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} })
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'test-thread' } } })
+  if (msg.method === 'turn/start') process.exit(0)
+})`,
+  })
+  const result = await session.send('unfinished')
+  assert.notEqual(result.exitCode, 0)
+  assert.ok(result.error)
+  assert.ok(result.failure)
+})
 
 test('a Codex session whose thread never opens dies instead of wedging', { skip: IS_WIN }, async () => {
   const { session } = await startFakeCodexSession()

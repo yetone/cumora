@@ -50,7 +50,7 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 import { runWithSessionRecovery } from './session-recovery.js'
 
@@ -295,6 +295,9 @@ export type TurnOutcome =
 
 export function classifyTurnOutcome(engineError: string | null | undefined): TurnOutcome {
   if (!engineError) return 'ok'
+  // Preserve normal retries for local startup failures, even when the path
+  // happens to contain provider keywords such as "quota".
+  if (classifyEngineFailure(engineDiagnosticProse(engineError)) === 'startup') return 'transient'
   if (isRateLimited(engineError)) return 'rate-limited'
   if (needsOperatorFix(engineError)) return 'operator-fix'
   return 'transient'
@@ -795,6 +798,9 @@ export function isStaleResumeError(err: string): boolean {
 }
 
 export function authFailureHint(engine: EngineId, detail: string): string {
+  if (classifyEngineFailure(engineDiagnosticProse(detail)) === 'startup') {
+    return 'The local engine could not start. Check the executable path and sandbox configuration on that computer, then wake the agent again.'
+  }
   if (CONTEXT_OVERFLOW_RE.test(detail)) {
     return 'The agent filled up its context window. Its session has been reset automatically — just wake the agent again and it will start fresh.'
   }

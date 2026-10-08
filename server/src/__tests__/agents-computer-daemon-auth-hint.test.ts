@@ -31,3 +31,11 @@ test('authFailureHint handles context overflow and poisoned body sentinels', () 
   assert.match(authFailureHint('qwen', 'lone surrogate split emoji poisoned'), /poisoned/)
   assert.match(authFailureHint('gemini', 'unrelated socket reset error'), /daemon terminal for details/)
 })
+
+test('local startup failures get executable and sandbox guidance, not account advice', () => {
+  const hint = authFailureHint('codex', 'process exited with code 1\nbwrap: execvp /home/quota/token/codex: No such file or directory')
+  assert.match(hint, /executable path/)
+  assert.match(hint, /sandbox/)
+  assert.doesNotMatch(hint, /login|quota|unsandboxed|disable/i)
+  assert.match(authFailureHint('codex', 'process terminated by SIGTERM'), /daemon terminal/)
+})

@@ -570,6 +570,7 @@ export interface EngineUsage {
 }
 
 export type EngineFailureKind =
+  | 'startup'
   | 'resume-not-found'
   | 'context-overflow'
   | 'authentication'
@@ -597,9 +598,16 @@ const RESUME_NOT_FOUND_RE = new RegExp([
 const ENGINE_CONTEXT_OVERFLOW_RE = /context window|context length|context_length_exceeded|maximum context|reached its context|prompt is too long|input is too long|too many tokens/i
 const ENGINE_RATE_LIMIT_RE = /rate.?limit|usage limit|quota|too many requests|overloaded|over capacity|credit balance is too low/i
 const ENGINE_AUTH_RE = /not (?:logged in|authenticated|signed in)|(?:please )?(?:sign|log) ?in|unauthori[sz]ed|forbidden|invalid (?:api )?key|authentication failed/i
+const ENGINE_STARTUP_RE = /\bbwrap:\s*execvp\b|\bspawn(?: [^\n]+)? (?:ENOENT|EACCES)\b/i
 const ENGINE_TRANSPORT_RE = /ECONN(?:RESET|REFUSED)|EPIPE|socket hang up|network|connection (?:closed|lost|terminated|timed out)|transport|process (?:exited|terminated)|failed to (?:spawn|write)/i
 
+function startupFailureLine(diagnostic: string): string | undefined {
+  return diagnostic.split('\n').find((line) => ENGINE_STARTUP_RE.test(line))
+}
+
 export function classifyEngineFailure(diagnostic: string, hadResume = false): EngineFailureKind {
+  // A local executable path can itself contain words such as "quota" or "token".
+  if (ENGINE_STARTUP_RE.test(diagnostic)) return 'startup'
   if (hadResume && RESUME_NOT_FOUND_RE.test(diagnostic)) return 'resume-not-found'
   if (ENGINE_CONTEXT_OVERFLOW_RE.test(diagnostic)) return 'context-overflow'
   if (ENGINE_RATE_LIMIT_RE.test(diagnostic)) return 'rate-limit'
@@ -1005,7 +1013,7 @@ export function failurePreview(args: {
   // salientError() already leads with this line, for exactly this reason, but
   // only the probe and handshake paths go through it — an ordinary turn lands
   // here instead. Lead with the cause and keep the full output behind it.
-  const rejected = argvRejection(detail)
+  const rejected = startupFailureLine(detail) ?? argvRejection(detail)
   const body = rejected ? `${rejected}\n${detail}` : detail
   return `${prefix}\n${body}`.slice(0, MAX_FAILURE_CHARS)
 }
@@ -1993,6 +2001,8 @@ class CodexSession implements EngineSession {
    *  attach latency_ms to the hop report at turn/completed. */
   private turnStartedAt: number | null = null
   private outBuf = ''
+  private stderrTail = ''
+  private hasSent = false
   private threadId: string | null
   private exited = false
   private exitCode = 0
@@ -2004,9 +2014,9 @@ class CodexSession implements EngineSession {
   // thread params WITHOUT threadId — reused to start a FRESH thread if a resume fails.
   private readonly baseThreadParams: Record<string, unknown>
   private ready = false
-  // Why the handshake died, when it did — so a send() landing after the teardown
+  // Why the session died, when it did — so a send() landing after the teardown
   // reports the real cause instead of a generic "process gone".
-  private handshakeError: string | null = null
+  private sessionError: string | null = null
   private pending: { resolve: (r: EngineRunResult) => void } | null = null
   private queuedPrompt: string | null = null
   private activeTurnId: string | null = null
@@ -2039,9 +2049,12 @@ class CodexSession implements EngineSession {
       : { method: 'thread/start', params }
     this.child = spawnEngineChild(bin, spawnArgs, { cwd: home, env, stdio: ['pipe', 'pipe', 'pipe'], shell: false })
     this.child.stdout?.on('data', (b: Buffer) => this.onStdout(b))
-    this.child.stderr?.on('data', (b: Buffer) => { for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) } })
+    this.child.stderr?.on('data', (b: Buffer) => {
+      this.stderrTail = (this.stderrTail + b.toString('utf8')).slice(-MAX_FAILURE_CHARS)
+      for (const raw of b.toString('utf8').split('\n')) { const l = cleanLine(raw); if (l) this.onLog(l) }
+    })
     this.child.on('error', (err) => this.die(1, err.message))
-    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `terminated by ${sig}` : `exited with code ${code}`))
+    this.child.on('close', (code, sig) => this.die(code ?? (sig ? 128 : 1), sig ? `process terminated by ${sig}` : `process exited with code ${code}`))
     // Begin the handshake once handlers are attached.
     queueMicrotask(() => { this.initializeId = this.req('initialize', { clientInfo: { name: 'cumora-daemon', version: '1.0.0' }, capabilities: { experimentalApi: true } }) })
   }
@@ -2051,7 +2064,11 @@ class CodexSession implements EngineSession {
 
   send(prompt: string): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId }, this.threadWasResume))
-    if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.handshakeError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
+    if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.sessionError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
+    // Only the first turn inherits output from process startup. Later turns
+    // must not classify an old turn's stderr as their own failure.
+    if (this.hasSent) this.stderrTail = ''
+    this.hasSent = true
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
@@ -2227,6 +2244,7 @@ class CodexSession implements EngineSession {
   private settle(error?: string): void {
     const p = this.pending
     this.pending = null
+    this.stderrTail = ''
     if (p) p.resolve(classifyEngineResult({ exitCode: error ? 1 : 0, error, sessionId: this.threadId, usage: this.turnUsage(), model: this.model }, this.threadWasResume))
   }
   private failPending(error: string): void {
@@ -2243,12 +2261,18 @@ class CodexSession implements EngineSession {
     // use, protocol drift), so `alive` would keep advertising a usable session
     // and the daemon would reuse the zombie on every wake. Tear it down instead:
     // a !alive session is dropped and the next wake spawns a clean one.
-    if (!this.ready) { this.handshakeError = error; this.stop() }
+    if (!this.ready) { this.sessionError = error; this.stop() }
   }
   private die(code: number, why: string): void {
     const alreadyDown = this.exited
     this.exited = true
-    this.exitCode = code
+    // Exiting before turn/completed is a failed turn, even after a clean EOF.
+    this.exitCode = code || 1
+    const diagnostic = engineDiagnosticText(cleanLine(this.stderrTail))
+    // The daemon displays only the first 900 characters. Keep the startup
+    // cause ahead of noisy stderr so the notice retains both cause and kind.
+    this.sessionError ??= [startupFailureLine(diagnostic), why, diagnostic]
+      .filter(Boolean).join('\n').slice(0, MAX_FAILURE_CHARS)
     // Same idle-death visibility as ClaudeSession.die: a session dying with no
     // turn in flight must leave a trace, not silently vanish until the next wake.
     if (!alreadyDown) {
@@ -2256,7 +2280,7 @@ class CodexSession implements EngineSession {
     }
     const p = this.pending
     this.pending = null
-    if (p) p.resolve(classifyEngineResult({ exitCode: code, error: why, sessionId: this.threadId }, this.threadWasResume))
+    if (p) p.resolve(classifyEngineResult({ exitCode: this.exitCode, error: this.sessionError, sessionId: this.threadId }, this.threadWasResume))
   }
 }
 
