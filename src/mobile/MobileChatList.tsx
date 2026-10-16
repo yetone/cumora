@@ -146,15 +146,6 @@ function MobileRow({ c, onTap, onLongPress }: {
   return (
     <motion.button
       {...press}
-      onClick={(e) => {
-        // Touch path uses onTap from useLongPress. This `onClick` is
-        // the mouse / external-keyboard fallback (Vite dev, iPad +
-        // trackpad). Suppress when a long-press already fired.
-        e.preventDefault()
-      }}
-      // Subtle press-in scale: rows are large so 0.985 reads as a
-      // gentle press without making the surrounding rows look
-      // shifted. iOS Mail / Messages use ~0.985–0.99 here.
       whileTap={{ scale: 0.985 }}
       transition={{ type: 'spring', stiffness: 600, damping: 30, mass: 0.5 }}
       className={cn(
@@ -251,7 +242,6 @@ function PinnedTile({ c, onSelect, onLongPress }: {
   return (
     <motion.button
       {...press}
-      onClick={(e) => e.preventDefault()}
       whileTap={{ scale: 0.92 }}
       transition={{ type: 'spring', stiffness: 600, damping: 30, mass: 0.5 }}
       className="flex flex-col items-center gap-0.5 w-[52px] shrink-0"
