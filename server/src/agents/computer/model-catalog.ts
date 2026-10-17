@@ -136,6 +136,15 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
     fastModelScope: 'agent',
     source: 'presets',
   },
+  maka: {
+    // Maka selects models in its own settings; ACP does not expose model selection.
+    models: [],
+    defaultModel: null,
+    defaultFastModel: null,
+    supportsCustom: false,
+    fastModelScope: 'agent',
+    source: 'presets',
+  },
 }
 
 const MODEL_PROBE_TIMEOUT_MS = 10_000

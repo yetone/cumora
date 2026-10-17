@@ -26,7 +26,7 @@ import { signAgentToken } from '../runtime/jwt.js'
 import type { EngineModelCatalog, EngineModelOption, FastModelScope, ModelCatalogSource } from './model-catalog.js'
 
 export type ComputerKind = 'cloud' | 'local' | 'vps'
-export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode'
+export type EngineId = 'managed' | 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka'
 export type ComputerStatus = 'online' | 'offline' | 'busy'
 
 /** How long a paired computer can go without a heartbeat before the sweep
@@ -70,6 +70,7 @@ const PAIRABLE: Record<Exclude<EngineId, 'managed'>, true> = {
   qwen: true,
   antigravity: true,
   zcode: true,
+  maka: true,
 }
 export const PAIRABLE_ENGINES: ReadonlySet<string> = new Set<string>(Object.keys(PAIRABLE))
 
@@ -122,6 +123,7 @@ const ENGINE_BINS: Record<Exclude<EngineId, 'managed'>, string> = {
   qwen: 'qwen',
   antigravity: 'agy',
   zcode: 'zcode',
+  maka: 'maka',
 }
 
 /** Cached PATH snapshot from the daemon. The app reads this; it never probes. */
@@ -836,7 +838,9 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
                       ? antigravityDefault
                       : r.engine === 'zcode'
                         ? zcodeDefault
-                    : null
+                        : r.engine === 'maka'
+                          ? null
+                          : null
     return dflt ? { ...agent, model: dflt, fastModel: fastModelWithEngineDefault } : { ...agent, fastModel: fastModelWithEngineDefault }
   })
 }

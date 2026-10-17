@@ -24,6 +24,8 @@ test('authFailureHint correctly mentions the relevant CLI/tool for each engine',
   assert.match(authFailureHint('gemini', 'quota exceeded'), /gemini/)
   assert.match(authFailureHint('qwen', 'quota exceeded'), /qwen/)
   assert.match(authFailureHint('antigravity', 'quota exceeded'), /agy/)
+  assert.match(authFailureHint('zcode', 'quota exceeded'), /zcode/)
+  assert.match(authFailureHint('maka', 'quota exceeded'), /maka/)
 })
 
 test('Codex authentication guidance signs in to the isolated runtime', () => {

@@ -791,7 +791,7 @@ type AgentRow = {
 
 const CLI_ORDER = [
   'claude', 'cursor', 'codex', 'grok', 'opencode',
-  'pi', 'gemini', 'qwen', 'zcode', 'hermes',
+  'pi', 'gemini', 'qwen', 'zcode', 'maka', 'hermes',
 ]
 
 const COMPUTER_STATUS_KEY: Record<string, MessageKey> = {

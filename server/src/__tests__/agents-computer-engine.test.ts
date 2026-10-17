@@ -1250,7 +1250,7 @@ test('a Grok ACP turn reports the model the engine announced', { skip: IS_WIN },
   assert.equal(result.model, 'grok-4.6', 'the turn must be priced on the real model, not left null')
   assert.equal(hops.length, 1)
   assert.equal(hops[0].model, 'grok-4.6', 'the ledger hop must name a real model, not the engine id')
-  assert.equal(hops[0].usage.output_tokens, 4)
+  assert.equal(hops[0].usage?.output_tokens, 4)
 })
 
 test('a Grok ACP turn still settles when no model is announced', { skip: IS_WIN }, async () => {
