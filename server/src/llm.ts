@@ -36,11 +36,15 @@
  *                              pure base-URL swap (server/src/orcarouter.ts),
  *                              since OrcaRouter speaks the Responses API
  *                              natively — no translation needed.
+ *   - `atlascloud/<model>`   → Atlas Cloud (https://www.atlascloud.ai), also a
+ *                              pure base-URL swap (server/src/atlascloud.ts),
+ *                              since it serves the Responses API.
  * Everything else about the returned client (chat.completions, images,
  * embeddings, non-prefixed responses.create calls) is the same object
  * callers already know.
  */
 import OpenAI from 'openai'
+import { atlascloudResponsesCreate, isAtlasCloudModel } from './atlascloud.js'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
 import { isNovitaModel, novitaResponsesShim } from './novita.js'
@@ -92,6 +96,8 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *    - `orcarouter/<model>` → OrcaRouter (server/src/orcarouter.ts), a pure
  *                             base-URL swap — OrcaRouter speaks the Responses
  *                             API natively.
+ *    - `atlascloud/<model>` → Atlas Cloud (server/src/atlascloud.ts), a pure
+ *                             base-URL swap — it serves the Responses API.
  *
  *  Model, not tenant, decides the provider: `getLlmClient` is resolved
  *  once per tenant/hop before the model for that specific call is even
@@ -102,13 +108,20 @@ export function __setLlmClientOverrideForTesting(fn: typeof testLlmOverride): vo
  *  images, embeddings) passes through to the real client untouched. */
 let novitaUnconfiguredWarned = false
 let orcarouterUnconfiguredWarned = false
+let atlascloudUnconfiguredWarned = false
 /** One log line per provider, not one per call — this fires on every hop of
  *  every turn of an agent whose model names an unconfigured provider. */
-function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter', model: string | undefined): void {
+function warnProviderUnconfiguredOnce(provider: 'Novita' | 'OrcaRouter' | 'Atlas Cloud', model: string | undefined): void {
   if (provider === 'Novita') {
     if (novitaUnconfiguredWarned) return
     novitaUnconfiguredWarned = true
     console.warn(`[llm] model "${model}" requests Novita but NOVITA_API_KEY is unset — using the tenant's normal client instead`)
+    return
+  }
+  if (provider === 'Atlas Cloud') {
+    if (atlascloudUnconfiguredWarned) return
+    atlascloudUnconfiguredWarned = true
+    console.warn(`[llm] model "${model}" requests Atlas Cloud but ATLASCLOUD_API_KEY is unset — using the tenant's normal client instead`)
     return
   }
   if (orcarouterUnconfiguredWarned) return
@@ -143,6 +156,12 @@ function withProviderRouting(client: OpenAI): OpenAI {
                 return orcarouterResponsesCreate(args, opts)
               }
               warnProviderUnconfiguredOnce('OrcaRouter', args.model)
+            } else if (isAtlasCloudModel(args.model)) {
+              // Same degrade-not-die guard for Atlas Cloud.
+              if (env.ATLASCLOUD_API_KEY) {
+                return atlascloudResponsesCreate(args, opts)
+              }
+              warnProviderUnconfiguredOnce('Atlas Cloud', args.model)
             }
             return (real.create as (a: unknown, o?: unknown) => unknown)(args, opts)
           }
