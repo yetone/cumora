@@ -1,15 +1,6 @@
 /**
- * The standing prompt has to describe the surface the agent actually has (#145).
- *
- * Secure mode removes the shell CLI on purpose — `<home>/bin` is never written,
- * `node` is not in the tool environment, no runtime URL or token crosses into
- * the model process — and gives the agent one MCP tool instead. Both secure
- * engines are shaped that way: Codex through `mcp_servers.cumora`, Claude
- * through `--tools …,mcp__cumora__cli` with Bash disallowed.
- *
- * Told to run `cumora` on its PATH, a secure agent spends the turn looking for
- * a binary that was deliberately withheld. The report describes exactly that:
- * it could reason and draft a reply, and could not publish it.
+ * The standing prompt must expose sandboxed development commands while keeping
+ * Cumora actions on the fixed MCP bridge (#145).
  *
  * Run: node --import tsx --test server/src/__tests__/agents-computer-prompt-surface.test.ts
  */
@@ -26,15 +17,18 @@ test('secure mode gets the MCP tool, compatibility mode keeps the CLI', () => {
   assert.equal(actionSurfaceFor(true), 'cli')
 })
 
-test('the secure prompt names the tool and forbids the hunt', () => {
+test('the secure prompt allows local development and routes Cumora actions through MCP', () => {
   const text = actionSurfaceText('mcp')
   assert.match(text, /mcp__cumora__cli/)
   assert.match(text, /argv/)
-  // The report's actual failure was the agent probing for these, one after
-  // another, instead of using the tool it had.
   assert.match(text, /no `cumora` on\s+PATH/)
-  assert.match(text, /no `node`/)
   assert.match(text, /no runtime URL or token/)
+  assert.match(text, /sandboxed shell/)
+  assert.match(text, /scripts, tests and builds/)
+  assert.match(text, /`workspace\/`/)
+  assert.match(text, /build caches there/)
+  assert.match(text, /Cumora actions still go through the MCP tool/)
+  assert.doesNotMatch(text, /NO shell|no `node`|try to run a command line|whole surface/)
   assert.doesNotMatch(text, /CLI on your PATH/)
 })
 

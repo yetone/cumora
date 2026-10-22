@@ -1,27 +1,8 @@
 /**
- * How a BYOA agent is told to reach Cumora — which is not the same in the two
- * modes, and used to be described as if it were.
- *
- * Secure mode deliberately makes the shell CLI unreachable: `<home>/bin` is
- * never written, it is not on PATH, `node` is absent from the permitted tool
- * environment, and no runtime URL or bearer token crosses into the model
- * process. Both secure engines are shaped that way — Codex gets
- * `mcp_servers.cumora` with `enabled_tools=["cli"]`, Claude gets
- * `--tools …,mcp__cumora__cli` with Bash disallowed outright.
- *
- * The standing prompt nevertheless told every agent to run `cumora` on its
- * PATH, so a secure agent spent its turn hunting for a binary, for `node`, and
- * for a runtime URL that had all been removed on purpose. It could read and
- * reason; it could not act (#145).
- *
- * Its posting advice was wrong in a second, sharper way: it said to write long
- * bodies to a file and post them with `--file`, and the MCP bridge REFUSES that
- * flag ("local file/stdin flags are unavailable; pass body text directly in
- * argv"). An agent that found the tool and followed the prompt still hit a
- * guaranteed error.
- *
- * Extracted here as pure functions so the wording of both modes can be pinned
- * without booting the daemon — the same reason cli-parse.ts is split out.
+ * Secure engines use MCP for Cumora actions and a sandboxed shell for local
+ * development. Only compatibility mode exposes the historical Cumora PATH shim.
+ * The prompt must distinguish these capabilities and match the bridge's argv
+ * interface, which deliberately refuses local --file / --stdin flags.
  */
 
 /** Whether the legacy shell CLI is on the model's PATH for this run. Compat
@@ -40,9 +21,10 @@ export function actionSurfaceText(surface: ActionSurface): string {
   return (
     'You act on Cumora through the `mcp__cumora__cli` tool. Pass the command words as `argv` — ' +
     '`{"argv":["reply","<conversationId>","your text"]}` is the shape; every `cumora <cmd> …` ' +
-    'below is the same words without the leading `cumora`. There is NO shell, no `cumora` on ' +
-    'PATH, no `node`, and no runtime URL or token — those are withheld deliberately, so do not ' +
-    'go looking for them or try to run a command line. The tool is the whole surface.\n\n'
+    'below is the same words without the leading `cumora`. There is no `cumora` on PATH ' +
+    'and no runtime URL or token to look for. Use the sandboxed shell for local scripts, ' +
+    'tests and builds under `workspace/`; keep project files and build caches there. ' +
+    'Cumora actions still go through the MCP tool, not the shell.\n\n'
   )
 }
 

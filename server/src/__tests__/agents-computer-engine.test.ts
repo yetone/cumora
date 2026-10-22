@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import { delimiter, dirname, join } from 'node:path'
 import { afterEach, beforeEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
+import { claudeSecureFlags, type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
 import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
 import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
@@ -53,7 +53,7 @@ async function writeFakeCli(binDir: string, name: string, source: string): Promi
   await chmod(launcher, 0o755)
 }
 
-function useFakeCliPath(binDir: string): void {
+function setFakeCliPath(binDir: string): void {
   process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ''}`
 }
 
@@ -165,7 +165,7 @@ test('local engine failure returns stderr tail for observability', async () => {
     'claude',
     "process.stderr.write('Claude Code error: usage limit reached, no tokens left\\n')\nprocess.exit(1)\n",
   )
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
 
   const logs: string[] = []
   const result = await getAdapter('claude').run({
@@ -183,7 +183,51 @@ test('local engine failure returns stderr tail for observability', async () => {
   assert.deepEqual(logs, ['Claude Code error: usage limit reached, no tokens left'])
 })
 
-test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS_WIN }, async () => {
+test('Claude Bash remains sandboxed with private tools, network and credentials denied', () => {
+  const home = '/home/cumora-policy-agent'
+  const argv = claudeSecureFlags(home, {
+    PATH: dirname(process.execPath),
+    CLAUDE_CONFIG_DIR: join(home, 'missing-config'),
+    CUMORA_AGENT_MCP_SHIM: join(home, 'trusted', 'cumora-mcp'),
+    ANTHROPIC_API_KEY: 'fixture-provider-key',
+    GITHUB_TOKEN: 'fixture-github-token',
+    BASH_ENV: '/untrusted-shell-startup',
+  })
+  const tools = argv[argv.indexOf('--tools') + 1].split(',')
+  assert.ok(tools.includes('Bash'))
+  assert.ok(tools.includes('mcp__cumora__cli'))
+  const allowed = argv.slice(argv.indexOf('--allowedTools') + 1, argv.indexOf('--disallowedTools'))
+  assert.deepEqual(allowed,
+    [`Read(/${home}/**)`, `Edit(/${home}/**)`, 'Bash', 'mcp__cumora__cli'])
+  const disallowed = argv[argv.indexOf('--disallowedTools') + 1].split(',')
+  assert.equal(disallowed.includes('Bash'), false)
+  for (const tool of ['PowerShell', 'WebFetch', 'WebSearch']) {
+    assert.equal(tools.includes(tool), false)
+    assert.ok(disallowed.includes(tool))
+  }
+  assert.ok(argv.includes('--restricted'))
+  assert.equal(argv[argv.indexOf('--permission-mode') + 1], 'dontAsk')
+  assert.ok(argv.includes('--strict-mcp-config'))
+
+  const { permissions, sandbox } = JSON.parse(argv[argv.indexOf('--settings') + 1])
+  assert.deepEqual(permissions.allow, allowed)
+  assert.ok(permissions.allow.includes('Bash'))
+  assert.equal(permissions.deny.includes('Bash'), false)
+  assert.ok(permissions.deny.includes(`Read(/${home}/bin/**)`))
+  assert.ok(permissions.deny.includes(`Edit(/${home}/bin/**)`))
+  assert.equal(sandbox.enabled, true)
+  assert.equal(sandbox.failIfUnavailable, true)
+  assert.equal(sandbox.allowUnsandboxedCommands, false)
+  assert.deepEqual(sandbox.excludedCommands, [])
+  assert.deepEqual(sandbox.network, { allowedDomains: [], strictAllowlist: true })
+  assert.ok(sandbox.filesystem.denyRead.includes('~/'))
+  assert.ok(sandbox.filesystem.allowRead.includes(home))
+  for (const name of ['ANTHROPIC_API_KEY', 'GITHUB_TOKEN', 'BASH_ENV']) {
+    assert.ok(sandbox.credentials.envVars.some((entry: { name: string; mode: string }) => entry.name === name && entry.mode === 'deny'))
+  }
+})
+
+async function checkClaudeSecureTransport(persistent: boolean): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-secure-'))
   tempDirs.push(root)
   const binDir = join(root, 'bin')
@@ -206,21 +250,28 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
     'claude',
     "process.stderr.write(JSON.stringify({ argv: process.argv.slice(2), scrub: process.env.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, coreEnv: { apiKey: process.env.ANTHROPIC_API_KEY, authToken: process.env.ANTHROPIC_AUTH_TOKEN, baseUrl: process.env.ANTHROPIC_BASE_URL, unrelated: process.env.UNRELATED_SECRET } }))\nprocess.exit(1)\n",
   )
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
 
   const logs: string[] = []
   const mcpShim = join(root, 'trusted', 'cumora-mcp')
-  await getAdapter('claude').run({
+  const args = {
     home,
-    prompt: 'wake',
     env: secureClaudeEnv(root, {
       CLAUDE_CONFIG_DIR: configDir,
       ANTHROPIC_API_KEY: 'explicit-daemon-api-key',
       OPENAI_API_KEY: 'must-not-appear-in-settings',
     }),
-    onLog: (line) => logs.push(line),
-    signal: new AbortController().signal,
-  })
+    onLog: (line: string) => logs.push(line),
+  }
+  if (persistent) {
+    const session = getAdapter('claude').startSession?.(args)
+    assert.ok(session)
+    liveSessions.push(session)
+    await session.send('wake')
+    await session.stop()
+  } else {
+    await getAdapter('claude').run({ ...args, prompt: 'wake', signal: new AbortController().signal })
+  }
 
   const captured = JSON.parse(logs[0] ?? '{}') as {
     argv?: string[]
@@ -235,7 +286,7 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
   })
   assert.ok(captured.argv?.includes('--restricted'))
   assert.ok(captured.argv?.includes('dontAsk'))
-  assert.ok(captured.argv?.includes('Read,Write,Edit,Glob,Grep,mcp__cumora__cli'))
+  assert.ok(captured.argv?.includes('Read,Write,Edit,Glob,Grep,Bash,mcp__cumora__cli'))
   assert.equal(captured.argv?.some((arg) => /Bash\(cumora/.test(arg)), false)
   assert.equal(captured.argv?.some((arg) => arg.includes('dangerously-skip-permissions')), false)
   const mcpIndex = captured.argv?.indexOf('--mcp-config') ?? -1
@@ -257,10 +308,12 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
       credentials?: { envVars?: Array<{ name?: string; mode?: string }> }
     }
   }
-  assert.ok(settings.permissions?.allow?.includes('Read(/**)'))
-  assert.ok(settings.permissions?.allow?.includes('Edit(/**)'))
-  assert.ok(settings.permissions?.deny?.includes('Read(/bin/**)'))
-  assert.ok(settings.permissions?.deny?.includes('Edit(/bin/**)'))
+  assert.ok(settings.permissions?.allow?.includes(`Read(/${home}/**)`))
+  assert.ok(settings.permissions?.allow?.includes(`Edit(/${home}/**)`))
+  assert.ok(settings.permissions?.allow?.includes('Bash'))
+  assert.equal(settings.permissions?.deny?.includes('Bash'), false)
+  assert.ok(settings.permissions?.deny?.includes(`Read(/${home}/bin/**)`))
+  assert.ok(settings.permissions?.deny?.includes(`Edit(/${home}/bin/**)`))
   assert.equal(settings.sandbox?.failIfUnavailable, true)
   assert.equal(settings.sandbox?.allowUnsandboxedCommands, false)
   assert.ok(settings.sandbox?.filesystem?.denyRead?.includes(process.platform === 'darwin' ? '/Users' : '/home'))
@@ -271,7 +324,12 @@ test('Claude secure mode is fail-closed and strips tool credentials', { skip: IS
   }
   assert.doesNotMatch(settingsText, /must-not-appear-in-settings/)
   assert.doesNotMatch(settingsText, /settings-auth-token|explicit-daemon-api-key|provider\.example\.test/)
-})
+}
+
+for (const persistent of [false, true]) {
+  test(`Claude secure ${persistent ? 'session' : 'one-shot'} preserves Bash and strips tool credentials`,
+    { skip: IS_WIN }, () => checkClaudeSecureTransport(persistent))
+}
 
 test('Claude secure triage stays inside the custom provider model namespace', { skip: IS_WIN }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-provider-model-'))
@@ -287,7 +345,7 @@ test('Claude secure triage stays inside the custom provider model namespace', { 
     'claude',
     "process.stdout.write(JSON.stringify({ result: JSON.stringify({ argv: process.argv.slice(2) }) }))\n",
   )
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
 
   const settingsPath = join(configDir, 'settings.json')
   await writeFile(settingsPath, JSON.stringify({
@@ -349,7 +407,7 @@ if (argv.includes('--input-format')) {
   process.stdout.write(JSON.stringify({type:'result', subtype:'success', result:'OK'}) + '\\n')
 }
 `)
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
   const preferences = {
     effortLevel: 'xhigh', modelSettings: { 'claude-opus-5': { effortLevel: 'medium' } },
     alwaysThinkingEnabled: true, language: 'Chinese',
@@ -436,7 +494,7 @@ const reply = () => {
 if (argv.includes('--input-format')) require('node:readline').createInterface({ input: process.stdin }).on('line', reply)
 else { process.stdin.resume(); process.stdin.on('end', reply) }
 `)
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
   for (const compatibility of [false, true]) {
     if (compatibility) process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
     else delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
@@ -493,7 +551,7 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
     'claude',
     "process.stderr.write('Claude Code error: subscription expired\\n')\nprocess.exit(1)\n",
   )
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
 
   const logs: string[] = []
   const session = getAdapter('claude').startSession?.({
@@ -533,7 +591,7 @@ test('persistent Claude classifies a rejected resume from its result event', asy
     '})\n' +
     'setInterval(() => {}, 1 << 30)\n',
   )
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
 
   const session = getAdapter('claude').startSession?.({
     home,
@@ -567,7 +625,7 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
     'grok',
     `process.stdout.write(${JSON.stringify(`${grokEvents.map((event) => JSON.stringify(event)).join('\n')}\n`)})\n`,
   )
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
 
   const adapter = getAdapter('grok')
   await adapter.seedHome(home, { id: 'iris', name: 'Iris', role: 'Designer', systemPrompt: null })
@@ -773,7 +831,7 @@ test('Claude and Codex one-shot adapters return structured engine failures', asy
   await mkdir(home)
   await writeFakeCli(binDir, 'claude', "process.stderr.write('No conversation found with session ID: claude-stale\\n')\nprocess.exit(1)\n")
   await writeFakeCli(binDir, 'codex', "process.stderr.write('429 Too Many Requests: rate limit reached\\n')\nprocess.exit(1)\n")
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
   process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
 
   const signal = new AbortController().signal
@@ -887,7 +945,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
   }
 })
 `)
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
   for (const nativeFastMode of [true, false]) {
     for (const resumeSessionId of [null, 'prior-thread', 'missing-thread']) {
       const logs: string[] = []
@@ -1298,7 +1356,7 @@ if (argv.includes('--input-format')) {
     ? capture() : JSON.stringify({type:'result', subtype:'success', result:'OK'})) + '\\n')
 }
 `)
-  useFakeCliPath(binDir)
+  setFakeCliPath(binDir)
   const adapter = getAdapter('claude')
   const profiles: ProviderProfile[] = ['alpha', 'beta'].map((id, index) => ({
     id, label: id, baseUrl: `https://${id}.example.test`, model: `${id}/big`, fastModel: `${id}/small`,

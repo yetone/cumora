@@ -1541,7 +1541,7 @@ const TOOL_ENV_ALLOWLIST = new Set([
   'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'WINDIR',
 ])
 
-function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv, nativeFastMode = false): string {
+function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv, nativeFastMode = false) {
   const deniedEnv = Object.keys(env)
     .filter((name) => !TOOL_ENV_ALLOWLIST.has(name.toUpperCase()) && !name.toUpperCase().startsWith('LC_'))
     .sort()
@@ -1558,7 +1558,9 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv, nativeF
     .filter(Boolean)
   pathDirs.push(dirname(process.execPath))
   const allowRead = [...new Set([agentHome, ...pathDirs])]
-  return JSON.stringify({
+  // Claude permission rules use // for absolute paths; / is source-relative.
+  const fileScope = `/${agentHome.replaceAll('\\', '/').replace(/\/$/, '')}`
+  return {
     ...readClaudeUserSettings(env).turnSettings,
     fastMode: nativeFastMode,
     permissions: {
@@ -1566,15 +1568,16 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv, nativeF
       // Restricted mode confines file tools to the working directory. Keep the
       // permission rules scoped too, so this JSON remains fail-closed if a
       // future Claude release changes a restricted-mode default.
-      allow: ['Read(/**)', 'Edit(/**)', 'mcp__cumora__cli'],
+      allow: [`Read(${fileScope}/**)`, `Edit(${fileScope}/**)`, 'Bash', 'mcp__cumora__cli'],
       // The MCP bridge runs as a trusted daemon helper outside the command
       // sandbox. The model must never rewrite either helper executable.
-      deny: ['Read(/bin/**)', 'Edit(/bin/**)', 'Bash', 'PowerShell', 'WebFetch', 'WebSearch'],
+      deny: [`Read(${fileScope}/bin/**)`, `Edit(${fileScope}/bin/**)`, 'PowerShell', 'WebFetch', 'WebSearch'],
     },
     sandbox: {
       enabled: true,
       failIfUnavailable: true,
       allowUnsandboxedCommands: false,
+      excludedCommands: [],
       autoAllowBashIfSandboxed: true,
       filesystem: {
         denyRead,
@@ -1583,7 +1586,7 @@ function claudeSecureSettings(agentHome: string, env: NodeJS.ProcessEnv, nativeF
       network: { allowedDomains: [], strictAllowlist: true },
       credentials: { envVars: deniedEnv },
     },
-  })
+  }
 }
 
 function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
@@ -1602,13 +1605,16 @@ function claudeSecureMcpConfig(env: NodeJS.ProcessEnv): string {
   })
 }
 
-function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv, nativeFastMode = false): string[] {
+export function claudeSecureFlags(agentHome: string, env: NodeJS.ProcessEnv, nativeFastMode = false): string[] {
+  const settings = claudeSecureSettings(agentHome, env, nativeFastMode)
   return [
     '--restricted',
     '--permission-mode', 'dontAsk',
-    '--tools', 'Read,Write,Edit,Glob,Grep,mcp__cumora__cli',
-    '--disallowedTools', 'Bash,PowerShell,WebFetch,WebSearch',
-    '--settings', claudeSecureSettings(agentHome, env, nativeFastMode),
+    '--tools', 'Read,Write,Edit,Glob,Grep,Bash,mcp__cumora__cli',
+    // Subprocess credential scrubbing requires an explicit CLI approval list.
+    '--allowedTools', ...settings.permissions.allow,
+    '--disallowedTools', 'PowerShell,WebFetch,WebSearch',
+    '--settings', JSON.stringify(settings),
     '--mcp-config', claudeSecureMcpConfig(env),
     '--strict-mcp-config',
   ]
