@@ -74,6 +74,8 @@ export interface EngineVersionSpec {
   brew?: string
   /** The vendor's own updater, preferred over brew/npm when it exists. */
   selfUpdate?: string
+  /** Restrict a vendor updater to binaries owned by its standalone installer. */
+  selfUpdatePath?: RegExp
   /** CLIs that report upstream themselves instead of via the npm registry. */
   latestVia?: 'cursor-about' | 'grok-check'
 }
@@ -96,6 +98,9 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
   codex: {
     versionArgs: ['--version'],
     npm: '@openai/codex',
+    brew: 'codex',
+    selfUpdate: 'codex update',
+    selfUpdatePath: /[/\\]\.codex[/\\]packages[/\\]standalone[/\\]/i,
   },
   grok: {
     versionArgs: ['--version'],
@@ -251,27 +256,23 @@ function realpathOf(binPath: string): string {
   }
 }
 
-export function isHomebrewInstall(binPath: string, real: string): boolean {
-  const hay = `${binPath}\n${real}`
-  return /(^|[/\\])(Homebrew|homebrew|linuxbrew|Cellar)([/\\]|$)/i.test(hay)
-    || binPath.startsWith('/opt/homebrew/')
-}
-
-function npmUpdateCommand(spec: EngineVersionSpec): string | null {
-  if (!spec.npm) return null
-  const flags = spec.npmFlags ? `${spec.npmFlags} ` : ''
-  return `npm install -g ${flags}${spec.npm}@latest`
+export function isHomebrewInstall(real: string, formula: string): boolean {
+  // npm under Homebrew's Node belongs to npm, not the Node formula's keg.
+  return real.match(/(?:^|[/\\])(?:Cellar|Caskroom)[/\\]([^/\\]+)[/\\]/i)?.[1] === formula
 }
 
 /** Prefer the CLI's own updater when it has one (`pi update`, `claude update`):
  *  that is the path vendors document, and it behaves the same on Windows. Fall
  *  back to brew only when the binary actually came from brew, else npm. */
 export function inferUpdateCommand(spec: EngineVersionSpec, binPath: string | null): string | null {
-  if (spec.selfUpdate) return spec.selfUpdate
-  if (spec.brew && binPath && isHomebrewInstall(binPath, realpathOf(binPath))) {
+  if (spec.selfUpdate && (!spec.selfUpdatePath || (binPath && spec.selfUpdatePath.test(realpathOf(binPath))))) {
+    return spec.selfUpdate
+  }
+  if (spec.brew && binPath && isHomebrewInstall(realpathOf(binPath), spec.brew)) {
     return `brew upgrade ${spec.brew}`
   }
-  return npmUpdateCommand(spec)
+  if (!spec.npm) return null
+  return `npm install -g ${spec.npmFlags ? `${spec.npmFlags} ` : ''}${spec.npm}@latest`
 }
 
 export function parseCursorAbout(text: string): string | null {
@@ -294,6 +295,8 @@ export interface CommandOutput {
   stderr: string
   /** stdout first — the order every combined-text caller wants. */
   combined: string
+  /** Exit code, or null when it never ran or was killed on timeout. */
+  code?: number | null
 }
 
 /** Run a command and return its output, or empty strings on any failure. Never
@@ -303,19 +306,19 @@ export interface CommandOutput {
  *  prints its version on stdout and its warnings on stderr, and merging them
  *  let an `npm warn EBADENGINE … node: '>=20.19.0'` line stand in for an
  *  engine's version at the secure floor. */
-function spawnCommand(cmd: string, args: string[], timeoutMs: number): Promise<CommandOutput> {
+function spawnCommand(cmd: string, args: string[], timeoutMs: number, forceShell = false): Promise<CommandOutput> {
   return new Promise((resolve) => {
     let settled = false
     let child: ReturnType<typeof spawn>
     try {
-      const invocation = versionCommandInvocation(cmd, args)
+      const invocation = versionCommandInvocation(cmd, args, process.platform, undefined, forceShell)
       child = spawn(invocation.command, invocation.args, {
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
         windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
       })
     } catch {
-      resolve({ stdout: '', stderr: '', combined: '' })
+      resolve({ stdout: '', stderr: '', combined: '', code: null })
       return
     }
     // Kept apart, then joined stdout-first. A CLI prints its version on stdout
@@ -327,10 +330,11 @@ function spawnCommand(cmd: string, args: string[], timeoutMs: number): Promise<C
     let stderr = ''
     child.stdout?.on('data', (buf: Buffer) => { stdout += buf.toString('utf8') })
     child.stderr?.on('data', (buf: Buffer) => { stderr += buf.toString('utf8') })
-    const captured = (): CommandOutput => ({
+    const captured = (code: number | null): CommandOutput => ({
       stdout: stdout.trim(),
       stderr: stderr.trim(),
       combined: `${stdout}\n${stderr}`.trim(),
+      code,
     })
     const finish = (value: CommandOutput) => {
       if (settled) return
@@ -339,11 +343,13 @@ function spawnCommand(cmd: string, args: string[], timeoutMs: number): Promise<C
       resolve(value)
     }
     const timer = setTimeout(() => {
+      // shortcut: kills the direct child only, so a wedged npm.cmd can outlive
+      // this on Windows; upgrade to a process-tree kill if that shows up.
       try { child.kill() } catch { /* already gone */ }
-      finish(captured())
+      finish(captured(null))
     }, timeoutMs)
-    child.on('error', () => finish({ stdout: '', stderr: '', combined: '' }))
-    child.on('close', () => finish(captured()))
+    child.on('error', () => finish({ stdout: '', stderr: '', combined: '', code: null }))
+    child.on('close', (code) => finish(captured(code)))
   })
 }
 
@@ -431,4 +437,48 @@ export async function probeLocalEngineVersionWithRetry(
     if (version) return version
   }
   return null
+}
+
+/** A global npm install or a brew upgrade downloads and unpacks: minutes, not
+ *  seconds, on a slow link. */
+const UPDATE_TIMEOUT_MS = 10 * 60 * 1000
+
+/** The update as argv. The CLI's own updater is named after the CLI (`claude
+ *  update`), and on Windows a bare `claude` is a `.cmd` shim only cmd.exe can
+ *  start — so the resolved path takes its place. npm and brew stay as they are:
+ *  they are package managers, not the CLI. */
+export function updateArgv(command: string, binPath: string | null): string[] {
+  const argv = command.split(/\s+/)
+  if (binPath && argv[0] !== 'npm' && argv[0] !== 'brew') argv[0] = binPath
+  return argv
+}
+
+/** Run one engine's update on this machine and say whether it worked.
+ *
+ *  The command is derived here from the same spec that produced the command the
+ *  app shows, and only the engine *id* ever crosses the wire — a request can
+ *  pick which known updater runs, never what it is.
+ *
+ *  shortcut: the daemon's own PATH is thinner than a login shell's, so an npm
+ *  that lives under a version manager may not be the one found here; upgrade to
+ *  resolving npm/brew from the CLI's own folder if a mis-install shows up. */
+export async function runEngineUpdate(
+  id: string,
+  binPath: string | null,
+): Promise<{ ok: boolean; command: string | null; error?: string }> {
+  if (!binPath) return { ok: false, command: null, error: `${id} is no longer installed` }
+  const spec = ENGINE_VERSION_SPECS[id]
+  const command = spec ? inferUpdateCommand(spec, binPath) : null
+  if (!command) return { ok: false, command, error: `no update command is known for ${id}` }
+  // The cached "latest" is 6 hours old by design; after an update it would make
+  // the engine read as still behind until it expires.
+  latestCache.delete(id)
+  const [file, ...args] = updateArgv(command, binPath)
+  if (!file) return { ok: false, command, error: `no update command is known for ${id}` }
+  // Through ComSpec on Windows: `npm` is a .cmd shim there, and CreateProcess
+  // cannot start one directly.
+  const out = await spawnCommand(file, args, UPDATE_TIMEOUT_MS, true)
+  if (out.code === 0) return { ok: true, command }
+  const detail = out.combined.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).pop()
+  return { ok: false, command, error: detail || `exit ${out.code ?? 'timeout'}` }
 }

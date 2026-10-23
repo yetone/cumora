@@ -1,4 +1,5 @@
 import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
+import type { EngineUpdate } from '../../shared/engine-update'
 import type {
   BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
   CalendarDispatch, CalendarEvent, CalendarEventKind, CalendarEventStatus,
@@ -1004,6 +1005,13 @@ export const api = {
   requestComputerEngineDetect: (id: string) =>
     http<{ ok: boolean }>(
       `/computers/${encodeURIComponent(id)}/detect`, { method: 'POST', body: '{}' }),
+  /** Start one update; its operation id distinguishes completion from scans. */
+  updateComputerEngine: (id: string, engine: string) =>
+    http<{ ok: boolean; updateId: string }>(
+      `/computers/${encodeURIComponent(id)}/engine-update`,
+      { method: 'POST', body: JSON.stringify({ engine }) }),
+  getComputerEngineUpdate: (id: string, updateId: string) =>
+    http<EngineUpdate>(`/computers/${encodeURIComponent(id)}/engine-updates/${encodeURIComponent(updateId)}`),
   /** Read per-engine default model settings for a computer. */
   getEngineDefaults: (id: string) =>
     http<{ defaults: EngineDefaultsMap }>(

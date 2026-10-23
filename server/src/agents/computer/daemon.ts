@@ -41,6 +41,7 @@ import { parseSseStream, wakeStreamWasStable } from '../runtime/sse-parse.js'
 import { type ProviderProfile, providerProfileEnv, providerProfileFingerprint, providerProfileMetadata, readProviderProfiles, redactProviderSecret } from './provider-profiles.js'
 import { modelIdOrNull } from './model-id.js'
 import { parseComputerControlEvent } from './control-event.js'
+import { runEngineUpdate } from './cli-version.js'
 import {
   mergeWakeBackgroundBriefs,
   parseWakeData,
@@ -1235,10 +1236,9 @@ export const CUMORA_SHIM = `#!/usr/bin/env node
 })().catch((e) => { console.error('cumora:', (e && e.message) || e); process.exit(70) })
 `
 
-/** Restricted Claude does not receive Bash at all. This fixed MCP bridge gives
- * it one structured tool that invokes the unprivileged file-IPC shim without
- * a shell. Local-body flags are rejected because the MCP process itself is not
- * inside Claude's Bash sandbox; callers pass body text as an argv item instead. */
+/** The fixed MCP bridge keeps Cumora actions outside the model's command
+ * sandbox without exposing daemon credentials. Local-body flags are rejected
+ * because MCP is not sandboxed; callers pass body text as an argv item instead. */
 export const CUMORA_MCP_SHIM = `#!/usr/bin/env node
 'use strict'
 var cp = require('child_process')
@@ -3750,6 +3750,46 @@ async function doRun(serverOverride?: string): Promise<void> {
   }
 
   let shuttingDown = false
+  // Serialize control events; the server refuses a second pending update.
+  //
+  // shortcut: an update is not deferred until agents are idle, so on Windows it
+  // can lose to a CLI that is mid-turn (EPERM); the card then still reads
+  // outdated and the daemon log says why. Upgrade to an idle wait if that shows
+  // up in practice.
+  let updating = Promise.resolve()
+  const updateEngine = (id: string, requestId: string): Promise<void> => {
+    if (!ENGINE_IDS.includes(id as EngineId)) return updating
+    updating = updating.then(async () => {
+      const report = (status: 'running' | 'succeeded' | 'failed', error?: string) =>
+        api(cfg.serverUrl, `/api/computers/me/engine-updates/${encodeURIComponent(requestId)}`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+          body: JSON.stringify({ status, error }),
+        })
+      // Claim before starting: another stream/process must not run this twice.
+      try { await report('running') }
+      catch (err) {
+        console.warn(`[computer] ${id} update was not accepted:`, err instanceof Error ? err.message : err)
+        return
+      }
+      let result: { ok: boolean; error?: string }
+      try {
+        const entry = (await snapshotDetectedEngines([id as EngineId]))[0]
+        const updated = await runEngineUpdate(id, entry?.path ?? null)
+        result = updated
+        if (!updated.ok) console.warn(`[computer] ${id} update failed (${updated.command}): ${updated.error}`)
+        else console.log(`[computer] ${id} updated: ${updated.command}`)
+      } catch (err) {
+        result = { ok: false, error: err instanceof Error ? err.message : String(err) }
+        console.warn(`[computer] ${id} update failed:`, result.error)
+      }
+      await rescanEngines(true).catch(() => {})
+      await report(result.ok ? 'succeeded' : 'failed', result.error)
+    }).catch((err) => {
+      console.warn(`[computer] ${id} update result could not be reported:`, err instanceof Error ? err.message : err)
+    })
+    return updating
+  }
   const controlStreamAbort = new AbortController()
   const controlStreamLoop = async (): Promise<void> => {
     let backoff = 1000
@@ -3771,9 +3811,9 @@ async function doRun(serverOverride?: string): Promise<void> {
             void heartbeat()
             continue
           }
-          if (event.event === 'engine.detect' && event.data && parseComputerControlEvent(event.data)) {
-            void rescanEngines(true)
-          }
+          const signal = event.data ? parseComputerControlEvent(event.data) : null
+          if (signal?.kind === 'engine.detect') void rescanEngines(true)
+          else if (signal?.kind === 'engine.update') void updateEngine(signal.engine, signal.id)
         }
         if (!shuttingDown) console.warn(`[computer] control-stream closed by server · retry in ${backoff}ms`)
       } catch (error) {

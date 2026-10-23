@@ -53,10 +53,11 @@ import {
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
-  setComputerDefaultEngine, updateEngineDefaults, getEngineDefaults,
+  setComputerDefaultEngine, updateEngineDefaults, getEngineDefaults, canUpdateEngine,
   rotateCompanyPairingCode, PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
-import { attachComputerControlStream, deliverEngineDetect } from '../agents/computer/control-bus.js'
+import { attachComputerControlStream, deliverEngineDetect, deliverEngineUpdate } from '../agents/computer/control-bus.js'
+import { getEngineUpdate, reportEngineUpdate, startEngineUpdate } from '../agents/computer/engine-update.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
 import {
@@ -1341,6 +1342,53 @@ api.post('/computers/:id/detect', safe(async (req, res) => {
     console.warn('[computers] immediate engine detection signal failed:', error instanceof Error ? error.message : String(error))
   }
   res.json({ ok: true, delivered })
+}))
+
+// Run one engine's own updater on the paired machine — the button beside the
+// "update available" badge. The daemon executes it and reports the new version
+// through the usual rescan; a separate operation result acknowledges completion.
+api.post('/computers/:id/engine-update', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  const computerId = String(req.params.id)
+  const engine = typeof req.body?.engine === 'string' ? req.body.engine : ''
+  if (!(await canUpdateEngine({ computerId, companyId, engine }))) {
+    throw new HttpError(400, 'this computer has no outdated engine by that name')
+  }
+  const update = await startEngineUpdate(computerId, companyId, engine)
+  if (!update) throw new HttpError(409, 'an engine update is already running on this computer')
+  let delivered = false
+  try {
+    delivered = (await deliverEngineUpdate(computerId, engine, update.id)) > 0
+  } catch (error) {
+    console.warn('[computers] immediate engine update signal failed:', error instanceof Error ? error.message : String(error))
+  }
+  if (!delivered) {
+    await reportEngineUpdate(computerId, update.id, 'failed', 'the computer has no connected control stream')
+    throw new HttpError(409, 'that computer did not answer — it is offline. Run the command there instead.')
+  }
+  res.json({ ok: true, updateId: update.id })
+}))
+
+api.get('/computers/:id/engine-updates/:updateId', safe(async (req, res) => {
+  const { companyId } = await requireCompany(req)
+  const update = await getEngineUpdate(String(req.params.updateId))
+  if (!update || update.companyId !== companyId || update.computerId !== String(req.params.id)) {
+    throw new HttpError(404, 'engine update not found or expired')
+  }
+  res.json({ id: update.id, engine: update.engine, status: update.status, error: update.error })
+}))
+
+api.post('/computers/me/engine-updates/:updateId', safe(async (req, res) => {
+  const { computerId } = await requireDevice(req)
+  const status = req.body?.status
+  if (status !== 'running' && status !== 'succeeded' && status !== 'failed') {
+    throw new HttpError(400, 'invalid engine update status')
+  }
+  const error = typeof req.body?.error === 'string' ? req.body.error : undefined
+  if (!(await reportEngineUpdate(computerId, String(req.params.updateId), status, error))) {
+    throw new HttpError(409, 'engine update is no longer pending for this computer')
+  }
+  res.json({ ok: true })
 }))
 
 api.post('/computers/:id/default-engine', safe(async (req, res) => {

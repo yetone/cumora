@@ -77,6 +77,19 @@ export async function deliverEngineDetect(computerId: string): Promise<number> {
   return redis.publish(CH_COMPUTER_CONTROL_PREFIX + computerId, JSON.stringify(event))
 }
 
+/** Publish an immediate engine-update nudge. A zero return means no daemon
+ *  stream is connected — and unlike a refresh there is no persisted fallback,
+ *  so the update simply did not start and the caller must say so. */
+export async function deliverEngineUpdate(computerId: string, engine: string, id = `engine.update-${randomUUID()}`): Promise<number> {
+  const event: ComputerControlEvent = {
+    kind: 'engine.update',
+    id,
+    at: Date.now(),
+    engine,
+  }
+  return redis.publish(CH_COMPUTER_CONTROL_PREFIX + computerId, JSON.stringify(event))
+}
+
 /** Attach the authenticated daemon's long-lived SSE control stream. */
 export async function attachComputerControlStream(
   computerId: string,

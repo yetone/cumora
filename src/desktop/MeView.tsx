@@ -16,6 +16,7 @@ import { cn } from '@/lib/utils'
 import { api, getPairingServerOrigin, getServerOrigin, type ApiProject, type ApiQuotaSnapshot, type ApiQuotaWindow } from '@/api/client'
 import { ENGINE_BIN, ENGINE_LABEL, RUNNABLE_ENGINES, RUNNABLE_ENGINE_IDS, engineLabel, type RunnableEngineId } from '@/lib/engines'
 import type { Computer, EngineId } from '@/types'
+import { ENGINE_UPDATE_TTL_SECONDS } from '../../shared/engine-update'
 
 // The tab's identity is its `key`; the label is a message key resolved at
 // render. Before this they were the same string, which would have made
@@ -864,6 +865,8 @@ function ComputersTab() {
   const [repairCopied, setRepairCopied] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
   const [copiedCli, setCopiedCli] = useState<string | null>(null)
+  // `computerId:engine` whose update the daemon is running right now.
+  const [updatingCli, setUpdatingCli] = useState<string | null>(null)
   // Engine model defaults editing: which computer+engine is being edited
   const [editingModel, setEditingModel] = useState<{ computerId: string; engineId: string } | null>(null)
   const [modelInput, setModelInput] = useState('')
@@ -1008,6 +1011,32 @@ function ComputersTab() {
       setErr(e instanceof Error ? e.message : String(e))
     } finally {
       setBusyId(null)
+    }
+  }
+
+  /** Only this request's result ends the wait; ordinary scans are unrelated. */
+  async function updateEngine(computerId: string, engineId: string) {
+    const key = `${computerId}:${engineId}`
+    setErr(null)
+    setUpdatingCli(key)
+    try {
+      const { updateId } = await api.updateComputerEngine(computerId, engineId)
+      const deadline = Date.now() + ENGINE_UPDATE_TTL_SECONDS * 1000
+      while (Date.now() < deadline) {
+        const update = await api.getComputerEngineUpdate(computerId, updateId)
+        if (update.status === 'failed') throw new Error(update.error || t('me.agentsUpdateFailed'))
+        if (update.status === 'succeeded') {
+          await useComputers.getState().refresh()
+          return
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, 2000))
+        await useComputers.getState().refresh()
+      }
+      setErr(t('me.agentsUpdateWaiting', { name: useComputers.getState().byId[computerId]?.name ?? '' }))
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setUpdatingCli(null)
     }
   }
 
@@ -1199,11 +1228,11 @@ function ComputersTab() {
                             </div>
                             {row.updateCommand && (
                               <div className="mt-2">
-                                {/* The card describes another machine, so say where the
-                                    command has to run — copying it here and pasting it
-                                    into a local shell would update the wrong computer. */}
+                                {/* The card describes another machine. The button
+                                    runs the updater there; the command stays for
+                                    anyone who would rather do it by hand. */}
                                 <div className="text-[11px] text-ink-400 mb-1">
-                                  {t('me.agentsRunOnComputer', { name: c.name })}
+                                  {t('me.agentsUpdateHint', { name: c.name })}
                                 </div>
                                 <div className="flex items-center gap-2">
                                 <pre className="flex-1 min-w-0 font-mono text-[11px] truncate bg-ink-900 text-cloud rounded-[8px] px-2 py-1.5 select-all">{row.updateCommand}</pre>
@@ -1218,6 +1247,17 @@ function ComputersTab() {
                                 >
                                   {copiedCli === copyKey ? t('me.copied') : t('me.agentsCopyUpdate')}
                                 </button>
+                                {row.outdated && (
+                                  <button
+                                    type="button"
+                                    disabled={updatingCli !== null}
+                                    onClick={(e) => { e.stopPropagation(); void updateEngine(c.id, row.id) }}
+                                    className="shrink-0 px-3 py-1.5 rounded-[8px] text-[12px] font-semibold text-white disabled:opacity-50"
+                                    style={{ background: 'var(--skype)' }}
+                                  >
+                                    {updatingCli === copyKey ? t('me.agentsUpdating') : t('me.agentsUpdate')}
+                                  </button>
+                                )}
                                 </div>
                               </div>
                             )}

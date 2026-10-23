@@ -1180,6 +1180,27 @@ export async function requestEngineDetect(args: {
   return Boolean(rowCount)
 }
 
+/** Authorize an app-initiated engine update. The computer must be this
+ *  company's, and the engine must be one it already reported as outdated — the
+ *  card is the only place the button exists, and a daemon should never be told
+ *  to run an updater for an engine nobody saw behind.
+ *
+ *  Nothing but the engine id travels: the daemon derives the command from its
+ *  own spec, so a request can pick which known updater runs, never what it is. */
+export async function canUpdateEngine(args: {
+  computerId: string
+  companyId: string
+  engine: string
+}): Promise<boolean> {
+  if (!PAIRABLE_ENGINES.has(args.engine)) return false
+  const { rows } = await pool.query<{ detected_engines: DetectedEngine[] }>(
+    `SELECT COALESCE(detected_engines, '[]'::jsonb) AS detected_engines FROM computers
+      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
+    [args.computerId, args.companyId],
+  )
+  return (rows[0]?.detected_engines ?? []).some((e) => e.id === args.engine && e.outdated === true)
+}
+
 /** Daemon reports a fresh PATH snapshot. Keeps the current default first when
  *  that engine is still installed. */
 export async function reportDetectedEngines(args: {

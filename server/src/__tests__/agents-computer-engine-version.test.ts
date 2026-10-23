@@ -19,9 +19,9 @@ process.env.CUMORA_RUNTIME_CLIENT = 'http'
 process.env.OPENAI_API_KEY ??= 'test-key'
 
 const {
-  parseCliVersion, isCliOutdated, isCliVersionAtLeast, inferUpdateCommand,
+  parseCliVersion, isCliOutdated, isCliVersionAtLeast, inferUpdateCommand, updateArgv,
   parseCursorAbout, parseGrokCheck, ENGINE_VERSION_SPECS, versionCommandInvocation,
-  probeLocalEngineVersionWithRetry,
+  probeLocalEngineVersionWithRetry, runEngineUpdate,
 } = await import('../agents/computer/cli-version.js')
 const { sanitizeDetectedEngines } = await import('../agents/computer/registry.js')
 
@@ -104,14 +104,14 @@ test('inferUpdateCommand prefers the vendor updater, then brew, then npm', () =>
   )
   // gemini has no self-updater: brew only when it actually came from brew.
   assert.equal(
-    inferUpdateCommand(ENGINE_VERSION_SPECS.gemini, '/opt/homebrew/bin/gemini'),
+    inferUpdateCommand(ENGINE_VERSION_SPECS.gemini, '/opt/homebrew/Cellar/gemini-cli/1.0.0/bin/gemini'),
     'brew upgrade gemini-cli',
   )
   assert.equal(
     inferUpdateCommand(ENGINE_VERSION_SPECS.gemini, '/usr/local/bin/gemini'),
     'npm install -g @google/gemini-cli@latest',
   )
-  // codex is npm-only.
+  // A regular npm Codex install keeps using npm.
   assert.equal(
     inferUpdateCommand(ENGINE_VERSION_SPECS.codex, '/usr/local/bin/codex'),
     'npm install -g @openai/codex@latest',
@@ -123,6 +123,43 @@ test('inferUpdateCommand prefers the vendor updater, then brew, then npm', () =>
     inferUpdateCommand(ENGINE_VERSION_SPECS.antigravity, '/Users/test/.local/bin/agy'),
     'agy update',
   )
+})
+
+test('updateArgv runs the CLI\'s own updater through its resolved path', () => {
+  // Windows: a bare `claude` is a .cmd shim only cmd.exe can start.
+  assert.deepEqual(updateArgv('claude update', 'C:\\bin\\claude.cmd'), ['C:\\bin\\claude.cmd', 'update'])
+  // Package managers are already runnable by name.
+  assert.deepEqual(
+    updateArgv('npm install -g @openai/codex@latest', '/usr/local/bin/codex'),
+    ['npm', 'install', '-g', '@openai/codex@latest'],
+  )
+  assert.deepEqual(updateArgv('brew upgrade gemini-cli', '/opt/homebrew/bin/gemini'), ['brew', 'upgrade', 'gemini-cli'])
+})
+
+test('Codex updates the installation that supplies its binary', () => {
+  const spec = ENGINE_VERSION_SPECS.codex
+  assert.equal(inferUpdateCommand(spec, '/opt/homebrew/Caskroom/codex/0.162.1/codex'), 'brew upgrade codex')
+  assert.equal(inferUpdateCommand(spec, '/usr/local/Caskroom/codex/0.160.0/codex'), 'brew upgrade codex')
+  assert.equal(inferUpdateCommand(spec, '/home/test/.codex/packages/standalone/current/bin/codex'), 'codex update')
+  assert.equal(inferUpdateCommand(spec, 'C:\\Users\\test\\.codex\\packages\\standalone\\current\\bin\\codex.exe'), 'codex update')
+  assert.equal(inferUpdateCommand(spec, '/usr/local/bin/codex'), 'npm install -g @openai/codex@latest')
+})
+
+test('Homebrew-installed Node does not make an npm Codex install belong to brew', () => {
+  const spec = ENGINE_VERSION_SPECS.codex
+  for (const path of [
+    '/opt/homebrew/lib/node_modules/@openai/codex/bin/codex.js',
+    '/opt/homebrew/Cellar/node@22/22.0.0/lib/node_modules/@openai/codex/bin/codex.js',
+    '/home/linuxbrew/.linuxbrew/lib/node_modules/@openai/codex/bin/codex.js',
+  ]) {
+    assert.equal(inferUpdateCommand(spec, path), 'npm install -g @openai/codex@latest')
+  }
+})
+
+test('an upgrade refuses an engine removed since the last scan', async () => {
+  assert.deepEqual(await runEngineUpdate('codex', null), {
+    ok: false, command: null, error: 'codex is no longer installed',
+  })
 })
 
 test('parseCursorAbout / parseGrokCheck read their vendor formats', () => {

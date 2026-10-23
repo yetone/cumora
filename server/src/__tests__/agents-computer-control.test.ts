@@ -24,6 +24,17 @@ test('malformed and unknown control events are ignored', () => {
   assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'daemon.stop', id: 'x', at: Date.now() })), null)
 })
 
+test('an engine update carries only an id, never a command', () => {
+  const event = parseComputerControlEvent(JSON.stringify({ kind: 'engine.update', id: 'u1', at: 1, engine: 'codex' }))
+  assert.deepEqual(event, { kind: 'engine.update', id: 'u1', at: 1, engine: 'codex' })
+  // Anything that is not a plain engine id is refused: the daemon picks the
+  // command itself, so a payload cannot smuggle one in.
+  for (const engine of ['', 'codex; rm -rf /', '../x', 'CODE X']) {
+    assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'engine.update', id: 'u1', at: 1, engine })), null)
+  }
+  assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'engine.update', id: 'u1', at: 1 })), null)
+})
+
 test('an immediate forced refresh arriving during a scan gets a forced follow-up', async () => {
   let releaseFirst!: () => void
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })
