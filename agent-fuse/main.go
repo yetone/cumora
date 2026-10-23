@@ -585,7 +585,9 @@ func main() {
 			Options:       []string{"default_permissions"},
 			DisableXAttrs: true,
 			Debug:         os.Getenv("CUMORA_FUSE_DEBUG") == "1",
-			DirectMount:   false,
+
+			// Bootstrap already owns CAP_SYS_ADMIN; avoid helper AppArmor transitions.
+			DirectMountStrict: true,
 		},
 		UID:             modelUID,
 		GID:             modelGID,
