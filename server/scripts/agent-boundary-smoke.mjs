@@ -9,7 +9,7 @@
 import { createInterface } from 'node:readline'
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { spawn, execFileSync } from 'node:child_process'
+import { spawn, spawnSync, execFileSync } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 
@@ -80,7 +80,12 @@ function execIn(name, args, user = 0, timeout = 20_000) {
 }
 
 function logs(name) {
-  return docker(['logs', name], { timeout: 10_000 })
+  const result = spawnSync('docker', ['logs', name], { encoding: 'utf8', timeout: 10_000 })
+  return {
+    status: result.status ?? 1,
+    stdout: decode(result.stdout),
+    stderr: decode(result.stderr || result.error?.message),
+  }
 }
 
 async function waitFor(predicate, timeoutMs = 60_000, intervalMs = 250) {
@@ -527,6 +532,15 @@ try {
   report.error = error instanceof Error ? error.message : String(error)
   report.failures.push('smoke_execution')
 } finally {
+  if (report.failures.length > 0) {
+    report.containerDiagnostics = []
+    for (const name of containers) {
+      const fuseLogPath = resolve(reportDir, `${name}.fuse.log`)
+      const copied = docker(['cp', `${name}:/tmp/cumora-fuse.log`, fuseLogPath])
+      const fuseLog = copied.status === 0 ? await readFile(fuseLogPath, 'utf8').catch(() => '') : ''
+      report.containerDiagnostics.push({ name, state: inspect(name), logs: logs(name), fuseLog })
+    }
+  }
   for (const name of containers) docker(['rm', '--force', name], { timeout: 20_000 })
   for (const volume of volumes) docker(['volume', 'rm', '--force', volume], { timeout: 20_000 })
   if (backend && !backend.killed) backend.kill('SIGTERM')
