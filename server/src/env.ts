@@ -80,6 +80,17 @@ export const env = {
    *  base-URL swap (no Chat-Completions translation, unlike Novita). */
   ORCAROUTER_BASE_URL: (process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, ''),
   /**
+   * Atlas Cloud LLM API key. Optional — when unset, agents configured with an
+   * `atlascloud/<model>` model id (see server/src/atlascloud.ts) fall back to
+   * the legacy/sub2api client instead, so an unconfigured deployment doesn't
+   * break the run; the model just won't resolve to Atlas Cloud as intended.
+   */
+  ATLASCLOUD_API_KEY: process.env.ATLASCLOUD_API_KEY ?? '',
+  /** Atlas Cloud's OpenAI-compatible base, which serves the Responses API, so
+   *  the `atlascloud/<model>` route is a pure base-URL swap (no Chat-Completions
+   *  translation, unlike Novita). */
+  ATLASCLOUD_BASE_URL: (process.env.ATLASCLOUD_BASE_URL ?? 'https://api.atlascloud.ai/v1').replace(/\/+$/, ''),
+  /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
    * `{ content: "..." }` JSON payload. When unset, alerts are still
