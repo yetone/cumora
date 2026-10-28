@@ -37,6 +37,7 @@ export interface InboxAttachment {
   name: string
   kind: string
   mime?: string
+  size?: number
   /** Storage key (`attachments/<uuid>.<ext>`) preserved for re-signing. */
   key?: string
 }
@@ -73,6 +74,9 @@ export interface InboxRow {
   sequence: number
   created_at: string
   attachment: InboxAttachment | null
+  /** Canonical ordered list. `attachment` remains the first-entry projection
+   *  for older runtime consumers. */
+  attachments?: InboxAttachment[]
   /** Set when this message is a reply: id of the message it quotes. */
   quoted_message_id: string | null
   /** Inline summary of the quoted-original so the agent turn sees both the

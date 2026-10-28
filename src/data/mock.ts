@@ -252,11 +252,11 @@ export const messages: Record<string, Message[]> = {
       kind: 'attachment',
       body: '',
       at: '13:21',
-      attachment: {
+      attachments: [{
         name: 'Aurora · Competitor Brief v2.pdf',
         meta: '12 pages · 1.4MB · just now',
         kind: 'pdf',
-      },
+      }],
       reactions: [
         { emoji: '🎯', count: 3 },
         { emoji: '📌', count: 1 },
@@ -290,11 +290,11 @@ export const messages: Record<string, Message[]> = {
       kind: 'attachment',
       body: '',
       at: '13:42',
-      attachment: {
+      attachments: [{
         name: 'aurora.hero — v3 (race-bars).fig',
         meta: '3 frames · open in Figma →',
         kind: 'fig',
-      },
+      }],
       reactions: [
         { emoji: '🌤️', count: 1, mine: true },
         { emoji: '🔥', count: 2 },
@@ -343,11 +343,11 @@ export const messages: Record<string, Message[]> = {
       kind: 'attachment',
       body: '',
       at: '13:40',
-      attachment: {
+      attachments: [{
         name: 'aurora · launch milestones.pdf',
         meta: '6 pages · 320KB',
         kind: 'pdf',
-      },
+      }],
     },
   ],
   'direct-iris': [

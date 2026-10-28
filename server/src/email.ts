@@ -18,6 +18,7 @@ import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
 import { env } from './env.js'
+import { grantAttachment } from './attachments/grants.js'
 
 /** Lowercased domain for an address-construction call. Returns '' when
  *  EMAIL_DOMAIN isn't configured — callers should treat that as "email
@@ -727,6 +728,9 @@ export async function persistEmailMessage(args: {
         const filename = a.filename.slice(0, 200)
         const mimeType = (a.mimeType || 'application/octet-stream').slice(0, 120)
         const truncated = Boolean(a.truncated)
+        if (a.storageKey && !truncated) {
+          await grantAttachment(client, args.companyId, a.storageKey)
+        }
         await client.query(
           `INSERT INTO email_attachments
            (id, message_id, conversation_id, company_id, filename, mime_type, size_bytes, storage_key, truncated)

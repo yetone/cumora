@@ -13,8 +13,10 @@ import { isProviderProfileId } from '../agents/computer/provider-profiles.js'
 import { InvalidModelIdError, parseModelId } from '../agents/computer/model-id.js'
 import type { PoolClient } from 'pg'
 import {
-  storage, UPLOAD_DIR, freshenAttachmentUrl, normalizeStorageKey,
+  storage, UPLOAD_DIR, normalizeStorageKey,
   storageKeyFromPublicUrl, messageAttachmentStorageKey,
+  CHAT_ATTACHMENT_MIME_POLICY, freshenMessageAttachments,
+  resolveMessageAttachments, validateChatUpload,
 } from '../storage.js'
 import { healthPool, pool } from '../db/pool.js'
 import { CH_MESSAGE_NEW, CH_REACTIONS, CH_CONVO_UPDATED, CH_DOCS, CH_TYPING, CH_CALENDAR_EVENTS, CH_BOARDS, CH_STATUS, CH_WORKSPACES, publish } from '../redis.js'
@@ -60,6 +62,7 @@ import { attachComputerControlStream, deliverEngineDetect, deliverEngineUpdate }
 import { getEngineUpdate, reportEngineUpdate, startEngineUpdate } from '../agents/computer/engine-update.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
+import { grantAttachment, hasAttachmentGrant, isGrantableAttachmentKey } from '../attachments/grants.js'
 import {
   findIdempotentCreate, IdempotencyConflictError,
   parseRequestId, requestHash,
@@ -79,55 +82,11 @@ export { UPLOAD_DIR }
  *  content into context. Anything outside this map gets rejected at the
  *  upload edge.
  */
-const MIME_POLICY: Record<string, { kind: 'img' | 'file'; ext: string }> = {
-  // Images — inline preview + vision
-  'image/png':  { kind: 'img',  ext: 'png'  },
-  'image/jpeg': { kind: 'img',  ext: 'jpg'  },
-  'image/webp': { kind: 'img',  ext: 'webp' },
-  'image/gif':  { kind: 'img',  ext: 'gif'  },
-  // Documents
-  'application/pdf': { kind: 'file', ext: 'pdf' },
-  'application/msword': { kind: 'file', ext: 'doc' },
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { kind: 'file', ext: 'docx' },
-  'application/vnd.ms-excel': { kind: 'file', ext: 'xls' },
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { kind: 'file', ext: 'xlsx' },
-  'application/vnd.ms-powerpoint': { kind: 'file', ext: 'ppt' },
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation': { kind: 'file', ext: 'pptx' },
-  // Archives
-  'application/zip': { kind: 'file', ext: 'zip' },
-  'application/x-tar': { kind: 'file', ext: 'tar' },
-  'application/gzip': { kind: 'file', ext: 'gz' },
-  // Text & code (extractable into agent context)
-  'text/plain': { kind: 'file', ext: 'txt' },
-  'text/markdown': { kind: 'file', ext: 'md' },
-  'text/csv': { kind: 'file', ext: 'csv' },
-  // NOTE: text/html is intentionally NOT accepted. An uploaded .html served
-  // from the app origin (local-storage mode) would run as the app and could
-  // read the localStorage session token — stored XSS → account takeover. The
-  // /uploads static handler also forces nosniff + attachment disposition as
-  // defense in depth, but the durable fix is never storing active content.
-  'application/json': { kind: 'file', ext: 'json' },
-  'application/x-yaml': { kind: 'file', ext: 'yml' },
-  'application/x-toml': { kind: 'file', ext: 'toml' },
-  // Audio / video — light support
-  'audio/mpeg': { kind: 'file', ext: 'mp3' },
-  'audio/wav': { kind: 'file', ext: 'wav' },
-  'video/mp4': { kind: 'file', ext: 'mp4' },
-  'video/quicktime': { kind: 'file', ext: 'mov' },
-}
+/** The shared policy lives in storage.ts so message persistence and upload
+ *  routes derive MIME/kind from the same trusted source. */
+const MIME_POLICY = CHAT_ATTACHMENT_MIME_POLICY
 
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024  // 25 MB (Skype-like ceiling)
-
-interface AttachmentPayload {
-  name: string
-  kind: 'img' | 'pdf' | 'file' | 'fig'
-  url: string
-  mime?: string
-  size?: number
-  /** Storage key — present when the file lives in object storage; lets us
-   *  resolve a fresh URL later without re-uploading. */
-  key?: string
-}
 
 export const api = Router()
 
@@ -581,23 +540,28 @@ api.post('/uploads/presign', async (req, res) => {
   // signed R2 PUT URLs and burn through our storage quota / host arbitrary
   // content under our domain. Membership-only is enough — we don't restrict
   // uploads by role since attachments are a basic chat affordance.
-  await requireCompany(req)
+  const { companyId: tenant } = await requireCompany(req)
   if (storage.mode !== 'r2') {
     res.status(501).json({ error: 'presign not available in local mode — POST /uploads instead' })
     return
   }
-  const name = String(req.body?.name ?? '').trim().slice(0, 200)
-  const mime = String(req.body?.mime ?? '').trim().toLowerCase()
-  const size = Number(req.body?.size ?? 0)
-  if (!name || !mime) { res.status(400).json({ error: 'name + mime required' }); return }
-  if (!Number.isFinite(size) || size <= 0 || size > MAX_UPLOAD_BYTES) {
-    res.status(413).json({ error: `size out of range (got ${size}, max ${MAX_UPLOAD_BYTES})` })
+  const checked = validateChatUpload({
+    name: req.body?.name,
+    mime: req.body?.mime,
+    size: req.body?.size,
+  })
+  if (!checked.ok) {
+    res.status(checked.status).json({ error: checked.error })
     return
   }
-  const policy = MIME_POLICY[mime]
+  const { name, mime, size } = checked
   const k = attachmentKey(mime)
-  if (!policy || !k) { res.status(415).json({ error: `mime not allowed: ${mime}` }); return }
-  const signed = await storage.presignPut(k.key, mime)
+  if (!k) { res.status(415).json({ error: `mime not allowed: ${mime}` }); return }
+  const signed = await storage.presignPut(k.key, mime, size)
+  // A presigned object has no DB row yet. Grant the tenant before returning
+  // the URL; message persistence still requires statObject, so an abandoned
+  // presign cannot be referenced as an attachment.
+  await grantAttachment(pool, tenant, k.key)
   res.json({
     uploadUrl: signed.uploadUrl,
     publicUrl: signed.publicUrl,
@@ -605,7 +569,7 @@ api.post('/uploads/presign', async (req, res) => {
     name,
     mime,
     size,
-    kind: policy.kind,
+    kind: checked.kind,
   })
 })
 
@@ -620,7 +584,7 @@ api.post('/uploads', requireAuthBeforeLargeBody, uploadJsonParser, async (req, r
   // Auth + tenant gate. Without this, anyone on the open internet could push
   // 25MB blobs into our storage — a DoS + cost vector. Membership-only is
   // sufficient since attachments are a baseline chat feature.
-  await requireCompany(req)
+  const { companyId: tenant } = await requireCompany(req)
   const name = String(req.body?.name ?? '').trim().slice(0, 200)
   const mime = String(req.body?.mime ?? '').trim().toLowerCase()
   const dataBase64 = String(req.body?.dataBase64 ?? '')
@@ -647,6 +611,7 @@ api.post('/uploads', requireAuthBeforeLargeBody, uploadJsonParser, async (req, r
   const k = attachmentKey(mime)
   if (!k) { res.status(415).json({ error: `mime not allowed: ${mime}` }); return }
   const url = await storage.put(k.key, buf, mime)
+  await grantAttachment(pool, tenant, k.key)
   res.json({
     url,
     key: k.key,
@@ -658,11 +623,14 @@ api.post('/uploads', requireAuthBeforeLargeBody, uploadJsonParser, async (req, r
 })
 
 api.post('/uploads/refresh-url', safe(async (req, res) => {
-  await requireCompany(req)
+  const { companyId: tenant } = await requireCompany(req)
   const url = String(req.body?.url ?? '').trim()
   const requestedKey = String(req.body?.key ?? '').trim()
   const key = normalizeStorageKey(requestedKey) ?? (url ? storageKeyFromPublicUrl(url) : null)
   if (!key) throw new HttpError(400, 'not a Cumora storage URL')
+  if (!isGrantableAttachmentKey(key) || !(await hasAttachmentGrant(pool, tenant, key))) {
+    throw new HttpError(403, 'attachment is not granted to this workspace')
+  }
   res.json({ key, url: await storage.publicUrl(key) })
 }))
 
@@ -1917,12 +1885,22 @@ api.delete('/companies/:id', safe(async (req, res) => {
       const key = row.storage_key ? normalizeStorageKey(row.storage_key) : null
       if (key) storageKeys.add(key)
     }
-    const { rows: messageFiles } = await client.query<{ attachment: unknown }>(
-      `SELECT attachment FROM messages WHERE company_id = $1 AND attachment IS NOT NULL`, [companyId],
+    const { rows: messageFiles } = await client.query<{ attachments: unknown }>(
+      `SELECT COALESCE(
+                CASE WHEN jsonb_typeof(attachments) = 'array' THEN attachments END,
+                CASE WHEN attachment IS NULL THEN '[]'::jsonb
+                     ELSE jsonb_build_array(attachment) END
+              ) AS attachments
+         FROM messages
+        WHERE company_id = $1
+          AND (attachment IS NOT NULL OR CASE
+            WHEN jsonb_typeof(attachments) = 'array' THEN jsonb_array_length(attachments) > 0
+            ELSE FALSE
+          END)`,
+      [companyId],
     )
     for (const row of messageFiles) {
-      const candidates = Array.isArray(row.attachment) ? row.attachment : [row.attachment]
-      for (const candidate of candidates) {
+      for (const candidate of Array.isArray(row.attachments) ? row.attachments : []) {
         if (!candidate || typeof candidate !== 'object') continue
         const key = messageAttachmentStorageKey(candidate as { key?: unknown; url?: unknown })
         if (key) storageKeys.add(key)
@@ -3463,7 +3441,12 @@ api.get('/conversations', async (req, res) => {
           'kind', m.kind,
           'body', m.body,
           'tool', m.tool,
-          'attachment', m.attachment,
+          'attachment', COALESCE(m.attachments->0, m.attachment),
+          'attachments', COALESCE(
+            CASE WHEN jsonb_typeof(m.attachments) = 'array' THEN m.attachments END,
+            CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                 ELSE jsonb_build_array(m.attachment) END
+          ),
           'createdAt', m.created_at,
           -- For email messages, surface the subject + direction so the
           -- sidebar preview can show "Re: contract draft" instead of a
@@ -3956,7 +3939,10 @@ api.get('/conversations/:id/messages', async (req, res) => {
           m.id, m.conversation_id AS "conversationId",
           m.author_id AS "authorId", m.kind, m.body, m.sequence,
           m.client_id AS "clientId",
-          m.tool, m.attachment, m.poll,
+          m.tool, COALESCE(m.attachments->0, m.attachment) AS attachment,
+          COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                      ELSE jsonb_build_array(m.attachment) END) AS attachments,
+          m.poll,
           -- Per-option vote tallies for polls. Empty array for non-poll
           -- rows. voterIds is sorted so the client can diff cheaply across
           -- successive WS poll.updated events.
@@ -4080,12 +4066,13 @@ api.get('/conversations/:id/messages', async (req, res) => {
     // wrap each refresh so a single bad attachment falls back to its
     // stored (possibly stale) URL instead of bringing down the response.
     for (const row of rows) {
-      if (!row.attachment) continue
+      const stored = row.attachments ?? row.attachment
+      if (!stored) continue
       try {
-        row.attachment = await freshenAttachmentUrl(row.attachment)
+        Object.assign(row, await freshenMessageAttachments(stored))
       } catch (e) {
         console.warn(
-          `[messages] freshenAttachmentUrl failed for message ${row.id} in ${id}; ` +
+          `[messages] freshenMessageAttachments failed for message ${row.id} in ${id}; ` +
           `falling back to stored URL`, e,
         )
       }
@@ -4121,38 +4108,20 @@ api.post('/conversations/:id/messages', async (req, res) => {
   const { userId: me, companyId: tenant } = await requireCompany(req)
   const { id } = req.params
   const body = String(req.body?.body ?? '').trim()
-  const rawAttachment = req.body?.attachment
-  let attachment: AttachmentPayload | null = null
-  if (rawAttachment && typeof rawAttachment === 'object') {
-    const a = rawAttachment as Record<string, unknown>
-    if (typeof a.url === 'string' && typeof a.name === 'string') {
-      // URLs are display data and may be client-controlled or expired. Resolve
-      // the server-generated object key, then mint the URL ourselves so a chat
-      // attachment can never turn an agent wake into an arbitrary server fetch.
-      const key = messageAttachmentStorageKey(a)
-      if (!key) {
-        res.status(400).json({ error: 'attachment must reference Cumora storage' })
-        return
-      }
-      let url: string
-      try {
-        url = await storage.publicUrl(key)
-      } catch {
-        res.status(400).json({ error: 'attachment storage reference is invalid' })
-        return
-      }
-      attachment = {
-        url,
-        name: a.name.trim().slice(0, 200),
-        kind: (a.kind === 'pdf' || a.kind === 'file' || a.kind === 'fig' ? a.kind : 'img') as AttachmentPayload['kind'],
-        mime: typeof a.mime === 'string' ? a.mime : undefined,
-        size: typeof a.size === 'number' ? a.size : undefined,
-        key,
-      }
-    }
+  // New clients send an ordered `attachments` list. The historical singular
+  // field remains accepted and is normalized into a one-entry list.
+  const attachmentInput = req.body?.attachments ?? req.body?.attachment
+  const resolved = await resolveMessageAttachments(attachmentInput, storage, {
+    attachmentGrant: (key) => hasAttachmentGrant(pool, tenant, key),
+  })
+  if (!resolved.ok) {
+    res.status(resolved.status).json({ error: resolved.error })
+    return
   }
-  // Allow empty body when an attachment is present (e.g. user just shares an image)
-  if (!body && !attachment) {
+  const attachments = resolved.attachments
+  const attachment = attachments[0] ?? null
+  // Allow an empty body when at least one attachment is present.
+  if (!body && attachments.length === 0) {
     res.status(400).json({ error: 'empty message' })
     return
   }
@@ -4331,12 +4300,18 @@ api.post('/conversations/:id/messages', async (req, res) => {
     const sequence = seqResult.rows[0]?.seq ?? 1
     const inserted = await client.query<{ id: string; sequence: number }>(
       `INSERT INTO messages
-         (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id, client_id)
-       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8,$9)
+         (id, conversation_id, author_id, kind, body, sequence, attachment, attachments,
+          quoted_message_id, company_id, client_id)
+       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7::jsonb,$8,$9,$10)
        ON CONFLICT (conversation_id, author_id, client_id) WHERE client_id IS NOT NULL
        DO NOTHING
        RETURNING id, sequence`,
-      [proposedMessageId, id, me, body, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, tenant, clientId],
+      [
+        proposedMessageId, id, me, body, sequence,
+        attachment ? JSON.stringify(attachment) : null,
+        JSON.stringify(attachments),
+        resolvedQuotedId, tenant, clientId,
+      ],
     )
     persisted = inserted.rows[0] ?? (clientId
       ? (await client.query<{ id: string; sequence: number }>(
@@ -4360,6 +4335,7 @@ api.post('/conversations/:id/messages', async (req, res) => {
           id: persisted.id, conversationId: id, authorId: me,
           kind: 'text', body, sequence: persisted.sequence, at: new Date().toISOString(),
           attachment: attachment ?? undefined,
+          attachments,
           quotedMessageId: resolvedQuotedId ?? undefined,
           quoted: quotedSummary ?? undefined,
           clientId: clientId ?? undefined,
@@ -4524,7 +4500,7 @@ api.post('/polls/:messageId/close', async (req, res) => {
  *    1. Reject pathological inputs (missing fields, too many, too big)
  *    2. Resolve each key to a fresh signed URL so Resend can fetch it
  *  Returns an Error (not throws) so callers stay flat. */
-async function resolveHttpAttachments(raw: unknown[]): Promise<Array<{
+async function resolveHttpAttachments(raw: unknown[], companyId: string): Promise<Array<{
   filename: string; mimeType: string; sizeBytes: number;
   storageKey: string; publicUrl: string;
 }> | Error> {
@@ -4540,11 +4516,16 @@ async function resolveHttpAttachments(raw: unknown[]): Promise<Array<{
   let totalBytes = 0
   for (const entry of raw) {
     const a = entry as Record<string, unknown>
-    const key = typeof a.key === 'string' ? a.key : ''
+    const key = typeof a.key === 'string' ? normalizeStorageKey(a.key) : null
     const filename = typeof a.filename === 'string' ? a.filename.slice(0, 200) : ''
     const mimeType = typeof a.mimeType === 'string' ? a.mimeType.slice(0, 120) : 'application/octet-stream'
     const sizeBytes = Math.max(0, Number(a.sizeBytes ?? 0))
-    if (!key || !filename) return new Error('each attachment needs key + filename')
+    if (!key || !filename || !key.startsWith('attachments/')) {
+      return new Error('each attachment needs a granted chat attachment key + filename')
+    }
+    if (!(await hasAttachmentGrant(pool, companyId, key))) {
+      return new Error('attachment is not granted to this workspace')
+    }
     totalBytes += sizeBytes
     if (totalBytes > MAX_ATTACH_TOTAL) return new Error(`attachments exceed ${MAX_ATTACH_TOTAL} bytes total`)
     const publicUrl = await storage.publicUrl(key)
@@ -4617,7 +4598,7 @@ api.post('/email/send', async (req, res) => {
       res.status(400).json({ error: 'to, subject, body required' })
       return
     }
-    const resolvedAttachments = await resolveHttpAttachments(attachRaw)
+    const resolvedAttachments = await resolveHttpAttachments(attachRaw, tenant)
     if (resolvedAttachments instanceof Error) {
       res.status(400).json({ error: resolvedAttachments.message })
       return
@@ -4785,7 +4766,7 @@ api.post('/email/reply/:messageId', async (req, res) => {
     const ccRaw = Array.isArray(req.body?.cc) ? req.body.cc as unknown[] : []
     const attachRaw = Array.isArray(req.body?.attachments) ? req.body.attachments as unknown[] : []
     if (!body) { res.status(400).json({ error: 'body required' }); return }
-    const resolvedAttachments = await resolveHttpAttachments(attachRaw)
+    const resolvedAttachments = await resolveHttpAttachments(attachRaw, tenant)
     if (resolvedAttachments instanceof Error) {
       res.status(400).json({ error: resolvedAttachments.message }); return
     }
@@ -4952,7 +4933,10 @@ api.get('/conversations/:id/messages/:rootId/replies', async (req, res) => {
       `SELECT
           m.id, m.conversation_id AS "conversationId",
           m.author_id AS "authorId", m.kind, m.body, m.sequence,
-          m.tool, m.attachment, m.poll,
+          m.tool, COALESCE(m.attachments->0, m.attachment) AS attachment,
+          COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                      ELSE jsonb_build_array(m.attachment) END) AS attachments,
+          m.poll,
           -- Per-option vote tallies for polls. Empty array for non-poll
           -- rows. voterIds is sorted so the client can diff cheaply across
           -- successive WS poll.updated events.
@@ -5016,11 +5000,12 @@ api.get('/conversations/:id/messages/:rootId/replies', async (req, res) => {
       [id, rootId, tenant],
     )
     for (const row of rows) {
-      if (!row.attachment) continue
-      try { row.attachment = await freshenAttachmentUrl(row.attachment) }
+      const stored = row.attachments ?? row.attachment
+      if (!stored) continue
+      try { Object.assign(row, await freshenMessageAttachments(stored)) }
       catch (e) {
         console.warn(
-          `[replies] freshenAttachmentUrl failed for message ${row.id}; ` +
+          `[replies] freshenMessageAttachments failed for message ${row.id}; ` +
           `falling back to stored URL`, e,
         )
       }

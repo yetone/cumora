@@ -20,7 +20,7 @@ import { pool } from '../../db/pool.js'
 import { CH_MESSAGE_NEW, CH_TYPING, publish, redis } from '../../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox } from '../../realtime-outbox.js'
 import { notifyAlert } from '../../alerting.js'
-import { freshenAttachmentUrl, type StoredAttachment } from '../../storage.js'
+import { freshenMessageAttachments } from '../../storage.js'
 
 /** Re-sign attachment download URLs just-in-time when loading messages for an
  *  agent turn. The url stored in `messages.attachment` is signed with a TTL
@@ -29,12 +29,12 @@ import { freshenAttachmentUrl, type StoredAttachment } from '../../storage.js'
  *  link — the HMAC has expired → 403 → "can't see the image". Re-sign each row's
  *  attachment so every consumer gets a URL valid for a fresh TTL. Best-effort:
  *  freshenAttachmentUrl keeps the stored url on any failure. */
-async function refreshAttachmentUrls(rows: ReadonlyArray<{ attachment?: unknown }>): Promise<void> {
+async function refreshAttachmentUrls(rows: ReadonlyArray<{ attachment?: unknown; attachments?: unknown }>): Promise<void> {
   await Promise.all(rows.map(async (r) => {
-    const a = r.attachment as StoredAttachment | null | undefined
-    if (!a || typeof a !== 'object' || !a.url) return
+    const stored = r.attachments ?? r.attachment
+    if (!stored) return
     try {
-      ;(r as { attachment?: unknown }).attachment = await freshenAttachmentUrl(a)
+      Object.assign(r, await freshenMessageAttachments(stored))
     } catch { /* keep the stored (possibly stale) url */ }
   }))
 }
@@ -189,7 +189,11 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
           co.conversation_title, co.conversation_kind, co.conversation_topic,
           co.project_id, co.project_name,
           m.author_id, p.kind AS author_kind, COALESCE(p.name, m.author_id) AS author_name,
-          m.body, m.kind, m.sequence, m.created_at, m.attachment, m.quoted_message_id,
+          m.body, m.kind, m.sequence, m.created_at,
+          COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                      ELSE jsonb_build_array(m.attachment) END) AS attachments,
+          COALESCE(m.attachments->0, m.attachment) AS attachment,
+          m.quoted_message_id,
           (
             SELECT jsonb_build_object(
               'id', qm.id, 'authorId', qm.author_id,
@@ -381,7 +385,11 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
        recent AS (
          SELECT
             m.id, m.conversation_id, m.author_id, m.kind, m.body, m.sequence,
-            m.created_at, m.attachment, m.quoted_message_id,
+            m.created_at,
+            COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                        ELSE jsonb_build_array(m.attachment) END) AS attachments,
+            COALESCE(m.attachments->0, m.attachment) AS attachment,
+            m.quoted_message_id,
             c.company_id,
             c.title AS conversation_title, c.kind AS conversation_kind, c.topic AS conversation_topic,
             pr.name AS project_name,
@@ -428,7 +436,8 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
        )
        SELECT id, conversation_id, company_id, conversation_title, conversation_kind, conversation_topic,
               project_name,
-              author_id, author_kind, author_name, body, kind, sequence, created_at, attachment,
+              author_id, author_kind, author_name, body, kind, sequence, created_at,
+              attachment, attachments,
               quoted_message_id, human_last_read_at,
               (
                 SELECT jsonb_build_object(

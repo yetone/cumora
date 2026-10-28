@@ -122,10 +122,21 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
     `SELECT storage_key FROM email_attachments WHERE storage_key = ANY($1::text[])`,
     [uniqueKeys],
   )
-  const messageFiles = await db.query<{ attachment: unknown }>(
-    `SELECT attachment
-       FROM messages
-      WHERE attachment->>'key' = ANY($1::text[])`,
+  const messageFiles = await db.query<{ attachments: unknown }>(
+    `SELECT COALESCE(
+              m.attachments,
+              CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                   ELSE jsonb_build_array(m.attachment) END
+            ) AS attachments
+       FROM messages m
+      WHERE m.attachment->>'key' = ANY($1::text[])
+         OR EXISTS (
+           SELECT 1 FROM jsonb_array_elements(
+             CASE WHEN jsonb_typeof(m.attachments) = 'array'
+                  THEN m.attachments ELSE '[]'::jsonb END
+           ) attachment
+            WHERE attachment->>'key' = ANY($1::text[])
+         )`,
     [uniqueKeys],
   )
   const avatars = await db.query<{ avatar_url: string }>(
@@ -150,7 +161,7 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
     if (key && uniqueKeys.includes(key)) referenced.add(key)
   }
   for (const row of messageFiles.rows) {
-    const attachments = Array.isArray(row.attachment) ? row.attachment : [row.attachment]
+    const attachments = Array.isArray(row.attachments) ? row.attachments : [row.attachments]
     for (const attachment of attachments) {
       if (!attachment || typeof attachment !== 'object') continue
       const key = messageAttachmentStorageKey(attachment as { key?: unknown; url?: unknown })

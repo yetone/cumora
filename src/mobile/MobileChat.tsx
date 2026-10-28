@@ -11,10 +11,11 @@ import { useMessages, sendUserMessage, messagesFor, toggleReaction, VIRTUOSO_FIR
 import type { MessagesState } from '@/stores/messages'
 import { Avatar, AvatarStack } from '@/components/Avatar'
 import { MessageRow, TypingRow } from '@/components/Message'
+import { ComposerAttachments } from '@/components/ComposerAttachments'
 import { RichInput, type RichInputHandle } from '@/components/RichInput'
 import { ScrollToLatestButton } from '@/components/ScrollToLatestButton'
 import { IBack, IConvene, IMore, IClip, IAt, ISmile, ISend, ISearch } from '@/components/icons'
-import { api, type ApiAttachment } from '@/api/client'
+import { api } from '@/api/client'
 import type { Message, Participant } from '@/types'
 import { cn } from '@/lib/utils'
 import { isImeComposing } from '@/lib/keyboard'
@@ -24,6 +25,17 @@ import { SKYPE_EMOJIS, findSkypeByShortcode } from '@/lib/skypeEmojis'
 import { TwEmoji } from '@/components/TwEmoji'
 import { SkypeEmoji } from '@/components/SkypeEmoji'
 import { useT, type MessageKey } from '@/lib/i18n'
+import {
+  checkRuntimeSelection,
+  descriptorsToRuntime,
+  hasPendingAttachments,
+  markAttachmentFailed,
+  markAttachmentUploaded,
+  markAttachmentUploading,
+  readyAttachments,
+  reconcileRuntimeWithDraft,
+  type ComposerAttachment,
+} from '@/lib/composerAttachments'
 
 export function MobileChat() {
   const t = useT()
@@ -72,14 +84,21 @@ export function MobileChat() {
   // message). Send + convo-switch clears the entry; the cleanup happens
   // inside `send()` and the convoId effect below.
   const draft = useApp((s) => (convoId ? s.composerDrafts[convoId]?.text ?? '' : ''))
+  const persistedAttachments = useApp((s) => (convoId ? s.composerDrafts[convoId]?.attachments : undefined))
   const setComposerDraft = useApp((s) => s.setComposerDraft)
+  const updateComposerDraft = useApp((s) => s.updateComposerDraft)
   const setDraft = useCallback((text: string) => {
     if (!convoId) return
     setComposerDraft(convoId, text)
   }, [convoId, setComposerDraft])
-  const [attachment, setAttachment] = useState<ApiAttachment | null>(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [attachmentsByConvo, setAttachmentsByConvo] = useState<Record<string, ComposerAttachment[]>>({})
+  const attachments = useMemo(
+    () => convoId ? reconcileRuntimeWithDraft(attachmentsByConvo[convoId], persistedAttachments ?? []) : [],
+    [attachmentsByConvo, convoId, persistedAttachments],
+  )
+  const ready = readyAttachments(attachments)
+  const uploading = hasPendingAttachments(attachments)
+  const hasErrors = attachments.some((item) => item.state === 'error')
   // Per-convo "replying to" pointer, lifted from the global app store so
   // it persists across mounts and matches the desktop composer's UX.
   const replyingToId = useApp((s) => convoId ? s.replyingTo[convoId] : undefined)
@@ -130,7 +149,7 @@ export function MobileChat() {
   // legacy manual `el.scrollTop = el.scrollHeight` effect is gone with the
   // <div> stream container it depended on.
 
-  // Reset attachment / mention / emoji-picker side state on convo
+  // Reset mention / emoji-picker side state on convo
   // switch. The composer text itself is reset by REMOUNTING RichInput
   // via `key={convoId}` on the JSX below — that path reads the right
   // draft from the store via defaultValue without going through
@@ -138,8 +157,6 @@ export function MobileChat() {
   // contenteditable in-gesture and pops the soft keyboard.
   useEffect(() => {
     if (!convoId) return
-    setAttachment(null)
-    setUploadError(null)
     setMention(null)
     setEmojiOpen(false)
   }, [convoId])
@@ -342,23 +359,75 @@ export function MobileChat() {
     setMenuOpen(false)
   }
 
-  const upload = async (file: File) => {
-    setUploading(true); setUploadError(null)
+  const upload = async (item: ComposerAttachment) => {
+    if (!convoId || !item.file) return
     try {
-      const a = await api.uploadFile(file)
-      setAttachment(a)
+      const uploaded = await api.uploadFile(item.file)
+      setAttachmentsByConvo((prev) => {
+        const current = prev[convoId] ?? descriptorsToRuntime(useApp.getState().composerDrafts[convoId]?.attachments ?? [])
+        const next = markAttachmentUploaded(current, item.id, uploaded)
+        const persisted = next.flatMap((entry) => entry.state === 'ready' && entry.attachment ? [entry.attachment] : [])
+        updateComposerDraft(convoId, (draft) => ({ ...draft, attachments: persisted }))
+        return { ...prev, [convoId]: next }
+      })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      setUploadError(msg)
-      window.setTimeout(() => setUploadError(null), 4500)
-    } finally {
-      setUploading(false)
+      setAttachmentsByConvo((prev) => ({
+        ...prev,
+        [convoId]: markAttachmentFailed(
+          prev[convoId] ?? descriptorsToRuntime(useApp.getState().composerDrafts[convoId]?.attachments ?? []),
+          item.id,
+          msg,
+        ),
+      }))
     }
   }
-  const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]
+  const addFiles = (files: File[]) => {
+    if (!convoId || files.length === 0) return
+    const current = attachmentsByConvo[convoId]
+      ?? descriptorsToRuntime(useApp.getState().composerDrafts[convoId]?.attachments ?? [])
+    const selection = checkRuntimeSelection(current, files)
+    if (!selection.ok) {
+      console.warn('[upload] selection rejected', selection.error)
+      return
+    }
+    setAttachmentsByConvo((prev) => ({ ...prev, [convoId]: [...current, ...selection.incoming] }))
+    for (const item of selection.incoming) void upload(item)
+  }
+  const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    if (f) await upload(f)
+    addFiles(files)
+  }
+
+  const onPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+    const files: File[] = []
+    for (const item of items) {
+      if (item.kind !== 'file') continue
+      const file = item.getAsFile()
+      if (file?.type.startsWith('image/')) files.push(file)
+    }
+    if (files.length === 0) return
+    e.preventDefault()
+    addFiles(files)
+  }
+
+  const removeAttachment = (id: string) => {
+    if (!convoId) return
+    const next = attachments.filter((item) => item.id !== id)
+    setAttachmentsByConvo((prev) => ({ ...prev, [convoId]: next }))
+    const persisted = next.flatMap((item) => item.state === 'ready' && item.attachment ? [item.attachment] : [])
+    updateComposerDraft(convoId, (draft) => ({ ...draft, attachments: persisted }))
+  }
+
+  const retryAttachment = (id: string) => {
+    if (!convoId) return
+    const item = attachments.find((candidate) => candidate.id === id)
+    if (!item?.file) return
+    setAttachmentsByConvo((prev) => ({ ...prev, [convoId]: markAttachmentUploading(attachments, id) }))
+    void upload(item)
   }
 
   // Recompute mention state when the draft or caret moves. Mirrors the
@@ -435,12 +504,15 @@ export function MobileChat() {
 
   const send = () => {
     const v = draft.trim()
-    if (!v && !attachment) return
+    if ((!v && ready.length === 0) || uploading || hasErrors) return
     if (!convoId) return
-    sendUserMessage(convoId, v, attachment, replyingToId ?? null)
+    void sendUserMessage(convoId, v, ready, replyingToId ?? null)
     setDraft('')
+    setAttachmentsByConvo((prev) => {
+      if (!(convoId in prev)) return prev
+      return { ...prev, [convoId]: [] }
+    })
     editorRef.current?.setValue('')
-    setAttachment(null)
     setMention(null)
     setReplyingTo(convoId, null)
     void tapHaptic()
@@ -480,7 +552,7 @@ export function MobileChat() {
       send()
     }
   }
-  const canSend = (draft.trim().length > 0 || attachment !== null) && !uploading
+  const canSend = (draft.trim().length > 0 || ready.length > 0) && !uploading && !hasErrors
   const memberPs = c.members
     .map((m) => byId[m])
     .filter((p): p is Participant => Boolean(p))
@@ -654,37 +726,12 @@ export function MobileChat() {
         <div className="px-1 pb-1">
           <TypingRow names={typingNames} />
         </div>
-        {attachment && (
-          <div className="mb-2 inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full">
-            {attachment.kind === 'img' ? (
-              <img src={attachment.url} alt={attachment.name}
-                className="w-10 h-10 object-cover rounded-md shrink-0" />
-            ) : (
-              <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
-                style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
-                <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
-              </div>
-            )}
-            <div className="min-w-0">
-              <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[220px]">{attachment.name}</div>
-              <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAttachment(null)}
-              className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 active:bg-cloud transition shrink-0"
-              aria-label={t('mobchat.removeAttachment')}
-            >×</button>
-          </div>
-        )}
-        {uploading && (
-          <div className="mb-2 text-[11.5px] text-ink-500 italic">{t('mobchat.uploading')}</div>
-        )}
-        {uploadError && (
-          <div className="mb-2 text-[11.5px] py-1 px-2 rounded-md text-coral-deep bg-coral-soft inline-block max-w-full truncate">
-            {uploadError}
-          </div>
-        )}
+        <ComposerAttachments
+          items={attachments}
+          onRemove={removeAttachment}
+          onRetry={retryAttachment}
+          mobile
+        />
         {replyingToId && convoId && (
           <div className="mb-2 flex items-stretch gap-2 rounded-md bg-sky2-50 border border-sky2-100 pl-2 pr-1 py-1.5">
             <div className="w-[3px] rounded bg-skype shrink-0" />
@@ -767,6 +814,7 @@ export function MobileChat() {
         <input
           ref={fileRef}
           type="file"
+          multiple
           // No `accept` filter — server's MIME whitelist is the source
           // of truth. Browser-side accept is only a hint anyway.
           className="hidden"
@@ -805,6 +853,7 @@ export function MobileChat() {
               }}
               onBlur={() => setTimeout(() => setMention(null), 120)}
               onKeyDown={onKey}
+              onPaste={onPaste}
               resolveMention={(id) => {
                 if (id === 'all') {
                   return { name: 'all', initial: '@', avatarBg: 'var(--ink-300)', kind: 'human' }

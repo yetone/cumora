@@ -88,7 +88,7 @@ describe('WS payload → last-message shape', () => {
 
   it('keeps the attachment descriptor the preview renders a 📎 from', () => {
     const attachment = { name: 'contract.pdf', kind: 'pdf' as const }
-    assert.deepEqual(lastMessageFromWs(wsMessage({ attachment })).attachment, attachment)
+    assert.deepEqual(lastMessageFromWs(wsMessage({ attachment })).attachment, [attachment])
   })
 })
 

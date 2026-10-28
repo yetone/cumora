@@ -11,9 +11,10 @@
 
 import { pool } from '../db/pool.js'
 import type { PoolClient } from 'pg'
-import { storage, freshenAttachmentUrl, type StoredAttachment } from '../storage.js'
+import { storage, freshenMessageAttachments, type StoredAttachment } from '../storage.js'
+import { normalizeAttachments } from '../../../shared/attachments.js'
 import { env } from '../env.js'
-import type { CliResult, CliSideEffect } from './cli-result.js'
+import type { CliAttachmentRead, CliResult, CliSideEffect } from './cli-result.js'
 import { fetchImageBytes } from './image-fetcher.js'
 import { stripLoneSurrogates } from './text-safety.js'
 import { dispatchMessagePush } from '../push.js'
@@ -26,6 +27,7 @@ import {
 import { memoryMetaForWrite, resolveMemoryWriteSource } from './memory-write.js'
 import { wakeKanbanAgents } from './kanban-wake.js'
 import { isBoardDueOn } from './board-due-date.js'
+import { grantAttachment } from '../attachments/grants.js'
 import {
   enqueueBroadcast,
   nudgeRealtimeOutbox,
@@ -44,11 +46,15 @@ import {
 // here means CLI output (read by agents as tool results) can never carry a split
 // emoji into a model transcript — the single chokepoint that covers all the
 // body.slice(0, N) truncations below. See text-safety.ts.
-function ok(text: string, sideEffects?: CliSideEffect[]): CliResult {
+function ok(text: string, sideEffects?: CliSideEffect[], attachmentReads?: CliAttachmentRead[]): CliResult {
   text = stripLoneSurrogates(text)
-  return sideEffects && sideEffects.length > 0
-    ? { ok: true, text, exitCode: 0, sideEffects }
-    : { ok: true, text, exitCode: 0 }
+  return {
+    ok: true,
+    text,
+    exitCode: 0,
+    ...(sideEffects && sideEffects.length > 0 ? { sideEffects } : {}),
+    ...(attachmentReads && attachmentReads.length > 0 ? { attachmentReads } : {}),
+  }
 }
 function err(text: string, code = 1): CliResult {
   return { ok: false, text: stripLoneSurrogates(text), exitCode: code }
@@ -235,20 +241,31 @@ async function releaseTenantWork(
  *  pattern in api/router.ts so a storage hiccup on one row never
  *  fails the whole list — falls back to the stored (possibly stale)
  *  URL with a warning. */
-async function freshenRowAttachment(row: { id: string; attachment: StoredAttachment | null }): Promise<void> {
-  if (!row.attachment) return
+async function freshenRowAttachment(row: { id: string; attachment?: StoredAttachment | null; attachments?: readonly StoredAttachment[] | null }): Promise<void> {
+  const stored = row.attachments?.length ? row.attachments : row.attachment
+  if (!stored) return
   try {
-    row.attachment = await freshenAttachmentUrl(row.attachment)
+    Object.assign(row, await freshenMessageAttachments(stored))
   } catch (e) {
-    console.warn(`[cli] freshenAttachmentUrl failed for message ${row.id}; falling back to stored URL`, e)
+    console.warn(`[cli] freshenMessageAttachments failed for message ${row.id}; falling back to stored URL`, e)
   }
 }
 
 /** One-line, agent-readable summary of an attachment. */
-function renderAttachment(att: StoredAttachment | null | undefined): string | null {
-  if (!att) return null
-  const size = typeof att.size === 'number' ? ` ${att.size}B` : ''
-  return `    ↳ [${att.kind}] ${att.name}${size} → ${att.url}`
+function renderAttachments(value: unknown): string[] {
+  return normalizeAttachments(value).map((att) => {
+    const size = typeof att.size === 'number' ? ` ${att.size}B` : ''
+    return `    ↳ [${att.kind}] ${att.name}${size} → ${att.url ?? '(no download URL)'}`
+  })
+}
+
+function attachmentReadsFor(
+  rows: ReadonlyArray<{ id: string; attachment?: StoredAttachment | null; attachments?: readonly StoredAttachment[] | null }>,
+): CliAttachmentRead[] {
+  return rows.flatMap((row) => {
+    const attachments = normalizeAttachments(row.attachments ?? row.attachment)
+    return attachments.length > 0 ? [{ messageId: row.id, attachments }] : []
+  })
 }
 
 /* ============== commands ============== */
@@ -712,7 +729,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   const limitParam = `$${params.length}`
   const { rows } = await pool.query<{
     id: string; author_id: string; kind: string; body: string; sequence: number;
-    created_at: string; attachment: StoredAttachment | null;
+    created_at: string; attachment: StoredAttachment | null; attachments: StoredAttachment[] | null;
     poll: InboxPollPayload | null;
     quoted_message_id: string | null;
     quoted: { id: string; authorId: string; authorName: string; body: string } | null;
@@ -734,7 +751,10 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
           )
      )
      SELECT
-        m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at, m.attachment, m.poll,
+        m.id, m.author_id, m.kind, m.body, m.sequence, m.created_at,
+        COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                     ELSE jsonb_build_array(m.attachment) END) AS attachments,
+        COALESCE(m.attachments->0, m.attachment) AS attachment, m.poll,
         m.quoted_message_id,
         (
           SELECT jsonb_build_object(
@@ -756,6 +776,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   )
   for (const row of rows) await freshenRowAttachment(row)
   const inOrder = rows.reverse()
+  const attachmentReads = attachmentReadsFor(inOrder)
   // Advance the Redis "seen" boundary — `cumora messages` just showed
   // the agent these rows, so the highest seq here counts as "what I've
   // seen" for the freshness preflight on its next `cumora reply`. Without
@@ -764,7 +785,7 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
   if (inOrder.length > 0) {
     await recordSeen(me, id, inOrder[inOrder.length - 1].sequence)
   }
-  if (parsed.flags.json) return ok(JSON.stringify(inOrder, null, 2))
+  if (parsed.flags.json) return ok(JSON.stringify(inOrder, null, 2), undefined, attachmentReads)
   if (inOrder.length === 0) {
     return ok(threadRootId
       ? `(no replies in thread ${threadRootId})`
@@ -789,10 +810,9 @@ async function cmdMessages(parsed: ParsedArgs): Promise<CliResult> {
     if (m.kind === 'poll' && m.poll) {
       for (const line of renderPollBlock(m.id, m.poll)) lines.push(line)
     }
-    const att = renderAttachment(m.attachment)
-    if (att) lines.push(att)
+    lines.push(...renderAttachments(m.attachments ?? m.attachment))
   }
-  return ok(lines.join('\n'))
+  return ok(lines.join('\n'), undefined, attachmentReads)
 }
 
 /** `cumora thread <convo_id> <root_msg_id> [--tail N]`
@@ -881,9 +901,12 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
   const limitParam = `$${params.length}`
   const { rows } = await pool.query<{
     id: string; conversation_id: string; author_id: string; body: string;
-    created_at: string; attachment: StoredAttachment | null
+    created_at: string; attachment: StoredAttachment | null; attachments: StoredAttachment[] | null
   }>(
-    `SELECT m.id, m.conversation_id, m.author_id, m.body, m.created_at, m.attachment
+    `SELECT m.id, m.conversation_id, m.author_id, m.body, m.created_at,
+            COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                         ELSE jsonb_build_array(m.attachment) END) AS attachments,
+            COALESCE(m.attachments->0, m.attachment) AS attachment
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
        JOIN participants requester
@@ -902,7 +925,8 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
     params,
   )
   for (const row of rows) await freshenRowAttachment(row)
-  if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2))
+  const attachmentReads = attachmentReadsFor(rows)
+  if (parsed.flags.json) return ok(JSON.stringify(rows, null, 2), undefined, attachmentReads)
   if (rows.length === 0) return ok(`(no matches for "${query}"${inConvo ? ` in ${inConvo}` : ''})`)
   const lines = [`${rows.length} match(es) for "${query}":`, '']
   for (const m of rows) {
@@ -910,10 +934,9 @@ async function cmdSearch(parsed: ParsedArgs): Promise<CliResult> {
     const idx = m.body.toLowerCase().indexOf(query.toLowerCase())
     const slice = m.body.slice(Math.max(0, idx - 20), idx + 100).replace(/\n/g, ' \\n ')
     lines.push(`  · [${t}] ${m.conversation_id} ${m.author_id}: …${slice}…`)
-    const att = renderAttachment(m.attachment)
-    if (att) lines.push(att)
+    lines.push(...renderAttachments(m.attachments ?? m.attachment))
   }
-  return ok(lines.join('\n'))
+  return ok(lines.join('\n'), undefined, attachmentReads)
 }
 
 async function cmdToolsLog(parsed: ParsedArgs): Promise<CliResult> {
@@ -994,6 +1017,7 @@ interface InboxItem {
   sequence: number
   created_at: string
   attachment: StoredAttachment | null
+  attachments: StoredAttachment[] | null
   poll: InboxPollPayload | null
   quoted_message_id: string | null
   quoted: InboxQuotedSummary | null
@@ -1048,7 +1072,9 @@ async function loadInbox(agentId: string): Promise<InboxItem[]> {
         m.kind,
         m.sequence,
         m.created_at,
-        m.attachment,
+        COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                     ELSE jsonb_build_array(m.attachment) END) AS attachments,
+        COALESCE(m.attachments->0, m.attachment) AS attachment,
         m.poll,
         m.quoted_message_id,
         (
@@ -1115,7 +1141,8 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
   const filterConvo = parsed.positional[0] ?? null
   const items = await loadInbox(me)
   const filtered = filterConvo ? items.filter((m) => m.conversation_id === filterConvo) : items
-  if (parsed.flags.json) return ok(JSON.stringify(filtered, null, 2))
+  const attachmentReads = attachmentReadsFor(filtered)
+  if (parsed.flags.json) return ok(JSON.stringify(filtered, null, 2), undefined, attachmentReads)
   if (filtered.length === 0) return ok(`(inbox empty for ${me})`)
 
   // Group by conversation
@@ -1147,13 +1174,12 @@ async function cmdInbox(parsed: ParsedArgs): Promise<CliResult> {
       if (m.kind === 'poll' && m.poll) {
         for (const line of renderPollBlock(m.id, m.poll)) lines.push(line)
       }
-      const att = renderAttachment(m.attachment)
-      if (att) lines.push(att)
+      lines.push(...renderAttachments(m.attachments ?? m.attachment))
     }
     lines.push('')
   }
   lines.push(`when you're done deciding what to do (reply / react / dm / nothing), run \`cumora ack <convo_id>\` to clear that conversation from your inbox so the next wake-up doesn't see it again. \`cumora ack --all\` clears everything in your inbox.`)
-  return ok(lines.join('\n'))
+  return ok(lines.join('\n'), undefined, attachmentReads)
 }
 
 /** `cumora glance <convo>` — read the room before committing a reply.
@@ -1185,10 +1211,15 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
     body: string
     created_at: string
     sequence: number
+    attachment: StoredAttachment | null
+    attachments: StoredAttachment[] | null
   }
   const { rows } = await pool.query<RecentRow>(
     `SELECT m.id, m.author_id, COALESCE(p.name, m.author_id) AS author_name,
-            m.kind, m.body, m.created_at, m.sequence
+            m.kind, m.body, m.created_at, m.sequence,
+            COALESCE(m.attachments, CASE WHEN m.attachment IS NULL THEN '[]'::jsonb
+                                         ELSE jsonb_build_array(m.attachment) END) AS attachments,
+            COALESCE(m.attachments->0, m.attachment) AS attachment
        FROM messages m
        JOIN conversations c ON c.id = m.conversation_id
        JOIN participants requester
@@ -1208,7 +1239,9 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
       LIMIT 12`,
     [convoId, me, companyId],
   )
+  for (const row of rows) await freshenRowAttachment(row)
   const recent = rows.reverse()
+  const attachmentReads = attachmentReadsFor(recent)
 
   // Advance the Redis "seen" boundary — glance just showed the agent
   // these messages, so they count as "seen" for the freshness preflight
@@ -1229,7 +1262,7 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
   // and the server's freshness gate (cmdReply preflight) serializes collisions.
   // glance now returns ONLY the stream, matching that model.
   if (parsed.flags.json) {
-    return ok(JSON.stringify({ conversation_id: convoId, recent }, null, 2))
+    return ok(JSON.stringify({ conversation_id: convoId, recent }, null, 2), undefined, attachmentReads)
   }
 
   const lines: string[] = []
@@ -1247,9 +1280,10 @@ async function cmdGlance(parsed: ParsedArgs): Promise<CliResult> {
           ? '[system]'
           : m.body.slice(0, 200).replace(/\n/g, ' \\n ')
       lines.push(`  [${m.id}] ${tag} ${t}  ${m.author_name}: ${body}`)
+      lines.push(...renderAttachments(m.attachments ?? m.attachment))
     }
   }
-  return ok(lines.join('\n'))
+  return ok(lines.join('\n'), undefined, attachmentReads)
 }
 
 async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
@@ -2250,7 +2284,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
     // as the body and uses --attach-text to mark it as an attachment.
     const content = String(parsed.flags['attach-text-content'] ?? body)
     if (!filename || !content) return err('--attach-text requires a filename and content')
-    attachment = await saveTextAttachment(filename, content)
+    attachment = await saveTextAttachment(filename, content, companyId)
   } else if (parsed.flags['attach-bytes']) {
     const filename = String(parsed.flags['attach-bytes']).trim().slice(0, 200)
     const b64 = String(parsed.flags['bytes-b64'] ?? '').trim()
@@ -2259,7 +2293,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       : undefined
     if (!filename || !b64) return err('--attach-bytes requires a filename and --bytes-b64 "<base64>"')
     try {
-      attachment = await saveBytesAttachment(filename, b64, mime)
+      attachment = await saveBytesAttachment(filename, b64, mime, companyId)
     } catch (e) {
       return err(`attach-bytes failed: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -2373,9 +2407,10 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       }
     }
     await txClient.query(
-      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, quoted_message_id, company_id)
-       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7,$8)`,
-      [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null, resolvedQuotedId, companyId],
+      `INSERT INTO messages (id, conversation_id, author_id, kind, body, sequence, attachment, attachments, quoted_message_id, company_id)
+       VALUES ($1,$2,$3,'text',$4,$5,$6::jsonb,$7::jsonb,$8,$9)`,
+      [messageId, convoId, me, finalBody, sequence, attachment ? JSON.stringify(attachment) : null,
+        attachment ? JSON.stringify([attachment]) : '[]', resolvedQuotedId, companyId],
     )
     await txClient.query(`UPDATE conversations SET updated_at = NOW() WHERE id = $1`, [convoId])
     await txClient.query(
@@ -2397,6 +2432,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         sequence,
         at: new Date().toISOString(),
         attachment: attachment ?? undefined,
+        attachments: attachment ? [attachment] : [],
         quotedMessageId: resolvedQuotedId ?? undefined,
         quoted: quotedSummary
           ? {
@@ -2535,6 +2571,7 @@ async function generateAndUploadImage(opts: {
   const id = randomUUID().replace(/-/g, '')
   const key = `attachments/${id}.png`
   const url = await storage.put(key, buf, 'image/png')
+  if (opts.tenant) await grantAttachment(pool, opts.tenant, key)
   // Slug the prompt into a friendly filename for the bubble caption.
   const slug = opts.prompt
     .toLowerCase()
@@ -2624,6 +2661,7 @@ async function saveBytesAttachment(
   filename: string,
   base64: string,
   mimeHint?: string,
+  tenant?: string,
 ): Promise<{ url: string; name: string; kind: 'img' | 'file'; mime: string; size: number; key: string }> {
   // Generous 32 MB ceiling — same as the user-upload edge. The base64
   // wire form is ~33% larger; we decode first then re-check.
@@ -2647,6 +2685,7 @@ async function saveBytesAttachment(
   const id = randomUUID().replace(/-/g, '')
   const key = `attachments/${id}.${ext}`
   const url = await storage.put(key, buf, mime)
+  if (tenant) await grantAttachment(pool, tenant, key)
   return { url, key, name: filename, kind, mime, size: buf.length }
 }
 
@@ -3852,6 +3891,7 @@ async function setAgentAvatarFromUrl(args: {
 async function saveTextAttachment(
   filename: string,
   content: string,
+  tenant?: string,
 ): Promise<{ url: string; name: string; kind: 'file'; mime: string; size: number; key: string }> {
   // Sniff a reasonable mime from the extension so the renderer + agent
   // both know how to handle it (text/* gets inlined into context on read).
@@ -3873,6 +3913,7 @@ async function saveTextAttachment(
   const id = randomUUID().replace(/-/g, '')
   const key = `attachments/${id}.${ext}`
   const url = await storage.put(key, buf, mime)
+  if (tenant) await grantAttachment(pool, tenant, key)
   return { url, key, name: filename, kind: 'file', mime, size: buf.length }
 }
 

@@ -27,12 +27,13 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { access, lstat, mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join, delimiter as PATH_DELIMITER } from 'node:path'
+import { dirname, isAbsolute, join, relative, sep, delimiter as PATH_DELIMITER } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { stripLoneSurrogates } from '../text-safety.js'
 import { CLAUDE_CORE_ENV_KEYS, claudeProviderFingerprint, isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { isCliVersionAtLeast, probeEngineVersion, probeLocalEngineVersionWithRetry, versionCommandInvocation } from './cli-version.js'
 import { discoverEngineModelCatalog, type EngineModelCatalog } from './model-catalog.js'
+import { visionCapabilityForModel } from './model-capabilities.js'
 import { CODEX_RUNTIME_CONFIG_ARGS, codexAuthFingerprint, codexRuntimeEnv } from './codex-runtime.js'
 import { cachedCodexProvider, codexProviderEnv, codexProviderFingerprint, codexProviderRuntime, prepareCodexProvider } from './codex-provider.js'
 import { assertCodexProviderTransport, codexCommandInvocation } from './codex-rpc.js'
@@ -305,6 +306,27 @@ const TURN_TIMEOUT_MS = Number(process.env.CUMORA_TURN_TIMEOUT_MS) || 0
 // fire-hose the daemon doesn't need. Set CUMORA_CODEX_VERBOSE=1 to dump it raw.
 const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
 
+function codexLocalImagePaths(home: string, localImages: readonly string[]): string[] {
+  let realHome: string
+  try { realHome = realpathSync(home) } catch { return [] }
+  return [...new Set(localImages.filter((path) => {
+    if (!path || !isAbsolute(path)) return false
+    try {
+      const actual = realpathSync(path)
+      const fromHome = relative(realHome, actual)
+      return fromHome !== '' && fromHome !== '..' && !fromHome.startsWith(`..${sep}`) && !isAbsolute(fromHome)
+    } catch { return false }
+  }))]
+}
+
+function codexTurnInput(prompt: string, localImages: readonly string[], home: string): Array<Record<string, unknown>> {
+  const images = codexLocalImagePaths(home, localImages)
+  return [
+    { type: 'text', text: stripLoneSurrogates(prompt), text_elements: [] },
+    ...images.map((path) => ({ type: 'localImage', path })),
+  ]
+}
+
 /** How to spawn a CLI bin cross-platform.
  *  - POSIX: spawn the bare bin with shell:false — unchanged, zero-risk.
  *  - Windows: engine CLIs are usually `.cmd` shims that Node CANNOT run with
@@ -324,8 +346,10 @@ const CODEX_LOG_RAW = process.env.CUMORA_CODEX_VERBOSE === '1'
 // needs a stable handle to the resolver without going through spawn().
 export function resolveSpawn(bin: string, env: NodeJS.ProcessEnv = process.env): { command: string; shell: boolean; wantsStdinPrompt: boolean } {
   if (!IS_WIN) return { command: bin, shell: false, wantsStdinPrompt: false }
-  const exts = (env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map((e) => e.trim()).filter(Boolean)
-  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+  const pathExt = env.PATHEXT ?? env.PathExt ?? '.COM;.EXE;.BAT;.CMD'
+  const searchPath = env.PATH ?? env.Path ?? ''
+  const exts = pathExt.split(';').map((e) => e.trim()).filter(Boolean)
+  for (const dir of searchPath.split(PATH_DELIMITER)) {
     if (!dir) continue
     for (const ext of exts) {
       const candidate = join(dir, bin + ext)
@@ -342,7 +366,7 @@ export function resolveSpawn(bin: string, env: NodeJS.ProcessEnv = process.env):
   // itself is a `#!/bin/sh` wrapper and cannot be exec'd without a shell → force
   // shell:true so Node routes the call through cmd.exe, which can find the
   // .cmd via PATHEXT after the shim.
-  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+  for (const dir of searchPath.split(PATH_DELIMITER)) {
     if (!dir) continue
     const shim = join(dir, bin)
     if (existsSync(shim)) {
@@ -560,6 +584,12 @@ export interface EngineRunArgs {
    *  (e.g. a counting relay: it knows it already said "2") instead of
    *  re-deriving everything from a frozen inbox snapshot each wake. */
   resumeSessionId?: string | null
+  /** Explicitly reported visual capability for the active model. */
+  vision?: 'supported' | 'unsupported' | 'unknown'
+  /** Absolute paths to image attachments already materialized in the agent home.
+   * Only adapters with a verified native image-input protocol consume these;
+   * other adapters continue to receive the textual attachment path. */
+  localImages?: readonly string[]
   /** Called for each stdout/stderr line — daemon logs / Phase-2 observability. */
   onLog: (line: string) => void
   /** Optional per-hop trajectory hook — same shape as EngineSessionArgs.onHopUsage.
@@ -794,6 +824,7 @@ export interface EngineSessionArgs {
    *  transcript stays small enough for native auto-compaction to keep up. Whether a
    *  session actually carried it is reported by EngineSession.carriesStandingPrompt. */
   standingPrompt?: string | null
+  vision?: 'supported' | 'unsupported' | 'unknown'
   onLog: (line: string) => void
   /** Fire-and-forget per-hop trajectory report. Called once per assistant
    *  message (Claude) / per turn-completed event (Codex) with that hop's own
@@ -811,7 +842,7 @@ export interface EngineSessionArgs {
 export interface EngineSession {
   /** Feed ONE turn; resolves when the engine emits its turn `result`. The daemon
    *  serializes calls (one turn at a time). */
-  send(prompt: string): Promise<EngineRunResult>
+  send(prompt: string, localImages?: readonly string[]): Promise<EngineRunResult>
   /** Same-turn steering: inject a message into the RUNNING turn at the next safe
    *  stream-json boundary so the agent answers a direct ping mid-task, then
    *  continues. No-op if no turn is in flight. */
@@ -2082,16 +2113,17 @@ class CodexSession implements EngineSession {
   // reports the real cause instead of a generic "process gone".
   private sessionError: string | null = null
   private pending: { resolve: (r: EngineRunResult) => void } | null = null
-  private queuedPrompt: string | null = null
+  private queuedInput: { prompt: string; localImages: readonly string[] } | null = null
   private activeTurnId: string | null = null
   private steerGate = false
   private readonly model: string | null
+  private readonly vision: EngineSessionArgs['vision']
   readonly carriesStandingPrompt: boolean
   // Codex reports a RUNNING thread token total; per-turn usage is the delta.
   private cum = { input: 0, cached: 0, output: 0 }
   private turnStart = { input: 0, cached: 0, output: 0 }
 
-  constructor(bin: string, spawnArgs: string[], home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs, providerChanged: () => boolean) {
+  constructor(bin: string, spawnArgs: string[], private readonly home: string, env: NodeJS.ProcessEnv, opts: EngineSessionArgs, providerChanged: () => boolean) {
     this.providerChanged = providerChanged
     this.authHome = env.CODEX_HOME!
     this.authFingerprint = codexAuthFingerprint(this.authHome)
@@ -2099,6 +2131,7 @@ class CodexSession implements EngineSession {
     this.onHopUsage = opts.onHopUsage
     this.threadId = opts.resumeSessionId ?? null
     this.model = opts.model ?? null
+    this.vision = opts.vision
     this.carriesStandingPrompt = !!opts.standingPrompt
     // experimentalRawEvents → Codex emits payload-free `rawResponseItem/*` pings we
     // use as a liveness signal; we suppress them from the log below.
@@ -2146,19 +2179,20 @@ class CodexSession implements EngineSession {
   }
   get sessionId(): string | null { return this.threadId }
 
-  send(prompt: string): Promise<EngineRunResult> {
+  send(prompt: string, localImages: readonly string[] = []): Promise<EngineRunResult> {
     if (this.pending) return Promise.resolve(classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.threadId }, this.threadWasResume))
     if (!this.alive) return Promise.resolve(classifyEngineResult({ exitCode: this.exitCode || 1, error: this.sessionError ?? 'engine session is not alive (process gone)', sessionId: this.threadId }, this.threadWasResume))
     // Only the first turn inherits output from process startup. Later turns
     // must not classify an old turn's stderr as their own failure.
     if (this.hasSent) this.stderrTail = ''
     this.hasSent = true
+    const input = { prompt, localImages: [...localImages] }
     return new Promise<EngineRunResult>((resolve) => {
       this.pending = { resolve }
       this.turnStart = { ...this.cum }
       // Fire now if the thread handshake already completed; else queue until it does.
-      if (this.ready && this.threadId) this.startTurn(prompt)
-      else this.queuedPrompt = prompt
+      if (this.ready && this.threadId) this.startTurn(input)
+      else this.queuedInput = input
     })
   }
 
@@ -2183,10 +2217,13 @@ class CodexSession implements EngineSession {
   private notify(method: string, params: Record<string, unknown>): void {
     writeStdin(this.child, JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n')
   }
-  private startTurn(prompt: string): void {
+  private startTurn(input: { prompt: string; localImages: readonly string[] }): void {
     if (this.threadId) {
       this.turnStartedAt = Date.now()
-      this.req('turn/start', { threadId: this.threadId, input: [{ type: 'text', text: stripLoneSurrogates(prompt) }] })
+      this.req('turn/start', {
+        threadId: this.threadId,
+        input: codexTurnInput(input.prompt, this.vision === 'supported' ? input.localImages : [], this.home),
+      })
     }
   }
 
@@ -2302,7 +2339,11 @@ class CodexSession implements EngineSession {
     this.threadId = threadId
     this.threadWasResume = false
     this.ready = true
-    if (this.queuedPrompt && this.pending) { const p = this.queuedPrompt; this.queuedPrompt = null; this.startTurn(p) }
+    if (this.queuedInput && this.pending) {
+      const input = this.queuedInput
+      this.queuedInput = null
+      this.startTurn(input)
+    }
   }
 
   private updateUsage(total: unknown): void {
@@ -2518,14 +2559,22 @@ class CodexAdapter implements EngineAdapter {
         : [...codexSecureExecArgs(args), '--skip-git-repo-check']
     if (!base.includes('--json')) base.push('--json')
     const model = args.model ? ['--model', args.model] : []
-    const resume = args.resumeSessionId ? ['resume', args.resumeSessionId] : []
+    const imageArgs = args.vision === 'supported'
+      ? codexLocalImagePaths(args.home, args.localImages ?? []).flatMap((path) => ['--image', path])
+      : []
+    // `resume` owns its own positional session id and --image option. Keep the
+    // option before the id so clap cannot mistake it for the prompt argument.
+    const resume = args.resumeSessionId
+      ? ['resume', ...imageArgs, args.resumeSessionId]
+      : []
+    const freshImages = args.resumeSessionId ? [] : imageArgs
     const { command, shell, argsPrefix } = resolveCodexSpawn()
     let sessionId = args.resumeSessionId ?? null
     assertCodexProviderTransport(provider.args, shell)
     let usage: EngineUsage | undefined
     let turnError: string | undefined
     const started = Date.now()
-    return spawnEngine(command, [...argsPrefix, ...provider.args, ...base, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), ...resume, '-'], args, {
+    return spawnEngine(command, [...argsPrefix, ...provider.args, ...base, ...freshImages, ...model, ...CODEX_RUNTIME_CONFIG_ARGS, ...codexServiceTierArgs(args.nativeFastMode ?? false), ...resume, '-'], args, {
       shell, stdinText: args.prompt,
       onStdoutLine(line) {
         let event
@@ -2582,7 +2631,8 @@ class CodexAdapter implements EngineAdapter {
 /** Official Grok Build install lives at ~/.grok/bin even when that dir is
  *  not on the daemon's PATH (launchd / login-shell mismatch). PATH wins. */
 function resolveGrokBin(env: NodeJS.ProcessEnv = process.env): string | null {
-  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+  const searchPath = env.PATH ?? env.Path ?? ''
+  for (const dir of searchPath.split(PATH_DELIMITER)) {
     if (!dir) continue
     const candidate = join(dir, IS_WIN ? 'grok.exe' : 'grok')
     if (existsSync(candidate)) return candidate
@@ -2859,14 +2909,14 @@ class GrokAdapter implements EngineAdapter {
   readonly bin = 'grok'
 
   private command(env?: NodeJS.ProcessEnv): string {
-    return resolveGrokBin(env) ?? this.bin
+    return resolveGrokBin(env) ?? resolveSpawn(this.bin, env).command
   }
 
   async classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
     const flags = extraArgs('CUMORA_TRIAGE_ARGS')
     const model = ['--model', args.model || 'grok-4.5']
     const command = this.command(args.env)
-    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin, args.env)
     const usingJson = flags.length === 0
     const base = flags.length
       ? [...flags, '-p']
@@ -2895,7 +2945,7 @@ class GrokAdapter implements EngineAdapter {
   probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
     const model = args.tier === 'small' ? ['--model', 'grok-4.5'] : []
     const command = this.command(args.env)
-    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin, args.env)
     const base = ['-p', ...model, '--output-format', 'json', '--always-approve', '--no-auto-update']
     const argv = wantsStdinPrompt ? base : ['-p', DOCTOR_PROMPT, ...base.slice(1)]
     return spawnCapture(command, argv, {
@@ -2996,7 +3046,7 @@ class GrokAdapter implements EngineAdapter {
     const model = args.model ? ['--model', args.model] : []
     const resume = args.resumeSessionId ? ['--resume', args.resumeSessionId] : []
     const command = this.command(args.env)
-    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin)
+    const { shell, wantsStdinPrompt } = resolveSpawn(this.bin, args.env)
     const base = flags.length
       ? [...flags, ...resume, '-p']
       : ['-p', ...resume, ...model, '--output-format', 'streaming-messages-json', '--always-approve', '--no-auto-update']
@@ -6805,6 +6855,15 @@ export async function enrichDetectedEngines(
     ])
     return { ...entry, ...version, modelCatalog }
   }))
+}
+
+/** Resolve the active model's visuals from the account-specific catalog. A
+ *  default model inherits the catalog default; a custom pin is looked up by id. */
+export function engineVisionCapability(
+  catalog: Pick<EngineModelCatalog, 'models' | 'defaultModel'> | null | undefined,
+  modelId: string | null | undefined,
+): 'supported' | 'unsupported' | 'unknown' {
+  return visionCapabilityForModel(catalog, modelId || catalog?.defaultModel || null)
 }
 
 /** Resolve a bin's absolute path on PATH (the first hit), or null if absent. */

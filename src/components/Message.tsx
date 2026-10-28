@@ -946,10 +946,9 @@ function ToolCard({ msg }: { msg: Message }) {
   )
 }
 
-function AttachmentCard({ msg }: { msg: Message }) {
+function SingleAttachmentCard({ attachment }: { attachment: NonNullable<Message['attachments']>[number] }) {
   const [viewerOpen, setViewerOpen] = useState(false)
-  if (!msg.attachment) return null
-  const a = msg.attachment
+  const a = attachment
 
   // Real image with a URL: render inline; clicking opens the lightbox.
   if (a.kind === 'img' && a.url) {
@@ -1048,6 +1047,21 @@ function AttachmentCard({ msg }: { msg: Message }) {
     >
       {inner}
     </a>
+  )
+}
+
+function AttachmentCard({ msg }: { msg: Message }) {
+  const attachments = msg.attachments ?? []
+  if (attachments.length === 0) return null
+  return (
+    <div className={cn(
+      'flex flex-col gap-1',
+      attachments.length > 1 && 'rounded-[12px] border border-ink-100 bg-cloud/75 p-1.5',
+    )}>
+      {attachments.map((attachment, index) => (
+        <SingleAttachmentCard key={`${attachment.key ?? attachment.url ?? attachment.name}-${index}`} attachment={attachment} />
+      ))}
+    </div>
   )
 }
 
@@ -1738,7 +1752,8 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
   const isMine = msg.authorId === meId
 
   const isToolOnly = msg.kind === 'tool' && !msg.body
-  const isAttachOnly = Boolean(msg.attachment) && !msg.body
+  const hasAttachments = Boolean(msg.attachments?.length)
+  const isAttachOnly = hasAttachments && !msg.body
   const _isEmail = msg.kind === 'email'
   const isPoll = msg.kind === 'poll'
   // Avatar click opens InfoPane for both kinds — humans now have profile
@@ -1802,7 +1817,7 @@ function MessageRowImpl({ msg, author, delay = 0, animate = true }: MessageRowPr
           ))}
         </div>
       )}
-      {msg.attachment && <AttachmentCard msg={msg} />}
+      {hasAttachments && <AttachmentCard msg={msg} />}
     </>
   )
 

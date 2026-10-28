@@ -205,6 +205,9 @@ function sanitizeModelCatalog(raw: unknown): EngineModelCatalog | undefined {
         description: displayString(model.description, 320),
         ...(recommendedFor?.length ? { recommendedFor } : {}),
         ...(typeof model.supportsFastMode === 'boolean' ? { supportsFastMode: model.supportsFastMode } : {}),
+        ...(model.vision === 'supported' || model.vision === 'unsupported' || model.vision === 'unknown'
+          ? { vision: model.vision }
+          : {}),
       })
     }
   }
@@ -765,7 +768,7 @@ export async function mintAgentRuntimeToken(args: {
  *  provider can explicitly make its unnamed local default authoritative so a
  *  vendor-specific deploy pin never crosses into the wrong namespace. */
 export async function listAgentsForComputer(computerId: string, supportsProviderProfiles = false): Promise<
-  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; providerProfile: string | null; nativeFastMode: boolean }>
+  Array<{ id: string; name: string; role: string | null; systemPrompt: string | null; engine: EngineId | null; model: string | null; fastModel: string | null; providerProfile: string | null; nativeFastMode: boolean; modelCatalog?: EngineModelCatalog }>
 > {
   const { rows } = await pool.query<{
     id: string; name: string; role: string | null; systemPrompt: string | null
@@ -800,11 +803,11 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
   const ompDefault = process.env.CUMORA_DEFAULT_OMP_MODEL?.trim() || null
   return rows.map((r) => {
     const { availableEngines, detectedEngines, engineDefaults, ...agent } = r
-    // A profile's endpoint owns its model namespace: neither the computer's
-    // engine_defaults nor the deploy-level pin may name a model for it.
-    if (agent.providerProfile) return agent
     const localCatalog = sanitizeDetectedEngines(detectedEngines, availableEngines ?? [])
       .find((entry) => entry.id === agent.engine)?.modelCatalog
+    // A profile's endpoint owns its model namespace: neither the computer's
+    // engine_defaults nor the deploy-level pin may name a model for it.
+    if (agent.providerProfile) return { ...agent, ...(localCatalog ? { modelCatalog: localCatalog } : {}) }
     // Parse the engine_defaults JSONB
     const defaults = (engineDefaults && typeof engineDefaults === 'object'
       ? engineDefaults as EngineDefaultsMap
@@ -815,6 +818,7 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
     if (localCatalog?.prefersLocalDefault) {
       return {
         ...agent,
+        ...(localCatalog ? { modelCatalog: localCatalog } : {}),
         model: agent.model ?? engineDefaultsForAgent?.model ?? null,
         fastModel: agent.fastModel ?? engineDefaultsForAgent?.fastModel ?? null,
       }
@@ -823,7 +827,7 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
     const modelWithEngineDefault = agent.model ?? engineDefaultsForAgent?.model ?? null
     const fastModelWithEngineDefault = agent.fastModel ?? engineDefaultsForAgent?.fastModel ?? null
     if (modelWithEngineDefault) {
-      return { ...agent, model: modelWithEngineDefault, fastModel: fastModelWithEngineDefault }
+      return { ...agent, ...(localCatalog ? { modelCatalog: localCatalog } : {}), model: modelWithEngineDefault, fastModel: fastModelWithEngineDefault }
     }
     const dflt = r.engine === 'codex'
       ? codexDefault
@@ -850,7 +854,9 @@ export async function listAgentsForComputer(computerId: string, supportsProvider
                           : r.engine === 'omp'
                             ? ompDefault
                             : null
-    return dflt ? { ...agent, model: dflt, fastModel: fastModelWithEngineDefault } : { ...agent, fastModel: fastModelWithEngineDefault }
+    return dflt
+      ? { ...agent, ...(localCatalog ? { modelCatalog: localCatalog } : {}), model: dflt, fastModel: fastModelWithEngineDefault }
+      : { ...agent, ...(localCatalog ? { modelCatalog: localCatalog } : {}), fastModel: fastModelWithEngineDefault }
   })
 }
 

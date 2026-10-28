@@ -585,7 +585,7 @@ test('grok adapter seeds AGENTS.md and reports sessionId from stream-json', asyn
     signal: new AbortController().signal,
   })
 
-  assert.equal(result.exitCode, 0)
+  assert.equal(result.exitCode, 0, `grok fixture failed: ${result.error ?? 'no error text'}`)
   assert.equal(result.sessionId, 'sess-grok-1')
   assert.equal(result.model, 'grok-4.6')
 })
@@ -641,10 +641,21 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   await mkdir(home)
 
   const capture = join(binDir, 'capture.js')
-  const captureSource = "let stdin = ''\n" +
-    "process.stdin.setEncoding('utf8')\n" +
-    "process.stdin.on('data', (chunk) => { stdin += chunk })\n" +
-    "process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin })))\n"
+  const captureSource = "const readline = require('node:readline')\n" +
+    "const appServer = process.argv.includes('app-server')\n" +
+    "if (appServer) {\n" +
+    "  const send = (message) => process.stdout.write(JSON.stringify(message) + '\\n')\n" +
+    "  readline.createInterface({ input: process.stdin }).on('line', (line) => {\n" +
+    "    const message = JSON.parse(line)\n" +
+    "    if (message.id === 1) send({ id: 1, result: {} })\n" +
+    "    if (message.id === 2) send({ id: 2, result: { config: {} } })\n" +
+    "  })\n" +
+    "} else {\n" +
+    "  let stdin = ''\n" +
+    "  process.stdin.setEncoding('utf8')\n" +
+    "  process.stdin.on('data', (chunk) => { stdin += chunk })\n" +
+    "  process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin }) + '\\n'))\n" +
+    "}\n"
   await writeFile(capture, captureSource, 'utf8')
   if (IS_WIN) {
     // Mirror npm's standard layout. Cumora must invoke this JS entry point
@@ -749,6 +760,112 @@ test('Codex one-shot paths send prompts through stdin', async () => {
   assert.equal(probeCapture.stdin, 'Connectivity check. Reply with exactly: OK')
 })
 
+test('Codex persistent turns preserve queued native image input', { skip: IS_WIN, timeout: 5000 }, async () => {
+  const source = `
+const send = (msg) => process.stdout.write(JSON.stringify(msg) + '\\n')
+const log = (msg) => process.stderr.write(JSON.stringify(msg) + '\\n')
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  if (msg.method === 'initialize') send({ id: msg.id, result: {} })
+  if (msg.method === 'thread/start') send({ id: msg.id, result: { thread: { id: 'fixture-thread' } } })
+  if (msg.method === 'turn/start') {
+    log(msg)
+    send({ id: msg.id, result: { turn: { id: 'fixture-turn' } } })
+    send({ method: 'turn/completed', params: { turn: { id: 'fixture-turn', status: 'completed' } } })
+  }
+})`
+
+  for (const vision of ['supported', 'unknown', 'unsupported'] as const) {
+    const { session, logs, home } = await startFakeCodexSession({ vision, source })
+    const image = join(home, 'attachments', 'diagram.png')
+    const outsideImage = join(dirname(home), 'outside.png')
+    await mkdir(dirname(image), { recursive: true })
+    await writeFile(image, 'image fixture', 'utf8')
+    await writeFile(outsideImage, 'outside fixture', 'utf8')
+
+    const result = await session.send('describe the image', [image, image, 'relative.png', outsideImage])
+    assert.equal(result.exitCode, 0)
+    const turn = logs
+      .filter((line) => line.startsWith('{'))
+      .map((line) => JSON.parse(line) as { method?: string; params?: { input?: unknown } })
+      .find((request) => request.method === 'turn/start')
+    assert.deepEqual(turn?.params?.input, [
+      { type: 'text', text: 'describe the image', text_elements: [] },
+      ...(vision === 'supported' ? [{ type: 'localImage', path: image }] : []),
+    ])
+  }
+})
+
+test('Codex one-shot image arguments preserve fresh and resumed command shapes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-codex-images-exec-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  const image = join(home, 'attachments', 'diagram.png')
+  const outsideImage = join(root, 'outside.png')
+  await mkdir(join(home, 'attachments'), { recursive: true })
+  await mkdir(binDir)
+  await writeFile(image, 'image fixture', 'utf8')
+  await writeFile(outsideImage, 'outside fixture', 'utf8')
+  await writeFakeCli(binDir, 'codex', `
+const readline = require('node:readline')
+const appServer = process.argv.includes('app-server')
+if (appServer) {
+  const send = message => process.stdout.write(JSON.stringify(message) + '\\n')
+  readline.createInterface({ input: process.stdin }).on('line', line => {
+    const message = JSON.parse(line)
+    if (message.id === 1) send({ id: 1, result: {} })
+    if (message.id === 2) send({ id: 2, result: { config: {} } })
+  })
+} else {
+  let stdin = ''
+  process.stdin.setEncoding('utf8')
+  process.stdin.on('data', chunk => { stdin += chunk })
+  process.stdin.on('end', () => process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), stdin }) + '\\n'))
+}`)
+  useFakeCliPath(binDir)
+  process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
+
+  const run = async (resumeSessionId: string | undefined, vision: 'supported' | 'unsupported' | 'unknown') => {
+    const logs: string[] = []
+    const result = await getAdapter('codex').run({
+      home,
+      prompt: 'describe the image',
+      env: secureClaudeEnv(root),
+      model: null,
+      fastModel: null,
+      resumeSessionId,
+      vision,
+      localImages: [image, image, 'relative.png', outsideImage],
+      onLog: (line) => logs.push(line),
+      signal: new AbortController().signal,
+    })
+    assert.equal(result.exitCode, 0)
+    return JSON.parse(logs.at(-1) ?? '{}') as { argv?: string[]; stdin?: string }
+  }
+
+  const fresh = await run(undefined, 'supported')
+  assert.equal(fresh.stdin, 'describe the image')
+  assert.equal(fresh.argv?.filter((arg) => arg === '--image').length, 1)
+  const freshImage = fresh.argv?.indexOf('--image') ?? -1
+  assert.equal(fresh.argv?.[freshImage + 1], image)
+  assert.equal(fresh.argv?.includes('resume'), false)
+
+  const resumed = await run('fixture-thread', 'supported')
+  const resumeIndex = resumed.argv?.indexOf('resume') ?? -1
+  const resumedImage = resumed.argv?.indexOf('--image') ?? -1
+  const threadIndex = resumed.argv?.indexOf('fixture-thread') ?? -1
+  assert.ok(resumeIndex >= 0)
+  assert.ok(resumedImage > resumeIndex)
+  assert.equal(resumed.argv?.[resumedImage + 1], image)
+  assert.ok(threadIndex > resumedImage)
+
+  for (const vision of ['unknown', 'unsupported'] as const) {
+    const capture = await run(undefined, vision)
+    assert.equal(capture.argv?.includes('--image'), false, `${vision} capability must not send native image input`)
+  }
+})
+
 test('Claude and Codex one-shot adapters return structured engine failures', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-structured-engine-failures-'))
   tempDirs.push(root)
@@ -757,7 +874,17 @@ test('Claude and Codex one-shot adapters return structured engine failures', asy
   await mkdir(binDir)
   await mkdir(home)
   await writeFakeCli(binDir, 'claude', "process.stderr.write('No conversation found with session ID: claude-stale\\n')\nprocess.exit(1)\n")
-  await writeFakeCli(binDir, 'codex', "process.stderr.write('429 Too Many Requests: rate limit reached\\n')\nprocess.exit(1)\n")
+  await writeFakeCli(binDir, 'codex', `
+if (process.argv.includes('app-server')) {
+  require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+    const message = JSON.parse(line)
+    if (message.id === 1) process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n')
+    if (message.id === 2) process.stdout.write(JSON.stringify({ id: 2, result: { config: {} } }) + '\\n')
+  })
+} else {
+  process.stderr.write('429 Too Many Requests: rate limit reached\\n')
+  process.exit(1)
+}`)
   useFakeCliPath(binDir)
   process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
 
@@ -831,7 +958,7 @@ async function fakeCodexRejectingThread(root: string): Promise<string> {
   return binDir
 }
 
-async function startFakeCodexSession(opts: { resume?: string; source?: string; onLog?: (line: string) => void } = {}) {
+async function startFakeCodexSession(opts: { resume?: string; source?: string; vision?: 'supported' | 'unsupported' | 'unknown'; onLog?: (line: string) => void } = {}) {
   process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
   const root = await mkdtemp(join(tmpdir(), 'cumora-codex-'))
   tempDirs.push(root)
@@ -850,11 +977,12 @@ async function startFakeCodexSession(opts: { resume?: string; source?: string; o
     home,
     env: secureClaudeEnv(root),
     resumeSessionId: opts.resume ?? null,
+    vision: opts.vision,
     onLog: (l) => { logs.push(l); opts.onLog?.(l) },
   })
   assert.ok(session, 'codex adapter must start a persistent session on this platform')
   liveSessions.push(session!)
-  return { session: session!, logs }
+  return { session: session!, logs, home }
 }
 
 const BWRAP_STARTUP_ERROR = 'bwrap: execvp /missing/codex: No such file or directory'

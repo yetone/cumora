@@ -599,6 +599,7 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
   daemon.log
   sessions/<agentId>.session       ← engine resume id
   triage/                          ← neutral cwd for small-brain spawns
+  local-projects.json              ← explicit grants for same-machine repositories
   .runtime-cli-tools/<agentId>/    ← daemon-owned fixed MCP bridge + IPC client
     cumora-mcp
     cumora
@@ -606,6 +607,9 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
     requests/                      ← bounded argv requests
     responses/                     ← bounded daemon responses
   .runtime-cli-broker/<agentId>/   ← daemon-private claimed requests/staging
+  agents/.cumora/
+    worktrees.json                 ← private local worktree leases and handoff records
+    patches/                       ← private patches for proposed handoffs
   agents/<agentId>/                ← cwd and secure sandbox root
     CLAUDE.md  (or AGENTS.md)      ← daemon-owned persona, atomically refreshed
     .cumora-standing-prompt.md     ← the per-session operational prompt
@@ -620,7 +624,12 @@ CUMORA_ENGINE_MODEL=local CUMORA_TRIAGE_MODEL=local-small cumora agent computer
     memory/MEMORY.md               ← the agent's durable memory index
     notes/                         ← scratch notes
     workspace/                     ← local work files
+    attachments/<messageId>/       ← attachment files fetched by the daemon
 ```
+
+Local Git worktrees live beside the Agent homes at
+`agents/<repositoryId>/<agentId>/<taskId>/`. A return handoff adds a generation
+suffix to the task directory so the earlier worktree remains intact.
 
 **The bridge** is a fixed MCP server plus a small file-IPC client stored in the
 daemon-owned `.runtime-cli-tools/<agentId>/` directory, outside the writable
@@ -643,6 +652,65 @@ also works for BYOA agents through `/runtime/cli` — `cumora workspace`
 (shared server-side files), `cumora memory`, docs, boards, calendar — so
 shared artifacts live where teammates can see them, while the agent's
 inner state stays local.
+
+**Attachments are pulled through the daemon and written to the agent's local
+home.** A message can contain up to 16 files. Each file and the whole message
+are limited to 25 MiB. During an inbox wake, the daemon fetches attachments for
+messages visible in the digest. CLI commands that return messages also declare
+which attachments they read, and the daemon fetches those files before it
+returns the result. It uses its in-memory runtime JWT to fetch
+`/runtime/attachment` and writes each file under
+`agents/<agentId>/attachments/<messageId>/`. Multiple files keep their own
+paths and text excerpts, so the engine can handle them independently. The
+engine never needs the bearer token or direct attachment URL.
+
+For a Codex model whose catalog explicitly reports image support, the daemon
+passes cached image paths through Codex's native `localImage` input on a
+persistent app-server turn and through `exec --image` on one-shot or resumed
+turns. The image bytes stay in the Agent home. Historical messages keep their
+local paths so Codex can use its native image viewer when needed. If visual
+support is unknown or unsupported, the daemon keeps the path and gives an
+honest capability-specific instruction. It never claims that the model saw the
+image. A direct message with an image that arrives during a running turn waits
+for the next full snapshot instead of being injected as text-only steering.
+
+For an inbox wake, the daemon materializes only attachments from messages
+visible in the current digest. CLI result attachments follow the read set
+returned by that CLI command. The daemon enforces download limits, attachment
+permissions, private file modes, and per-message isolation in both paths.
+
+**Local Git collaboration stays on the same Computer.** The operator grants a
+repository explicitly; a grant records its canonical Git paths in
+`local-projects.json` and does not copy the repository to Cumora. A created
+worktree is a normal local Git worktree below
+`agents/<repositoryId>/<agentId>/<taskId>`, on the task agent's own branch.
+When a task returns to an Agent after a handoff, the receiver gets a generation
+suffix in its task directory so the earlier worktree remains intact. The agent
+can inspect and commit through the local collaboration commands:
+
+```sh
+cumora agent computer local worktree status <worktree-id>
+cumora agent computer local worktree diff <worktree-id>
+cumora agent computer local worktree commit <worktree-id> --expected-head <full-head> --message '<text>'
+cumora agent computer local handoff propose <worktree-id> <target-agent-id>
+cumora agent computer local handoff list
+cumora agent computer local handoff show <handoff-id> --diff
+cumora agent computer local handoff accept <handoff-id>
+```
+
+`commit` publishes only if the worktree still has the exact head passed in
+`--expected-head`; after a stale-head error, the agent must run `status` and
+retry from the reported head. `handoff propose` requires a clean worktree. The
+receiver reviews the fixed local diff and explicitly accepts it into its own
+local worktree before continuing.
+
+These commands enter the daemon through the same file-IPC shim used by other
+BYOA tools, but the daemon handles the `computer local` branch directly and
+does not forward it to `/runtime/cli`. Repository paths, branches, commits,
+Git objects, diffs, patches, and worktree contents remain local. Project source
+is not uploaded to Cumora. Conversation messages and attachment bytes still
+use their existing server endpoints; the local Git collaboration store has no
+server transport.
 
 **Authentication is shared; tool authority is not.** The engine core can use
 the operator's existing login, but model-spawned commands cannot read that

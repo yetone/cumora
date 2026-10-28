@@ -10,6 +10,7 @@ import { configuredEngineModels } from './configured-models.js'
 import type { EngineId } from './engine.js'
 import { modelIdOrNull } from './model-id.js'
 import { fetchProviderModels, MAX_CATALOG_MODELS, readProviderCatalogFile } from './provider-models.js'
+import type { VisionCapability } from './model-capabilities.js'
 
 export type ModelCatalogSource = 'protocol' | 'cli' | 'presets'
 export type FastModelScope = 'agent' | 'computer' | 'unsupported'
@@ -20,6 +21,8 @@ export interface EngineModelOption {
   description?: string | null
   recommendedFor?: Array<'big' | 'small'>
   supportsFastMode?: boolean
+  /** Explicitly reported vision support. Missing means unknown. */
+  vision?: VisionCapability
 }
 
 /** Model choices advertised by the daemon that actually owns the CLI login.
@@ -210,6 +213,9 @@ function mergeModels(discovered: EngineModelOption[], fallback: EngineModelOptio
       description: clean(model.description, 320),
       recommendedFor: model.recommendedFor?.filter((tier): tier is 'big' | 'small' => tier === 'big' || tier === 'small'),
       ...(typeof model.supportsFastMode === 'boolean' ? { supportsFastMode: model.supportsFastMode } : {}),
+      ...(model.vision === 'supported' || model.vision === 'unsupported' || model.vision === 'unknown'
+        ? { vision: model.vision }
+        : {}),
     })
     if (out.length >= MAX_CATALOG_MODELS) break
   }
@@ -390,6 +396,9 @@ interface CodexListItem {
   description?: unknown
   isDefault?: unknown
   serviceTiers?: unknown
+  input_modalities?: unknown
+  inputModalities?: unknown
+  input?: unknown
 }
 
 async function discoverCodex(command: string, env: NodeJS.ProcessEnv, providerArgs: string[]): Promise<{ models: EngineModelOption[]; defaultModel: string | null } | null> {
@@ -409,8 +418,16 @@ async function discoverCodex(command: string, env: NodeJS.ProcessEnv, providerAr
     for (const row of result.data as CodexListItem[]) {
       const id = modelIdOrNull(typeof row.model === 'string' ? row.model : typeof row.id === 'string' ? row.id : null)
       if (!id) continue
+      const modalities = Array.isArray(row.input_modalities)
+        ? row.input_modalities
+        : Array.isArray(row.inputModalities)
+          ? row.inputModalities
+          : row.input && typeof row.input === 'object' && Array.isArray((row.input as { modalities?: unknown }).modalities)
+            ? (row.input as { modalities: unknown[] }).modalities
+            : null
       models.push({ id, label: clean(row.displayName, 160) ?? id, description: clean(row.description, 320),
         recommendedFor: row.isDefault === true ? ['big'] : undefined,
+        ...(modalities ? { vision: modalities.includes('image') ? 'supported' as const : 'unsupported' as const } : {}),
         ...(Array.isArray(row.serviceTiers) ? {
           supportsFastMode: row.serviceTiers.some((tier) => tier?.id === 'fast' || tier?.id === 'priority'),
         } : {}),

@@ -15,6 +15,7 @@ import { useApp } from '@/stores/app'
 import { useMessages } from '@/stores/messages'
 import { useParticipants } from '@/stores/participants'
 import { api, type ApiMessage } from '@/api/client'
+import { attachmentsFromMessage } from '@/lib/messageAttachments'
 import { MessageRow } from '@/components/Message'
 import { Composer } from '@/desktop/ChatPane'
 import type { Message, Participant } from '@/types'
@@ -23,7 +24,6 @@ import { useT } from '@/lib/i18n'
 function apiToMessage(m: ApiMessage): Message {
   const raw = m as unknown as {
     tool?: Message['tool']
-    attachment?: Message['attachment']
     whisperLink?: Message['whisperLink']
     quotedMessageId?: string | null
     quoted?: Message['quoted'] | null
@@ -38,7 +38,7 @@ function apiToMessage(m: ApiMessage): Message {
     at: m.at ?? '',
     reactions: m.reactions && m.reactions.length > 0 ? m.reactions : undefined,
     tool: raw.tool ?? undefined,
-    attachment: raw.attachment ?? undefined,
+    attachments: attachmentsFromMessage(m),
     whisperLink: raw.whisperLink ?? undefined,
     quotedMessageId: raw.quotedMessageId ?? undefined,
     quoted: raw.quoted ?? undefined,

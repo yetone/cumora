@@ -27,9 +27,10 @@ export interface DraftAttachment {
 
 export interface ComposerDraft {
   text: string
-  /** An upload the user already paid for. Dropping it on navigation loses a
-   *  file that is sitting in storage, so it rides along with the text. */
-  attachment: DraftAttachment | null
+  /** Ordered uploads already stored by the server. In-flight and failed local
+   *  files stay in the composer runtime so a reload only restores sendable
+   *  files. */
+  attachments: DraftAttachment[]
 }
 
 /** Keyed by composer SCOPE, not conversation: the desktop thread drawer is a
@@ -48,14 +49,14 @@ export const MAX_DRAFTS = 50
  *  for the whole origin; drafts are a guest in it, not the tenant. */
 export const MAX_SERIALIZED_BYTES = 256 * 1024
 
-export const EMPTY_DRAFT: ComposerDraft = { text: '', attachment: null }
+export const EMPTY_DRAFT: ComposerDraft = { text: '', attachments: [] }
 
 export function emptyComposerDraft(): ComposerDraft {
   return EMPTY_DRAFT
 }
 
 export function isEmptyDraft(d: ComposerDraft): boolean {
-  return d.text === '' && d.attachment === null
+  return d.text === '' && d.attachments.length === 0
 }
 
 /** Re-insert a key so it lands at the end of the object's iteration order.
@@ -83,7 +84,7 @@ export function applyDraftUpdate(
 ): ComposerDrafts {
   const current = drafts[scope] ?? EMPTY_DRAFT
   const next = updater(current)
-  if (next.text === current.text && next.attachment === current.attachment) return drafts
+  if (next.text === current.text && next.attachments === current.attachments) return drafts
   if (isEmptyDraft(next)) {
     if (!(scope in drafts)) return drafts
     const copy = { ...drafts }
@@ -113,13 +114,24 @@ export function parseStoredDrafts(raw: string | null): ComposerDrafts {
   const out: ComposerDrafts = {}
   for (const [scope, value] of Object.entries(parsed as Record<string, unknown>)) {
     if (!scope || typeof value !== 'object' || value === null) continue
-    const v = value as { text?: unknown; attachment?: unknown }
+    const v = value as { text?: unknown; attachment?: unknown; attachments?: unknown }
     const text = typeof v.text === 'string' ? v.text : ''
-    const attachment = parseAttachment(v.attachment)
-    const draft: ComposerDraft = { text, attachment }
+    // `attachment` is the old single-file draft shape. Keep accepting it
+    // indefinitely so users who upgrade with a stored draft do not lose it.
+    const source = v.attachments === undefined ? v.attachment : v.attachments
+    const attachments = parseAttachments(source)
+    const draft: ComposerDraft = { text, attachments }
     if (!isEmptyDraft(draft)) out[scope] = draft
   }
   return evict(out)
+}
+
+function parseAttachments(value: unknown): DraftAttachment[] {
+  if (value === null || value === undefined) return []
+  const source = Array.isArray(value) ? value : [value]
+  return source
+    .map(parseAttachment)
+    .filter((attachment): attachment is DraftAttachment => attachment !== null)
 }
 
 function parseAttachment(value: unknown): DraftAttachment | null {

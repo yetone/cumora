@@ -24,9 +24,10 @@ async function productionTypeScriptFiles(root: string): Promise<string[]> {
 test('production authorization and routing never use the JSONB membership projection', async () => {
   const violations: string[] = []
   for (const path of await productionTypeScriptFiles(serverSource)) {
+    const relativePath = relative(serverSource, path).replaceAll('\\', '/')
     // Migration 0001 is frozen historical SQL and deliberately retains its
     // old containment index and compatibility helpers.
-    if (relative(serverSource, path) === 'db/migrate.ts') continue
+    if (relativePath === 'db/migrate.ts') continue
     const source = await readFile(path, 'utf8')
     for (const pattern of [
       /members\s*@>/g,
@@ -34,7 +35,7 @@ test('production authorization and routing never use the JSONB membership projec
       /jsonb_array_elements_text\([^\n]*members/g,
       /\.members\.includes\(/g,
     ]) {
-      if (pattern.test(source)) violations.push(`${relative(serverSource, path)}: ${pattern.source}`)
+      if (pattern.test(source)) violations.push(`${relativePath}: ${pattern.source}`)
     }
   }
   assert.deepEqual(violations, [])

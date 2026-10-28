@@ -1,4 +1,5 @@
 import type { ApiConversation, ApiMessage } from '@/api/client'
+import { previewAttachmentsFromMessage } from './messageAttachments'
 import type { Conversation } from '@/types'
 
 /**
@@ -39,7 +40,7 @@ export function lastMessageFromWs(m: ApiMessage): NonNullable<ApiConversation['l
     kind: m.kind,
     body: m.body,
     tool: m.tool,
-    attachment: m.attachment,
+    attachment: previewAttachmentsFromMessage(m),
     createdAt: m.createdAt ?? m.at,
     email: m.email
       ? { subject: m.email.subject, direction: m.email.direction, from: m.email.from }

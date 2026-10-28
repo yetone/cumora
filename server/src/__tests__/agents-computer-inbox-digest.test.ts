@@ -13,7 +13,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { conversationHeader, renderInboxDigest } from '../agents/computer/daemon.js'
+import { conversationHeader, renderInboxDigest, visibleInboxMessageIds } from '../agents/computer/daemon.js'
 
 type Convo = { head: string; msgs: string[] }
 
@@ -76,6 +76,26 @@ test('omitted unread is announced with its count and how to read it', () => {
 test('the budget is respected', () => {
   const digest = renderInboxDigest(build([['a', 100], ['b', 100], ['c', 100]]), 40)
   assert.ok(messageLines(digest).length <= 40, 'must not exceed the line budget')
+})
+
+test('attachment materialization follows the messages the digest actually shows', () => {
+  const byConvo = new Map([
+    ['dm', {
+      head: '# dm',
+      msgs: ['  [dm-0] dm: one'],
+      ids: ['dm-0'],
+    }],
+    ['busy', {
+      head: '# busy',
+      msgs: Array.from({ length: 60 }, (_, i) => `  [busy-${i}] busy: ${i}`),
+      ids: Array.from({ length: 60 }, (_, i) => `busy-${i}`),
+    }],
+  ])
+  const visible = visibleInboxMessageIds(byConvo, 40)
+  assert.ok(visible.has('dm-0'))
+  assert.ok(visible.has('busy-59'))
+  assert.ok(!visible.has('busy-0'), 'older unread rows outside the digest are not downloaded')
+  assert.equal(visible.size, 40)
 })
 
 test('a conversation budgeted to zero shows none of its messages, not all of them', () => {

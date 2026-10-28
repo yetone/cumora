@@ -23,6 +23,8 @@ const { agentProviderProfileChecksum } = await import('../db/migrations/0008-age
 const { agentRoutingClaimsChecksum } = await import('../db/migrations/0009-agent-routing-claims.js')
 const { boardCardDueOnChecksum } = await import('../db/migrations/0010-board-card-due-on.js')
 const { agentNativeFastModeChecksum } = await import('../db/migrations/0011-agent-native-fast-mode.js')
+const { messageAttachmentsChecksum } = await import('../db/migrations/0012-message-attachments.js')
+const { attachmentGrantsChecksum } = await import('../db/migrations/0013-attachment-grants.js')
 const { verifySchemaCompatibility } = await import('../db/schema-version.js')
 type SchemaVersionQueryable = import('../db/schema-version.js').SchemaVersionQueryable
 
@@ -70,6 +72,14 @@ test('the board card due date migration matches its immutable manifest checksum'
 
 test('the native Fast Mode migration matches its immutable manifest checksum', () => {
   assert.equal(agentNativeFastModeChecksum(), SCHEMA_MIGRATIONS[10].checksum)
+})
+
+test('the message attachments migration matches its immutable manifest checksum', () => {
+  assert.equal(messageAttachmentsChecksum(), SCHEMA_MIGRATIONS[11].checksum)
+})
+
+test('the attachment grants migration matches its immutable manifest checksum', () => {
+  assert.equal(attachmentGrantsChecksum(), SCHEMA_MIGRATIONS[12].checksum)
 })
 
 test('the migration owner accepts an exact prefix and reports its pending suffix', () => {

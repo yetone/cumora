@@ -6,6 +6,7 @@ import ts from 'typescript'
 import { create } from 'zustand'
 import type { ApiMessage } from '../src/api/client'
 import { applyReplyCountDelta } from '../src/lib/replyCount'
+import { attachmentsFromMessage, apiAttachmentsFromMessage } from '../src/lib/messageAttachments'
 import type { Message } from '../src/types'
 
 // Execute the actual store with an in-memory API, without loading the browser
@@ -40,6 +41,7 @@ function setup(last: number, cache: Message[] = messages(1, 80)) {
     zustand: { create },
     '@/api/client': { api },
     '@/lib/replyCount': { applyReplyCountDelta },
+    '@/lib/messageAttachments': { attachmentsFromMessage, apiAttachmentsFromMessage },
     '@/stores/auth': { getMeId: () => 'user' },
     '@/stores/app': { useApp: { getState: () => ({ selectedConversationId: 'chat' }) } },
   }

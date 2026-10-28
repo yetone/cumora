@@ -130,12 +130,16 @@ function previewOf(last: ApiConversation['lastMessage']): string {
     // optional caption. Prefix with a 📎 + filename so the row reads
     // as "shared a file" instead of going blank when the user uploads
     // without a caption.
-    const a = last.attachment
+    const first = Array.isArray(last.attachment) ? last.attachment[0] : last.attachment
+    const count = Array.isArray(last.attachment) ? last.attachment.length : 1
+    if (!first) return trimmedBody
+    const a = first
     const verb = a.kind === 'img' ? '📷' : '📎'
     const filename = a.name ?? (a.kind === 'img' ? 'image' : 'file')
+    const fileLabel = count > 1 ? `${filename} +${count - 1}` : filename
     const label = trimmedBody
-      ? `${verb} ${filename} — ${trimmedBody.slice(0, 80)}`
-      : `${verb} ${filename}`
+      ? `${verb} ${fileLabel} — ${trimmedBody.slice(0, 80)}`
+      : `${verb} ${fileLabel}`
     return authorName ? `${authorName}: ${label}` : label
   }
   if (trimmedBody) {

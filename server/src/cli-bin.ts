@@ -18,7 +18,8 @@ async function main() {
       await runComputerDaemon(argv.slice(2))
     } catch (err) {
       process.stderr.write(`error: ${err instanceof Error ? err.message : String(err)}\n`)
-      process.exitCode = 2
+      const pairing = argv.slice(2).some((arg) => arg === '--pair' || arg.startsWith('--pair='))
+      process.exitCode = pairing ? 1 : 2
     }
     return
   }

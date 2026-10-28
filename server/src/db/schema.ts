@@ -1,5 +1,6 @@
 import { sql } from 'drizzle-orm'
 import { pgTable, text, integer, timestamp, jsonb, boolean, index, uniqueIndex } from 'drizzle-orm/pg-core'
+import type { AttachmentDescriptor } from '../../../shared/attachments.js'
 
 export const conversations = pgTable('conversations', {
   id: text('id').primaryKey(),
@@ -25,7 +26,9 @@ export const messages = pgTable(
     sequence: integer('sequence').notNull(),
     reactions: jsonb('reactions').$type<Array<{ emoji: string; count: number; mine?: boolean }> | null>(),
     tool: jsonb('tool').$type<Record<string, unknown> | null>(),
-    attachment: jsonb('attachment').$type<Record<string, unknown> | null>(),
+    /** Legacy first-attachment projection. New code reads `attachments`. */
+    attachment: jsonb('attachment').$type<AttachmentDescriptor | null>(),
+    attachments: jsonb('attachments').$type<AttachmentDescriptor[] | null>(),
     clientId: text('client_id'),
     // Durable one-shot delivery for departure notices after membership is
     // removed. Ordinary messages leave this null.

@@ -7,7 +7,7 @@ import { isMuted, useConversations } from '@/stores/conversations'
 import { useParticipants } from '@/stores/participants'
 import { useMessages, sendUserMessage, messagesFor, VIRTUOSO_FIRST_INDEX_BASE } from '@/stores/messages'
 import type { MessagesState } from '@/stores/messages'
-import { api, type ApiAttachment } from '@/api/client'
+import { api } from '@/api/client'
 import { Avatar, AvatarStack } from '@/components/Avatar'
 import { MembersPopover } from '@/components/MembersPopover'
 import { PreviewText } from '@/components/PreviewText'
@@ -21,10 +21,22 @@ import { COMPOSER_EMOJIS } from '@/lib/emoji'
 import { isImeComposing } from '@/lib/keyboard'
 import { MessageRow, TypingRow } from '@/components/Message'
 import { PollComposer } from '@/components/PollComposer'
+import { ComposerAttachments } from '@/components/ComposerAttachments'
 import { ScrollToLatestButton } from '@/components/ScrollToLatestButton'
 import { ISearch, IPin, IClip, IAt, ISmile, ISend, IConvene } from '@/components/icons'
 import type { Participant } from '@/types'
 import { useT } from '@/lib/i18n'
+import {
+  checkRuntimeSelection,
+  descriptorsToRuntime,
+  hasPendingAttachments,
+  markAttachmentFailed,
+  markAttachmentUploaded,
+  markAttachmentUploading,
+  reconcileRuntimeWithDraft,
+  readyAttachments,
+  type ComposerAttachment,
+} from '@/lib/composerAttachments'
 
 /** Soft "Coming soon" popover anchored beneath the trigger. Auto-dismisses
  *  after a beat; also closes on outside-click or Escape. The sparkle
@@ -581,8 +593,7 @@ export function Composer({
   // to localStorage, so a reload doesn't lose it either.
   const draftsByScope = useApp((s) => s.composerDrafts)
   const updateDraftInStore = useApp((s) => s.updateComposerDraft)
-  const [uploadingByScope, setUploadingByScope] = useState<Record<string, boolean>>({})
-  const [uploadErrorsByScope, setUploadErrorsByScope] = useState<Record<string, string>>({})
+  const [attachmentsByScope, setAttachmentsByScope] = useState<Record<string, ComposerAttachment[]>>({})
   const editorRef = useRef<RichInputHandle>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   // Per-scope "have we hydrated the editor DOM yet?" map. Switching scope
@@ -595,9 +606,13 @@ export function Composer({
 
   const currentDraft = draftsByScope[scopeKey] ?? EMPTY_COMPOSER_DRAFT
   const draft = currentDraft.text
-  const attachment = currentDraft.attachment
-  const uploading = Boolean(uploadingByScope[scopeKey])
-  const uploadError = uploadErrorsByScope[scopeKey] ?? null
+  const attachments = useMemo(
+    () => reconcileRuntimeWithDraft(attachmentsByScope[scopeKey], currentDraft.attachments),
+    [attachmentsByScope, scopeKey, currentDraft.attachments],
+  )
+  const ready = readyAttachments(attachments)
+  const uploading = hasPendingAttachments(attachments)
+  const hasErrors = attachments.some((item) => item.state === 'error')
 
   // Same signature as before; the empty-draft deletion and the
   // nothing-changed short-circuit now live in the store so both shells share
@@ -616,40 +631,28 @@ export function Composer({
     }))
   }, [scopeKey, updateComposerDraft])
 
-  const setAttachmentForScope = useCallback((targetScope: string, nextAttachment: ApiAttachment | null) => {
-    updateComposerDraft(targetScope, (current) => ({
-      ...current,
-      attachment: nextAttachment,
-    }))
-  }, [updateComposerDraft])
+  const setRuntimeAttachments = useCallback((targetScope: string, next: ComposerAttachment[]) => {
+    setAttachmentsByScope((prev) => ({ ...prev, [targetScope]: next }))
+  }, [])
 
-  const setAttachment = useCallback((nextAttachment: ApiAttachment | null) => {
-    setAttachmentForScope(scopeKey, nextAttachment)
-  }, [scopeKey, setAttachmentForScope])
+  const persistReadyAttachments = useCallback((targetScope: string, next: ComposerAttachment[]) => {
+    const persisted = next.flatMap((item) => item.state === 'ready' && item.attachment ? [item.attachment] : [])
+    const current = draftsRef.current[targetScope]?.attachments ?? []
+    if (persisted.length === current.length
+      && persisted.every((attachment, index) => {
+        const prior = current[index]
+        return prior?.key === attachment.key && prior.url === attachment.url
+      })) return
+    updateComposerDraft(targetScope, (draft) => ({ ...draft, attachments: persisted }))
+  }, [updateComposerDraft])
 
   const clearComposerDraft = useCallback(() => {
     updateComposerDraft(scopeKey, () => EMPTY_COMPOSER_DRAFT)
+    setAttachmentsByScope((prev) => {
+      if (!(scopeKey in prev)) return prev
+      return { ...prev, [scopeKey]: [] }
+    })
   }, [scopeKey, updateComposerDraft])
-
-  const setUploadingForScope = useCallback((targetScope: string, nextUploading: boolean) => {
-    setUploadingByScope((prev) => {
-      if (Boolean(prev[targetScope]) === nextUploading) return prev
-      const copy = { ...prev }
-      if (nextUploading) copy[targetScope] = true
-      else delete copy[targetScope]
-      return copy
-    })
-  }, [])
-
-  const setUploadErrorForScope = useCallback((targetScope: string, nextError: string | null) => {
-    setUploadErrorsByScope((prev) => {
-      if ((prev[targetScope] ?? null) === nextError) return prev
-      const copy = { ...prev }
-      if (nextError) copy[targetScope] = nextError
-      else delete copy[targetScope]
-      return copy
-    })
-  }, [])
 
   // Reply state — read the quoted message id for THIS convo. The store
   // keeps a per-convo map so flipping rooms preserves each room's draft.
@@ -759,51 +762,88 @@ export function Composer({
     requestAnimationFrame(() => editorRef.current?.focus())
   }
 
-  const upload = async (file: File, targetScope = scopeKey) => {
-    setUploadingForScope(targetScope, true)
-    setUploadErrorForScope(targetScope, null)
+  const upload = async (item: ComposerAttachment, targetScope = scopeKey) => {
+    if (!item.file) return
     try {
-      const a = await api.uploadFile(file)
-      setAttachmentForScope(targetScope, a)
+      const uploaded = await api.uploadFile(item.file)
+      setAttachmentsByScope((prev) => {
+        const next = markAttachmentUploaded(
+          prev[targetScope] ?? descriptorsToRuntime(draftsRef.current[targetScope]?.attachments ?? []),
+          item.id,
+          uploaded,
+        )
+        persistReadyAttachments(targetScope, next)
+        return { ...prev, [targetScope]: next }
+      })
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.warn('[upload] failed', msg)
-      setUploadErrorForScope(targetScope, msg)
-      // Auto-clear after a few seconds so the composer doesn't carry
-      // stale error chrome into the next message.
-      window.setTimeout(() => setUploadErrorForScope(targetScope, null), 4500)
-    } finally {
-      setUploadingForScope(targetScope, false)
+      setAttachmentsByScope((prev) => ({
+        ...prev,
+        [targetScope]: markAttachmentFailed(
+          prev[targetScope] ?? descriptorsToRuntime(draftsRef.current[targetScope]?.attachments ?? []),
+          item.id,
+          msg,
+        ),
+      }))
     }
   }
 
-  const onPickFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const f = e.target.files?.[0]
+  const addFiles = useCallback((files: File[], targetScope = scopeKey) => {
+    const current = attachmentsByScope[targetScope] ?? descriptorsToRuntime(draftsRef.current[targetScope]?.attachments ?? [])
+    const selection = checkRuntimeSelection(current, files)
+    if (!selection.ok) {
+      console.warn('[upload] selection rejected', selection.error)
+      return
+    }
+    const next = [...current, ...selection.incoming]
+    setRuntimeAttachments(targetScope, next)
+    for (const item of selection.incoming) void upload(item, targetScope)
+  }, [attachmentsByScope, scopeKey, setRuntimeAttachments])
+
+  const onPickFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files ?? [])
     e.target.value = ''
-    if (f) await upload(f)
+    addFiles(files)
   }
 
-  const onPaste = async (e: React.ClipboardEvent<HTMLDivElement>) => {
+  const onPaste = (e: React.ClipboardEvent<HTMLDivElement>) => {
     const items = e.clipboardData?.items
     if (!items) return
+    const files: File[] = []
     for (const it of items) {
       if (it.kind === 'file') {
         const f = it.getAsFile()
         // Paste path: still images-only. Pasting an arbitrary file is
         // unusual outside of clipboard hijack attacks; keep this narrow.
         if (f && f.type.startsWith('image/')) {
-          e.preventDefault()
-          await upload(f)
-          return
+          files.push(f)
         }
       }
     }
+    if (files.length > 0) {
+      e.preventDefault()
+      addFiles(files)
+    }
   }
 
-  const onDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+  const onDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault()
-    const f = e.dataTransfer.files?.[0]
-    if (f) await upload(f)
+    addFiles(Array.from(e.dataTransfer.files ?? []))
+  }
+
+  const removeAttachment = (id: string) => {
+    const next = attachments.filter((item) => item.id !== id)
+    setRuntimeAttachments(scopeKey, next)
+    persistReadyAttachments(scopeKey, next)
+  }
+
+  const retryAttachment = (id: string) => {
+    const item = attachments.find((candidate) => candidate.id === id)
+    if (!item?.file) return
+    const next = markAttachmentUploading(attachments, id)
+    setRuntimeAttachments(scopeKey, next)
+    void upload(item)
   }
 
   /** Insert raw text at the current caret. Skype shortcodes get a
@@ -906,9 +946,9 @@ export function Composer({
       openPollComposer()
       return
     }
-    if (!v && !attachment) return
+    if ((!v && ready.length === 0) || uploading || hasErrors) return
     finalizeTyping()
-    sendUserMessage(convoId, v, attachment, replyingToId ?? null)
+    void sendUserMessage(convoId, v, ready, replyingToId ?? null)
     clearComposerDraft()
     editorRef.current?.setValue('')
     if (!isThread) setReplyingTo(convoId, null)
@@ -1007,7 +1047,7 @@ export function Composer({
     requestAnimationFrame(() => editorRef.current?.focus())
   }, [scopeKey])
 
-  const canSend = (draft.trim().length > 0 || attachment !== null) && !uploading
+  const canSend = (draft.trim().length > 0 || ready.length > 0) && !uploading && !hasErrors
 
   return (
     <div className={isThread ? '' : 'px-[22px] pt-1.5 pb-[18px]'}
@@ -1040,37 +1080,7 @@ export function Composer({
         isThread ? 'bg-paper' : 'bg-cloud',
       )}
         style={{ border: '1.5px solid var(--ink-100)' }}>
-        {attachment && (
-          <div className="mb-2 inline-flex items-center gap-2.5 py-1.5 px-2 bg-sky2-50 border border-sky2-100 rounded-lg max-w-full">
-            {attachment.kind === 'img' ? (
-              <img src={attachment.url} alt={attachment.name}
-                className="w-10 h-10 object-cover rounded-md" />
-            ) : (
-              <div className="w-10 h-10 rounded-md grid place-items-center shrink-0"
-                style={{ background: 'linear-gradient(135deg, #2A2A35, #1A1A22)' }}>
-                <IClip className="w-4 h-4 text-white/85" strokeWidth={1.8} />
-              </div>
-            )}
-            <div className="min-w-0">
-              <div className="text-[12px] font-semibold text-ink-700 truncate max-w-[260px]">{attachment.name}</div>
-              <div className="text-[10.5px] text-ink-500 truncate">{attachment.mime ?? attachment.kind}{attachment.size ? ` · ${Math.round(attachment.size / 1024)}KB` : ''}</div>
-            </div>
-            <button
-              type="button"
-              onClick={() => setAttachment(null)}
-              className="ml-1 w-6 h-6 rounded-md grid place-items-center text-ink-500 hover:bg-cloud hover:text-ink-900 transition shrink-0"
-              aria-label={t('chat.removeAttachment')}
-            >×</button>
-          </div>
-        )}
-        {uploading && (
-          <div className="mb-2 text-[11.5px] text-ink-500 italic">{t('chat.uploading')}</div>
-        )}
-        {uploadError && (
-          <div className="mb-2 text-[11.5px] py-1 px-2 rounded-md text-coral-deep bg-coral-soft inline-block max-w-full truncate">
-            {uploadError}
-          </div>
-        )}
+        <ComposerAttachments items={attachments} onRemove={removeAttachment} onRetry={retryAttachment} />
         {showReplyingPill && (
           <div className="mb-2 flex items-stretch gap-2 rounded-md bg-sky2-50 border border-sky2-100 pl-2 pr-1 py-1.5 min-w-0">
             <div className="w-[3px] rounded bg-skype shrink-0" />
@@ -1235,6 +1245,7 @@ export function Composer({
           <input
             ref={fileRef}
             type="file"
+            multiple
             // No `accept` — let the user pick anything; the server enforces
             // the mime whitelist. Browser-side accept is only a hint anyway
             // (you can still pick any file via drag-drop), so we lean on

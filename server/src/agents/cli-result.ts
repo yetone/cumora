@@ -1,3 +1,5 @@
+import type { AttachmentDescriptor } from '../../../shared/attachments.js'
+
 export interface CliSideEffect {
   event: string
   command?: string
@@ -9,11 +11,21 @@ export interface CliSideEffect {
   [key: string]: unknown
 }
 
+/** Attachment descriptors discovered by a read command. The runtime HTTP
+ *  surface returns these beside the rendered text so a BYOA daemon can cache
+ *  the exact files the agent just inspected. They never choose a fetch URL:
+ *  the daemon downloads only their validated Cumora storage keys. */
+export interface CliAttachmentRead {
+  messageId: string
+  attachments: readonly AttachmentDescriptor[]
+}
+
 export interface CliResult {
   ok: boolean
   text: string
   exitCode: number
   sideEffects?: CliSideEffect[]
+  attachmentReads?: CliAttachmentRead[]
 }
 
 export interface CliSideEffectsParseResult {

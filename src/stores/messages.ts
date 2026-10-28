@@ -1,7 +1,8 @@
 import { create } from 'zustand'
 import type { Message, ReactionEntry } from '@/types'
 import { applyReplyCountDelta } from '@/lib/replyCount'
-import { api, ApiError, ws, type WsEvent, type ApiMessage } from '@/api/client'
+import { api, ApiError, ws, type ApiAttachment, type WsEvent, type ApiMessage } from '@/api/client'
+import { attachmentsFromMessage, apiAttachmentsFromMessage } from '@/lib/messageAttachments'
 import { useApp } from '@/stores/app'
 import { getMeId } from '@/stores/auth'
 
@@ -251,7 +252,6 @@ function fromApi(m: ApiMessage): Message {
   }
   const raw = m as unknown as {
     tool?: Message['tool']
-    attachment?: Message['attachment']
     whisperLink?: Message['whisperLink']
     quotedMessageId?: string | null
     quoted?: Message['quoted'] | null
@@ -270,7 +270,7 @@ function fromApi(m: ApiMessage): Message {
     at,
     reactions: deriveMineForReactions(m.reactions),
     tool: raw.tool ?? undefined,
-    attachment: raw.attachment ?? undefined,
+    attachments: attachmentsFromMessage(m),
     whisperLink: raw.whisperLink ?? undefined,
     quotedMessageId: raw.quotedMessageId ?? undefined,
     quoted: raw.quoted ?? undefined,
@@ -676,17 +676,17 @@ function isDefinitiveSendFailure(error: unknown): boolean {
 export async function sendUserMessage(
   convoId: string,
   body: string,
-  attachment?: import('@/api/client').ApiAttachment | null,
+  attachments: readonly ApiAttachment[] = [],
   quotedMessageId?: string | null,
   clientId = newTempId(),
 ): Promise<void> {
   const v = body.trim()
-  if (!v && !attachment) return
+  if (!v && attachments.length === 0) return
   const meId = getMeId()
   // Without a signed-in user we can't paint an optimistic bubble (no authorId
   // to attribute it to). Fall back to the old fire-and-forget path.
   if (!meId) {
-    try { await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null) }
+    try { await api.sendMessage(convoId, v, attachments, quotedMessageId ?? null) }
     catch (err) { console.warn('[messages] send failed', err) }
     return
   }
@@ -720,16 +720,14 @@ export async function sendUserMessage(
     kind: 'text',
     body: v,
     at: timeFromIso(),
-    attachment: attachment
-      ? {
-          name: attachment.name,
-          kind: attachment.kind,
-          url: attachment.url,
-          key: attachment.key,
-          mime: attachment.mime,
-          size: attachment.size,
-        }
-      : undefined,
+    attachments: attachments.map((attachment) => ({
+      name: attachment.name,
+      kind: attachment.kind,
+      url: attachment.url,
+      key: attachment.key,
+      mime: attachment.mime,
+      size: attachment.size,
+    })),
     quotedMessageId: quotedMessageId ?? undefined,
     quoted: quotedSummary,
     pending: true,
@@ -756,7 +754,7 @@ export async function sendUserMessage(
   }))
 
   try {
-    const { id: realId } = await api.sendMessage(convoId, v, attachment ?? null, quotedMessageId ?? null, clientId)
+    const { id: realId } = await api.sendMessage(convoId, v, attachments, quotedMessageId ?? null, clientId)
     // Reconcile the temp bubble with the server. Either the WS `message.new`
     // already raced ahead of us (real id already in the list → drop the temp)
     // or it hasn't (rename temp → real id so the eventual WS event dedupes
@@ -818,14 +816,11 @@ export async function retryFailedMessage(convoId: string, tempId: string): Promi
   const msg = list.find((m) => m.id === tempId)
   if (!msg) return
   const body = msg.body ?? ''
-  const att = msg.attachment
-  const retryAttachment: import('@/api/client').ApiAttachment | null = att
-    ? { url: att.url ?? '', name: att.name, kind: att.kind, key: att.key, mime: att.mime, size: att.size }
-    : null
+  const retryAttachments = apiAttachmentsFromMessage(msg)
   const quotedId = msg.quotedMessageId ?? null
   const clientId = msg.clientId ?? tempId
   discardFailedMessage(convoId, tempId)
-  await sendUserMessage(convoId, body, retryAttachment, quotedId, clientId)
+  await sendUserMessage(convoId, body, retryAttachments, quotedId, clientId)
 }
 
 export async function toggleReaction(messageId: string, emoji: string): Promise<void> {

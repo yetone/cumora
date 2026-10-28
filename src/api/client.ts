@@ -1,5 +1,6 @@
 import { getActiveCompanyId, getAuthToken, useAuth } from '@/stores/auth'
 import type { EngineUpdate } from '../../shared/engine-update'
+import type { AttachmentDescriptor } from '../../shared/attachments'
 import type {
   BoardCardComment, BoardCardLookup, BoardSnapshot, BoardSummary,
   CalendarDispatch, CalendarEvent, CalendarEventKind, CalendarEventStatus,
@@ -138,6 +139,8 @@ export async function http<T>(path: string, init?: RequestInit): Promise<T> {
 export interface ApiMessage extends Message {
   sequence: number
   createdAt?: string
+  /** Older reads and WS frames still carry the singular column value. */
+  attachments?: readonly AttachmentDescriptor[]
   reactions?: Array<{ emoji: string; count: number; mine?: boolean; users?: string[] }>
 }
 
@@ -166,7 +169,7 @@ export interface ApiConversation {
     kind: string
     body: string
     tool?: unknown
-    attachment?: { name?: string; kind?: 'img' | 'pdf' | 'file' | 'fig' } | null
+    attachment?: AttachmentDescriptor | readonly AttachmentDescriptor[] | null
     createdAt: string
     /** Set when last message is an email — used to render "Re: subject"
      *  previews in the sidebar instead of the raw body excerpt. */
@@ -1144,7 +1147,7 @@ export const api = {
   sendMessage: (
     conversationId: string,
     body: string,
-    attachment?: ApiAttachment | null,
+    attachments?: readonly ApiAttachment[],
     quotedMessageId?: string | null,
     /** Optional client-supplied idempotency key (the optimistic bubble's
      *  tempId). The server persists it and returns the original message when
@@ -1155,7 +1158,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({
         body,
-        attachment: attachment ?? undefined,
+        attachments: attachments?.length ? attachments : undefined,
         quotedMessageId: quotedMessageId ?? undefined,
         clientId: clientId ?? undefined,
       }),

@@ -20,15 +20,23 @@
  *   - `email-attachments/` — inbound and outbound mail files (signed)
  *   - `avatars/`           — portraits (the only unsigned R2 prefix)
  */
-import { writeFile, mkdir, readdir, stat, unlink } from 'node:fs/promises'
-import { join, resolve, dirname } from 'node:path'
+import { writeFile, mkdir, readdir, readFile, stat, unlink } from 'node:fs/promises'
+import { basename, join, resolve, dirname } from 'node:path'
 import { createHmac } from 'node:crypto'
 import {
-  S3Client, PutObjectCommand, GetObjectCommand,
+  S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand,
   DeleteObjectCommand, ListObjectsV2Command,
 } from '@aws-sdk/client-s3'
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner'
 import { env } from './env.js'
+import {
+  ATTACHMENT_MAX_FILE_BYTES,
+  ATTACHMENT_MAX_TOTAL_BYTES,
+  normalizeAttachments,
+  validateAttachmentInput,
+  type AttachmentDescriptor,
+  type AttachmentKind,
+} from '../../shared/attachments.js'
 import {
   normalizeStorageKey,
   storageKeyFromPublicUrl as storageKeyFromPublicUrlForBase,
@@ -70,6 +78,88 @@ export function signedUrlExpiresSoon(raw: string, leewaySeconds = 300): boolean 
  *  abstraction lands. */
 export const UPLOAD_DIR = resolve(process.cwd(), 'server/uploads')
 
+/** The chat-upload MIME allowlist also defines the extension and renderer kind
+ *  for a new object. Message persistence derives both from stored metadata. */
+export const CHAT_ATTACHMENT_MIME_POLICY: Record<string, { kind: 'img' | 'file'; ext: string }> = {
+  'image/png': { kind: 'img', ext: 'png' },
+  'image/jpeg': { kind: 'img', ext: 'jpg' },
+  'image/webp': { kind: 'img', ext: 'webp' },
+  'image/gif': { kind: 'img', ext: 'gif' },
+  'application/pdf': { kind: 'file', ext: 'pdf' },
+  'application/msword': { kind: 'file', ext: 'doc' },
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': { kind: 'file', ext: 'docx' },
+  'application/vnd.ms-excel': { kind: 'file', ext: 'xls' },
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': { kind: 'file', ext: 'xlsx' },
+  'application/vnd.ms-powerpoint': { kind: 'file', ext: 'ppt' },
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': { kind: 'file', ext: 'pptx' },
+  'application/zip': { kind: 'file', ext: 'zip' },
+  'application/x-tar': { kind: 'file', ext: 'tar' },
+  'application/gzip': { kind: 'file', ext: 'gz' },
+  'text/plain': { kind: 'file', ext: 'txt' },
+  'text/markdown': { kind: 'file', ext: 'md' },
+  'text/csv': { kind: 'file', ext: 'csv' },
+  'application/json': { kind: 'file', ext: 'json' },
+  'application/x-yaml': { kind: 'file', ext: 'yml' },
+  'application/x-toml': { kind: 'file', ext: 'toml' },
+  'audio/mpeg': { kind: 'file', ext: 'mp3' },
+  'audio/wav': { kind: 'file', ext: 'wav' },
+  'video/mp4': { kind: 'file', ext: 'mp4' },
+  'video/quicktime': { kind: 'file', ext: 'mov' },
+}
+
+function attachmentKindForMime(mime: string): AttachmentKind {
+  if (mime === 'application/pdf') return 'pdf'
+  return CHAT_ATTACHMENT_MIME_POLICY[mime]?.kind ?? 'file'
+}
+
+/** Validate a presign request against the same policy the message write uses. */
+export function validateChatUpload(input: {
+  name: unknown
+  mime: unknown
+  size: unknown
+}):
+  | { ok: true; name: string; mime: string; size: number; kind: AttachmentKind }
+  | { ok: false; status: 400 | 413 | 415; error: string } {
+  const name = String(input.name ?? '').trim().slice(0, 200)
+  const mime = String(input.mime ?? '').trim().toLowerCase()
+  const size = Number(input.size ?? 0)
+  if (!name || !mime) return { ok: false, status: 400, error: 'name + mime required' }
+  if (!Number.isSafeInteger(size) || size <= 0 || size > ATTACHMENT_MAX_FILE_BYTES) {
+    return { ok: false, status: 413, error: `size out of range (got ${size}, max ${ATTACHMENT_MAX_FILE_BYTES})` }
+  }
+  const policy = CHAT_ATTACHMENT_MIME_POLICY[mime]
+  if (!policy) return { ok: false, status: 415, error: `mime not allowed: ${mime}` }
+  return { ok: true, name, mime, size, kind: attachmentKindForMime(mime) }
+}
+
+const STORAGE_MIME_BY_EXTENSION = new Map<string, string>()
+for (const [mime, policy] of Object.entries(CHAT_ATTACHMENT_MIME_POLICY)) {
+  STORAGE_MIME_BY_EXTENSION.set(policy.ext, mime)
+}
+
+function normalizedMime(raw: string): string {
+  return raw.split(';', 1)[0]?.trim().toLowerCase() ?? ''
+}
+
+/** Local uploads use a small sidecar for the exact MIME supplied when the
+ *  server wrote the bytes. The sidecar never becomes a message attachment. */
+async function putLocalMimeMetadata(key: string, mime: string): Promise<void> {
+  const marker = localMimeMarker(key)
+  await mkdir(dirname(marker), { recursive: true })
+  await writeFile(marker, mime)
+}
+
+function localMimeMarker(key: string): string {
+  return join(UPLOAD_DIR, dirname(key), `${basename(key)}.cumora-mime`)
+}
+
+/** Local files have no object-store Content-Type header. Their server-minted
+ *  extension is the storage-side type record used for persistence and reads. */
+export function mimeTypeFromStorageKey(key: string): string | undefined {
+  const extension = key.toLowerCase().match(/\.([a-z0-9]+)$/)?.[1]
+  return extension ? STORAGE_MIME_BY_EXTENSION.get(extension) : undefined
+}
+
 /** One enumerated object. lastModifiedMs is the storage backend's notion
  *  of when the object was last written — GC uses it to spare keys that
  *  were uploaded recently (the row write may still be in flight). */
@@ -79,6 +169,14 @@ export interface StorageObject {
   lastModifiedMs: number
 }
 
+/** Authoritative metadata for one stored object. Callers use this instead of
+ *  trusting browser-supplied MIME or size values when persisting a message. */
+export interface StoredObjectMetadata {
+  key: string
+  sizeBytes: number
+  mime?: string
+}
+
 export interface Storage {
   mode: 'local' | 'r2'
   /** Write bytes synchronously from the server side (avatar gen path).
@@ -86,7 +184,14 @@ export interface Storage {
   put(key: string, body: Buffer, mime: string): Promise<string>
   /** Return a short-lived PUT URL the browser uploads to directly, plus
    *  the public URL the file will be available at after the upload. */
-  presignPut(key: string, mime: string, ttlSeconds?: number): Promise<{ uploadUrl: string; publicUrl: string }>
+  presignPut(
+    key: string,
+    mime: string,
+    sizeBytes: number,
+    ttlSeconds?: number,
+  ): Promise<{ uploadUrl: string; publicUrl: string }>
+  /** Return object metadata, or null when the key does not exist. */
+  statObject(key: string): Promise<StoredObjectMetadata | null>
   /** Resolve a long-lived public URL for a key. R2 mode emits a presigned
    *  GET when no public base is configured. */
   publicUrl(key: string): Promise<string>
@@ -108,6 +213,7 @@ class LocalStorage implements Storage {
     const path = join(UPLOAD_DIR, key)
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, body)
+    await putLocalMimeMetadata(key, _mime)
     // Existing static handler mounts UPLOAD_DIR at /uploads/.
     return `/uploads/${key}`
   }
@@ -116,8 +222,33 @@ class LocalStorage implements Storage {
   // `POST /uploads` (base64). Callers MUST check `storage.mode` first
   // and pick the base64 path; this method only exists to satisfy the
   // interface and will throw if reached.
-  async presignPut(_key: string, _mime: string, _ttl?: number): Promise<{ uploadUrl: string; publicUrl: string }> {
+  async presignPut(
+    _key: string,
+    _mime: string,
+    _sizeBytes: number,
+    _ttl?: number,
+  ): Promise<{ uploadUrl: string; publicUrl: string }> {
     throw new Error('presignPut not supported in local mode — POST /uploads (base64) instead')
+  }
+
+  async statObject(key: string): Promise<StoredObjectMetadata | null> {
+    const path = join(UPLOAD_DIR, key)
+    try {
+      const s = await stat(path)
+      if (!s.isFile()) return null
+      const metaMarker = localMimeMarker(key)
+      let mime: string | undefined
+      try {
+        const raw = (await readFile(metaMarker, 'utf8')).trim()
+        if (raw) mime = normalizedMime(raw)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      }
+      return { key, sizeBytes: s.size, mime }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+      throw error
+    }
   }
 
   async publicUrl(key: string): Promise<string> {
@@ -204,15 +335,45 @@ class R2Storage implements Storage {
     return this.publicUrl(key)
   }
 
-  async presignPut(key: string, mime: string, ttl = 300): Promise<{ uploadUrl: string; publicUrl: string }> {
+  async presignPut(
+    key: string,
+    mime: string,
+    sizeBytes: number,
+    ttl = 300,
+  ): Promise<{ uploadUrl: string; publicUrl: string }> {
     const cmd = new PutObjectCommand({
       Bucket: this.bucket,
       Key: key,
       ContentType: mime,
+      // SigV4 binds this header into the presigned URL. The browser's PUT must
+      // carry the same Content-Length, preventing a larger object upload.
+      ContentLength: sizeBytes,
     })
     const uploadUrl = await getSignedUrl(this.client, cmd, { expiresIn: ttl })
     const publicUrl = await this.publicUrl(key)
     return { uploadUrl, publicUrl }
+  }
+
+  async statObject(key: string): Promise<StoredObjectMetadata | null> {
+    try {
+      const res = await this.client.send(new HeadObjectCommand({
+        Bucket: this.bucket,
+        Key: key,
+      }))
+      if (typeof res.ContentLength !== 'number' || !Number.isSafeInteger(res.ContentLength)) {
+        throw new Error('storage object has no valid Content-Length')
+      }
+      return {
+        key,
+        sizeBytes: res.ContentLength,
+        ...(res.ContentType ? { mime: res.ContentType.toLowerCase() } : {}),
+      }
+    } catch (error) {
+      const name = (error as { name?: unknown } | null)?.name
+      const status = (error as { $metadata?: { httpStatusCode?: unknown } } | null)?.$metadata?.httpStatusCode
+      if (name === 'NotFound' || name === 'NoSuchKey' || status === 404) return null
+      throw error
+    }
   }
 
   async listObjectsByPrefix(prefix: string): Promise<StorageObject[]> {
@@ -339,4 +500,114 @@ export async function freshenAttachmentUrl<T extends StoredAttachment | null | u
   const url = await storage.publicUrl(key)
   if (url === att.url && att.key === key) return att
   return { ...att, url, key } as T
+}
+
+export type ResolveMessageAttachmentsResult =
+  | { readonly ok: true; readonly attachments: readonly AttachmentDescriptor[] }
+  | {
+      readonly ok: false
+      readonly status: 400 | 413
+      readonly error: string
+      readonly index?: number
+    }
+
+/** Validate the ordered wire list, resolve each trusted Cumora object, and
+ *  replace every client-controlled size/MIME/kind/URL with storage-derived
+ *  values. Message persistence must use this result verbatim. */
+export async function resolveMessageAttachments(
+  raw: unknown,
+  backend: Pick<Storage, 'statObject' | 'publicUrl'> = storage,
+  opts: {
+    mimeForLegacyKey?: (key: string) => string | undefined
+    /** Tenant-bound grant check supplied by the API boundary. Keeping the
+     * callback here avoids coupling storage backends to Postgres. */
+    attachmentGrant?: (key: string) => Promise<boolean>
+  } = {},
+): Promise<ResolveMessageAttachmentsResult> {
+  const parsed = validateAttachmentInput(raw)
+  if (!parsed.ok) {
+    const indexSuffix = parsed.index === undefined ? '' : ` at index ${parsed.index}`
+    switch (parsed.issue) {
+      case 'too-many-files':
+        return { ok: false, status: 413, error: 'too many attachments (maximum 16)' }
+      case 'file-too-large':
+        return { ok: false, status: 413, error: `attachment${indexSuffix} exceeds 25 MiB` }
+      case 'total-too-large':
+        return { ok: false, status: 413, error: `attachments${indexSuffix} exceed 25 MiB total` }
+      case 'invalid-shape':
+        return { ok: false, status: 400, error: `invalid attachment${indexSuffix}` }
+    }
+  }
+
+  const attachments: AttachmentDescriptor[] = []
+  let totalBytes = 0
+  for (let index = 0; index < parsed.attachments.length; index++) {
+    const input = parsed.attachments[index]
+    const key = messageAttachmentStorageKey(input)
+    if (!key) {
+      return { ok: false, status: 400, error: 'attachment must reference Cumora storage', index }
+    }
+    if (opts.attachmentGrant && !(await opts.attachmentGrant(key))) {
+      return { ok: false, status: 400, error: 'attachment is not granted to this workspace', index }
+    }
+    let stored: StoredObjectMetadata | null
+    let url: string
+    try {
+      ;[stored, url] = await Promise.all([backend.statObject(key), backend.publicUrl(key)])
+    } catch {
+      return { ok: false, status: 400, error: 'attachment storage reference is invalid', index }
+    }
+    if (!stored) return { ok: false, status: 400, error: 'attachment object does not exist', index }
+    if (stored.sizeBytes <= 0 || stored.sizeBytes > ATTACHMENT_MAX_FILE_BYTES) {
+      return { ok: false, status: 413, error: `attachment object size is invalid (maximum 25 MiB)`, index }
+    }
+    if (input.size !== undefined && input.size !== stored.sizeBytes) {
+      return { ok: false, status: 400, error: 'attachment size does not match uploaded object', index }
+    }
+    totalBytes += stored.sizeBytes
+    if (totalBytes > ATTACHMENT_MAX_TOTAL_BYTES) {
+      return { ok: false, status: 413, error: 'attachments exceed 25 MiB total', index }
+    }
+
+    const mime = stored.mime
+      ? normalizedMime(stored.mime)
+      : (opts.mimeForLegacyKey ?? mimeTypeFromStorageKey)(key)
+    if (!mime || !CHAT_ATTACHMENT_MIME_POLICY[mime]) {
+      return { ok: false, status: 400, error: 'attachment object has an unsupported content type', index }
+    }
+    if (input.mime && normalizedMime(input.mime) !== mime) {
+      return { ok: false, status: 400, error: 'attachment MIME does not match uploaded object', index }
+    }
+    attachments.push({
+      name: input.name,
+      kind: attachmentKindForMime(mime),
+      url,
+      key,
+      mime,
+      size: stored.sizeBytes,
+    })
+  }
+  return { ok: true, attachments }
+}
+
+/** Add the canonical ordered list plus the first-entry legacy projection to a
+ *  message response without changing any surrounding fields. */
+export async function freshenMessageAttachments(
+  value: unknown,
+): Promise<{ attachment?: AttachmentDescriptor; attachments: readonly AttachmentDescriptor[] }> {
+  const attachments = await Promise.all(normalizeAttachments(value).map(async (attachment) => {
+    const freshened = await freshenAttachmentUrl({
+      ...attachment,
+      url: attachment.url ?? '',
+    })
+    return {
+      ...attachment,
+      ...(freshened.url ? { url: freshened.url } : {}),
+      ...(freshened.key ? { key: freshened.key } : {}),
+    }
+  }))
+  return {
+    ...(attachments[0] ? { attachment: attachments[0] } : {}),
+    attachments,
+  }
 }

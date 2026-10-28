@@ -22,6 +22,7 @@ import { env } from '../env.js'
 import { redis } from '../redis.js'
 import { readLocalMessageAttachment } from '../local-attachment-files.js'
 import { messageAttachmentStorageKey } from '../storage-keys.js'
+import { ATTACHMENT_TEXT_EXCERPT_BYTES, normalizeAttachments } from '../../../shared/attachments.js'
 import { classifyInboxTriage, gateSyntheticWake } from './inbox-triage.js'
 import { GLANCE_YIELD_RULES } from './glance-protocol.js'
 import { TOOL_DEFS_RESPONSES, executePodTool } from './runtime/pod-tools.js'
@@ -106,6 +107,7 @@ interface InboxRow {
   sequence: number
   created_at: string
   attachment: InboxAttachment | null
+  attachments?: InboxAttachment[]
   /** Set when this message is a reply: the id of the quoted-original. */
   quoted_message_id: string | null
   /** Inlined summary of the quoted-original — saves the agent a second
@@ -662,10 +664,8 @@ function renderContext(
           .join('  ')
         line += `   ⟨${summary}⟩`
       }
-      if (m.attachment) {
-        const a = m.attachment
-        line += ` [attachment: ${a.kind} "${a.name}" ${a.url}]`
-      }
+      const messageAttachments = normalizeAttachments(m.attachments ?? m.attachment)
+      for (const a of messageAttachments) line += ` [attachment: ${a.kind} "${a.name}" ${a.url ?? ''}]`
       lines.push(line)
       // Reply context: render the quoted-original right below so the LLM
       // sees BOTH the reply and what it's replying to. `↩ quoting [id]
@@ -681,9 +681,10 @@ function renderContext(
       }
       // Inline the text-file content below the message line so the LLM
       // actually READS the file rather than just noting it exists.
-      const excerpt = textExcerpts.get(m.id)
-      if (excerpt) {
-        lines.push(`    ▼ file content (${m.attachment?.name ?? 'attachment'}${excerpt.truncated ? ', truncated' : ''}):`)
+      for (const [index, attachment] of messageAttachments.entries()) {
+        const excerpt = textExcerpts.get(`${m.id}\0${index}`)
+        if (!excerpt) continue
+        lines.push(`    ▼ file content (${attachment.name}${excerpt.truncated ? ', truncated' : ''}):`)
         lines.push(`    \`\`\`${excerpt.lang}`)
         for (const ln of excerpt.text.split('\n')) lines.push(`    ${ln}`)
         lines.push('    ```')
@@ -704,9 +705,9 @@ function renderContext(
  * between "an agent NOTICES Alice sent me a config.yaml" and "an agent
  * actually READS the config.yaml" — Skype-like behaviour.
  */
-const MAX_TEXT_ATTACHMENT_BYTES = 50_000  // 50 KB per file
 const TEXT_LIKE_MIMES = new Set([
-  'application/json', 'application/x-yaml', 'application/x-toml',
+  'application/json', 'application/x-yaml', 'application/x-toml', 'application/xml',
+  'application/javascript', 'application/sql',
 ])
 
 /** Return a short fence language label for a mime, used purely as a hint
@@ -726,7 +727,7 @@ function langFromMime(mime: string, name: string): string {
 
 interface TextExcerpt { lang: string; text: string; truncated: boolean }
 
-/** Read a single text-like attachment, returning at most MAX_TEXT_ATTACHMENT_BYTES.
+/** Read a single text-like attachment, returning at most 50 KiB.
  *  Returns null for non-text mimes or fetch failures — callers fall back to
  *  the "[attachment: file ...]" pointer-only line. */
 async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | null> {
@@ -758,8 +759,8 @@ async function readTextAttachment(att: InboxAttachment): Promise<TextExcerpt | n
     }
   }
   if (!buf) return null
-  const truncated = buf.length > MAX_TEXT_ATTACHMENT_BYTES
-  const sliced = truncated ? buf.subarray(0, MAX_TEXT_ATTACHMENT_BYTES) : buf
+  const truncated = buf.length > ATTACHMENT_TEXT_EXCERPT_BYTES
+  const sliced = truncated ? buf.subarray(0, ATTACHMENT_TEXT_EXCERPT_BYTES) : buf
   return {
     lang: langFromMime(mime, att.name),
     text: sliced.toString('utf8'),
@@ -774,10 +775,11 @@ async function loadTextExcerpts(items: InboxRow[]): Promise<Map<string, TextExce
   const out = new Map<string, TextExcerpt>()
   const work: Array<Promise<void>> = []
   for (const m of items) {
-    if (!m.attachment) continue
-    work.push(readTextAttachment(m.attachment).then((ex) => {
-      if (ex) out.set(m.id, ex)
-    }))
+    for (const [index, attachment] of normalizeAttachments(m.attachments ?? m.attachment).entries()) {
+      work.push(readTextAttachment(attachment as InboxAttachment).then((ex) => {
+        if (ex) out.set(`${m.id}\0${index}`, ex)
+      }))
+    }
   }
   await Promise.all(work)
   return out
@@ -786,18 +788,34 @@ async function loadTextExcerpts(items: InboxRow[]): Promise<Map<string, TextExce
 /** Pull every image attachment out of the inbox so we can pass them as input_image.
  *  Re-signs URLs just-in-time so OpenAI's fetch from the Worker side doesn't
  *  hit an expired HMAC. */
-async function collectImageAttachments(items: InboxRow[]): Promise<Array<{ messageId: string; url: string; name: string }>> {
-  const out: Array<{ messageId: string; url: string; name: string }> = []
+interface CollectedImageAttachments {
+  images: Array<{ messageId: string; url: string; name: string }>
+  unavailable: Array<{ messageId: string; name: string; reason: string }>
+}
+
+async function collectImageAttachments(items: InboxRow[]): Promise<CollectedImageAttachments> {
+  const out: CollectedImageAttachments = { images: [], unavailable: [] }
   for (const m of items) {
-    const a = m.attachment
-    if (!a || a.kind !== 'img' || !a.url) continue
-    const source = await trustedAttachmentSource(a)
-    if (!source) continue
-    const url = publicUrlFor(source.url)
-    // Only ship images OpenAI can actually fetch. Local /uploads paths without
-    // a PUBLIC_HOST get textually mentioned but not vision-fed.
-    if (!/^https?:\/\//.test(url)) continue
-    out.push({ messageId: m.id, url, name: a.name })
+    for (const a of normalizeAttachments(m.attachments ?? m.attachment)) {
+      if (a.kind !== 'img' && a.mime?.startsWith('image/') !== true) continue
+      if (!a.url) {
+        out.unavailable.push({ messageId: m.id, name: a.name, reason: 'the attachment has no download URL' })
+        continue
+      }
+      const source = await trustedAttachmentSource(a as InboxAttachment)
+      if (!source) {
+        out.unavailable.push({ messageId: m.id, name: a.name, reason: 'the image does not reference trusted Cumora storage' })
+        continue
+      }
+      const url = publicUrlFor(source.url)
+      // Only ship images OpenAI can actually fetch. Local /uploads paths without
+      // a PUBLIC_HOST get textually mentioned but not vision-fed.
+      if (!/^https?:\/\//.test(url)) {
+        out.unavailable.push({ messageId: m.id, name: a.name, reason: 'the image is not reachable from this runtime' })
+        continue
+      }
+      out.images.push({ messageId: m.id, url, name: a.name })
+    }
   }
   return out
 }
@@ -972,14 +990,12 @@ function traceInboxMessage(m: InboxRow): Record<string, unknown> {
     sequence: m.sequence,
     createdAt: m.created_at,
     body: traceText(m.body),
-    attachment: m.attachment
-      ? {
-          name: m.attachment.name,
-          kind: m.attachment.kind,
-          mime: m.attachment.mime,
-          url: m.attachment.url,
-        }
-      : null,
+    attachments: normalizeAttachments(m.attachments ?? m.attachment).map((attachment) => ({
+      name: attachment.name,
+      kind: attachment.kind,
+      mime: attachment.mime,
+      url: attachment.url,
+    })),
     quotedMessageId: m.quoted_message_id,
     quoted: m.quoted
       ? {
@@ -2287,7 +2303,7 @@ Mechanics:
   // input_image content items so vision-capable models can actually see them.
   // (We cast through unknown because the SDK's ResponseInputItem union is
   // narrower than the runtime API actually accepts for multimodal content.)
-  const images = await collectImageAttachments(inbox)
+  const collectedImages = await collectImageAttachments(inbox)
   const userContent: Array<Record<string, unknown>> = [{ type: 'input_text', text: wakePrompt }]
 
   // Materialize every external image URL into a base64 `data:` URL *here*
@@ -2301,7 +2317,7 @@ Mechanics:
   // accept the bytes (rare format issues, etc.).
   const [faceMats, imageMats] = await Promise.all([
     Promise.all(faces.map(async (f) => ({ f, mat: await materializeImage(f.url) }))),
-    Promise.all(images.map(async (img) => ({ img, mat: await materializeImage(img.url) }))),
+    Promise.all(collectedImages.images.map(async (img) => ({ img, mat: await materializeImage(img.url) }))),
   ])
 
   if (faces.length > 0) {
@@ -2323,7 +2339,18 @@ Mechanics:
     userContent.push({ type: 'input_text', text: `↳ image attached to message ${img.messageId} ("${img.name}"):` })
     if (mat.ok) {
       userContent.push({ type: 'input_image', image_url: mat.dataUrl, detail: 'auto' })
+    } else {
+      userContent.push({
+        type: 'input_text',
+        text: `The image "${img.name}" could not be loaded (${mat.reason}). Do not claim to have seen it.`,
+      })
     }
+  }
+  for (const unavailable of collectedImages.unavailable) {
+    userContent.push({
+      type: 'input_text',
+      text: `The image "${unavailable.name}" attached to message ${unavailable.messageId} was not included because ${unavailable.reason}. Do not claim to have seen it.`,
+    })
   }
 
   const skippedImages = [

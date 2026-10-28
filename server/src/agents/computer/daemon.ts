@@ -51,12 +51,15 @@ import {
 import { SKYPE_EMOTICONS_GUIDE } from '../skype-emoticons.js'
 import { finalizeTriage, isRateLimited, parseTriage } from '../triage-core.js'
 import { type ActionSurface, actionSurfaceFor, actionSurfaceText, calendarExampleText, postingMechanicsText } from './prompt-surface.js'
-import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
+import { allowUnsandboxedByoa, classifyEngineFailure, detectEnginesWithStatus, ENGINE_IDS, engineFailureOf, engineVisionCapability, type DetectedEngineSnapshot, type EngineHopReport, type EngineId, type EngineRunResult, type EngineSession, type EngineUsage, enrichDetectedEngines, evaluateRunnableEngines, getAdapter, loginCodexRuntime, runEngineDoctor, type RunnableEngineEvaluation, snapshotDetectedEngines } from './engine.js'
 import { EngineSessionStore, sessionIdPreview } from './session-store.js'
 import { CODEX_LOGIN_COMMAND, CODEX_MIGRATE_COMMAND, CODEX_SESSION_SCOPE, codexRuntimeHome } from './codex-runtime.js'
 import { cachedCodexProvider } from './codex-provider.js'
 import { migrateCodexSession, migrateCodexSessions } from './codex-session-migration.js'
 import { runWithSessionRecovery } from './session-recovery.js'
+import { LocalCollaboration } from './local-collaboration.js'
+import { normalizeAttachments, type AttachmentDescriptor } from '../../../../shared/attachments.js'
+import { AgentAttachmentCache, attachmentImageGuidance, isImageAttachment, renderCachedAttachments, type AttachmentCacheResult } from './attachment-cache.js'
 
 export { conversationHeader }
 
@@ -464,19 +467,14 @@ interface AgentInfo {
   model: string | null
   fastModel: string | null
   nativeFastMode?: boolean
+  modelCatalog?: {
+    models: Array<{ id: string; label: string; vision?: 'supported' | 'unsupported' | 'unknown' }>
+    defaultModel: string | null
+  }
 }
 
-/** One line's worth of "there is a file on this message".
- *
- *  The attachment already travelled: /inbox selects `m.attachment` and the
- *  daemon received it. It was simply never rendered, so a BYOA agent saw the
- *  text of a message and no sign that a file came with it — and said so, truthfully,
- *  when a user asked why it could not see their zip. The cloud path (turn.ts)
- *  has always surfaced attachments; only this one dropped them.
- *
- *  Name, type and size go inline so the agent can reason about the file, and the
- *  URL follows so it can actually fetch it. Bounded, because this shares the
- *  digest's line budget with the message bodies. */
+/** Render one attachment descriptor in the inbox digest. The daemon separately
+ *  downloads authorized bytes into the Agent home. */
 export function attachmentNote(
   att: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null | undefined,
 ): string {
@@ -492,6 +490,86 @@ export function attachmentNote(
   return `  [attachment: ${name}${type ? ` · ${type}` : ''}${size}${url}]`
 }
 
+/** Render every descriptor in canonical order. The singular helper remains for
+ *  legacy callers and tests; the digest always goes through this list boundary. */
+export function attachmentNotes(value: unknown): string {
+  return normalizeAttachments(value).map((attachment) => attachmentNote({
+    name: attachment.name,
+    kind: attachment.kind,
+    mime: attachment.mime,
+    size: attachment.size,
+    url: attachment.url,
+  })).join('')
+}
+
+interface RuntimeCliAttachmentRead {
+  messageId: string
+  attachments: AttachmentDescriptor[]
+}
+
+function runtimeCliAttachmentReads(value: unknown): RuntimeCliAttachmentRead[] {
+  if (!Array.isArray(value)) return []
+  const reads: RuntimeCliAttachmentRead[] = []
+  for (const candidate of value.slice(0, 200)) {
+    if (!candidate || typeof candidate !== 'object') continue
+    const record = candidate as Record<string, unknown>
+    if (typeof record.messageId !== 'string' || !record.messageId) continue
+    const attachments = normalizeAttachments(record.attachments)
+    if (attachments.length > 0) reads.push({ messageId: record.messageId, attachments: [...attachments] })
+  }
+  return reads
+}
+
+/** Add the local path to each attachment object inside the CLI's JSON result.
+ *  JSON output stays valid instead of receiving a trailing prose block. */
+export function enrichCliJsonWithAttachmentPaths(
+  text: string,
+  cachedByMessage: ReadonlyMap<string, AttachmentCacheResult>,
+  vision: 'supported' | 'unsupported' | 'unknown',
+): string | null {
+  let value: unknown
+  try { value = JSON.parse(text) } catch { return null }
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item)
+      return
+    }
+    const record = node as Record<string, unknown>
+    const messageId = typeof record.id === 'string' ? record.id : null
+    const cached = messageId ? cachedByMessage.get(messageId) : undefined
+    if (cached) {
+      for (const field of ['attachments', 'attachment'] as const) {
+        const raw = record[field]
+        const list = Array.isArray(raw) ? raw : raw && typeof raw === 'object' ? [raw] : []
+        for (const attachment of list) {
+          if (!attachment || typeof attachment !== 'object') continue
+          const descriptor = attachment as Record<string, unknown>
+          const key = typeof descriptor.key === 'string' ? descriptor.key : null
+          const file = cached.files.find((candidate) => candidate.attachment.key === key)
+          if (file) {
+            descriptor.localPath = file.path
+            if (file.attachment.kind === 'img' || file.attachment.mime?.startsWith('image/') === true) {
+              descriptor.localImageGuidance = attachmentImageGuidance(vision)
+            }
+            if (file.text !== undefined) {
+              descriptor.localText = file.text
+              descriptor.localTextTruncated = file.textTruncated === true
+            }
+          } else {
+            const failure = cached.failures.find((candidate) => candidate.key === key)
+              ?? cached.failures.find((candidate) => !candidate.key && candidate.name === descriptor.name)
+            if (failure) descriptor.localError = failure.reason
+          }
+        }
+      }
+    }
+    for (const child of Object.values(record)) visit(child)
+  }
+  visit(value)
+  return JSON.stringify(value, null, 2)
+}
+
 interface RuntimeInboxResponse {
   rows?: Array<{
     id?: string
@@ -505,9 +583,10 @@ interface RuntimeInboxResponse {
     author_kind?: string
     body?: string
     kind?: string
-    /** Already delivered by /inbox (loadInbox selects m.attachment) and, until
-     *  now, dropped on the floor when the digest line was built. */
-    attachment?: { name?: string; kind?: string; mime?: string; size?: number; url?: string } | null
+    /** Legacy first-entry projection for clients that predate multi-attachments. */
+    attachment?: AttachmentDescriptor | null
+    /** Canonically ordered message attachments. */
+    attachments?: AttachmentDescriptor[]
     sequence?: number
   }>
 }
@@ -535,11 +614,16 @@ const DIGEST_MAX_MESSAGE_LINES = 40
  *  shown, exactly as before.
  *
  *  Exported for tests — pure, no server and no engine. */
-export function renderInboxDigest(
-  byConvo: Map<string, { head: string; msgs: string[] }>,
-  budget = DIGEST_MAX_MESSAGE_LINES,
-): string {
-  if (byConvo.size === 0) return ''
+interface InboxDigestConversation {
+  head: string
+  msgs: string[]
+  ids?: string[]
+}
+
+function inboxDigestKeepCounts(
+  byConvo: Map<string, InboxDigestConversation>,
+  budget: number,
+): Map<string, number> {
   // Water-fill quietest-first: each conversation takes at most an even share of
   // what is LEFT, so a small conversation keeps all of its messages and the busy
   // one absorbs the slack. When the total fits, this hands every conversation
@@ -553,6 +637,31 @@ export function renderInboxDigest(
     lineBudget -= n
     unserved -= 1
   }
+  return keep
+}
+
+/** IDs represented by the rendered digest lines. Attachment materialization
+ *  uses the same water-fill decision so it downloads exactly what the engine
+ *  is shown, rather than every unread row returned by /inbox. */
+export function visibleInboxMessageIds(
+  byConvo: Map<string, InboxDigestConversation>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): Set<string> {
+  const keep = inboxDigestKeepCounts(byConvo, budget)
+  const visible = new Set<string>()
+  for (const [id, convo] of byConvo) {
+    const shown = keep.get(id) ?? 0
+    for (const messageId of (convo.ids ?? []).slice(convo.msgs.length - shown)) visible.add(messageId)
+  }
+  return visible
+}
+
+export function renderInboxDigest(
+  byConvo: Map<string, InboxDigestConversation>,
+  budget = DIGEST_MAX_MESSAGE_LINES,
+): string {
+  if (byConvo.size === 0) return ''
+  const keep = inboxDigestKeepCounts(byConvo, budget)
   const lines: string[] = []
   for (const [id, convo] of byConvo) {
     const shown = keep.get(id) ?? 0
@@ -1868,6 +1977,9 @@ export class AgentRunner {
   private lastPostedStatus: string | null = null
   private lastPostedStatusAt = 0
   private readonly adapter
+  /** Per-agent attachment cache. A long-lived instance lets cleanup protect
+   * paths used by the current turn and reap them when the runner stops. */
+  private readonly attachmentCache: AgentAttachmentCache
   /** Privileged local broker: the engine sees only its IPC directory, while the
    *  daemon keeps the short-lived runtime JWT in memory. */
   private cliBroker: RuntimeCliBroker | null = null
@@ -1896,6 +2008,11 @@ export class AgentRunner {
     // granted only the two leaf request/response directories; Claude reaches
     // them through the fixed MCP bridge, not a model-controlled shell.
     this.ipcDir = join(CONFIG_DIR, '.runtime-cli-ipc', this.agent.id)
+    this.attachmentCache = new AgentAttachmentCache(
+      this.home,
+      this.cfg.serverUrl,
+      () => this.ensureToken(),
+    )
     // The profile is a third dimension of session identity alongside agent and
     // engine: a different endpoint/account owns a different transcript, so its
     // session id must never be offered to another profile's provider.
@@ -2020,15 +2137,20 @@ export class AgentRunner {
 
   /** Execute exactly one engine attempt. Session capture and the persistent to
    * one-shot transport fallback live here so chat and agenda cannot drift. */
-  private async runEngineAttempt(delta: string, resumeSessionId: string | null): Promise<EngineRunResult> {
+  private async runEngineAttempt(
+    delta: string,
+    resumeSessionId: string | null,
+    localImages: readonly string[] = [],
+  ): Promise<EngineRunResult> {
     const session = this.ensureEngineSession(resumeSessionId)
     const prompt = this.turnPrompt(session, delta)
+    const nativeImages = this.nativeImagePaths(localImages)
     let result: EngineRunResult
     if (session) {
       const capture = setInterval(() => { if (session.sessionId) this.setSessionId(session.sessionId) }, 2000)
       capture.unref?.()
       try {
-        result = await this.trackEngineRun(session.send(prompt))
+        result = await this.trackEngineRun(session.send(prompt, nativeImages))
       } finally {
         clearInterval(capture)
       }
@@ -2050,6 +2172,8 @@ export class AgentRunner {
           fastModel: this.engineFastModel(),
           nativeFastMode: this.agent.nativeFastMode ?? false,
           resumeSessionId,
+          vision: this.visionCapability(),
+          localImages: nativeImages,
           onLog: (line) => this.logEngineLine(line),
           onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
           signal: this.teardown.signal,
@@ -2064,6 +2188,8 @@ export class AgentRunner {
         fastModel: this.engineFastModel(),
         nativeFastMode: this.agent.nativeFastMode ?? false,
         resumeSessionId,
+        vision: this.visionCapability(),
+        localImages: nativeImages,
         onLog: (line) => this.logEngineLine(line),
         onHopUsage: (r) => this.onEngineHop(r, 'agent-turn'),
         signal: this.teardown.signal,
@@ -2076,11 +2202,14 @@ export class AgentRunner {
   /** A missing resume target proves the model never began the requested turn,
    * so one fresh retry is safe. Every other failure returns immediately to
    * avoid duplicating tool side effects after an ambiguous crash or timeout. */
-  private async runWithSessionRecovery(delta: string): Promise<EngineRunResult> {
+  private async runWithSessionRecovery(
+    delta: string,
+    localImages: readonly string[] = [],
+  ): Promise<EngineRunResult> {
     const resumeSessionId = this.resumeSessionId()
     return runWithSessionRecovery({
       resumeSessionId,
-      run: (resume) => this.runEngineAttempt(delta, resume),
+      run: (resume) => this.runEngineAttempt(delta, resume, localImages),
       reset: () => this.resetEngineSession(`${this.engine} resume target ${sessionIdPreview(resumeSessionId ?? '')} does not exist`),
       onFreshRetry: () => console.warn(`[computer] ${this.agent.id} retrying turn once with a fresh ${this.engine} session`),
     })
@@ -2159,7 +2288,7 @@ export class AgentRunner {
     if (this.wakeDebounceTimer) { clearTimeout(this.wakeDebounceTimer); this.wakeDebounceTimer = null }
   }
 
-  async stop(options: { forceEngine?: boolean } = {}): Promise<void> {
+  async stop(options: { forceEngine?: boolean; purgeAttachments?: boolean } = {}): Promise<void> {
     this.beginStop()
     const session = this.engineSession
     this.engineSession = null
@@ -2179,6 +2308,9 @@ export class AgentRunner {
       this.activeEngineRun ?? Promise.resolve(),
       this.activeTriage ?? Promise.resolve(),
     ])
+    await this.attachmentCache.dispose({ purge: options.purgeAttachments === true }).catch((error) => {
+      console.warn(`[computer] ${this.agent.id} attachment cache cleanup failed`, error)
+    })
     await this.sessionStore.flush()
   }
 
@@ -2220,6 +2352,10 @@ export class AgentRunner {
    *  only argv strings; identity, URL, Authorization, redirects, and token
    *  refresh remain daemon-owned and cannot be changed by the model. */
   private async invokeRuntimeCli(argv: string[], lifecycleSignal: AbortSignal): Promise<RuntimeCliBrokerResult> {
+    if (argv[0] === 'agent' && argv[1] === 'computer' && argv[2] === 'local') {
+      const result = await new LocalCollaboration({ homeRoot: AGENTS_ROOT }).run(argv.slice(3), { agentId: this.agent.id })
+      return { text: result.text, exitCode: result.exitCode }
+    }
     const requestAbort = new AbortController()
     const timeout = setTimeout(() => requestAbort.abort(), HTTP_TIMEOUT_MS)
     const onLifecycleAbort = () => requestAbort.abort()
@@ -2239,9 +2375,32 @@ export class AgentRunner {
         const body = await res.text().catch(() => '')
         return { exitCode: 70, error: `HTTP ${res.status} ${body.slice(0, 200)}`.trim() }
       }
-      const data = await res.json() as { text?: unknown; exitCode?: unknown }
+      const data = await res.json() as { text?: unknown; exitCode?: unknown; attachmentReads?: unknown }
+      let text = typeof data.text === 'string' ? data.text : ''
+      const reads = runtimeCliAttachmentReads(data.attachmentReads)
+      const cachedByMessage = new Map<string, AttachmentCacheResult>()
+      if (reads.length > 0) {
+        for (const read of reads) {
+          cachedByMessage.set(read.messageId, await this.attachmentCache.materialize(read.messageId, read.attachments))
+        }
+        const trimmed = text.trimStart()
+        const enriched = trimmed.startsWith('{') || trimmed.startsWith('[')
+          ? enrichCliJsonWithAttachmentPaths(text, cachedByMessage, this.visionCapability())
+          : null
+        if (enriched !== null) {
+          text = enriched
+        } else if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+          console.warn(`[computer] ${this.agent.id} CLI returned unparseable JSON with attachments`)
+        } else {
+          const blocks = [...cachedByMessage.entries()]
+            .map(([messageId, cached]) =>
+              `Message ${messageId}:\n${renderCachedAttachments(cached, this.visionCapability())}`)
+            .filter((block) => block.trim().length > 0)
+          if (blocks.length > 0) text += `\n\nAttachment files cached in your Agent home:\n${blocks.join('\n\n')}`
+        }
+      }
       return {
-        text: typeof data.text === 'string' ? data.text : '',
+        text,
         exitCode: typeof data.exitCode === 'number' ? data.exitCode : 0,
       }
     } catch (err) {
@@ -2307,6 +2466,7 @@ export class AgentRunner {
       nativeFastMode: this.agent.nativeFastMode ?? false,
       resumeSessionId,
       standingPrompt: this.standingPrompt(),
+      vision: this.visionCapability(),
       onLog: (line) => this.logEngineLine(line),
       // Trajectory hook — every assistant hop (Claude) / turn-completed (Codex)
       // shows up here and gets batched to the universal ledger. Purpose is
@@ -2582,7 +2742,7 @@ export class AgentRunner {
     } catch { return null }
   }
 
-  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[] }> {
+  private async snapshotUnread(token: string): Promise<{ seen: Map<string, string>; digest: string; hasReal: boolean; projectIds: string[]; imagePaths: string[] }> {
     const inbox = await runtimeGet<RuntimeInboxResponse>(this.cfg.serverUrl, '/inbox', token)
     this.lastInboxDrainAt = inbox ? Date.now() : 0
     if (!inbox) throw new Error('inbox fetch failed')
@@ -2593,7 +2753,7 @@ export class AgentRunner {
     // Grouped rather than one flat line list because the digest has a LINE
     // BUDGET, and spending it per conversation is what stops a busy room from
     // evicting — and `ackSeen` then burying — a quiet one. See renderInboxDigest.
-    const byConvo = new Map<string, { head: string; msgs: string[] }>()
+    const byConvo = new Map<string, InboxDigestConversation>()
     // `hasReal` = is ANY unread a genuine human/agent message (not a system
     // relay/status/membership notice)? The cost gate in runTurn uses this to
     // refuse to spend ANY model on a system-only (or empty) inbox.
@@ -2617,7 +2777,7 @@ export class AgentRunner {
           conversation_topic: row.conversation_topic,
           project_name: row.project_name,
         })
-        convo = { head, msgs: [] }
+        convo = { head, msgs: [], ids: [] }
         byConvo.set(row.conversation_id, convo)
       }
       const author = row.author_name ?? 'someone'
@@ -2630,12 +2790,46 @@ export class AgentRunner {
       // Keep the message id + convo id on each line (like the cloud agent's
       // context) so the engine can QUOTE the exact message: `cumora reply
       // <convo> '<body>' --quote <message_id>`.
-      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNote(row.attachment)}`)
+      convo.msgs.push(`  [${row.id}] ${row.conversation_id}  ${who}: ${body}${attachmentNotes(row.attachments ?? row.attachment)}`)
+      if (row.id) convo.ids?.push(row.id)
+    }
+    const attachmentBlocks: string[] = []
+    const imagePaths: string[] = []
+    const visibleMessageIds = visibleInboxMessageIds(byConvo)
+    for (const row of inbox.rows ?? []) {
+      if (!row.id || !visibleMessageIds.has(row.id)) continue
+      const descriptors = normalizeAttachments(row.attachments ?? row.attachment)
+      if (descriptors.length === 0) continue
+      const cached = await this.attachmentCache.materialize(row.id, descriptors)
+      for (const file of cached.files) {
+        if (isImageAttachment(file.attachment)) imagePaths.push(file.path)
+      }
+      const block = renderCachedAttachments(cached, this.visionCapability())
+      if (block) attachmentBlocks.push(`Message ${row.id}:\n${block}`)
     }
     const projectIds = uniqueProjectIds(
       (inbox?.rows ?? []).map((r) => (typeof r.project_id === 'string' ? r.project_id : null)),
     )
-    return { seen, digest: renderInboxDigest(byConvo), hasReal, projectIds }
+    const digest = renderInboxDigest(byConvo)
+    return {
+      seen,
+      digest: `${digest}${attachmentBlocks.length ? `\n\nAttachment files cached in your Agent home:\n${attachmentBlocks.join('\n\n')}` : ''}`,
+      hasReal,
+      projectIds,
+      imagePaths: [...new Set(imagePaths)],
+    }
+  }
+
+  private visionCapability(): 'supported' | 'unsupported' | 'unknown' {
+    return engineVisionCapability(this.agent.modelCatalog, this.engineModel())
+  }
+
+  /** Only Codex has a verified native path-input contract in this daemon. Keep
+   * the capability gate here so an unknown or non-visual model still receives
+   * the textual path and honest guidance, never an unsupported image request. */
+  private nativeImagePaths(paths: readonly string[]): readonly string[] {
+    if (this.engine !== 'codex' || this.visionCapability() !== 'supported') return []
+    return [...new Set(paths.filter((path) => path.length > 0 && isAbsolute(path)))]
   }
 
   /** Advance this agent's read cursor over the conversations it just saw, so a
@@ -2723,6 +2917,22 @@ export class AgentRunner {
       `Write project decisions/materials under \`memory/projects/<id>/\` (and a pointer in that folder's MEMORY.md); ` +
       `write identity-level facts under \`memory/\`. Pinning a memory makes it global. ` +
       `Saying "got it" does NOT persist. Chat history can be wiped by compaction; memory files remain.\n\n` +
+      `Local code collaboration (same Computer only): an operator must first grant a repository from ` +
+      `their Computer terminal with \`cumora agent computer local projects grant <absolute-path>\`. ` +
+      `Then use \`cumora agent computer local worktree create <project-id> <task-id>\` to get your own ` +
+      `worktree. Work only inside that worktree. Inspect it with ` +
+      `\`cumora agent computer local worktree status <worktree-id>\` and read changes with ` +
+      `\`cumora agent computer local worktree diff <worktree-id>\`. ` +
+      `Commit with \`cumora agent computer local worktree commit <worktree-id> --expected-head ` +
+      `<full-head-from-status> --message <text>\`. If the head changed, run status again and retry ` +
+      `from the new head. After status is clean, propose the committed change with ` +
+      `\`cumora agent computer local handoff propose <worktree-id> <target-agent-id>\`. ` +
+      `The receiver checks \`cumora agent computer local handoff list\`, reviews ` +
+      `\`cumora agent computer local handoff show <handoff-id> --diff\`, and accepts with ` +
+      `\`cumora agent computer local handoff accept <handoff-id>\` to receive the fixed commit in ` +
+      `their own local worktree. ` +
+      `These commands read and write the local Computer only: never upload repository paths, files, Git objects, ` +
+      `commits, diffs, or worktree contents to Cumora.\n\n` +
       `Drive what you own forward — see a task through. Multi-step turns are fine; you do NOT have to ` +
       `fragment. If someone DMs you mid-task, answer briefly then keep going. The only thing to avoid ` +
       `is a pointless loop. If progress is waiting on a quiet teammate, follow up (short @<their-id> ` +
@@ -3018,6 +3228,12 @@ export class AgentRunner {
       }
       const latest = rows[rows.length - 1]
       if (!latest.id || latest.id === this.lastSteeredMsgId) return // dedup repeated wakes for the same ping
+      const hasImage = normalizeAttachments(latest.attachments ?? latest.attachment).some(isImageAttachment)
+      if (hasImage) {
+        this.lastSteeredMsgId = latest.id
+        console.log(`[computer] ${this.agent.id} STEER deferred (image attachment will be sent with the next full turn)`)
+        return
+      }
       this.lastSteeredMsgId = latest.id
       const who = latest.author_name ?? 'someone'
       const body = (latest.body ?? '').replace(/\s+/g, ' ').slice(0, 300)
@@ -3043,6 +3259,7 @@ export class AgentRunner {
       return
     }
     this.busy = true
+    this.attachmentCache.beginTurn()
     let activeBackgroundBrief: WakeBackgroundBrief | null = null
     try {
       do {
@@ -3081,7 +3298,7 @@ export class AgentRunner {
         // superset of what we may ack — a real task that lands during/after
         // triage keeps a higher id, stays out of `seen`, and so survives to
         // drive the coalesced rerun rather than being silently acked away.
-        const { seen, digest, hasReal, projectIds } = await this.snapshotUnread(token)
+        const { seen, digest, hasReal, projectIds, imagePaths } = await this.snapshotUnread(token)
         // Which conversation should show "<agent> is typing…"? Prefer the one the
         // wake named, but fall back to the unread we just snapshotted, because a
         // wake often carries no conversation at all:
@@ -3254,7 +3471,7 @@ export class AgentRunner {
           const delta = turnBackgroundBrief
             ? this.manualBriefDelta(turnBackgroundBrief, memoryDigest, digest, roster)
             : this.chatDelta(memoryDigest, triageNote, digest, roster)
-          const result = await this.runWithSessionRecovery(delta)
+          const result = await this.runWithSessionRecovery(delta, imagePaths)
           exitCode = result.exitCode
           turnUsage = result.usage
           turnModel = result.model
@@ -3373,6 +3590,9 @@ export class AgentRunner {
       console.error(`[computer] ${this.agent.id} turn aborted (will retry on next wake/poll):`,
         err instanceof Error ? err.message : err)
     } finally {
+      await this.attachmentCache.endTurn().catch((error) => {
+        console.warn(`[computer] ${this.agent.id} attachment cache sweep failed`, error)
+      })
       this.busy = false
     }
   }
@@ -3639,7 +3859,7 @@ async function doRun(serverOverride?: string): Promise<void> {
     for (const [id, runner] of runners) {
       if (!live.has(id)) {
         runners.delete(id)
-        await runner.stop({ forceEngine: true })
+        await runner.stop({ forceEngine: true, purgeAttachments: true })
       }
     }
   }
@@ -4802,6 +5022,12 @@ async function runDoctor(providerId?: string): Promise<void> {
 // ─── entry ──────────────────────────────────────────────────────────────
 
 export async function runComputerDaemon(argv: string[]): Promise<void> {
+  if (argv[0] === 'local') {
+    const result = await new LocalCollaboration({ homeRoot: AGENTS_ROOT }).run(argv.slice(1))
+    process.stdout.write(`${result.text}\n`)
+    process.exitCode = result.exitCode
+    return
+  }
   const args = parseArgs(argv)
   if (args.provider !== undefined && !args.doctor) throw new Error('--provider requires --doctor')
   const serverUrl = (args.server || DEFAULT_SERVER).replace(/\/+$/, '')

@@ -38,10 +38,11 @@ test('a thread composer does not share text with its conversation', () => {
   assert.equal(d['convo-1::thread::m-9'].text, 'thread')
 })
 
-test('an attachment rides along with the text', () => {
+test('multiple attachments ride along with the text in order', () => {
   // Dropping it would strand a file the user already uploaded.
-  const d = applyDraftUpdate({}, 'c', (c) => ({ ...c, attachment: att }))
-  assert.deepEqual(d.c.attachment, att)
+  const second = { ...att, name: 'y.pdf', url: 'https://cdn.example/y.pdf' }
+  const d = applyDraftUpdate({}, 'c', (c) => ({ ...c, attachments: [att, second] }))
+  assert.deepEqual(d.c.attachments, [att, second])
   assert.equal(d.c.text, '')
 })
 
@@ -55,9 +56,9 @@ test('emptying a draft deletes it rather than leaving a tombstone', () => {
 })
 
 test('clearing text but keeping an attachment keeps the draft', () => {
-  let d = applyDraftUpdate({}, 'c', (c) => ({ text: 'x', attachment: att }))
+  let d = applyDraftUpdate({}, 'c', (c) => ({ text: 'x', attachments: [att] }))
   d = applyDraftUpdate(d, 'c', (c) => ({ ...c, text: '' }))
-  assert.deepEqual(d.c, { text: '', attachment: att })
+  assert.deepEqual(d.c, { text: '', attachments: [att] })
 })
 
 test('an unchanged update returns the SAME object', () => {
@@ -99,9 +100,15 @@ test('touching an old draft protects it from eviction', () => {
 
 // ── what comes back from storage is not trusted ─────────────────────────────
 
-test('a round trip preserves text and attachment', () => {
-  const d = applyDraftUpdate({}, 'c', () => ({ text: 'hello', attachment: att }))
+test('a round trip preserves text and ordered attachments', () => {
+  const second = { ...att, name: 'y.pdf', url: 'https://cdn.example/y.pdf' }
+  const d = applyDraftUpdate({}, 'c', () => ({ text: 'hello', attachments: [att, second] }))
   assert.deepEqual(parseStoredDrafts(serializeDrafts(d)), d)
+})
+
+test('a legacy single-attachment draft is migrated to an array', () => {
+  const raw = JSON.stringify({ c: { text: 'hello', attachment: att } })
+  assert.deepEqual(parseStoredDrafts(raw), { c: { text: 'hello', attachments: [att] } })
 })
 
 test('garbage in storage yields no drafts instead of throwing', () => {
@@ -110,15 +117,15 @@ test('garbage in storage yields no drafts instead of throwing', () => {
   }
 })
 
-test('a malformed attachment is dropped, not replayed into the composer', () => {
+test('a malformed legacy attachment is dropped, not replayed into the composer', () => {
   // This value is handed to the send path; a half-parsed one must not survive.
   const raw = JSON.stringify({ c: { text: 'hi', attachment: { url: 'u' } } })   // no name/kind
-  assert.deepEqual(parseStoredDrafts(raw), { c: { text: 'hi', attachment: null } })
+  assert.deepEqual(parseStoredDrafts(raw), { c: { text: 'hi', attachments: [] } })
 })
 
 test('an unknown attachment kind is rejected', () => {
   const raw = JSON.stringify({ c: { text: 't', attachment: { ...att, kind: 'exe' } } })
-  assert.equal(parseStoredDrafts(raw).c.attachment, null)
+  assert.deepEqual(parseStoredDrafts(raw).c.attachments, [])
 })
 
 test('stored entries that decode to empty are not resurrected', () => {
@@ -150,7 +157,7 @@ test('evict is a no-op below the cap and preserves identity', () => {
 })
 
 test('isEmptyDraft only calls a draft empty when both halves are', () => {
-  assert.equal(isEmptyDraft({ text: '', attachment: null }), true)
-  assert.equal(isEmptyDraft({ text: ' ', attachment: null }), false)
-  assert.equal(isEmptyDraft({ text: '', attachment: att }), false)
+  assert.equal(isEmptyDraft({ text: '', attachments: [] }), true)
+  assert.equal(isEmptyDraft({ text: ' ', attachments: [] }), false)
+  assert.equal(isEmptyDraft({ text: '', attachments: [att] }), false)
 })

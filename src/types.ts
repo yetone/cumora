@@ -1,3 +1,5 @@
+import type { AttachmentDescriptor } from '../shared/attachments'
+
 export type AgentRole = 'researcher' | 'designer' | 'engineer' | 'pm' | 'brand' | 'ops'
 export type ParticipantKind = 'agent' | 'human'
 export type Status = 'avail' | 'working' | 'thinking' | 'waiting' | 'resting'
@@ -15,6 +17,8 @@ export interface EngineModelOption {
   description?: string | null
   recommendedFor?: Array<'big' | 'small'>
   supportsFastMode?: boolean
+  /** Explicit capability claim from the paired daemon. Missing is unknown. */
+  vision?: 'supported' | 'unsupported' | 'unknown'
 }
 
 export interface EngineModelCatalog {
@@ -269,20 +273,11 @@ export interface Message {
     detail: string
     icon?: 'web' | 'github' | 'figma' | 'db'
   }
-  /** for attachments */
-  attachment?: {
-    name: string
-    /** kind 'img' renders inline; others render as a file card */
-    kind: 'img' | 'pdf' | 'file' | 'fig'
-    /** real assets carry a URL; mock/legacy data may not */
-    url?: string
-    /** Storage key used to refresh expiring signed URLs. */
-    key?: string
-    mime?: string
-    size?: number
-    /** legacy descriptor — fallback when no real file is present (e.g. mock data) */
-    meta?: string
-  }
+  /** Canonical ordered list. Older history and realtime payloads may still
+   *  carry the first item through the singular compatibility field below. */
+  attachments?: readonly AttachmentDescriptor[]
+  /** Legacy single-attachment compatibility projection. */
+  attachment?: AttachmentDescriptor | null
   /** for whisper-link cards in main chat */
   whisperLink?: {
     pair: [string, string]

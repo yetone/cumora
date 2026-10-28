@@ -35,6 +35,7 @@ import { consumeAgentTurnToken } from '../scheduler.js'
 import {
   isRuntimeAgentAuthorized,
   withRuntimeAgentRunAuthorization,
+  withRuntimeAttachmentReadAuthorization,
   withRuntimeConversationAuthorization,
   withRuntimeMessageReadAuthorization,
 } from './authorization.js'
@@ -45,6 +46,8 @@ import { attachFsEndpoints } from './fs-endpoints.js'
 import { inprocClient } from './inproc-client.js'
 import { type AgentRuntimeClaims, verifyAgentToken } from './jwt.js'
 import { attachWakeStream, } from './wake-bus.js'
+import { normalizeStorageKey } from '../../storage-keys.js'
+import { storage } from '../../storage.js'
 
 export type { WakeEvent } from './wake-bus.js'
 
@@ -183,6 +186,7 @@ runtimeRouter.post('/cli', withAgent(async (c, req, res) => {
     exitCode: result.exitCode,
     ok: result.ok,
     sideEffects: result.sideEffects ?? [],
+    attachmentReads: result.attachmentReads ?? [],
   })
 }))
 
@@ -222,6 +226,37 @@ runtimeRouter.get('/inbox', withAgent(async (c, req, res) => {
     await Promise.all([...perConvoMaxSeq.entries()].map(([cid, seq]) => recordSeen(c.sub, cid, seq)))
   }
   res.json({ rows })
+}))
+
+// BYOA engines use this authenticated endpoint instead of a raw storage URL.
+// The object must be both a Cumora chat attachment and referenced by a message
+// this exact runtime placement can read. The server redirects to a freshly
+// generated storage URL; callers cannot select an arbitrary fetch target.
+runtimeRouter.get('/attachment', withAgent(async (c, req, res) => {
+  const key = normalizeStorageKey(typeof req.query.key === 'string' ? req.query.key : '')
+  const messageId = typeof req.query.messageId === 'string' && req.query.messageId
+    ? req.query.messageId
+    : undefined
+  if (!key?.startsWith('attachments/')) {
+    res.status(400).json({ error: 'invalid chat attachment key' })
+    return
+  }
+  if (!(await withRuntimeAttachmentReadAuthorization({
+    agentId: c.sub,
+    companyId: c.companyId,
+    key,
+    messageId,
+  }))) {
+    res.status(403).json({ error: 'attachment is not readable by this agent' })
+    return
+  }
+  const metadata = await storage.statObject(key)
+  if (!metadata) {
+    res.status(404).json({ error: 'attachment not found' })
+    return
+  }
+  res.setHeader('Cache-Control', 'private, no-store')
+  res.redirect(303, await storage.publicUrl(key))
 }))
 
 // BYOA: build the triage request server-side (we have the DB for inbox+context)

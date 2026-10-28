@@ -1,5 +1,6 @@
 import type { PoolClient } from 'pg'
 import { pool } from '../../db/pool.js'
+import { storageKeyFromPublicUrl } from '../../storage.js'
 import type { AgentRuntimeClaims } from './jwt.js'
 
 /**
@@ -29,6 +30,13 @@ export async function isRuntimeAgentAuthorized(
     [claims.sub, claims.companyId, claims.computerId, claims.assignmentId],
   )
   return rowCount === 1
+}
+
+/** Legacy rows may not cache a storage key. Derive one only through the same
+ *  configured-origin parser used when serving that row; arbitrary URLs from a
+ *  message can never authorize an attachment read. */
+export function attachmentUrlMatchesStorageKey(url: string, key: string): boolean {
+  return storageKeyFromPublicUrl(url) === key
 }
 
 /** Hold the live runtime identity and every referenced run stable through an
@@ -187,6 +195,117 @@ export async function withRuntimeMessageReadAuthorization<T>(args: {
     const result = await args.task(client)
     await client.query('COMMIT')
     return { authorized: true, result }
+  } catch (error) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw error
+  } finally {
+    client.release()
+  }
+}
+
+/** Authorize an attachment object only when it is referenced by a message the
+ *  runtime agent can currently read. The storage key is a selector; membership
+ *  and tenant are the authority. */
+export async function withRuntimeAttachmentReadAuthorization(args: {
+  agentId: string
+  companyId: string
+  key: string
+  /** When supplied, the exact message must also currently be readable. */
+  messageId?: string
+}): Promise<boolean> {
+  const client = await pool.connect()
+  try {
+    await client.query('BEGIN')
+    const participant = await client.query(
+      `SELECT id FROM participants
+        WHERE id = $1 AND company_id = $2
+          AND kind = 'agent' AND departed_at IS NULL
+        FOR SHARE`,
+      [args.agentId, args.companyId],
+    )
+    if (!participant.rowCount) {
+      await client.query('ROLLBACK')
+      return false
+    }
+    const allowed = await client.query(
+      `SELECT 1
+         FROM messages m
+         JOIN conversations c
+           ON c.id = m.conversation_id AND c.company_id = m.company_id
+        WHERE m.company_id = $1
+          AND ($4::text IS NULL OR m.id = $4)
+          AND (
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $2
+            )
+            OR (m.kind = 'system' AND m.delivery_recipient_id = $2)
+          )
+          AND (
+            m.attachment->>'key' = $3
+            OR EXISTS (
+              SELECT 1
+                FROM jsonb_array_elements(
+                  CASE WHEN jsonb_typeof(m.attachments) = 'array'
+                       THEN m.attachments ELSE '[]'::jsonb END
+                ) attachment
+               WHERE attachment->>'key' = $3
+            )
+          )
+          AND EXISTS (
+            SELECT 1 FROM attachment_grants ag
+             WHERE ag.storage_key = $3
+               AND ag.company_id = $1
+               AND ag.status = 'active'
+          )
+        LIMIT 1
+        FOR SHARE OF c, m`,
+      [args.companyId, args.agentId, args.key, args.messageId ?? null],
+    )
+    if (allowed.rowCount) {
+      await client.query('COMMIT')
+      return true
+    }
+
+    // Older rows predate persisted storage keys. Re-signing derives their key
+    // from the URL, so authorization must accept the same legacy reference.
+    // Narrow in SQL to rows whose URL contains this unguessable key, then apply
+    // the configured-origin parser before authorizing the fetch.
+    const legacy = await client.query<{ attachment: { url?: unknown } | null }>(
+      `SELECT m.attachment
+         FROM messages m
+         JOIN conversations c
+           ON c.id = m.conversation_id AND c.company_id = m.company_id
+        WHERE m.company_id = $1
+          AND ($4::text IS NULL OR m.id = $4)
+          AND jsonb_typeof(m.attachment) = 'object'
+          AND strpos(COALESCE(m.attachment->>'url', ''), $3) > 0
+          AND EXISTS (
+            SELECT 1 FROM attachment_grants ag
+             WHERE ag.storage_key = $3
+               AND ag.company_id = $1
+               AND ag.status = 'active'
+          )
+          AND (
+            EXISTS (
+              SELECT 1 FROM conversation_members cm
+               WHERE cm.conversation_id = c.id
+                 AND cm.company_id = c.company_id
+                 AND cm.participant_id = $2
+            )
+            OR (m.kind = 'system' AND m.delivery_recipient_id = $2)
+          )
+        LIMIT 200`,
+      [args.companyId, args.agentId, args.key, args.messageId ?? null],
+    )
+    const derived = legacy.rows.some((row) => {
+      const url = row.attachment?.url
+      return typeof url === 'string' && attachmentUrlMatchesStorageKey(url, args.key)
+    })
+    await client.query(derived ? 'COMMIT' : 'ROLLBACK')
+    return derived
   } catch (error) {
     await client.query('ROLLBACK').catch(() => {})
     throw error

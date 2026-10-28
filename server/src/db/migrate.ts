@@ -53,6 +53,8 @@ import {
   boardCardDueOnChecksum,
 } from './migrations/0010-board-card-due-on.js'
 import { AGENT_NATIVE_FAST_MODE_SQL, agentNativeFastModeChecksum } from './migrations/0011-agent-native-fast-mode.js'
+import { MESSAGE_ATTACHMENTS_SQL, messageAttachmentsChecksum } from './migrations/0012-message-attachments.js'
+import { ATTACHMENT_GRANTS_SQL, attachmentGrantsChecksum } from './migrations/0013-attachment-grants.js'
 
 /** Frozen data backfill embedded in migration 0001. Exported so its behavior
  * can be exercised against PostgreSQL without replaying the whole migration. */
@@ -2641,6 +2643,18 @@ const VERSIONED_MIGRATIONS: readonly VersionedMigration[] = [
     sourceChecksum: agentNativeFastModeChecksum(),
     transactional: true,
     up: async (client) => { await client.query(AGENT_NATIVE_FAST_MODE_SQL) },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[11],
+    sourceChecksum: messageAttachmentsChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(MESSAGE_ATTACHMENTS_SQL) },
+  },
+  {
+    ...SCHEMA_MIGRATIONS[12],
+    sourceChecksum: attachmentGrantsChecksum(),
+    transactional: true,
+    up: async (client) => { await client.query(ATTACHMENT_GRANTS_SQL) },
   },
 ]
 

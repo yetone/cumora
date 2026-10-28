@@ -61,8 +61,8 @@ test('the verdict is drawn from the gate-aware helper, not from brains alone', a
   // The four tests above exercise the helper. They would all still pass against
   // a runDoctor that computed its own verdict and never called it — which is
   // exactly the state being fixed. Read the source.
-  const source = await readFile(new URL('../agents/computer/daemon.ts', import.meta.url), 'utf8')
-  const doctor = source.slice(source.indexOf('async function runDoctor'))
+  const source = (await readFile(new URL('../agents/computer/daemon.ts', import.meta.url), 'utf8')).replaceAll('\r\n', '\n')
+  const doctor = source.slice(source.indexOf('async function runDoctor('))
   const body = doctor.slice(0, doctor.indexOf('\n}\n') + 2)
 
   assert.match(body, /doctorUsableEngines\(/, 'runDoctor no longer asks the gate')
