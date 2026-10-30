@@ -23,8 +23,11 @@
 import { test, beforeEach, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { redis } from '../redis.js'
-import { recordHold, consumeHold, clearHold } from '../agents/seen-boundary.js'
-import { normalizeWorkSubject, worklogField } from '../agents/runtime/inproc-client.js'
+import {
+  recordHold, consumeHold, clearHold,
+  recordHeldAttempt, clearHeldAttempts, heldEscalationNote, HELD_ESCALATE_AT,
+} from '../agents/seen-boundary.js'
+import { normalizeWorkSubject, worklogField, inprocClient } from '../agents/runtime/inproc-client.js'
 
 // ── in-memory redis stand-in ───────────────────────────────────────────
 // seen-boundary only uses SET (EX), EVAL (GET+DEL script), and DEL for
@@ -35,12 +38,13 @@ type AnyFn = (...args: unknown[]) => unknown
 const store = new Map<string, string>()
 let failMode = false
 let lastSetTtlSec: number | null = null
-
 const SAVED = {
   set: redis.set as AnyFn,
   eval: redis.eval as AnyFn,
   del: redis.del as AnyFn,
   multi: redis.multi as AnyFn,
+  incr: redis.incr as AnyFn,
+  expire: redis.expire as AnyFn,
 }
 
 beforeEach(() => {
@@ -68,6 +72,19 @@ beforeEach(() => {
     if (failMode) throw new Error('redis down (simulated)')
     return store.delete(args[0] as string) ? 1 : 0
   }
+  // recordHeldAttempt: INCR (create on first write) + EXPIRE on the first
+  // increment only. Both fail when failMode is on.
+  ;(redis as unknown as Record<string, AnyFn>).incr = async (...args: unknown[]) => {
+    if (failMode) throw new Error('redis down (simulated)')
+    const key = args[0] as string
+    const next = Number(store.get(key) ?? '0') + 1
+    store.set(key, String(next))
+    return next
+  }
+  ;(redis as unknown as Record<string, AnyFn>).expire = async (...args: unknown[]) => {
+    if (failMode) throw new Error('redis down (simulated)')
+    return store.has(args[0] as string) ? 1 : 0
+  }
   // inprocClient.unmarkThinking pipelines ZREMs before clearing holds —
   // stub a chainable no-op pipeline so the test never needs a live Redis.
   ;(redis as unknown as Record<string, AnyFn>).multi = () => {
@@ -86,11 +103,14 @@ after(() => {
   ;(redis as unknown as Record<string, AnyFn>).eval = SAVED.eval
   ;(redis as unknown as Record<string, AnyFn>).del = SAVED.del
   ;(redis as unknown as Record<string, AnyFn>).multi = SAVED.multi
+  ;(redis as unknown as Record<string, AnyFn>).incr = SAVED.incr
+  ;(redis as unknown as Record<string, AnyFn>).expire = SAVED.expire
   try { redis.disconnect() } catch { /* ignore */ }
   void import('../redis.js').then(({ sub }) => { try { sub.disconnect() } catch { /* ignore */ } })
 })
 
 const AGENT = 'nova-877e'
+const CONVO = 'allhands-d7f8ffcf-2'
 const SCOPE = 'reply:allhands-d7f8ffcf-2'
 
 // ── hold token contract ────────────────────────────────────────────────
@@ -163,6 +183,61 @@ test('empty agent or scope never consults Redis and is never armed', async () =>
   await assert.doesNotReject(recordHold('', SCOPE))
   assert.equal((await consumeHold(AGENT, '')).armed, false)
   assert.equal((await consumeHold('', SCOPE)).armed, false)
+})
+
+// ── HELD attempt counter (per-turn cost cap) ───────────────────────────
+// Every HELD costs a full reasoning round-trip. The counter does NOT gate
+// anything — it decides when the envelope stops merely explaining the hold
+// and starts telling the agent to conclude.
+
+test('recordHeldAttempt counts per turn and clearHeldAttempts resets it', async () => {
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 1)
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 2)
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 3)
+  await clearHeldAttempts(AGENT, CONVO)
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 1, 'a new turn starts counting from zero')
+})
+
+test('the counter is scoped per agent and per conversation', async () => {
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 1)
+  assert.equal(await recordHeldAttempt('saga-x798', CONVO), 1, 'another agent has its own budget')
+  assert.equal(await recordHeldAttempt(AGENT, 'other-convo'), 1, 'another room has its own budget')
+})
+
+test('heldEscalationNote is silent below the threshold and speaks at it', () => {
+  assert.equal(heldEscalationNote(0), '')
+  assert.equal(heldEscalationNote(1), '', 'the first hold only explains itself')
+  assert.equal(heldEscalationNote(HELD_ESCALATE_AT - 1), '')
+  assert.match(heldEscalationNote(HELD_ESCALATE_AT), /STOP RE-DECIDING/)
+  assert.match(heldEscalationNote(HELD_ESCALATE_AT), /cumora ack/, 'silence must be offered as a real exit')
+})
+
+test('escalation text matches the gate: a verbatim dup cannot be cleared by re-sending', () => {
+  const freshness = heldEscalationNote(HELD_ESCALATE_AT, 'freshness')
+  const verbatim = heldEscalationNote(HELD_ESCALATE_AT, 'verbatim')
+  assert.match(freshness, /a plain re-send passes now/)
+  assert.doesNotMatch(verbatim, /a plain re-send passes now/,
+    'a verbatim-dup hold can never be cleared by re-sending the same body')
+  assert.match(verbatim, /re-sending it can never pass/)
+  assert.match(verbatim, /cumora ack/)
+})
+
+test('recordHeldAttempt fails OPEN to 1 on Redis error — no escalation without a real count', async () => {
+  failMode = true
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 1)
+})
+
+test('clearHeldAttempts never throws on Redis error', async () => {
+  failMode = true
+  await assert.doesNotReject(clearHeldAttempts(AGENT, CONVO))
+})
+
+test('unmarkThinking (turn end) resets the HELD count for the turn convos', async () => {
+  await recordHeldAttempt(AGENT, CONVO)
+  await recordHeldAttempt(AGENT, CONVO)
+  await inprocClient.unmarkThinking(AGENT, [CONVO])
+  assert.equal(await recordHeldAttempt(AGENT, CONVO), 1,
+    'the next turn must not inherit the previous turn\'s escalations')
 })
 
 // ── shared subject normalization ───────────────────────────────────────

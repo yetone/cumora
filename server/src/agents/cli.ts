@@ -186,6 +186,7 @@ import type { WorkTaskType, WorklogEntry } from './runtime/client.js'
 import {
   recordSeen, getSeen, recordHold, consumeHold, clearHold,
   readTurnPost, recordTurnPost, MAX_POSTS_PER_TURN_PER_CONVERSATION,
+  recordHeldAttempt, clearHeldAttempts, heldEscalationNote,
 } from './seen-boundary.js'
 
 function tenantScopeKey(companyId: string): string {
@@ -1303,6 +1304,7 @@ async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
       // acknowledgement is void — it must not arm a later turn's
       // preemptive --send-anyway (the 2026-07-08 stale-"6" path).
       void clearHold(me, `reply:${id}`)
+      void clearHeldAttempts(me, id)
     }
     return ok(`acked ${convoIds.length} conversation(s)`)
   }
@@ -1331,6 +1333,7 @@ async function cmdAck(parsed: ParsedArgs): Promise<CliResult> {
   if (!rowCount) return err(`conversation ${convoId} not found or no longer authorized`)
   // Standing down — see the --all branch above.
   void clearHold(me, `reply:${convoId}`)
+  void clearHeldAttempts(me, convoId)
   return ok(`acked ${convoId}`)
 }
 
@@ -1416,6 +1419,7 @@ async function cmdMute(parsed: ParsedArgs): Promise<CliResult> {
   })
   if (!muted) return err(`conversation ${conversationId} is no longer authorized`)
   void clearHold(me, `reply:${conversationId}`)
+  void clearHeldAttempts(me, conversationId)
   const expiry = until ? ` until ${until.toISOString()}` : ' until you follow it again'
   return ok(
     `Muted ${conversationId} ("${conversation.title}")${expiry}. ` +
@@ -2079,7 +2083,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
       // high-water seq, so a considered re-run works without re-holding on
       // these same rows (the hold envelope itself advances the seen cursor).
       await recordSeen(me, convoId, maxHeldSeq)
-      await recordHold(me, replyHoldScope, maxHeldSeq)
+      const heldAttempt = await recordHeldAttempt(me, convoId)
       const lines = newer.map((r) =>
         `  [seq=${r.sequence}] ${r.author_name || r.author_id}: ${r.body.replace(/\s+/g, ' ').slice(0, 200)}`
       ).join('\n')
@@ -2090,8 +2094,8 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         `(counting: post the next number after the latest, not the one you drafted; ` +
         `relay/chain: continue from the latest entry; if a peer above already delivered what you were about to deliver, stand down or react instead). ` +
         `Run \`cumora reply <convoId> "<revised body>"\` with your new decision, ` +
-        `or rerun with --send-anyway only if your draft is STILL correct despite these messages (rare).`,
-        2,
+        `or rerun with --send-anyway only if your draft is STILL correct despite these messages (rare).` +
+        heldEscalationNote(heldAttempt),
       )
     }
   }
@@ -2140,6 +2144,7 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         // post after this, the re-attempt holds again on the truly-new ones.
         const maxHeldSeq = newer[newer.length - 1].sequence
         await recordSeen(me, convoId, maxHeldSeq)
+        const heldAttempt = await recordHeldAttempt(me, convoId)
         const lines = newer.map((r) =>
           `  [seq=${r.sequence}] ${r.author_name || r.author_id}: ${r.body.replace(/\s+/g, ' ').slice(0, 200)}`
         ).join('\n')
@@ -2156,7 +2161,8 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
             : '') +
           `You have now seen these — re-decide against THIS state, then simply re-send: a plain \`cumora reply <convoId> "<revised body>"\` will go through (no flag needed). ` +
           `Usually your draft is now wrong (counting: post the next number after the latest; relay/chain: continue from the latest entry; ` +
-          `if a peer above already delivered what you were about to deliver, the work is DONE — stand down or react instead).`,
+          `if a peer above already delivered what you were about to deliver, the work is DONE — stand down or react instead).` +
+          heldEscalationNote(heldAttempt),
           2,  // exit code 2 = "held, retry with different content" (distinct from 1 = generic error)
         )
       }
@@ -2201,10 +2207,12 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
         await recordSeen(me, convoId, lastPeer[0].sequence)
         await recordHold(me, replyHoldScope, lastPeer[0].sequence)
         const peer = lastPeer[0]
+        const heldAttempt = await recordHeldAttempt(me, convoId)
         return err(
           `HELD — your draft is VERBATIM IDENTICAL to the most recent peer post in ${convoId}:\n` +
           `  [seq=${peer.sequence}] ${peer.author_name || peer.author_id}: ${peer.body.replace(/\s+/g, ' ').slice(0, 200)}\n\n` +
-          `They beat you to it. Real teammates don't immediately repeat the same thing — pick a different angle, the NEXT item in a sequence, or stay silent if their post already covers what you wanted to say.`,
+          `They beat you to it. Real teammates don't immediately repeat the same thing — pick a different angle, the NEXT item in a sequence, or stay silent if their post already covers what you wanted to say.` +
+          heldEscalationNote(heldAttempt, 'verbatim'),
           2,
         )
       }
@@ -2397,10 +2405,12 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
           await txClient.query('ROLLBACK')
           await recordSeen(me, convoId, lastPeer[0].sequence)
           await recordHold(me, replyHoldScope, lastPeer[0].sequence)
+          const heldAttempt = await recordHeldAttempt(me, convoId)
           return err(
             `HELD — verbatim duplicate of the immediately-prior peer post in ${convoId}:\n` +
             `  [seq=${lastPeer[0].sequence}] ${lastPeer[0].author_id}: ${lastPeer[0].body.replace(/\s+/g, ' ').slice(0, 200)}\n\n` +
-            `They posted the exact same content${sendAnywayFlag ? ' (and --send-anyway does NOT bypass this check — verbatim-dup is never legitimate)' : ''}. Real teammates don't immediately repeat the same word. Pick the NEXT item, a different angle, or stay silent if their post already covers what you wanted.`,
+            `They posted the exact same content${sendAnywayFlag ? ' (and --send-anyway does NOT bypass this check — verbatim-dup is never legitimate)' : ''}. Real teammates don't immediately repeat the same word. Pick the NEXT item, a different angle, or stay silent if their post already covers what you wanted.` +
+            heldEscalationNote(heldAttempt, 'verbatim'),
             2,
           )
         }
@@ -2483,6 +2493,9 @@ async function cmdReply(parsed: ParsedArgs): Promise<CliResult> {
   // override, so a hold acknowledged-but-unused must not arm a later
   // preemptive --send-anyway in this conversation.
   void clearHold(me, replyHoldScope)
+  // The turn's draft landed — the hold budget is spent, and a later turn
+  // must start counting from zero rather than inherit this one's escalations.
+  void clearHeldAttempts(me, convoId)
   // A new message advances the conversation — the stall-state has changed,
   // so any prior "give up on this stalled state" fallback-decline counter
   // is now stale; clear it so a future stall (if it stalls again later) gets

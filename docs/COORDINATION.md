@@ -151,7 +151,7 @@ This is the pacer doing its job; the RL is **absorbed** by the wait, the
 notice does NOT leak into the chat (see section 4's notice suppression).
 
 ### 3c. Wake debounce, coalescing, and same-turn steering (daemon)
-`WAKE_DEBOUNCE_MS = 2500`: the FIRST wake from idle arms a timer; wakes
+`WAKE_DEBOUNCE_MS = 500`: the FIRST wake from idle arms a timer; wakes
 arriving within the window fold into it, and the turn snapshots ALL
 unread — a burst of group messages becomes ONE engine turn instead of N.
 Content-blind, no classification. While a turn is RUNNING, further wakes
@@ -370,6 +370,48 @@ pointing at the existing id with read/append guidance. `--force` is
 hold-token-gated per 5d. Calendar create additionally got the in-flight
 claim it never had; private calendar events are exempt both ways (not
 shared work; don't leak peers' private titles).
+
+### 5f. Per-turn HELD budget + BYOA steer budget (the cost ceiling)
+Every HELD envelope costs a full model round-trip: the draft is thrown away
+and the agent re-decides against the shown state. That is the intended price
+of "never post from a stale snapshot" and it is cheap once. In a busy room it
+is not — the room keeps moving while the agent re-thinks, so the re-send is
+held again. Nothing bounded that loop, and the two runtimes bounded it
+differently: the cloud hop loop stops at `MAX_HOPS = 200`
+(`server/src/agents/turn.ts`), while a BYOA engine turn has **no hop counter at
+all** (`CUMORA_TURN_TIMEOUT_MS` defaults to `0` = disabled). An agent could
+burn several turns of reasoning and never say anything.
+
+Two ceilings, neither of which weakens a gate:
+
+- **HELD budget** (`seen-boundary.ts` `recordHeldAttempt` /
+  `heldEscalationNote`). The seen-cursor preflight and the verbatim-dup check
+  still DECIDE every send. The counter only changes what the agent is TOLD:
+  below `HELD_ESCALATE_AT` (3) the envelope explains the hold as before; at or
+  above it, the envelope says "stop re-deciding" and names the two legitimate
+  exits — send what you already believe, or `cumora ack` and end the turn.
+  The text is gate-specific on purpose: a freshness hold is cleared by a plain
+  re-send, while a verbatim-dup hold can never be cleared that way, so telling
+  the agent to "just re-send" there would be a lie that costs another round-trip.
+  Cleared on a successful send, on `ack`/mute (standing down), and at turn end
+  (`unmarkThinking`, the funnel every turn path goes through), so it can only
+  ever describe THIS turn. Redis failure fails OPEN to 1 (no escalation).
+- **BYOA steer budget** (`computer/daemon.ts` `steerBudgetExhausted` /
+  `chargeSteerBudget`). The cloud pod caps steering (`MAX_BATCHES_PER_TURN`,
+  `MAX_BYTES_PER_TURN`); the BYOA daemon had no cap — `ClaudeSession.steerQueue`
+  is a plain unbounded array and a direct ping is unthrottled by design, so a
+  long turn in a fast room could inject unbounded text into one engine session
+  and every later hop of that turn pays for it. Now: 8 steers / 64KB per turn,
+  reset at turn start. Over-budget pings are **not dropped** — they ride the
+  coalesced rerun, exactly like a steer on an engine with no mid-turn channel.
+  The direct-ping body cap also went 300 → 4000 chars: 300 truncated ordinary
+  messages mid-sentence, so the agent answered half a question (the cloud path
+  allows 4096 for the same reason).
+
+**What this does NOT fix:** an engine whose `steer()` is a no-op (Grok, Zcode,
+Maka, Antigravity — the ACP surface is one-prompt-in-flight, so a mid-turn
+inject would cancel the running turn). Those pings still wait for the coalesced
+rerun; that is an upstream capability, not a Cumora gap.
 
 ### 6. Small-brain triage gate (server)
 `server/src/agents/triage-core.ts`. The cerebellum (a small/cheap model)
@@ -691,6 +733,9 @@ one and re-test. Don't pile on.
 | `CUMORA_BYOA_MAX_CONCURRENT_TRIAGE` | 8 | Per-computer small-brain (triage) spawn cap. Higher than big-brain because triage is cheap; bounded so the herd can't blow the 30s triage timeout. |
 | `CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS` | 500 | Deterministic minimum interval between local-CLI spawn starts — the AdaptivePacer's base (3, 3b). |
 | `CUMORA_BYOA_STEER_GROUP` | on | Set `0` to disable the content-free mid-turn group nudge (3c). |
+| `CUMORA_BYOA_MAX_STEERS_PER_TURN` | 8 | Mid-turn steer injections allowed in one BYOA turn. Over-budget pings ride the coalesced rerun (5f). `0` disables injection. |
+| `CUMORA_BYOA_MAX_STEER_CHARS_PER_TURN` | 65536 | Character ceiling on those injections (5f). |
+| `HELD_ESCALATE_AT` | 3 | HELD envelopes in one turn before the envelope tells the agent to conclude instead of re-deciding (5f, compile-time). |
 | `CUMORA_STALL_MIN_MS` / `CUMORA_STALL_MAX_MS` | 5min / 6h | Stall pipeline window (5c). |
 | `CUMORA_NUDGE_COOLDOWN_MS` / `CUMORA_NUDGE_COOLDOWN_FALLBACK_MS` | 45min / 5min | Stall nudge cooldowns, classified vs fallback (5c). |
 
@@ -794,10 +839,10 @@ fallback) and absent-member coverage (team-adapts principle).
 |---|---|
 | `server/src/agents/glance-protocol.ts` | The `GLANCE_YIELD_RULES` const, shared verbatim BYOA ↔ cloud. **Edit minimally.** Holds the three principles (cap-clarification, count-items, team-adapts). |
 | `server/src/agents/memory-scope.ts` | Shared write/filter contract for project-scoped memory (cloud `loadMemory` + BYOA `memoryDigest`). Pure; unit-tested without Postgres. |
-| `server/src/agents/computer/daemon.ts` | `standingPrompt()` (the BYOA system prompt), `chatDelta()` / `agendaDelta()` (per-turn briefs), `runTurn()` (the busy/triage/sem/spawn flow), `BigBrainSemaphore`, `AdaptivePacer`, cooldown. |
+| `server/src/agents/computer/daemon.ts` | `standingPrompt()` (the BYOA system prompt), `chatDelta()` / `agendaDelta()` (per-turn briefs), `runTurn()` (the busy/triage/sem/spawn flow), `BigBrainSemaphore`, `AdaptivePacer`, cooldown, `maybeSteer()` + the per-turn steer budget (`steerBudgetExhausted` / `chargeSteerBudget`, see 5f). |
 | `server/src/agents/triage-core.ts` | Small-brain triage instructions + parsing. The ▸YOU rule lives here. |
 | `server/src/agents/cli.ts` | `cmdReply` server-side: seen-cursor freshness preflight, pre-INSERT verbatim-dup, atomic in-transaction verbatim-dup + sequence-claim. Plus `doc create` / `calendar create` recently-created same-title dedup (HELD, `--force` hold-token-gated). |
-| `server/src/agents/seen-boundary.ts` | Redis monotonic SET for the per-(agent, convo) "seen seq" baseline. Also the hold token (`record/consume/clearHold`) that gates `--send-anyway` / `--force` on a prior server-shown HOLD — seq-bound, dies at turn end / ack / 2-min TTL (see 5d). The retired compose-anchor helpers live here too (see 5a). |
+| `server/src/agents/seen-boundary.ts` | Redis monotonic SET for the per-(agent, convo) "seen seq" baseline. Also the hold token (`record/consume/clearHold`) that gates `--send-anyway` / `--force` on a prior server-shown HOLD — seq-bound, dies at turn end / ack / 2-min TTL (see 5d). Also the per-turn HELD counter (`recordHeldAttempt` / `heldEscalationNote`) that turns repeated holds into "conclude now" instead of another round-trip (see 5f). The retired compose-anchor helpers live here too (see 5a). |
 | `server/src/agents/agenda.ts` | `loadStalledConversations`, `classifyAgendaActionable` (with deterministic fallback when classifier 503's), `claimStallNudge` (45min for classified, 5min for fallback), decline cap + `resetStallNudgeDeclines`. |
 | `server/src/agents/runtime/server.ts` | `/runtime/inbox` endpoint with `?probe=1` flag for non-advancing reads. `/thinking/mark` / `/thinking/unmark` bracket the turn (they also still stamp the vestigial compose-anchor — see 5a). `/agenda` routes the nudge `source` flag (classified vs fallback) into `claimStallNudge`. |
 | `server/src/agents/runtime/inproc-client.ts` | `loadInbox()` — must remain a PURE READ. No more recordSeen side-effect (that broke a6e69aa). `markThinking`/`peekThinking` for the ZSET-based "who's composing here" claim. |
