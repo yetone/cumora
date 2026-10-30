@@ -15,6 +15,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from './db/pool.js'
+import { collectDocumentStorageKeys } from './documents/rooms.js'
 import { env } from './env.js'
 import {
   messageAttachmentStorageKey,
@@ -22,7 +23,6 @@ import {
   storage,
   storageKeyFromPublicUrl,
 } from './storage.js'
-import { collectDocumentStorageKeys } from './documents/rooms.js'
 
 interface CleanupJob {
   id: string
@@ -134,8 +134,8 @@ export async function findReferencedStorageKeys(keys: string[], client?: PoolCli
            SELECT 1 FROM jsonb_array_elements(
              CASE WHEN jsonb_typeof(m.attachments) = 'array'
                   THEN m.attachments ELSE '[]'::jsonb END
-           ) attachment
-            WHERE attachment->>'key' = ANY($1::text[])
+           ) candidate
+            WHERE candidate->>'key' = ANY($1::text[])
          )`,
     [uniqueKeys],
   )
