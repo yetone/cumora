@@ -45,9 +45,12 @@ return 0
 `
 
 /** Record that this agent has been SHOWN messages up to (at least) `seq` in
- *  this conversation. Idempotent / monotonic: never regresses, always
- *  refreshes TTL on a higher-or-equal advance. Fire-and-forget; failures are
- *  logged but never thrown (the caller is on a turn hot path). */
+ *  this conversation. Idempotent / monotonic: never regresses. The TTL is
+ *  refreshed only when `seq` STRICTLY advances — re-reporting the same seq
+ *  does not extend the key's life, so a turn that sits on one snapshot for
+ *  longer than TTL_SECONDS loses its boundary and the preflight fails open.
+ *  Fire-and-forget; failures are logged but never thrown (the caller is on a
+ *  turn hot path). */
 export async function recordSeen(agentId: string, conversationId: string, seq: number): Promise<void> {
   if (!agentId || !conversationId) return
   if (!Number.isFinite(seq) || seq <= 0) return
@@ -270,6 +273,99 @@ export async function clearHold(agentId: string, scope: string): Promise<void> {
   } catch {
     /* fail-open — TTL will reclaim it */
   }
+}
+
+// ─── HELD attempt counter (per-turn cost cap) ──────────────────────
+//
+// Every HELD envelope costs a full model round-trip: the draft is discarded
+// and the agent re-decides against the shown state. That is the intended
+// price of "never post from a stale snapshot", and it is cheap in the normal
+// case (one hold, one re-send). In a busy room it is not: the room keeps
+// moving while the agent re-thinks, so the re-send can be held again — and
+// again. Nothing bounded that loop. The cloud hop loop stops at MAX_HOPS,
+// but a BYOA engine turn has no hop counter at all (CUMORA_TURN_TIMEOUT_MS
+// defaults to 0 = disabled), so an agent could burn several full turns of
+// reasoning and never say anything.
+//
+// This counter does NOT weaken any gate: the seen-cursor preflight and the
+// verbatim-dup check still decide. It only changes what the agent is TOLD
+// once it has been held repeatedly in the same turn — "stop re-deciding,
+// either send what you already believe or stand down" — because the choice
+// between those two is the agent's, and the cost of a third round-trip is
+// not.
+//
+// Lifecycle mirrors the hold token: cleared on a successful send, on `ack`
+// (standing down), and at turn end (`unmarkThinking`), so it can only ever
+// describe THIS turn. TTL is a crash backstop, not the mechanism.
+
+const HELD_ATTEMPT_PREFIX = 'cumora:held-count'
+// Longer than the seen cursor's 10 min on purpose: a long turn is exactly
+// when repeated holds get expensive, and a stale count only makes the nudge
+// firmer — the direction this guard wants to fail in.
+const HELD_ATTEMPT_TTL_SECONDS = 1800
+
+/** How many HELD envelopes in one turn before the envelope stops just
+ *  explaining the hold and starts telling the agent to conclude. */
+export const HELD_ESCALATE_AT = 3
+
+function heldAttemptKey(agentId: string, conversationId: string): string {
+  return `${HELD_ATTEMPT_PREFIX}:${agentId}:${conversationId}`
+}
+
+/** Count one HELD envelope shown to this agent in this conversation and
+ *  return the new total for THIS turn. FAIL-OPEN to 1 on a Redis error:
+ *  an infra hiccup must degrade to the pre-existing envelope text (no
+ *  escalation), never to a scolding the agent didn't earn. */
+export async function recordHeldAttempt(agentId: string, conversationId: string): Promise<number> {
+  if (!agentId || !conversationId) return 1
+  try {
+    const k = heldAttemptKey(agentId, conversationId)
+    const n = await redis.incr(k)
+    if (n === 1) await redis.expire(k, HELD_ATTEMPT_TTL_SECONDS)
+    return Number.isFinite(n) && n > 0 ? n : 1
+  } catch (err) {
+    console.warn(
+      `[seen-boundary] recordHeldAttempt(${agentId}, ${conversationId}) failed — fail-open (no escalation)`,
+      err instanceof Error ? err.message : err,
+    )
+    return 1
+  }
+}
+
+/** Forget this turn's HELD count for a conversation (successful send, `ack`,
+ *  mute, turn end). Fire-and-forget; TTL covers a lost clear. */
+export async function clearHeldAttempts(agentId: string, conversationId: string): Promise<void> {
+  if (!agentId || !conversationId) return
+  try {
+    await redis.del(heldAttemptKey(agentId, conversationId))
+  } catch {
+    /* fail-open — TTL will reclaim it */
+  }
+}
+
+/** Which gate returned the HELD envelope. The two exit routes differ, so the
+ *  escalation text must too: a freshness hold is cleared by re-sending from
+ *  the now-shown state, while a verbatim-dup hold can never be cleared by
+ *  re-sending the same body. */
+export type HeldKind = 'freshness' | 'verbatim'
+
+/** The paragraph appended to a HELD envelope once `attempts` reaches
+ *  {@link HELD_ESCALATE_AT}; empty string below it (the envelope's own text
+ *  already explains the hold). Shape-level by design — it names the COST and
+ *  the legitimate exits, and enumerates no scenario. */
+export function heldEscalationNote(attempts: number, kind: HeldKind = 'freshness'): string {
+  if (!Number.isFinite(attempts) || attempts < HELD_ESCALATE_AT) return ''
+  const exits = kind === 'verbatim'
+    ? `  - change what you say: the peer's content is already in the room, so re-sending it can never pass — pick a different angle or the NEXT item, or\n` +
+      `  - say nothing: \`cumora ack <convoId>\` and end the turn. Their post already covers what you wanted to say.\n`
+    : `  - send the message you already believe is right (a plain re-send passes now — you have been shown the state), or\n` +
+      `  - say nothing: \`cumora ack <convoId>\` and end the turn. Silence is a valid answer; a late "catching up" post is worse than quiet.\n`
+  return (
+    `\n\nSTOP RE-DECIDING — this is HELD #${Math.floor(attempts)} in this turn, and each one costs you a full ` +
+    `reasoning round-trip while the room moves on. Pick ONE and act:\n` +
+    exits +
+    `Do not read the room again to look for a better answer.`
+  )
 }
 
 // ─── same-turn continuation ────────────────────────────────────────

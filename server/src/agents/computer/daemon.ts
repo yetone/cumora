@@ -170,6 +170,41 @@ const STEER_GROUP_IN_TURN = process.env.CUMORA_BYOA_STEER_GROUP !== '0'
 // Throttle for the content-free group notice so a fast room can't spam the live
 // session — at most one group nudge per this window (direct pings are unthrottled).
 const GROUP_STEER_MIN_INTERVAL_MS = Math.max(0, Number(process.env.CUMORA_BYOA_STEER_GROUP_INTERVAL_MS ?? 8_000))
+// Per-turn steering BUDGET. The cloud pod's steer queue has caps
+// (MAX_BATCHES_PER_TURN / MAX_BYTES_PER_TURN in ../steer.ts); the BYOA path
+// had none — ClaudeSession.steerQueue is an unbounded array, and a direct ping
+// is unthrottled by design. A long turn in a fast room could therefore inject
+// an unbounded amount of text into one engine session, which costs context on
+// every subsequent hop of that turn. These mirror the cloud numbers where the
+// shape matches; over-budget pings are NOT dropped — they ride the coalesced
+// rerun, exactly like a steer on an engine with no mid-turn channel.
+const MAX_STEERS_PER_TURN = Math.max(0, Number(process.env.CUMORA_BYOA_MAX_STEERS_PER_TURN ?? 8))
+const MAX_STEER_CHARS_PER_TURN = Math.max(0, Number(process.env.CUMORA_BYOA_MAX_STEER_CHARS_PER_TURN ?? 65_536))
+// Body cap for a DIRECT ping's injected text. The old 300 chars truncated
+// ordinary messages mid-sentence, so the agent answered half a question; the
+// cloud path allows 4096 (MAX_BODY_BYTES in ../steer.ts) for the same reason.
+const STEER_BODY_CHARS = 4_000
+
+/** One turn's steering allowance. Pure so the arithmetic is testable without
+ *  booting a runner. A steer that does not fit is refused, not truncated, and
+ *  the message rides the coalesced rerun instead. */
+export interface SteerBudget {
+  steers: number
+  chars: number
+  maxSteers: number
+  maxChars: number
+}
+
+/** True when another steer fits. Callers check BEFORE building the text. */
+export function steerBudgetExhausted(b: SteerBudget): boolean {
+  return b.steers >= b.maxSteers || b.chars >= b.maxChars
+}
+
+/** Account for one injected steer of `chars` characters. */
+export function chargeSteerBudget(b: SteerBudget, chars: number): SteerBudget {
+  return { ...b, steers: b.steers + 1, chars: b.chars + Math.max(0, chars) }
+}
+
 // Board-awareness: when chat is idle, check the agent's AGENDA (assigned Kanban
 // cards + due calendar events) so it PROACTIVELY picks up assigned board work
 // instead of only reacting to a chat push. Gated like the cloud idle scheduler:
@@ -844,6 +879,27 @@ export function typingConversation(
 ): string | null {
   if (wakeConvo) return wakeConvo
   return seen.size === 1 ? [...seen.keys()][0] : null
+}
+
+/** Every conversation a turn must claim and then release: the unread snapshot
+ *  it was handed, plus the room picked for the "<agent> is typing…" indicator.
+ *
+ *  Both sides must use THIS list. `/thinking/mark` already claimed the whole
+ *  snapshot, so releasing only the indicator room left the other rooms' claims
+ *  to expire on their own TTL — and, because turn end is also where the
+ *  per-turn HELD counter is cleared, it left their hold counts alive into the
+ *  NEXT turn. An agent held twice in room X, with the indicator in room Y,
+ *  then escalated on its first hold of the following turn.
+ *
+ *  Exported for tests: the claim and the release drifting apart is invisible at
+ *  runtime until the counter misreads a fresh turn. */
+export function turnThinkingConvos(
+  convo: string | null,
+  seen: Map<string, string>,
+): string[] {
+  const ids = new Set(seen.keys())
+  if (convo) ids.add(convo)
+  return [...ids]
 }
 
 function hashText(text: string): string {
@@ -1963,6 +2019,12 @@ export class AgentRunner {
   private lastGroupSteeredMsgId: string | null = null
   private lastGroupSteerAt = 0
   private pollTimer: ReturnType<typeof setInterval> | undefined
+  /** Per-turn steering budget (MAX_STEERS_PER_TURN / MAX_STEER_CHARS_PER_TURN).
+   *  Reset at every turn start, so each turn gets a fresh allowance; once spent,
+   *  further pings ride the coalesced rerun instead of being injected. */
+  private steerBudget: SteerBudget = {
+    steers: 0, chars: 0, maxSteers: MAX_STEERS_PER_TURN, maxChars: MAX_STEER_CHARS_PER_TURN,
+  }
   /** Wake-stream liveness for fallbackPollDue: when the stream last showed
    *  signs of life (connect, any event, any `: ping`); null while disconnected. */
   private streamLastSeenAt: number | null = null
@@ -3167,6 +3229,13 @@ export class AgentRunner {
   private async maybeSteer(convo: string): Promise<void> {
     const session = this.engineSession
     if (!session?.alive || this.sideSteering) return
+    // Budget spent → do not inject. The ping is already durable in `messages`
+    // and the coalesced rerun reads it after this turn, so skipping the steer
+    // costs latency, never the message.
+    if (steerBudgetExhausted(this.steerBudget)) {
+      console.log(`[computer] ${this.agent.id} steer budget spent (${this.steerBudget.steers} steers, ${this.steerBudget.chars} chars) — ping rides the rerun`)
+      return
+    }
     this.sideSteering = true
     try {
       await this.ensureToken()
@@ -3198,9 +3267,10 @@ export class AgentRunner {
         if (nowMs - this.lastGroupSteerAt < GROUP_STEER_MIN_INTERVAL_MS) return
         this.lastGroupSteeredMsgId = latestGroup.id
         this.lastGroupSteerAt = nowMs
-        session.steer(
-          `⚡ ${rows.length} new message(s) arrived in ${convo} while you work — bodies withheld to keep you focused. At a natural pause, \`cumora glance ${convo}\` and handle it if it's yours (yield/claim as usual); otherwise keep going. Do NOT drop your current task.`,
-        )
+        const notice =
+          `⚡ ${rows.length} new message(s) arrived in ${convo} while you work — bodies withheld to keep you focused. At a natural pause, \`cumora glance ${convo}\` and handle it if it's yours (yield/claim as usual); otherwise keep going. Do NOT drop your current task.`
+        session.steer(notice)
+        this.steerBudget = chargeSteerBudget(this.steerBudget, notice.length)
         console.log(`[computer] ${this.agent.id} GROUP-NOTICE → live turn (${rows.length} msg(s) in ${convo}, content-free)`)
         return
       }
@@ -3214,10 +3284,14 @@ export class AgentRunner {
       }
       this.lastSteeredMsgId = latest.id
       const who = latest.author_name ?? 'someone'
-      const body = (latest.body ?? '').replace(/\s+/g, ' ').slice(0, 300)
-      session.steer(
-        `⚡ A direct message arrived while you work — answer it BRIEFLY, then resume your current task (do NOT drop it). ${who} in ${convo}: "${body}". Reply one line now: \`cumora reply ${convo} 'text'\` — a quick answer, or "on it, mid-task, will follow up". Then continue what you were doing.`,
-      )
+      // 300 chars cut ordinary messages mid-sentence, so the agent answered
+      // half a question. The cloud steer path allows 4096 for the same reason;
+      // the full body stays in `messages` for anything longer.
+      const body = (latest.body ?? '').replace(/\s+/g, ' ').slice(0, STEER_BODY_CHARS)
+      const text =
+        `⚡ A direct message arrived while you work — answer it BRIEFLY, then resume your current task (do NOT drop it). ${who} in ${convo}: "${body}". Reply one line now: \`cumora reply ${convo} 'text'\` — a quick answer, or "on it, mid-task, will follow up". Then continue what you were doing.`
+      session.steer(text)
+      this.steerBudget = chargeSteerBudget(this.steerBudget, text.length)
       console.log(`[computer] ${this.agent.id} STEER → live turn (direct msg in ${convo} from ${who})`)
     } catch { /* best-effort; the coalesced rerun still handles it at turn end */ } finally {
       this.sideSteering = false
@@ -3238,6 +3312,9 @@ export class AgentRunner {
     }
     this.busy = true
     this.attachmentCache.beginTurn()
+    // Fresh steering allowance for this turn. The counter describes ONE turn:
+    // carrying it forward would silently starve every later turn's pings.
+    this.steerBudget = { steers: 0, chars: 0, maxSteers: MAX_STEERS_PER_TURN, maxChars: MAX_STEER_CHARS_PER_TURN }
     let activeBackgroundBrief: WakeBackgroundBrief | null = null
     try {
       do {
@@ -3374,13 +3451,17 @@ export class AgentRunner {
         // "<agent> is typing…" in the conversation that woke us, refreshed
         // while the engine works (BYOA runs can be long), cleared at the end.
         let typingTimer: ReturnType<typeof setInterval> | undefined
+        // Rooms this turn claims as "composing", and the SAME list the finally
+        // block releases. Claiming one set and releasing another left unread
+        // rooms' claims and HELD counters alive past the turn (see
+        // turnThinkingConvos). Empty without a typing room, because the claim
+        // below is gated on that room existing.
+        const thinkingIds: string[] = convo ? turnThinkingConvos(convo, seen) : []
         if (convo) {
           const ping = (): void => { void runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: false }) }
           // Stamp every conversation in this wake, not just the trigger.
           // Mixed-project wakes then fall back to GLOBAL on memory writes
           // instead of guessing the trigger group's project.
-          const wakeConvos = [...seen.keys()]
-          const thinkingIds = wakeConvos.length > 0 ? wakeConvos : [convo]
           const thinkingPing = (): void => { void runtimeBest(this.cfg.serverUrl, '/thinking/mark', token, { conversationIds: thinkingIds, ttlSec: 60 }) }
           ping()
           thinkingPing()
@@ -3469,10 +3550,14 @@ export class AgentRunner {
           if (typingTimer) clearInterval(typingTimer)
           // Per-turn ledger drain (mirrors the agenda finally above).
           this.currentRunId = null
-          void this.reporter.flush()
           if (convo) {
             await runtimeBest(this.cfg.serverUrl, '/typing', token, { conversationId: convo, done: true })
-            await runtimeBest(this.cfg.serverUrl, '/thinking/unmark', token, { conversationIds: [convo] })
+          }
+          // Release EVERY room this turn claimed. The indicator room is the one
+          // the human sees, but the claim — and the per-turn HELD count cleared
+          // alongside it — belongs to all of them.
+          if (thinkingIds.length > 0) {
+            await runtimeBest(this.cfg.serverUrl, '/thinking/unmark', token, { conversationIds: thinkingIds })
           }
           // Release the semaphore slot regardless of success / error — the
           // next queued agent can now spawn. MUST be in the same finally

@@ -17,6 +17,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import type { PoolClient } from 'pg'
 import { pool } from '../../db/pool.js'
+import { clearHold, clearHeldAttempts } from '../seen-boundary.js'
 import { CH_MESSAGE_NEW, CH_TYPING, publish, redis } from '../../redis.js'
 import { enqueueBroadcast, nudgeRealtimeOutbox } from '../../realtime-outbox.js'
 import { notifyAlert } from '../../alerting.js'
@@ -859,10 +860,15 @@ export class InProcRuntimeClient implements AgentRuntimeClient {
     // 3.5 minutes after the HOLD it acknowledged (the 2026-07-08 counting-
     // game stale-"6" dup). Every turn path funnels through here (BYOA
     // daemon and cloud pod via /thinking/unmark, in-proc turns directly).
+    // The per-turn HELD count dies here too: it describes THIS turn only, and
+    // carrying it into the next wake would escalate that turn's very first
+    // hold. Every turn path funnels through this method.
     try {
-      const { clearHold } = await import('../seen-boundary.js')
-      await Promise.all(conversationIds.map((cid) => clearHold(agentId, `reply:${cid}`)))
-    } catch { /* fail-open — the short TTL reclaims it */ }
+      await Promise.all(conversationIds.flatMap((cid) => [
+        clearHold(agentId, `reply:${cid}`),
+        clearHeldAttempts(agentId, cid),
+      ]))
+    } catch { /* fail-open — both TTLs reclaim */ }
   }
 
   async peekThinking(conversationId: string): Promise<Array<{ agentId: string; claimedAt: number }>> {
