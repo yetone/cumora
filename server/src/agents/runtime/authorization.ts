@@ -250,8 +250,8 @@ export async function withRuntimeAttachmentReadAuthorization(args: {
                 FROM jsonb_array_elements(
                   CASE WHEN jsonb_typeof(m.attachments) = 'array'
                        THEN m.attachments ELSE '[]'::jsonb END
-                ) attachment
-               WHERE attachment->>'key' = $3
+                ) candidate
+               WHERE candidate->>'key' = $3
             )
           )
           AND EXISTS (
