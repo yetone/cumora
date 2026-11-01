@@ -55,10 +55,11 @@ import {
   resolveDevice, mintAgentRuntimeToken, listAgentsForComputer,
   listComputers, revokeComputer, assignAgentToComputer, heartbeatComputer,
   cloudComputerId, issueRepairCode, requestEngineDetect, reportDetectedEngines,
+  getComputerUnsandboxedMode, setComputerUnsandboxedMode,
   setComputerDefaultEngine, updateEngineDefaults, getEngineDefaults, canUpdateEngine,
   rotateCompanyPairingCode, PAIRABLE_ENGINES, type EngineId,
 } from '../agents/computer/registry.js'
-import { attachComputerControlStream, deliverEngineDetect, deliverEngineUpdate } from '../agents/computer/control-bus.js'
+import { attachComputerControlStream, deliverComputerSecurityMode, deliverEngineDetect, deliverEngineUpdate } from '../agents/computer/control-bus.js'
 import { getEngineUpdate, reportEngineUpdate, startEngineUpdate } from '../agents/computer/engine-update.js'
 import { companyTier } from '../tier.js'
 import { createShippingRouter } from './shipping-router.js'
@@ -1251,11 +1252,12 @@ api.post('/computers/pair', safe(async (req, res) => {
   const hostName = typeof req.body?.hostName === 'string' ? req.body.hostName : undefined
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
+  const unsandboxed = typeof req.body?.unsandboxed === 'boolean' ? req.body.unsandboxed : undefined
   // Defer the "online" broadcast until AFTER seeding (below): the desktop flips
   // its onboarding gate on that event and immediately reloads its roster, so the
   // starter team + "Everyone" group must already exist when it fires — otherwise
   // the user lands on an empty Conversations list that fills in a beat later.
-  const paired = await pairComputer({ code, hostName, engines, detected, blocked: blockedAtPair, version, supervised, deferBroadcast: true })
+  const paired = await pairComputer({ code, hostName, engines, detected, blocked: blockedAtPair, version, supervised, unsandboxed, deferBroadcast: true })
   if (!paired) throw new HttpError(400, 'invalid pairing token')
   // Free-tier BYOA onboarding on pair. The daemon sends the engines list with
   // the user's CHOSEN engine first (`cumora agent computer --pair … --engine X`),
@@ -1310,6 +1312,27 @@ api.post('/computers/:id/detect', safe(async (req, res) => {
     console.warn('[computers] immediate engine detection signal failed:', error instanceof Error ? error.message : String(error))
   }
   res.json({ ok: true, delivered })
+}))
+
+// Persist a host-wide compatibility opt-in and nudge the paired daemon. The
+// daemon only applies the new environment after a restart; supervised daemons
+// restart themselves, while foreground daemons get a copyable CLI hint.
+api.put('/computers/:id/unsandboxed-mode', safe(async (req, res) => {
+  const { companyId } = await requireCompanyRole(req)
+  if (typeof req.body?.enabled !== 'boolean') throw new HttpError(400, 'enabled must be a boolean')
+  const mode = await setComputerUnsandboxedMode({
+    computerId: String(req.params.id), companyId, enabled: req.body.enabled,
+  })
+  if (!mode) throw new HttpError(404, 'computer not found or not configurable')
+  let delivered = mode.active === mode.enabled
+  if (!delivered && mode.online) {
+    try {
+      delivered = (await deliverComputerSecurityMode(String(req.params.id), req.body.enabled)) > 0
+    } catch (error) {
+      console.warn('[computers] security mode signal failed:', error instanceof Error ? error.message : String(error))
+    }
+  }
+  res.json({ ok: true, ...mode, delivered })
 }))
 
 // Run one engine's own updater on the paired machine — the button beside the
@@ -1429,19 +1452,30 @@ api.get('/computers/me/agents', safe(async (req, res) => {
   res.json(await listAgentsForComputer(computerId, req.query.providerProfiles === '1'))
 }))
 
+// The daemon reads this before engine discovery so a persisted UI setting is
+// available even when its service supervisor has an older fixed environment.
+api.get('/computers/me/unsandboxed-mode', safe(async (req, res) => {
+  const { computerId } = await requireDevice(req)
+  const enabled = await getComputerUnsandboxedMode(computerId)
+  if (enabled === null) throw new HttpError(404, 'computer not found')
+  res.json({ enabled })
+}))
+
 // Daemon liveness heartbeat — keeps the computer 'online' (an offline sweep
 // flips it once heartbeats go stale).
 api.post('/computers/heartbeat', safe(async (req, res) => {
   const { computerId } = await requireDevice(req)
   const version = typeof req.body?.version === 'string' ? req.body.version : undefined
   const supervised = typeof req.body?.supervised === 'boolean' ? req.body.supervised : undefined
+  const unsandboxedActive = typeof req.body?.unsandboxed === 'boolean' ? req.body.unsandboxed : undefined
   // Engines the daemon can currently see on PATH. Optional: an older daemon
   // sends none and its stored list is left exactly as it was.
   const engines = Array.isArray(req.body?.engines)
     ? (req.body.engines as unknown[]).filter((e): e is string => typeof e === 'string')
     : undefined
-  const detectRequested = await heartbeatComputer(computerId, version, supervised, engines)
-  res.json({ ok: true, detectRequested })
+  const detectRequested = await heartbeatComputer(computerId, version, supervised, engines, unsandboxedActive)
+  const unsandboxedEnabled = await getComputerUnsandboxedMode(computerId)
+  res.json({ ok: true, detectRequested, unsandboxedEnabled })
 }))
 
 // Mint a per-agent runtime JWT for the calling computer (daemon refresh loop).

@@ -133,11 +133,13 @@ test('daemon run mode (supervised) is persisted on pair and heartbeat', async ()
 
   await registry.pairComputer({
     code: 'repair-token', hostName: 'MacBook Air', engines: ['claude'],
-    version: '0.1.122', supervised: true, deferBroadcast: true,
+    version: '0.1.122', supervised: true, unsandboxed: true, deferBroadcast: true,
   })
   const updates = () => calls.filter((c) => /UPDATE computers\s+SET credential_hash/.test(c.sql))
   assert.equal(updates()[0]?.params[4], '0.1.122')
   assert.equal(updates()[0]?.params[5], true)
+  assert.equal(updates()[0]?.params[6], true)
+  assert.equal(typeof updates()[0]?.params[7], 'string', 'detected-engine JSON stays in the final placeholder')
 
   // An old daemon that doesn't report the mode must not clobber the stored
   // value: the param is NULL and the SQL COALESCEs it away.
@@ -145,6 +147,7 @@ test('daemon run mode (supervised) is persisted on pair and heartbeat', async ()
     code: 'repair-token', hostName: 'MacBook Air', engines: ['claude'], deferBroadcast: true,
   })
   assert.equal(updates()[1]?.params[5], null)
+  assert.equal(updates()[1]?.params[6], null)
 
   // Heartbeat carries the live mode — a service uninstalled + re-run by hand
   // flips supervised true→false within one heartbeat.
@@ -153,6 +156,7 @@ test('daemon run mode (supervised) is persisted on pair and heartbeat', async ()
   assert.ok(hb, 'heartbeat should bump the row')
   assert.equal(hb.params[1], '0.1.122')
   assert.equal(hb.params[2], false)
+  assert.equal(hb.params[3], null)
 })
 
 test('pairComputer accepts antigravity engine as primary and stores it in available_engines', async () => {
@@ -178,5 +182,42 @@ test('pairComputer accepts antigravity engine as primary and stores it in availa
   const update = calls.find((c) => /UPDATE computers\s+SET credential_hash/.test(c.sql))
   assert.ok(update)
   assert.equal(update.params[1], JSON.stringify(['antigravity', 'claude']))
+})
+
+test('a newly paired computer persists its unsandboxed opt-in as both requested and active mode', async () => {
+  const calls = installPoolMock(({ sql }) => {
+    if (/SELECT id, company_id, available_engines FROM computers/.test(sql)) return { rows: [] }
+    if (/SELECT id, owner_user_id FROM companies/.test(sql)) {
+      return { rows: [{ id: 'co-1', owner_user_id: 'u-1' }] }
+    }
+    if (/SELECT id FROM computers/.test(sql)) return { rows: [] }
+    if (/INSERT INTO computers/.test(sql)) return { rowCount: 1 }
+    throw new Error(`unexpected query: ${sql}`)
+  })
+
+  await registry.pairComputer({
+    code: 'company-token', hostName: 'New workstation', engines: ['claude'],
+    unsandboxed: true, deferBroadcast: true,
+  })
+
+  const insert = calls.find((call) => /INSERT INTO computers/.test(call.sql))
+  assert.ok(insert)
+  assert.match(insert.sql, /unsandboxed_enabled, unsandboxed_active/)
+  assert.equal(insert.params[9], true)
+})
+
+test('computer security-mode updates are scoped to the owning company and BYOA rows', async () => {
+  const calls = installPoolMock(({ sql }) => {
+    assert.match(sql, /company_id = \$2/)
+    assert.match(sql, /kind <> 'cloud'/)
+    return { rows: [{ unsandboxed_enabled: true, unsandboxed_active: false, daemon_supervised: false, status: 'online' }] }
+  })
+
+  const mode = await registry.setComputerUnsandboxedMode({
+    computerId: 'comp-1', companyId: 'co-1', enabled: true,
+  })
+
+  assert.deepEqual(mode, { enabled: true, active: false, supervised: false, online: true })
+  assert.deepEqual(calls[0]?.params, ['comp-1', 'co-1', true])
 })
 

@@ -35,6 +35,15 @@ test('an engine update carries only an id, never a command', () => {
   assert.equal(parseComputerControlEvent(JSON.stringify({ kind: 'engine.update', id: 'u1', at: 1 })), null)
 })
 
+test('security mode control events carry only a boolean mode', () => {
+  assert.deepEqual(parseComputerControlEvent(JSON.stringify({
+    kind: 'security.mode', id: 'security.mode-1', at: 1, unsandboxed: true,
+  })), { kind: 'security.mode', id: 'security.mode-1', at: 1, unsandboxed: true })
+  assert.equal(parseComputerControlEvent(JSON.stringify({
+    kind: 'security.mode', id: 'security.mode-1', at: 1, unsandboxed: '1',
+  })), null)
+})
+
 test('an immediate forced refresh arriving during a scan gets a forced follow-up', async () => {
   let releaseFirst!: () => void
   const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve })

@@ -3,16 +3,20 @@ export type ComputerControlEvent =
   | { kind: 'engine.detect'; id: string; at: number }
   /** `engine` names what to update; the daemon derives the command itself. */
   | { kind: 'engine.update'; id: string; at: number; engine: string }
+  | { kind: 'security.mode'; id: string; at: number; unsandboxed: boolean }
 
 const ENGINE_ID = /^[a-z][a-z0-9-]{0,31}$/
 
 export function parseComputerControlEvent(raw: string): ComputerControlEvent | null {
   try {
-    const value = JSON.parse(raw) as { kind?: unknown; id?: unknown; at?: unknown; engine?: unknown } | null
+    const value = JSON.parse(raw) as { kind?: unknown; id?: unknown; at?: unknown; engine?: unknown; unsandboxed?: unknown } | null
     if (!value) return null
     const { kind, id, at } = value
     if (typeof id !== 'string' || !id || typeof at !== 'number' || !Number.isFinite(at)) return null
     if (kind === 'engine.detect') return { kind, id, at }
+    if (kind === 'security.mode' && typeof value.unsandboxed === 'boolean') {
+      return { kind, id, at, unsandboxed: value.unsandboxed }
+    }
     const { engine } = value
     // Only a plain engine id crosses the wire: the daemon picks the command, so
     // a payload can never smuggle one in.

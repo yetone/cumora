@@ -304,6 +304,9 @@ export interface ComputerRow {
    *  FALSE = a manually-run foreground command, NULL = cloud / an old daemon
    *  that doesn't report it. Drives run-mode-specific update instructions. */
   daemon_supervised: boolean | null
+  /** Requested compatibility mode and the mode reported by the live daemon. */
+  unsandboxed_enabled: boolean
+  unsandboxed_active: boolean
   detected_engines: DetectedEngine[]
   engines_detected_at: string | null
   detect_requested_at: string | null
@@ -481,6 +484,8 @@ export async function pairComputer(args: {
   version?: string
   /** Whether the daemon runs supervised (service) vs. as a foreground command. */
   supervised?: boolean
+  /** Whether this daemon is currently running without the secure boundary. */
+  unsandboxed?: boolean
   /** Skip the online WS broadcast so the caller can fire it later (e.g. after
    *  seeding the starter team). The DB row is still marked online; only the
    *  client-facing notification is deferred. Caller must then call
@@ -493,6 +498,8 @@ export async function pairComputer(args: {
   const detectedJson = JSON.stringify(detected)
   const version = typeof args.version === 'string' && args.version ? args.version.slice(0, 32) : null
   const supervised = typeof args.supervised === 'boolean' ? args.supervised : null
+  const unsandboxed = args.unsandboxed === true
+  const unsandboxedActive = typeof args.unsandboxed === 'boolean' ? args.unsandboxed : null
   const deviceToken = randomBytes(32).toString('base64url')
   const reportedName = (args.hostName ?? '').slice(0, 80)
   const name = reportedName || 'My computer'
@@ -516,10 +523,11 @@ export async function pairComputer(args: {
               name = COALESCE(NULLIF($3, ''), name),
               daemon_version = COALESCE($5, daemon_version),
               daemon_supervised = COALESCE($6, daemon_supervised),
-              detected_engines = $7::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
+              unsandboxed_active = COALESCE($7, unsandboxed_active),
+              detected_engines = $8::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
               status = 'online', last_seen_at = NOW(), paired_at = NOW()
         WHERE id = $4`,
-      [hashToken(deviceToken), JSON.stringify(orderedEngines), reportedName, id, version, supervised, reconnectDetectedJson],
+      [hashToken(deviceToken), JSON.stringify(orderedEngines), reportedName, id, version, supervised, unsandboxedActive, reconnectDetectedJson],
     )
     if (!args.deferBroadcast) await broadcastComputerStatus(id, companyId, 'online')
     return { computerId: id, companyId, deviceToken }
@@ -560,19 +568,20 @@ export async function pairComputer(args: {
             SET credential_hash = $1, available_engines = $2::jsonb,
                 daemon_version = COALESCE($4, daemon_version),
                 daemon_supervised = COALESCE($5, daemon_supervised),
-                detected_engines = $6::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
+                unsandboxed_active = COALESCE($6, unsandboxed_active),
+                detected_engines = $7::jsonb, engines_detected_at = NOW(), detect_requested_at = NULL,
                 status = 'online', last_seen_at = NOW(), paired_at = NOW(), revoked_at = NULL
           WHERE id = $3`,
-        [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised, detectedJson],
+        [hashToken(deviceToken), JSON.stringify(engines), id, version, supervised, unsandboxedActive, detectedJson],
       )
       paired = { computerId: id, companyId, deviceToken }
     } else {
       const computerId = `comp-${randomUUID().slice(0, 12)}`
       await client.query(
         `INSERT INTO computers
-           (id, company_id, owner_user_id, name, kind, available_engines, status, credential_hash, paired_at, last_seen_at, daemon_version, daemon_supervised, detected_engines, engines_detected_at)
-         VALUES ($1, $2, $3, $4, 'local', $5::jsonb, 'online', $6, NOW(), NOW(), $7, $8, $9::jsonb, NOW())`,
-        [computerId, companyId, ownerUserId, name, JSON.stringify(engines), hashToken(deviceToken), version, supervised, detectedJson],
+           (id, company_id, owner_user_id, name, kind, available_engines, status, credential_hash, paired_at, last_seen_at, daemon_version, daemon_supervised, detected_engines, engines_detected_at, unsandboxed_enabled, unsandboxed_active)
+         VALUES ($1, $2, $3, $4, 'local', $5::jsonb, 'online', $6, NOW(), NOW(), $7, $8, $9::jsonb, NOW(), $10, $10)`,
+        [computerId, companyId, ownerUserId, name, JSON.stringify(engines), hashToken(deviceToken), version, supervised, detectedJson, unsandboxed],
       )
       paired = { computerId, companyId, deviceToken }
     }
@@ -596,6 +605,7 @@ export async function heartbeatComputer(
   version?: string,
   supervised?: boolean,
   detectedEngines?: string[],
+  unsandboxedActive?: boolean,
 ): Promise<boolean> {
   const v = typeof version === 'string' && version ? version.slice(0, 32) : null
   const sup = typeof supervised === 'boolean' ? supervised : null
@@ -605,17 +615,19 @@ export async function heartbeatComputer(
   // heartbeat reached the server.
   const bumped = await pool.query<{ detect_requested_at: string | null }>(
     `UPDATE computers SET last_seen_at = NOW(), daemon_version = COALESCE($2, daemon_version),
-            daemon_supervised = COALESCE($3, daemon_supervised)
+            daemon_supervised = COALESCE($3, daemon_supervised),
+            unsandboxed_active = COALESCE($4, unsandboxed_active)
       WHERE id = $1 AND revoked_at IS NULL AND status = 'online' RETURNING detect_requested_at`,
-    [computerId, v, sup],
+    [computerId, v, sup, typeof unsandboxedActive === 'boolean' ? unsandboxedActive : null],
   )
   let detectRequested = Boolean(bumped.rows[0]?.detect_requested_at)
   if (!bumped.rowCount) {
     const { rows } = await pool.query<{ company_id: string; detect_requested_at: string | null }>(
       `UPDATE computers SET status = 'online', last_seen_at = NOW(), daemon_version = COALESCE($2, daemon_version),
-              daemon_supervised = COALESCE($3, daemon_supervised)
+              daemon_supervised = COALESCE($3, daemon_supervised),
+              unsandboxed_active = COALESCE($4, unsandboxed_active)
         WHERE id = $1 AND revoked_at IS NULL RETURNING company_id, detect_requested_at`,
-      [computerId, v, sup],
+      [computerId, v, sup, typeof unsandboxedActive === 'boolean' ? unsandboxedActive : null],
     )
     detectRequested = Boolean(rows[0]?.detect_requested_at)
     if (rows[0]) await broadcastComputerStatus(computerId, rows[0].company_id, 'online')
@@ -869,7 +881,8 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
             last_seen_at, paired_at, revoked_at, created_at, daemon_version, daemon_supervised,
             COALESCE(detected_engines, '[]'::jsonb) AS detected_engines,
             engines_detected_at, detect_requested_at,
-            COALESCE(engine_defaults, '{}'::jsonb) AS engine_defaults
+            COALESCE(engine_defaults, '{}'::jsonb) AS engine_defaults,
+            unsandboxed_enabled, unsandboxed_active
        FROM computers
       WHERE company_id = $1 AND revoked_at IS NULL
       ORDER BY (kind = 'cloud') DESC, created_at ASC`,
@@ -886,6 +899,42 @@ export async function listComputers(companyId: string): Promise<ComputerWithUpgr
       r.kind !== 'cloud' && latest != null &&
       (r.daemon_version == null || versionGt(latest, r.daemon_version)),
   }))
+}
+
+/** Read the desired host-wide mode for an authenticated daemon. */
+export async function getComputerUnsandboxedMode(computerId: string): Promise<boolean | null> {
+  const { rows } = await pool.query<{ unsandboxed_enabled: boolean }>(
+    `SELECT unsandboxed_enabled FROM computers
+      WHERE id = $1 AND kind <> 'cloud' AND revoked_at IS NULL LIMIT 1`,
+    [computerId],
+  )
+  return rows[0]?.unsandboxed_enabled ?? null
+}
+
+/** Store the requested host-wide mode and return delivery/status information. */
+export async function setComputerUnsandboxedMode(args: {
+  computerId: string
+  companyId: string
+  enabled: boolean
+}): Promise<{ enabled: boolean; active: boolean; supervised: boolean | null; online: boolean } | null> {
+  const { rows } = await pool.query<{
+    unsandboxed_enabled: boolean
+    unsandboxed_active: boolean
+    daemon_supervised: boolean | null
+    status: ComputerStatus
+  }>(
+    `UPDATE computers SET unsandboxed_enabled = $3
+      WHERE id = $1 AND company_id = $2 AND kind <> 'cloud' AND revoked_at IS NULL
+      RETURNING unsandboxed_enabled, unsandboxed_active, daemon_supervised, status`,
+    [args.computerId, args.companyId, args.enabled],
+  )
+  const row = rows[0]
+  return row ? {
+    enabled: row.unsandboxed_enabled,
+    active: row.unsandboxed_active,
+    supervised: row.daemon_supervised,
+    online: row.status !== 'offline',
+  } : null
 }
 
 export interface ResolvedAgentHost {

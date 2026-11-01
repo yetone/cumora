@@ -869,6 +869,10 @@ function ComputersTab() {
   const [repairCode, setRepairCode] = useState<string | null>(null)
   const [repairCopied, setRepairCopied] = useState(false)
   const [busyId, setBusyId] = useState<string | null>(null)
+  const [modeBusyId, setModeBusyId] = useState<string | null>(null)
+  const [modeNotice, setModeNotice] = useState<string | null>(null)
+  const hasPendingMode = Object.values(byId).some((c) => c.kind !== 'cloud'
+    && Boolean(c.unsandboxedEnabled) !== Boolean(c.unsandboxedActive))
   const [copiedCli, setCopiedCli] = useState<string | null>(null)
   // `computerId:engine` whose update the daemon is running right now.
   const [updatingCli, setUpdatingCli] = useState<string | null>(null)
@@ -910,6 +914,13 @@ function ComputersTab() {
   useEffect(() => {
     void useComputers.getState().refresh()
   }, [])
+  useEffect(() => {
+    // Resume confirmation after a reload; a saved preference is not an active mode.
+    if (!hasPendingMode || modeBusyId !== null) return
+    const interval = window.setInterval(() => { void useComputers.getState().refresh() }, 1000)
+    const timeout = window.setTimeout(() => window.clearInterval(interval), 45_000)
+    return () => { window.clearInterval(interval); window.clearTimeout(timeout) }
+  }, [hasPendingMode, modeBusyId])
   useEffect(() => { if (!repairCopied) return; const id = window.setTimeout(() => setRepairCopied(false), 1600); return () => window.clearTimeout(id) }, [repairCopied])
   useEffect(() => { if (!copiedCli) return; const id = window.setTimeout(() => setCopiedCli(null), 1600); return () => window.clearTimeout(id) }, [copiedCli])
   useEffect(() => { setCopied(false) }, [code, companyId])
@@ -1019,6 +1030,50 @@ function ComputersTab() {
     }
   }
 
+  async function toggleUnsandboxed(computer: Computer) {
+    const enabled = !computer.unsandboxedEnabled
+    const confirmation = enabled
+      ? t('me.unsandboxedConfirmOn', { name: computer.name })
+      : t('me.unsandboxedConfirmOff', { name: computer.name })
+    if (!confirm(confirmation)) return
+    setModeBusyId(computer.id)
+    setModeNotice(null)
+    setErr(null)
+    try {
+      const result = await api.setComputerUnsandboxedMode(computer.id, enabled)
+      await useComputers.getState().refresh()
+      if (result.active === enabled) {
+        // The daemon reports the new mode before its post-restart engine scan;
+        // request that snapshot so the card cannot claim success with stale rows.
+        await refreshEngines(computer.id)
+        setModeNotice(t(enabled ? 'me.unsandboxedActive' : 'me.compatibilityDisabled'))
+      } else if (!result.online) {
+        setModeNotice(t('me.unsandboxedOffline'))
+      } else if (result.supervised === true) {
+        setModeNotice(t('me.unsandboxedAutoRestart'))
+        const deadline = Date.now() + 45_000
+        while (Date.now() < deadline) {
+          await new Promise((resolve) => window.setTimeout(resolve, 1000))
+          await useComputers.getState().refresh()
+          if (useComputers.getState().byId[computer.id]?.unsandboxedActive === enabled) {
+            await refreshEngines(computer.id)
+            setModeNotice(t(enabled ? 'me.unsandboxedActive' : 'me.compatibilityDisabled'))
+            return
+          }
+        }
+        setModeNotice(t('me.unsandboxedRestartFailed'))
+      } else if (result.supervised === false) {
+        setModeNotice(t('me.unsandboxedManualRestart', { command: 'npx cumora@latest agent computer' }))
+      } else {
+        setModeNotice(t('me.unsandboxedRestartFailed'))
+      }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setModeBusyId(null)
+    }
+  }
+
   /** Only this request's result ends the wait; ordinary scans are unrelated. */
   async function updateEngine(computerId: string, engineId: string) {
     const key = `${computerId}:${engineId}`
@@ -1054,6 +1109,7 @@ function ComputersTab() {
         {!loaded && <div className="text-[13px] text-ink-400">{t('common.loading')}</div>}
 
         {err && <div className="mb-3 text-[12px] text-coral-deep bg-coral-soft rounded-[8px] p-2">{err}</div>}
+        {modeNotice && <div className="mb-3 text-[12px] text-skype-deep bg-sky2-50 rounded-[8px] p-2">{modeNotice}</div>}
 
         <div className="grid gap-3">
           {list.map((c) => {
@@ -1064,6 +1120,8 @@ function ComputersTab() {
             const repairCmd = repairCode ? `npx cumora@latest agent computer --pair ${repairCode}${serverFlag}` : ''
             const rows = repairable ? pairedRows(c) : []
             const detecting = busyId === c.id
+            const modePending = Boolean(c.unsandboxedEnabled) !== Boolean(c.unsandboxedActive)
+            const modeApplying = modeBusyId === c.id || modePending
             // Extracted so the header can be wrapped in either a plain
             // container or a real toggle control without duplicating it.
             const headerBody = (
@@ -1076,6 +1134,12 @@ function ComputersTab() {
                           <span className="w-2 h-2 rounded-full" style={{ background: STATUS_COLOR[c.status] ?? 'var(--ink-300)' }} />
                           {t(COMPUTER_STATUS_KEY[c.status] ?? 'me.computerStatus.offline')}
                         </span>
+                        {repairable && (c.unsandboxedActive || modeApplying) && (
+                          <span className={cn('text-[10px] font-semibold px-2 py-0.5 rounded-full',
+                            modeApplying ? 'bg-sky2-50 text-skype-deep' : 'bg-coral-soft text-coral-deep')}>
+                            {t(modeApplying ? 'me.unsandboxedPending' : 'me.unsandboxedActive')}
+                          </span>
+                        )}
                         {c.daemonOutdated && (
                           <span className="inline-flex items-center gap-1 text-[10.5px] font-semibold px-2 py-0.5 rounded-full"
                             style={{ background: 'rgba(244,183,64,0.18)', color: 'var(--gold-deep)' }}
@@ -1111,6 +1175,47 @@ function ComputersTab() {
                     </div>
                     {repairable && (
                       <>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={Boolean(c.unsandboxedEnabled)}
+                          aria-busy={modeApplying}
+                          aria-label={t('me.compatibilityMode')}
+                          disabled={modeBusyId === c.id}
+                          onClick={(e) => { e.stopPropagation(); void toggleUnsandboxed(c) }}
+                          className="group inline-flex items-center gap-2 rounded-full px-2 py-1 text-[11px] font-semibold text-ink-600 transition-transform active:scale-[.97] hover:bg-sky2-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-skype disabled:opacity-50"
+                          title={t('me.unsandboxedHint')}
+                        >
+                          <span
+                            aria-hidden="true"
+                            className={cn('relative block h-5 w-9 shrink-0 overflow-hidden rounded-full transition-[background,box-shadow] duration-300',
+                              c.unsandboxedEnabled ? 'bg-skype' : 'bg-ink-200')}
+                            style={{
+                              boxShadow: c.unsandboxedEnabled
+                                ? 'inset 0 1px 2px rgba(255,255,255,.55), 0 2px 9px rgba(0,120,200,.25)'
+                                : 'inset 0 1px 2px rgba(25,45,60,.12)',
+                            }}
+                          >
+                            <span className="absolute inset-x-1 top-px h-[7px] rounded-full bg-gradient-to-r from-white/20 via-white/70 to-white/10 opacity-80" />
+                            <span
+                              className="absolute top-0.5 h-4 w-4 rounded-full transition-[left,transform] duration-300 ease-out group-active:scale-x-110"
+                              style={{
+                                left: c.unsandboxedEnabled ? 18 : 2,
+                                background: 'linear-gradient(145deg, #fff 8%, #f3fbff 68%, #cfeeff)',
+                                boxShadow: '0 1px 4px rgba(31,65,87,.28), inset 0 1px 1px rgba(255,255,255,.95)',
+                              }}
+                            >
+                              <span className="absolute left-[3px] top-[2px] h-1 w-1 rounded-full bg-white/90 blur-[.5px]" />
+                            </span>
+                          </span>
+                          <span>{t('me.compatibilityMode')}</span>
+                          <span className={c.unsandboxedEnabled || modeApplying ? 'text-skype-deep' : 'text-ink-400'}>
+                            {modePending
+                              ? t(c.unsandboxedEnabled ? 'me.unsandboxedPendingOn' : 'me.unsandboxedPendingOff')
+                              : modeApplying ? t('me.unsandboxedPending')
+                              : t(c.unsandboxedEnabled ? 'me.compatibilityEnabled' : 'me.compatibilityDisabled')}
+                          </span>
+                        </button>
                         <button type="button" disabled={detecting} onClick={(e) => { e.stopPropagation(); void refreshEngines(c.id) }}
                           className="text-[12px] font-semibold text-skype-deep disabled:opacity-45 px-2 py-1">
                           {detecting ? t('me.agentsRefreshing') : t('me.agentsRefresh')}
@@ -1162,6 +1267,14 @@ function ComputersTab() {
             return (
               <div key={c.id} className="bg-cloud rounded-[14px]" style={{ border: '1px solid var(--ink-100)' }}>
                 {header}
+                {repairable && modePending && c.daemonSupervised !== true && (
+                  <p className="px-4 pb-3 text-[12px] text-ink-500">
+                    {c.status === 'offline' ? t('me.unsandboxedOffline')
+                      : c.daemonSupervised === false
+                        ? t('me.unsandboxedManualRestart', { command: 'npx cumora@latest agent computer' })
+                        : t('me.unsandboxedRestartFailed')}
+                  </p>
+                )}
                 {repairable && enginesShown && (
                   rows.length === 0 ? (
                     <div className="px-4 pb-4 text-[12px] text-ink-400">{t('me.agentsNoEngines')}</div>

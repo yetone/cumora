@@ -489,6 +489,8 @@ interface DaemonConfig {
   serverUrl: string
   computerId: string
   deviceToken: string
+  /** Persisted host-wide compatibility mode; absent means secure default. */
+  unsandboxed?: boolean
 }
 
 interface AgentInfo {
@@ -1326,6 +1328,25 @@ async function saveConfig(cfg: DaemonConfig): Promise<void> {
   await chmod(CONFIG_PATH, 0o600)
 }
 
+/** Apply the server's durable preference before any engine capability checks. */
+async function syncUnsandboxedPreference(cfg: DaemonConfig): Promise<void> {
+  try {
+    const result = await api<{ enabled?: unknown }>(cfg.serverUrl, '/api/computers/me/unsandboxed-mode', {
+      headers: { Authorization: `Bearer ${cfg.deviceToken}` },
+    })
+    if (typeof result.enabled === 'boolean') {
+      cfg.unsandboxed = result.enabled
+      await saveConfig(cfg)
+    }
+  } catch (err) {
+    console.warn('[computer] could not refresh security mode; using the last saved preference:', err instanceof Error ? err.message : err)
+  }
+  if (typeof cfg.unsandboxed === 'boolean') {
+    if (cfg.unsandboxed) process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = '1'
+    else delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
+  }
+}
+
 // ─── the `cumora` shim ──────────────────────────────────────────────────
 //
 // The engine must be able to use Cumora without also receiving a reusable JWT
@@ -1786,14 +1807,15 @@ async function doPair(code: string, serverUrl: string, preferredEngine?: string)
     ...await snapshotDetectedEngines(engines),
     ...await blockedSnapshotRows(evaluated.blocked),
   ]
+  const unsandboxed = allowUnsandboxedByoa()
   const paired = await api<{ computerId: string; deviceToken: string }>(
     serverUrl, '/api/computers/pair',
     { method: 'POST', body: JSON.stringify({
       code, hostName: await detectHostName(), engines, detected: snapshot,
-      blocked: blockedIds, version: CURRENT_VERSION, supervised: SUPERVISED,
+      blocked: blockedIds, version: CURRENT_VERSION, supervised: SUPERVISED, unsandboxed,
     }) },
   )
-  await saveConfig({ serverUrl, computerId: paired.computerId, deviceToken: paired.deviceToken })
+  await saveConfig({ serverUrl, computerId: paired.computerId, deviceToken: paired.deviceToken, unsandboxed })
   console.log(`[computer] paired as ${paired.computerId} (default engine: ${engines[0] ?? 'none'}; available: ${engines.join(', ') || 'none'}) — starting…`)
 }
 
@@ -3801,6 +3823,9 @@ async function doRun(serverOverride?: string): Promise<void> {
     return
   }
   if (serverOverride) cfg.serverUrl = serverOverride
+  // Resolve the server preference before engine discovery so every adapter
+  // sees the same mode. Offline restarts fall back to the last saved value.
+  await syncUnsandboxedPreference(cfg)
   let initialEngines: EngineId[]
   try {
     initialEngines = [...(await requireLocalEngine()).runnable]
@@ -4039,13 +4064,35 @@ async function doRun(serverOverride?: string): Promise<void> {
         // `supervised` tells the server HOW this daemon runs (service vs. a
         // foreground command), so the app's upgrade banner can show the right
         // update instructions for this machine.
-        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, engines: engineInventory.current }),
+        body: JSON.stringify({ version: CURRENT_VERSION, supervised: SUPERVISED, unsandboxed: allowUnsandboxedByoa(), engines: engineInventory.current }),
       })
       if (!response.ok) return
-      const heartbeatResult = await response.json().catch(() => null) as { detectRequested?: boolean } | null
+      const heartbeatResult = await response.json().catch(() => null) as { detectRequested?: boolean; unsandboxedEnabled?: boolean | null } | null
+      if (typeof heartbeatResult?.unsandboxedEnabled === 'boolean' && heartbeatResult.unsandboxedEnabled !== allowUnsandboxedByoa()) {
+        // A toggle made while this daemon was offline is picked up here. A
+        // supervised daemon exits and is relaunched with the saved config;
+        // foreground daemons keep running safely until the operator restarts.
+        if (cfg.unsandboxed !== heartbeatResult.unsandboxedEnabled) {
+          cfg.unsandboxed = heartbeatResult.unsandboxedEnabled
+          await saveConfig(cfg)
+          if (SUPERVISED) console.warn('[computer] security mode changed while offline; restarting to apply it')
+          else console.warn('[computer] security mode changed while offline; restart this foreground daemon to apply it')
+          if (SUPERVISED) {
+            if (restartForSecurityMode) restartForSecurityMode(!heartbeatResult.unsandboxedEnabled)
+            else {
+              securityModeRestartPending = true
+              securityModeRestartImmediate = !heartbeatResult.unsandboxedEnabled
+            }
+          }
+        }
+      }
       if (heartbeatResult?.detectRequested) void rescanEngines(true)
     } catch { /* transient — next tick retries */ }
   }
+
+  let securityModeRestartPending = false
+  let securityModeRestartImmediate = false
+  let restartForSecurityMode: ((immediate: boolean) => void) | null = null
 
   let shuttingDown = false
   // Serialize control events; the server refuses a second pending update.
@@ -4112,6 +4159,12 @@ async function doRun(serverOverride?: string): Promise<void> {
           const signal = event.data ? parseComputerControlEvent(event.data) : null
           if (signal?.kind === 'engine.detect') void rescanEngines(true)
           else if (signal?.kind === 'engine.update') void updateEngine(signal.engine, signal.id)
+          else if (signal?.kind === 'security.mode') {
+            cfg.unsandboxed = signal.unsandboxed
+            await saveConfig(cfg)
+            if (SUPERVISED) void shutdown('security mode change', !signal.unsandboxed)
+            else console.warn('[computer] security mode saved; restart this foreground daemon with `npx cumora@latest agent computer` to apply it (press Ctrl-C first)')
+          }
         }
         if (!shuttingDown) console.warn(`[computer] control-stream closed by server · retry in ${backoff}ms`)
       } catch (error) {
@@ -4153,7 +4206,7 @@ async function doRun(serverOverride?: string): Promise<void> {
   // window to FINISH (so it persists its session id + finalizes its run) before we
   // kill the engine child. A long task won't finish in the window and gets killed,
   // but its session id is on disk → the relaunched daemon `--resume`s it.
-  const shutdown = async (why: string): Promise<void> => {
+  const shutdown = async (why: string, immediate = false): Promise<void> => {
     if (shuttingDown) return
     shuttingDown = true
     controlStreamAbort.abort()
@@ -4164,14 +4217,16 @@ async function doRun(serverOverride?: string): Promise<void> {
     if (windowsShutdownRequest) await rm(windowsShutdownRequest, { force: true }).catch(() => {})
     for (const runner of runners.values()) runner.beginStop() // no new turns; leave in-flight running
     const deadline = Date.now() + SHUTDOWN_GRACE_MS
-    if (anyBusy()) console.log(`[computer] ${why}: waiting up to ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s for in-flight turn(s) to finish…`)
-    while (anyBusy() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500))
+    if (anyBusy() && !immediate) console.log(`[computer] ${why}: waiting up to ${Math.round(SHUTDOWN_GRACE_MS / 1000)}s for in-flight turn(s) to finish…`)
+    while (!immediate && anyBusy() && Date.now() < deadline) await new Promise((r) => setTimeout(r, 500))
     // process.exit() follows immediately, so engine-specific delayed fallbacks
     // cannot run. Force each child to receive its termination signal first.
     await Promise.all([...runners.values()].map((runner) => runner.stop({ forceEngine: true })))
     console.log(`[computer] shutting down (${why})`)
     process.exit(0)
   }
+  restartForSecurityMode = (immediate) => { void shutdown('security mode change', immediate) }
+  if (securityModeRestartPending) restartForSecurityMode(securityModeRestartImmediate)
   process.on('SIGINT', () => { void shutdown('SIGINT') })
   process.on('SIGTERM', () => { void shutdown('SIGTERM') })
   if (windowsShutdownRequest) {

@@ -82,6 +82,9 @@ export interface Computer {
   /** How the daemon runs: true = installed service (launchd/systemd),
    *  false = manually-run foreground command, null = cloud / unknown. */
   daemonSupervised?: boolean | null
+  /** Requested host-wide compatibility mode and the live daemon mode. */
+  unsandboxedEnabled?: boolean
+  unsandboxedActive?: boolean
   /** Newest published daemon version (for the upgrade banner). */
   latestDaemonVersion?: string | null
   /** True when the daemon is behind the latest version → show the upgrade banner. */

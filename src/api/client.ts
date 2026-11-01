@@ -253,6 +253,8 @@ export interface ApiComputer {
    *  manually-run foreground command; null = cloud / an old daemon that
    *  doesn't report it. Drives run-mode-specific update instructions. */
   daemon_supervised?: boolean | null
+  unsandboxed_enabled?: boolean
+  unsandboxed_active?: boolean
   /** Newest published cumora daemon version, for the upgrade banner. */
   latest_daemon_version?: string | null
   /** True when this BYOA daemon is behind the latest version → show upgrade banner. */
@@ -1008,6 +1010,11 @@ export const api = {
   requestComputerEngineDetect: (id: string) =>
     http<{ ok: boolean }>(
       `/computers/${encodeURIComponent(id)}/detect`, { method: 'POST', body: '{}' }),
+  /** Persist a computer-wide high-risk compatibility opt-in and signal its daemon. */
+  setComputerUnsandboxedMode: (id: string, enabled: boolean) =>
+    http<{ ok: boolean; delivered: boolean; supervised: boolean | null; active: boolean; online: boolean }>(
+      `/computers/${encodeURIComponent(id)}/unsandboxed-mode`,
+      { method: 'PUT', body: JSON.stringify({ enabled }) }),
   /** Start one update; its operation id distinguishes completion from scans. */
   updateComputerEngine: (id: string, engine: string) =>
     http<{ ok: boolean; updateId: string }>(

@@ -27,6 +27,8 @@ function fromApi(c: ApiComputer): Computer {
     pairedAt: c.paired_at ?? null,
     daemonVersion: c.daemon_version ?? null,
     daemonSupervised: c.daemon_supervised ?? null,
+    unsandboxedEnabled: c.unsandboxed_enabled ?? false,
+    unsandboxedActive: c.unsandboxed_active ?? false,
     latestDaemonVersion: c.latest_daemon_version ?? null,
     daemonOutdated: c.daemon_outdated ?? false,
     engineDefaults: c.engine_defaults,

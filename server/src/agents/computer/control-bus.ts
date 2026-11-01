@@ -90,6 +90,17 @@ export async function deliverEngineUpdate(computerId: string, engine: string, id
   return redis.publish(CH_COMPUTER_CONTROL_PREFIX + computerId, JSON.stringify(event))
 }
 
+/** Tell a supervised daemon to restart and re-read its host-wide security mode. */
+export async function deliverComputerSecurityMode(computerId: string, unsandboxed: boolean): Promise<number> {
+  const event: ComputerControlEvent = {
+    kind: 'security.mode',
+    id: `security.mode-${randomUUID()}`,
+    at: Date.now(),
+    unsandboxed,
+  }
+  return redis.publish(CH_COMPUTER_CONTROL_PREFIX + computerId, JSON.stringify(event))
+}
+
 /** Attach the authenticated daemon's long-lived SSE control stream. */
 export async function attachComputerControlStream(
   computerId: string,
