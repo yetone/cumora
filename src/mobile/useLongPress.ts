@@ -74,6 +74,17 @@ export function useLongPress(
       }
     },
     onTouchCancel: () => { clear(); movedRef.current = false },
+    ...(onTap ? {
+      onClick: (e: React.MouseEvent) => {
+        e.preventDefault()
+        const nativeEvent = e.nativeEvent as MouseEvent & {
+          pointerType?: string
+          sourceCapabilities?: { firesTouchEvents?: boolean }
+        }
+        if (nativeEvent.pointerType === 'touch' || nativeEvent.sourceCapabilities?.firesTouchEvents) return
+        onTap()
+      },
+    } : {}),
     onContextMenu: (e: React.MouseEvent) => {
       e.preventDefault()
       onLongPress({ x: e.clientX, y: e.clientY })
