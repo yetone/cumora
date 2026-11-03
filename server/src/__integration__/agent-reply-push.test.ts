@@ -214,3 +214,66 @@ test('[integration] an agent-only conversation still pushes to nobody', async ()
   const withRecipients = sent.filter((s) => s.recipientUserIds.length > 0)
   assert.deepEqual(withRecipients, [], 'pushed for a conversation with no humans in it')
 })
+
+// ─── a poll is a message too ────────────────────────────────────────────────
+//
+// `createPoll` commits a kind='poll' row and enqueues the same message.new
+// broadcast every other sender enqueues, and then stopped: it was the one
+// human-visible message kind that never reached dispatchMessagePush.
+//
+// Not a missing feature, an asymmetry. NotificationToasts skips only
+// `kind === 'system'`, so a poll already toasts on desktop and in the Electron
+// notification window, and Message.tsx renders the poll bubble on both shells —
+// so a phone-only member could see and vote on a poll nobody told them about.
+// polls.ts says what the shadow body is for in its own comment: "notifications,
+// search index, plain-text logs".
+
+test('[integration] a poll reaches the phone', async () => {
+  const { companyId, agentId } = await seedCompanyWithAgent()
+  const humanId = 'u-poll-target'
+  await seedOfflineHuman(companyId, humanId)
+  await seedRoom(companyId, 'c-poll', [agentId, humanId])
+
+  const { createPoll } = await import('../polls.js')
+  const { messageId } = await createPoll({
+    conversationId: 'c-poll',
+    companyId,
+    authorId: agentId,
+    question: 'Ship Friday?',
+    mode: 'single',
+    options: ['yes', 'no'],
+  })
+  assert.ok(messageId)
+  await new Promise((r) => setTimeout(r, 150))
+
+  assert.equal(sent.length, 1, 'a poll produced no push — the phone is never told')
+  assert.deepEqual(sent[0].recipientUserIds, [humanId])
+  assert.match(sent[0].body, /Ship Friday\?/, 'the notification body does not name the question')
+})
+
+test('[integration] a poll obeys the same recipient filters', async () => {
+  // The guard rail: adding a dispatch must not add a delivery path that ignores
+  // mute or the "currently looking at the app" rule.
+  const { companyId, agentId } = await seedCompanyWithAgent()
+  const muted = 'u-poll-muted'
+  await seedOfflineHuman(companyId, muted)
+  await seedRoom(companyId, 'c-poll-muted', [agentId, muted])
+  await pool.query(
+    `INSERT INTO conversation_mutes (user_id, conversation_id, muted_until) VALUES ($1, 'c-poll-muted', NULL)`,
+    [muted],
+  )
+
+  const { createPoll } = await import('../polls.js')
+  await createPoll({
+    conversationId: 'c-poll-muted',
+    companyId,
+    authorId: agentId,
+    question: 'Ship Friday?',
+    mode: 'single',
+    options: ['yes', 'no'],
+  })
+  await new Promise((r) => setTimeout(r, 150))
+
+  const withRecipients = sent.filter((s) => s.recipientUserIds.length > 0)
+  assert.deepEqual(withRecipients, [], 'pushed a poll into a muted conversation')
+})
