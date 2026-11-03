@@ -80,6 +80,18 @@ export const env = {
    *  base-URL swap (no Chat-Completions translation, unlike Novita). */
   ORCAROUTER_BASE_URL: (process.env.ORCAROUTER_BASE_URL ?? 'https://api.orcarouter.ai/v1').replace(/\/+$/, ''),
   /**
+   * Cheaper Inference LLM API key. Optional — when unset, agents configured
+   * with a `cheaperinference/<model>` model id (see
+   * server/src/cheaperinference.ts) fall back to the legacy/sub2api client
+   * instead, so an unconfigured deployment doesn't break the run; the model
+   * just won't resolve to Cheaper Inference as intended.
+   */
+  CHEAPER_INFERENCE_API_KEY: process.env.CHEAPER_INFERENCE_API_KEY ?? '',
+  /** Cheaper Inference's OpenAI-compatible Responses base. It speaks the
+   *  Responses API natively, so the `cheaperinference/<model>` route is a
+   *  pure base-URL swap (no Chat-Completions translation, unlike Novita). */
+  CHEAPER_INFERENCE_BASE_URL: (process.env.CHEAPER_INFERENCE_BASE_URL ?? 'https://api.cheaperinference.com/v1').replace(/\/+$/, ''),
+  /**
    * Webhook URL for process-level alerts (unhandledRejection /
    * uncaughtException). Currently expects a Discord-compatible
    * `{ content: "..." }` JSON payload. When unset, alerts are still
