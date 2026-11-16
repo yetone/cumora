@@ -409,7 +409,7 @@ Two ceilings, neither of which weakens a gate:
   allows 4096 for the same reason).
 
 **What this does NOT fix:** an engine whose `steer()` is a no-op (Grok, Zcode,
-Maka, Antigravity — the ACP surface is one-prompt-in-flight, so a mid-turn
+Maka, Antigravity, Kimi Code — the ACP surface is one-prompt-in-flight, so a mid-turn
 inject would cancel the running turn). Those pings still wait for the coalesced
 rerun; that is an upstream capability, not a Cumora gap.
 
@@ -729,6 +729,9 @@ one and re-test. Don't pile on.
 | `CUMORA_DEFAULT_GEMINI_MODEL` | unset | Same shape for Gemini CLI; leave blank for the configured default. |
 | `CUMORA_DEFAULT_QWEN_MODEL` | unset | Same shape for Qwen Code; leave blank for the configured default. |
 | `CUMORA_DEFAULT_ANTIGRAVITY_MODEL` | unset | Same shape for Antigravity; leave blank for the configured default. |
+| `CUMORA_DEFAULT_ZCODE_MODEL` | unset | Same shape for ZCode; leave blank for the configured default. |
+| `CUMORA_DEFAULT_OMP_MODEL` | unset | Deploy pin for omp; leave blank for the configured provider default. |
+| `CUMORA_DEFAULT_KIMI_MODEL` | unset | Deploy pin for Kimi Code when no reported ACP local default is authoritative; leave blank for the configured local default. |
 | `CUMORA_BYOA_MAX_CONCURRENT_BIG_BRAIN` | 6 | Per-computer big-brain turn cap. Drop to 2-4 for very tight quotas; raise for higher tiers. |
 | `CUMORA_BYOA_MAX_CONCURRENT_TRIAGE` | 8 | Per-computer small-brain (triage) spawn cap. Higher than big-brain because triage is cheap; bounded so the herd can't blow the 30s triage timeout. |
 | `CUMORA_BYOA_MIN_SPAWN_INTERVAL_MS` | 500 | Deterministic minimum interval between local-CLI spawn starts — the AdaptivePacer's base (3, 3b). |

@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
+import { StringDecoder } from 'node:string_decoder'
 import { isCustomAnthropicEndpoint, readClaudeUserSettings, withClaudeUserSettingsEnv } from './claude-user-settings.js'
 import { versionCommandInvocation } from './cli-version.js'
 import { codexProviderFingerprint, codexProviderRuntime } from './codex-provider.js'
@@ -163,6 +164,14 @@ const PRESETS: Record<EngineId, EngineModelCatalog> = {
   omp: {
     // The namespace is the operator's own ~/.omp provider config, so there is
     // no first-party preset to name — supportsCustom stays open for a pin.
+    models: [],
+    defaultModel: null,
+    defaultFastModel: null,
+    supportsCustom: true,
+    fastModelScope: 'agent',
+    source: 'presets',
+  },
+  kimi: {
     models: [],
     defaultModel: null,
     defaultFastModel: null,
@@ -442,6 +451,121 @@ async function discoverCodex(command: string, env: NodeJS.ProcessEnv, providerAr
   return null
 }
 
+export function parseKimiConfigOptions(input: unknown): { models: EngineModelOption[]; defaultModel: string | null } {
+  if (!Array.isArray(input)) return { models: [], defaultModel: null }
+  const modelOption = input.find((value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+    return (value as { id?: unknown }).id === 'model'
+  }) as { currentValue?: unknown; options?: unknown } | undefined
+  if (!modelOption || !Array.isArray(modelOption.options)) return { models: [], defaultModel: null }
+  const models: EngineModelOption[] = []
+  for (const value of modelOption.options) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) continue
+    const row = value as { value?: unknown; name?: unknown; description?: unknown }
+    const id = modelIdOrNull(typeof row.value === 'string' ? row.value : null)
+    if (!id) continue
+    models.push({
+      id,
+      label: clean(row.name, 160) ?? id,
+      description: clean(row.description, 320),
+      supportsFastMode: false,
+    })
+  }
+  return {
+    models: mergeModels(models, []),
+    defaultModel: modelIdOrNull(typeof modelOption.currentValue === 'string' ? modelOption.currentValue : null),
+  }
+}
+
+async function discoverKimi(command: string, env: NodeJS.ProcessEnv, timeoutMs = MODEL_PROBE_TIMEOUT_MS): Promise<{ models: EngineModelOption[]; defaultModel: string | null }> {
+  const invocation = /\.[cm]?js$/i.test(command)
+    ? { command: process.execPath, args: [command, 'acp'], windowsVerbatimArguments: false }
+    : versionCommandInvocation(command, ['acp'])
+  const child = spawn(invocation.command, invocation.args, {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    windowsHide: true,
+    env, cwd: homedir(),
+    windowsVerbatimArguments: invocation.windowsVerbatimArguments === true,
+  })
+  const waiters = new Map<number, { resolve: (result: Record<string, unknown>) => void; reject: (error: Error) => void }>()
+  const decoder = new StringDecoder('utf8')
+  let nextId = 0
+  let buffer = ''
+  let outputBytes = 0
+  let failure: Error | null = null
+  const fail = (error: Error): void => {
+    if (!failure) failure = error
+    for (const waiter of waiters.values()) waiter.reject(failure)
+    waiters.clear()
+  }
+  child.once('error', (error) => fail(error))
+  child.on('close', () => fail(new Error('kimi acp exited before the catalog request completed')))
+  child.stdin?.on('error', () => { /* the child's error/close path rejects pending requests */ })
+  child.stderr?.resume()
+  child.stdout?.on('data', (chunk: Buffer) => {
+    outputBytes += chunk.length
+    if (outputBytes > MODEL_OUTPUT_LIMIT) {
+      fail(new Error('kimi acp catalog output exceeded the size limit'))
+      stopChild(child)
+      return
+    }
+    buffer += decoder.write(chunk)
+    let newline: number
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (!line.startsWith('{')) continue
+      let msg: { id?: unknown; result?: unknown; error?: { message?: unknown } }
+      try { msg = JSON.parse(line) } catch { continue }
+      if (typeof msg.id !== 'number') continue
+      const waiter = waiters.get(msg.id)
+      if (!waiter) continue
+      waiters.delete(msg.id)
+      if (msg.error) {
+        waiter.reject(new Error(typeof msg.error.message === 'string' ? msg.error.message : 'kimi acp catalog request failed'))
+      } else {
+        waiter.resolve(msg.result && typeof msg.result === 'object' && !Array.isArray(msg.result)
+          ? msg.result as Record<string, unknown> : {})
+      }
+    }
+  })
+  const rpc = (method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> => {
+    if (failure) return Promise.reject(failure)
+    const id = ++nextId
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      waiters.set(id, { resolve, reject })
+      child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n', (error) => {
+        if (error) {
+          waiters.delete(id)
+          reject(error)
+        }
+      })
+    })
+  }
+  const timer = setTimeout(() => {
+    fail(new Error('kimi acp catalog request timed out'))
+    stopChild(child)
+  }, timeoutMs)
+  timer.unref?.()
+  let sessionId: string | null = null
+  try {
+    await rpc('initialize', {
+      protocolVersion: 1,
+      clientInfo: { name: 'cumora-model-catalog', version: '1.0.0' },
+      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false } },
+    })
+    const session = await rpc('session/new', { cwd: homedir(), mcpServers: [] })
+    sessionId = typeof session.sessionId === 'string' ? session.sessionId : null
+    return parseKimiConfigOptions(session.configOptions)
+  } finally {
+    if (sessionId) {
+      try { await rpc('session/delete', { sessionId }) } catch { /* cleanup is best-effort */ }
+    }
+    clearTimeout(timer)
+    stopChild(child)
+  }
+}
+
 /** Discover the account/config-specific catalog without making a model call.
  * Failure is deliberately soft: the preset still names the engine's own
  * defaults and the app keeps custom entry open, which beats blocking an engine
@@ -452,6 +576,7 @@ export async function discoverEngineModelCatalog(
   binPath: string | null,
   refresh = false,
   env: NodeJS.ProcessEnv = process.env,
+  options: { kimiTimeoutMs?: number } = {},
 ): Promise<EngineModelCatalog> {
   const preset = clonePreset(id)
   if (!binPath) return preset
@@ -475,6 +600,16 @@ export async function discoverEngineModelCatalog(
   if (id === 'omp') {
     const models = parseOmpModels(await runText(binPath, ['models', '--json'], env, OMP_CATALOG_TIMEOUT_MS) ?? '')
     return models.length ? fromDiscovered(id, models, 'cli', null) : preset
+  }
+  if (id === 'kimi') {
+    try {
+      const discovered = await discoverKimi(binPath, env, options.kimiTimeoutMs)
+      return {
+        ...fromDiscovered(id, discovered.models, 'protocol', discovered.defaultModel),
+        defaultFastModel: null,
+        prefersLocalDefault: discovered.defaultModel !== null,
+      }
+    } catch { return failed() }
   }
   if (id === 'gemini' || id === 'qwen' || id === 'zcode') {
     try {

@@ -145,6 +145,11 @@ export const ENGINE_VERSION_SPECS: Record<string, EngineVersionSpec> = {
     npm: '@oh-my-pi/pi-coding-agent',
     selfUpdate: 'omp update',
   },
+  kimi: {
+    versionArgs: ['--version'],
+    npm: '@moonshot-ai/kimi-code',
+    selfUpdate: 'kimi upgrade -y',
+  },
   hermes: {
     versionArgs: ['version'],
     selfUpdate: 'hermes update',

@@ -13,6 +13,7 @@ export const BYOA_SOURCES = [
   'byoa-zcode',
   'byoa-maka',
   'byoa-omp',
+  'byoa-kimi',
 ] as const
 
 export type ByoaSource = typeof BYOA_SOURCES[number]

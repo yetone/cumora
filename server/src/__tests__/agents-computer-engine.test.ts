@@ -10,6 +10,7 @@ import { delimiter, dirname, join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { type EngineHopReport, type EngineRunResult, getAdapter, headlessSpawnOptions, resolveSpawn, runnableEngineIds, secureEngineCapabilityReason } from '../agents/computer/engine.js'
+import { shouldFallbackPersistentSession } from '../agents/computer/daemon.js'
 import { type ProviderProfile, providerProfileEnv } from '../agents/computer/provider-profiles.js'
 import { CLAUDE_CORE_ENV_KEYS, CLAUDE_TURN_ENV_KEYS } from '../agents/computer/claude-user-settings.js'
 
@@ -76,6 +77,15 @@ afterEach(async () => {
   if (ORIGINAL_UNSANDBOXED === undefined) delete process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED
   else process.env.CUMORA_BYOA_ALLOW_UNSANDBOXED = ORIGINAL_UNSANDBOXED
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+})
+
+test('persistent fallback replays only explicit startup failures, never mid-turn death', () => {
+  const startup = { kind: 'startup', message: 'spawn ENOENT', diagnostic: 'spawn ENOENT' } as const
+  const transport = { kind: 'transport', message: 'process exited with code 17', diagnostic: 'process exited with code 17' } as const
+  assert.equal(shouldFallbackPersistentSession(startup, false), true)
+  assert.equal(shouldFallbackPersistentSession(transport, false), false)
+  assert.equal(shouldFallbackPersistentSession(startup, true), false)
+  assert.equal(shouldFallbackPersistentSession(undefined, false), false)
 })
 
 test('secure inventory exposes only engines with a verified boundary', () => {
@@ -518,6 +528,33 @@ test('persistent Claude startup failure keeps stderr for first send', async () =
   assert.equal(logs.length, 2)
   assert.match(logs[1] ?? '', /\[session\] engine process died .*exit 1/)
   })
+
+test('persistent Claude death after a prompt without stdout is not a startup retry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-engine-session-'))
+  tempDirs.push(root)
+  const binDir = join(root, 'bin')
+  const home = join(root, 'home')
+  await mkdir(binDir)
+  await mkdir(home)
+  await writeFakeCli(
+    binDir,
+    'claude',
+    "process.stdin.once('data', () => process.exit(17))\n",
+  )
+  useFakeCliPath(binDir)
+
+  const session = getAdapter('claude').startSession?.({
+    home,
+    env: secureClaudeEnv(root),
+    model: null,
+    fastModel: null,
+    onLog: () => {},
+  })
+  assert.ok(session)
+  const result = await session.send('wake')
+  assert.notEqual(result.failure?.kind, 'startup')
+  assert.equal(shouldFallbackPersistentSession(result.failure, false), false)
+})
 
 test('persistent Claude classifies a rejected resume from its result event', async () => {
   const root = await mkdtemp(join(tmpdir(), 'cumora-claude-stale-resume-'))

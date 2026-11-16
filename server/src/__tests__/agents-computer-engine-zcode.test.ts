@@ -42,7 +42,7 @@ rl.on('line', (line) => {
   const fail = (message) => out({ jsonrpc: '2.0', id: req.id, error: { message } })
   if (req.method === 'initialize') return reply({})
   if (req.method === 'session/load') {
-    if (mode === 'stale-load') return fail('Internal error')
+    if (mode === 'stale-load') return fail('Session is not active')
     loaded = true
     return reply({ sessionId: req.params.sessionId })
   }

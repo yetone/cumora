@@ -5,11 +5,12 @@
  */
 import { after, test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 import { readClaudeUserSettings, withClaudeUserSettingsEnv } from '../agents/computer/claude-user-settings.js'
-import { clearModelCatalogCache, discoverEngineModelCatalog, parseListedModels, parseOmpModels } from '../agents/computer/model-catalog.js'
+import { clearModelCatalogCache, discoverEngineModelCatalog, parseKimiConfigOptions, parseListedModels, parseOmpModels } from '../agents/computer/model-catalog.js'
 
 // Metadata probes must never share the developer's real Codex home/login.
 const isolatedHome = await mkdtemp(join(tmpdir(), 'cumora-catalog-home-'))
@@ -394,5 +395,208 @@ test('omp discovery falls back to its preset on an empty or non-JSON listing', a
       clearModelCatalogCache()
       await cleanup()
     }
+  }
+})
+
+
+test('Kimi configOptions expose only model metadata and preserve the local default', () => {
+  const parsed = parseKimiConfigOptions([
+    { id: 'mode', currentValue: 'default', options: [{ value: 'default' }, { value: 'auto' }] },
+    {
+      id: 'model', currentValue: 'provider/current',
+      options: [
+        { value: 'provider/current', name: 'Current model', description: 'Default route', apiKey: 'never-return' },
+        { value: 'provider/other', name: 'Other model', headers: { Authorization: 'never-return' } },
+        { value: 'provider/current', name: 'Duplicate id with a different label' },
+        { name: 'Missing an executable id' },
+      ],
+    },
+  ])
+  assert.equal(parsed.defaultModel, 'provider/current')
+  assert.deepEqual(parsed.models, [
+    { id: 'provider/current', label: 'Current model', description: 'Default route', recommendedFor: undefined, supportsFastMode: false },
+    { id: 'provider/other', label: 'Other model', description: null, recommendedFor: undefined, supportsFastMode: false },
+  ])
+  assert.equal(JSON.stringify(parsed).includes('never-return'), false)
+})
+
+test('Kimi ACP catalog discovery initializes, reads, and deletes an empty session without prompting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-kimi-catalog-'))
+  const script = join(root, 'catalog.mjs')
+  const log = join(root, 'calls.jsonl')
+  const configOptions = [
+    { id: 'mode', currentValue: 'default', options: [{ value: 'default' }, { value: 'auto' }] },
+    {
+      id: 'model', currentValue: 'provider/current',
+      options: [
+        { value: 'provider/current', name: 'Current model', apiKey: 'never-return' },
+        { value: 'provider/other', name: 'Other model', description: 'Alternate route' },
+      ],
+    },
+  ]
+  await writeFile(script, `
+import { appendFileSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+const argv = process.argv.slice(2)
+if (JSON.stringify(argv) !== JSON.stringify(['acp'])) process.exit(2)
+createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  appendFileSync(${JSON.stringify(log)}, JSON.stringify(msg) + '\\n')
+  const reply = result => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n')
+  if (msg.method === 'initialize') reply({ protocolVersion: 1 })
+  else if (msg.method === 'session/new') reply({ sessionId: 'catalog-session', configOptions: ${JSON.stringify(configOptions)} })
+  else if (msg.method === 'session/delete') reply({})
+  else if (msg.method === 'session/prompt') process.exit(19)
+})
+`)
+  try {
+    clearModelCatalogCache()
+    const catalog = await discoverEngineModelCatalog('kimi', script, true, { ...process.env })
+    assert.equal(catalog.source, 'protocol')
+    assert.equal(catalog.trustedModels, true)
+    assert.equal(catalog.defaultModel, 'provider/current')
+    assert.equal(catalog.defaultFastModel, null)
+    assert.equal(catalog.prefersLocalDefault, true)
+    assert.equal(catalog.supportsCustom, true)
+    assert.deepEqual(catalog.models.map((model) => model.id), ['provider/current', 'provider/other'])
+    assert.equal(JSON.stringify(catalog).includes('never-return'), false)
+    const calls = (await readFile(log, 'utf8')).trim().split('\n').map((line) => JSON.parse(line))
+    assert.deepEqual(calls.map((call) => call.method), ['initialize', 'session/new', 'session/delete'])
+    assert.equal(calls.some((call) => call.method === 'session/prompt'), false)
+  } finally {
+    clearModelCatalogCache()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Kimi catalog failure is stale and untrusted rather than a fabricated listing', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-kimi-catalog-missing-'))
+  try {
+    const catalog = await discoverEngineModelCatalog('kimi', join(root, 'missing-kimi.mjs'), true, { ...process.env })
+    assert.equal(catalog.source, 'presets')
+    assert.equal(catalog.stale, true)
+    assert.equal(catalog.trustedModels, undefined)
+    assert.deepEqual(catalog.models, [])
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('Kimi catalog without a current model leaves the deploy fallback available', async () => {
+  const peer = await stubKimiPeer(`
+  if (msg.method === 'initialize') reply({ protocolVersion: 1 })
+  else if (msg.method === 'session/new') reply({ sessionId: 'no-default', configOptions: [{ id: 'model', options: [{ value: 'provider/other', name: 'Other model' }] }] })
+  else if (msg.method === 'session/delete') reply({})
+  `)
+  try {
+    clearModelCatalogCache()
+    const catalog = await discoverEngineModelCatalog('kimi', peer.script, true, { ...process.env })
+    assert.equal(catalog.defaultModel, null)
+    assert.equal(catalog.prefersLocalDefault, false)
+  } finally {
+    clearModelCatalogCache()
+    await peer.cleanup()
+  }
+})
+
+
+async function stubKimiPeer(handler: string): Promise<{ script: string; exitLog: string; cleanup: () => Promise<void> }> {
+  const root = await mkdtemp(join(tmpdir(), 'cumora-kimi-peer-'))
+  const script = join(root, 'peer.mjs')
+  const exitLog = join(root, 'exit')
+  await writeFile(script, `
+import { appendFileSync } from 'node:fs'
+import { createInterface } from 'node:readline'
+process.on('exit', () => appendFileSync(${JSON.stringify(exitLog)}, String(process.pid)))
+createInterface({ input: process.stdin }).on('line', line => {
+  const msg = JSON.parse(line)
+  const reply = result => process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }) + '\\n')
+  ${handler}
+})
+`)
+  return { script, exitLog, cleanup: () => rm(root, { recursive: true, force: true }) }
+}
+
+async function waitForPeerExit(exitLog: string): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    try {
+      await readFile(exitLog, 'utf8')
+      return
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      await delay(20)
+    }
+  }
+  assert.fail('Kimi ACP child was not reaped')
+}
+
+function assertStaleKimiFailure(catalog: Awaited<ReturnType<typeof discoverEngineModelCatalog>>): void {
+  assert.equal(catalog.source, 'presets')
+  assert.equal(catalog.stale, true)
+  assert.equal(catalog.trustedModels, undefined)
+  assert.deepEqual(catalog.models, [])
+}
+
+test('Kimi silent-peer timeout fails stale and untrusted and reaps the child', async () => {
+  const { script, exitLog, cleanup } = await stubKimiPeer('')
+  try {
+    const catalog = await discoverEngineModelCatalog('kimi', script, true, { ...process.env }, { kimiTimeoutMs: 30 })
+    assertStaleKimiFailure(catalog)
+    await waitForPeerExit(exitLog)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Kimi output overflow fails stale and untrusted and reaps the child', async () => {
+  const { script, exitLog, cleanup } = await stubKimiPeer(`
+if (msg.method === 'initialize') process.stdout.write('x'.repeat(2 * 1024 * 1024 + 1))
+`)
+  try {
+    const catalog = await discoverEngineModelCatalog('kimi', script, true, { ...process.env }, { kimiTimeoutMs: 1_000 })
+    assertStaleKimiFailure(catalog)
+    await waitForPeerExit(exitLog)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Kimi death during discovery fails stale and untrusted without an uncaught stdin error', async () => {
+  const { script, exitLog, cleanup } = await stubKimiPeer(`
+if (msg.method === 'initialize') {
+  reply({ protocolVersion: 1 })
+  setTimeout(() => process.exit(17), 5)
+}
+`)
+  try {
+    const catalog = await discoverEngineModelCatalog('kimi', script, true, { ...process.env }, { kimiTimeoutMs: 1_000 })
+    assertStaleKimiFailure(catalog)
+    await waitForPeerExit(exitLog)
+    await delay(25)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('Kimi death after valid metadata leaves the trusted catalog intact', async () => {
+  const configOptions = [{
+    id: 'model', currentValue: 'provider/current',
+    options: [{ value: 'provider/current', name: 'Current model' }],
+  }]
+  const { script, exitLog, cleanup } = await stubKimiPeer(`
+if (msg.method === 'initialize') reply({ protocolVersion: 1 })
+else if (msg.method === 'session/new') reply({ sessionId: 'catalog-session', configOptions: ${JSON.stringify(configOptions)} })
+else if (msg.method === 'session/delete') process.exit(0)
+`)
+  try {
+    const catalog = await discoverEngineModelCatalog('kimi', script, true, { ...process.env }, { kimiTimeoutMs: 1_000 })
+    assert.equal(catalog.source, 'protocol')
+    assert.equal(catalog.stale, undefined)
+    assert.equal(catalog.trustedModels, true)
+    assert.equal(catalog.defaultModel, 'provider/current')
+    assert.deepEqual(catalog.models.map(model => model.id), ['provider/current'])
+    await waitForPeerExit(exitLog)
+  } finally {
+    await cleanup()
   }
 })
