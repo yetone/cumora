@@ -3,7 +3,7 @@
  *
  * A BYOA agent's reasoning loop is delegated to a local CLI engine running
  * on the user's machine: Claude Code, Codex, Grok Build, Cursor Agent,
- * OpenCode, pi, Gemini CLI, Qwen Code, Antigravity, or ZCode. The daemon (daemon.ts) hands
+ * OpenCode, pi, Gemini CLI, Qwen Code, Antigravity, ZCode, omp, or Kimi Code. The daemon (daemon.ts) hands
  * each wake to an adapter, which spawns the engine headlessly in the agent's
  * dedicated home directory. The engine reads its persona + memory + skills
  * from that home natively (CLAUDE.md / AGENTS.md, .claude/skills, …) and acts
@@ -418,10 +418,10 @@ export async function loginCodexRuntime(): Promise<void> {
   })
 }
 
-export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka' | 'omp'
+export type EngineId = 'claude' | 'codex' | 'grok' | 'cursor' | 'opencode' | 'pi' | 'gemini' | 'qwen' | 'antigravity' | 'zcode' | 'maka' | 'omp' | 'kimi'
 
 /** The pairable engine ids, in the daemon's default detection order. */
-export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode', 'maka', 'omp']
+export const ENGINE_IDS: EngineId[] = ['claude', 'codex', 'grok', 'cursor', 'opencode', 'pi', 'gemini', 'qwen', 'antigravity', 'zcode', 'maka', 'omp', 'kimi']
 
 /** Engines for which Cumora can impose a fail-closed filesystem + tool-network
  * boundary non-interactively. The remaining adapters still work for operators
@@ -3138,6 +3138,8 @@ interface AcpRpcConnectionHooks {
   /** Process death, fired exactly once. In-flight rpc() calls have already
    *  been rejected when it fires. */
   onDeath: (exitCode: number, why: string) => void
+  /** Whether a load/resume rejection proves the saved session is gone. */
+  isMissingSession: (message: string) => boolean
   /** session/load fell back to a fresh session/new. */
   onLoadFallback: (why: string) => void
 }
@@ -3150,6 +3152,7 @@ interface AcpRpcConnectionHooks {
  * session, which observes death and handshake fallback through the hooks.
  */
 class AcpRpcConnection {
+  private static readonly MAX_FRAME_BYTES = 8 * 1024 * 1024
   private readonly child: ChildProcess
   private readonly sessionParams: () => Record<string, unknown>
   private readonly hooks: AcpRpcConnectionHooks
@@ -3254,6 +3257,7 @@ class AcpRpcConnection {
         return
       } catch (err) {
         const why = err instanceof Error ? err.message : String(err)
+        if (!this.hooks.isMissingSession(why)) throw err
         this.resumed = false
         this.sid = null
         this.hooks.onLoadFallback(why)
@@ -3263,11 +3267,23 @@ class AcpRpcConnection {
   }
 
   private onStdout(buf: Buffer): void {
+    if (this.dead) return
+    const failOversizedFrame = (): void => {
+      this.outBuf = ''
+      const why = `ACP frame exceeded ${AcpRpcConnection.MAX_FRAME_BYTES} bytes`
+      this.hooks.onLog(`[acp] ${why}; closing the connection`)
+      this.die(1, why)
+      void terminateEngineTree(this.child, true)
+    }
     this.outBuf += this.stdoutDecoder.write(buf)
     let nl: number
     while ((nl = this.outBuf.indexOf('\n')) >= 0) {
       const line = this.outBuf.slice(0, nl)
       this.outBuf = this.outBuf.slice(nl + 1)
+      if (Buffer.byteLength(line, 'utf8') > AcpRpcConnection.MAX_FRAME_BYTES) {
+        failOversizedFrame()
+        return
+      }
       const t = line.trim()
       if (!t.startsWith('{')) { const c = cleanLine(line); if (c) this.hooks.onLog(c); continue }
       let msg: AcpMsg | null = null
@@ -3279,6 +3295,7 @@ class AcpRpcConnection {
       }
       this.hooks.onNotification(msg)
     }
+    if (Buffer.byteLength(this.outBuf, 'utf8') > AcpRpcConnection.MAX_FRAME_BYTES) failOversizedFrame()
   }
 
   private absorbSessionId(msg: AcpMsg): void {
@@ -3331,6 +3348,7 @@ class ZcodeSession implements EngineSession {
         onLog: (line) => this.onLog(line),
         onNotification: (msg) => this.onUpdate(msg),
         onDeath: (code, why) => this.onDeath(code, why),
+        isMissingSession: (message) => ZCODE_MISSING_SESSION_RE.test(message),
         onLoadFallback: (why) => {
           this.onLog(`[zcode] session/load failed (${why}) — starting a fresh session`)
         },
@@ -3645,6 +3663,7 @@ class MakaSession implements EngineSession {
         onLog: (line) => this.onLog(line),
         onNotification: (msg) => this.onUpdate(msg),
         onDeath: (code, why) => this.onDeath(code, why),
+        isMissingSession: (message) => MAKA_MISSING_SESSION_RE.test(message),
         onLoadFallback: (why) => {
           this.onLog(`[maka] session/resume failed (${why}) — starting a fresh session`)
         },
@@ -3992,6 +4011,7 @@ class OmpSession implements EngineSession {
         onLog: (line) => this.onLog(line),
         onNotification: (msg) => this.onUpdate(msg),
         onDeath: (code, why) => this.onDeath(code, why),
+        isMissingSession: (message) => OMP_MISSING_SESSION_RE.test(message),
         onLoadFallback: (why) => {
           this.onLog(`[omp] session/load failed (${why}) — starting a fresh session`)
         },
@@ -4253,6 +4273,388 @@ class OmpAdapter implements EngineAdapter {
         ? 'aborted (timeout)'
         : err instanceof Error ? err.message : String(err)
       return { ok: false, detail: `omp acp handshake failed: ${why}`.slice(0, 240) }
+    } finally {
+      await session.stop({ force: true })
+    }
+  }
+}
+
+// ─── kimi ─────────────────────────────────────────────────────────────────
+// Kimi Code (`kimi acp`) speaks ACP v1 over stdio. Persistent wakes resume the
+// saved session without replaying its transcript; triage and doctor use fresh,
+// disposable sessions. Kimi 2.6.2 exposes model/mode configuration and prompt
+// stop reasons, but no usage or selected model in session/prompt results, so
+// the ledger records one turn with absent usage rather than inventing counts.
+
+/** Resolve `CUMORA_KIMI_BIN` or `kimi` on `env.PATH`. */
+export function resolveKimiBin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = env.CUMORA_KIMI_BIN?.trim()
+  if (explicit) return explicit
+  for (const dir of (env.PATH ?? '').split(PATH_DELIMITER)) {
+    if (!dir) continue
+    const candidate = join(dir, IS_WIN ? 'kimi.cmd' : 'kimi')
+    if (existsSync(candidate)) return candidate
+    if (IS_WIN && existsSync(join(dir, 'kimi.exe'))) return join(dir, 'kimi.exe')
+    if (IS_WIN && existsSync(join(dir, 'kimi'))) return join(dir, 'kimi')
+  }
+  return null
+}
+
+function resolveKimiAcpSpawn(env: NodeJS.ProcessEnv): { command: string; args: string[]; shell: boolean } {
+  const explicit = env.CUMORA_KIMI_BIN?.trim()
+  if (explicit) {
+    if (/\.[cm]?js$/i.test(explicit)) return { command: process.execPath, args: [explicit, 'acp'], shell: false }
+    const sp = resolveSpawn(explicit, env)
+    return { command: sp.command, args: ['acp'], shell: sp.shell }
+  }
+  const sp = resolveSpawn(resolveKimiBin(env) ?? 'kimi', env)
+  return { command: sp.command, args: ['acp'], shell: sp.shell }
+}
+
+interface KimiTurnOptions {
+  cwd: string
+  env: NodeJS.ProcessEnv
+  prompt: string
+  model?: string | null
+  resumeSessionId?: string | null
+  signal: AbortSignal
+  onLog?: (line: string) => void
+  onHopUsage?: (r: EngineHopReport) => void
+  discard?: boolean
+}
+
+interface KimiSessionOptions extends EngineSessionArgs {
+  onAgentText?: (text: string) => void
+  signal?: AbortSignal
+}
+
+const KIMI_MISSING_SESSION_RE = /unknown sessionid/i
+
+class KimiSession implements EngineSession {
+  readonly carriesStandingPrompt = false
+
+  private readonly conn: AcpRpcConnection
+  private readonly onLog: (line: string) => void
+  private readonly onHopUsage?: (r: EngineHopReport) => void
+  private readonly onAgentText?: (text: string) => void
+  private readonly model: string | null
+  private modeTried = false
+  private modelPinTried = false
+  private modelPinAccepted = false
+  private acknowledgedModel: string | null = null
+  private turn: { resolve: (r: EngineRunResult) => void } | null = null
+  private promptInFlight = false
+  private turnTextChars = 0
+  private steerWarned = false
+  private stopped = false
+
+  constructor(home: string, env: NodeJS.ProcessEnv, opts: KimiSessionOptions) {
+    this.onLog = opts.onLog
+    this.onHopUsage = opts.onHopUsage
+    this.onAgentText = opts.onAgentText
+    this.model = opts.model ?? null
+    this.conn = new AcpRpcConnection(
+      resolveKimiAcpSpawn(env),
+      home,
+      env,
+      opts.resumeSessionId ?? null,
+      () => ({ cwd: home, mcpServers: [] }),
+      {
+        onLog: (line) => this.onLog(line),
+        onNotification: (msg) => this.onUpdate(msg),
+        onDeath: (code, why) => this.onDeath(code, why),
+        isMissingSession: (message) => KIMI_MISSING_SESSION_RE.test(message),
+        onLoadFallback: (why) => {
+          this.onLog(`[kimi] session/resume failed (${why}) — starting a fresh session`)
+        },
+      },
+      opts.signal,
+      'session/resume',
+    )
+  }
+
+  get alive(): boolean { return this.conn.alive }
+  get sessionId(): string | null { return this.conn.sid }
+  whenReady(): Promise<void> { return this.conn.ready }
+
+  async send(prompt: string): Promise<EngineRunResult> {
+    if (this.turn) return classifyEngineResult({ exitCode: 1, error: 'engine session busy — a turn is already in flight', sessionId: this.conn.sid }, this.conn.resumed)
+    if (!this.alive) return classifyEngineResult({ exitCode: this.conn.exitStatusCode || 1, error: 'engine session is not alive (process gone)', sessionId: this.conn.sid }, this.conn.resumed)
+    let resolveTurn!: (r: EngineRunResult) => void
+    const done = new Promise<EngineRunResult>((resolve) => { resolveTurn = resolve })
+    let settled = false
+    const settle = (r: EngineRunResult) => { if (!settled) { settled = true; this.turn = null; resolveTurn(r) } }
+    this.turn = { resolve: settle }
+    try {
+      await this.conn.ready
+      await this.applyMode()
+      await this.applyModelPin()
+      if (!this.alive) throw new Error('engine session is not alive (process gone)')
+      const wasResume = this.conn.resumed
+      const startedAt = Date.now()
+      this.turnTextChars = 0
+      this.promptInFlight = true
+      const resp = await this.conn.rpc('session/prompt', {
+        sessionId: this.conn.sid,
+        prompt: [{ type: 'text', text: stripLoneSurrogates(prompt) }],
+      })
+      this.conn.resumed = false
+      const stopReason = (resp.result as { stopReason?: unknown } | undefined)?.stopReason
+      if (stopReason === 'cancelled' || stopReason === 'refusal') {
+        settle(this.failureResult(`kimi turn ended with ${stopReason}`, wasResume, 1))
+        return done
+      }
+      const usage = extractAcpUsage(resp.result) ?? undefined
+      const model = this.acknowledgedModel ?? '<kimi-default>'
+      if (this.onHopUsage) {
+        try {
+          this.onHopUsage({
+            model,
+            usage,
+            latencyMs: Date.now() - startedAt,
+            hopIndex: 1,
+            textChars: this.turnTextChars,
+          })
+        } catch { /* never break the stream */ }
+      }
+      settle(classifyEngineResult({ exitCode: 0, sessionId: this.conn.sid, usage, model }, wasResume))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const wasResume = this.conn.resumed
+      this.conn.resumed = false
+      settle(this.failureResult(message, wasResume, this.conn.exitStatusCode || 1))
+    } finally {
+      this.promptInFlight = false
+    }
+    return done
+  }
+
+  steer(_text: string): void {
+    if (!this.steerWarned) {
+      this.steerWarned = true
+      this.log('[kimi] same-turn steer is not supported on ACP stdio — the ping rides the next wake')
+    }
+  }
+
+  async stop(options: { force?: boolean } = {}): Promise<void> {
+    this.stopped = true
+    await this.conn.stop(options)
+  }
+
+  async deleteSession(): Promise<void> {
+    if (!this.conn.sid) return
+    await this.conn.whenReady()
+    const sessionId = this.conn.sid
+    if (!sessionId) return
+    await this.conn.rpc('session/delete', { sessionId })
+    this.conn.sid = null
+  }
+
+  private async applyMode(): Promise<void> {
+    if (this.modeTried || !this.conn.sid) return
+    this.modeTried = true
+    try {
+      await this.conn.rpc('session/set_config_option', { sessionId: this.conn.sid, configId: 'mode', value: 'auto' })
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err)
+      this.log(`[kimi] auto mode rejected (${why}) — permission requests will be answered by the compatibility adapter`)
+    }
+  }
+
+  private async applyModelPin(): Promise<void> {
+    if (this.modelPinTried || !this.model || !this.conn.sid) return
+    this.modelPinTried = true
+    try {
+      const response = await this.conn.rpc('session/set_config_option', { sessionId: this.conn.sid, configId: 'model', value: this.model })
+      const result = response.result as { configOptions?: unknown } | undefined
+      const options = Array.isArray(result?.configOptions) ? result.configOptions : []
+      const acknowledged = options.find((option) => {
+        if (!option || typeof option !== 'object') return false
+        return (option as { id?: unknown }).id === 'model'
+      }) as { currentValue?: unknown } | undefined
+      this.modelPinAccepted = acknowledged?.currentValue === this.model
+      this.acknowledgedModel = typeof acknowledged?.currentValue === 'string' ? acknowledged.currentValue : null
+      if (!this.modelPinAccepted) {
+        const current = typeof acknowledged?.currentValue === 'string' ? acknowledged.currentValue : 'engine default'
+        this.log(`[kimi] model pin (${this.model}) acknowledged a different model (${current}) — continuing on the acknowledged model`)
+      }
+    } catch (err) {
+      const why = err instanceof Error ? err.message : String(err)
+      this.log(`[kimi] model pin (${this.model}) rejected (${why}) — continuing on the engine default`)
+    }
+  }
+
+  private failureResult(message: string, wasResume: boolean, exitCode = 1): EngineRunResult {
+    const missingSession = KIMI_MISSING_SESSION_RE.test(message)
+    return classifyEngineResult({
+      exitCode,
+      error: message,
+      failure: missingSession
+        ? { kind: 'resume-not-found', message, diagnostic: message }
+        : undefined,
+      sessionId: this.conn.sid,
+    }, wasResume)
+  }
+
+  private onDeath(code: number, why: string): void {
+    if (!this.stopped) {
+      this.log(`[session] engine process died ${this.turn ? 'MID-TURN' : 'while idle'}: ${why} (exit ${code})`)
+    }
+    const wasResume = this.conn.resumed
+    this.conn.resumed = false
+    this.turn?.resolve(this.failureResult(why, wasResume, code))
+  }
+
+  private onUpdate(msg: AcpMsg): void {
+    if (msg.method === 'session/request_permission' && msg.id !== undefined) {
+      const options = Array.isArray(msg.params?.options)
+        ? msg.params.options as Array<{ optionId?: unknown; kind?: unknown }>
+        : []
+      const toolCall = msg.params?.toolCall as { title?: unknown } | undefined
+      const isQuestion = toolCall?.title === 'AskUserQuestion'
+        || options.some((option) => typeof option?.optionId === 'string' && /^q\d+_(?:opt_\d+|skip)$/.test(option.optionId))
+      if (isQuestion) {
+        this.conn.reply(msg.id, { outcome: { outcome: 'cancelled' } })
+        return
+      }
+      const preferred = options.find((o) => o?.kind === 'allow_always')
+        ?? options.find((o) => o?.kind === 'allow_once')
+      if (typeof preferred?.optionId === 'string' && preferred.optionId) {
+        this.conn.reply(msg.id, { outcome: { outcome: 'selected', optionId: preferred.optionId } })
+      } else {
+        this.conn.reply(msg.id, { outcome: { outcome: 'cancelled' } })
+      }
+      return
+    }
+    if (msg.method === 'elicitation/create' && msg.id !== undefined) {
+      // An unattended daemon cannot answer for the operator. ACP's cancel action
+      // declines the question without fabricating structured form content.
+      this.conn.reply(msg.id, { action: 'cancel' })
+      return
+    }
+    if (msg.method !== 'session/update' || !this.promptInFlight) return
+    const u = (msg.params?.update ?? msg.params) as Record<string, unknown> | undefined
+    const kind = typeof u?.sessionUpdate === 'string' ? u.sessionUpdate : null
+    if (kind === 'tool_call' && typeof u?.title === 'string') {
+      this.log(`[kimi] tool ${u.title}`)
+    } else if (kind === 'agent_message_chunk') {
+      const content = u?.content as { text?: unknown } | undefined
+      if (typeof content?.text === 'string' && content.text) {
+        this.turnTextChars += content.text.length
+        this.onAgentText?.(content.text)
+        if (content.text.trim()) this.log(`[kimi] » ${content.text.replace(/\s+/g, ' ').slice(0, 200)}`)
+      }
+    }
+  }
+
+  private log(line: string): void { this.onLog(line) }
+}
+
+async function runKimiAcpTurn(opts: KimiTurnOptions): Promise<EngineRunResult & { text: string }> {
+  const maxTextChars = 1024 * 1024
+  let text = ''
+  let truncationLogged = false
+  const session = new KimiSession(opts.cwd, opts.env, {
+    home: opts.cwd,
+    env: opts.env,
+    model: opts.model,
+    standingPrompt: null,
+    resumeSessionId: opts.resumeSessionId ?? null,
+    onLog: opts.onLog ?? (() => {}),
+    onHopUsage: opts.onHopUsage,
+    onAgentText: (chunk) => {
+      const remaining = Math.max(0, maxTextChars - text.length)
+      text += chunk.slice(0, remaining)
+      if (chunk.length > remaining && !truncationLogged) {
+        truncationLogged = true
+        opts.onLog?.(`[kimi] one-shot text output truncated at ${maxTextChars} characters`)
+      }
+    },
+    signal: opts.signal,
+  })
+  try {
+    const result = { ...await session.send(opts.prompt), text }
+    if (opts.discard) {
+      try { await session.deleteSession() } catch (err) {
+        opts.onLog?.(`[kimi] disposable session cleanup failed (${err instanceof Error ? err.message : String(err)})`)
+      }
+    }
+    return result
+  } finally {
+    await session.stop({ force: true })
+  }
+}
+
+class KimiAdapter implements EngineAdapter {
+  readonly id = 'kimi' as const
+  readonly bin = 'kimi'
+
+  async seedHome(home: string, persona: EnginePersona): Promise<void> {
+    await ensureCommonHome(home)
+    await mkdir(join(home, '.kimi-code', 'skills'), { recursive: true })
+    await atomicAgentWrite(
+      join(home, 'AGENTS.md'),
+      PERSONA_HEADER(persona, { personaFile: 'AGENTS.md', skillsDir: '.kimi-code/skills/' }),
+    )
+  }
+
+  run(args: EngineRunArgs): Promise<EngineRunResult> {
+    return runKimiAcpTurn({
+      cwd: args.home,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      resumeSessionId: args.resumeSessionId,
+      signal: args.signal,
+      onLog: args.onLog,
+      onHopUsage: args.onHopUsage,
+    })
+  }
+
+  startSession(args: EngineSessionArgs): EngineSession | null {
+    return new KimiSession(args.home, args.env, args)
+  }
+
+  classify(args: EngineClassifyArgs): Promise<EngineClassifyResult> {
+    return runKimiAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: args.prompt,
+      model: args.model,
+      signal: args.signal,
+      onLog: args.onLog,
+      discard: true,
+    })
+  }
+
+  probe(args: EngineProbeArgs): Promise<EngineClassifyResult> {
+    return runKimiAcpTurn({
+      cwd: args.cwd,
+      env: args.env,
+      prompt: DOCTOR_PROMPT,
+      signal: args.signal,
+      discard: true,
+    })
+  }
+
+  async probeWake(args: EngineWakeProbeArgs): Promise<EngineWakeProbeResult> {
+    const session = new KimiSession(args.cwd, args.env, {
+      home: args.cwd,
+      env: args.env,
+      standingPrompt: null,
+      resumeSessionId: null,
+      onLog: () => {},
+      signal: args.signal,
+    })
+    try {
+      await session.whenReady()
+      try { await session.deleteSession() } catch { /* cleanup is best-effort */ }
+      return { ok: true, detail: '' }
+    } catch (err) {
+      const why = args.signal.aborted
+        ? 'aborted (timeout)'
+        : err instanceof Error ? err.message : String(err)
+      return { ok: false, detail: `kimi acp handshake failed: ${why}`.slice(0, 240) }
     } finally {
       await session.stop({ force: true })
     }
@@ -6766,6 +7168,7 @@ const ADAPTERS: Record<EngineId, EngineAdapter> = {
   zcode: new ZcodeAdapter(),
   maka: new MakaAdapter(),
   omp: new OmpAdapter(),
+  kimi: new KimiAdapter(),
 }
 
 export function getAdapter(id: EngineId): EngineAdapter {
@@ -6789,6 +7192,7 @@ export async function detectEnginesWithStatus(): Promise<EngineDetection> {
       || (id === 'grok' && resolveGrokBin() != null)
       || (id === 'maka' && resolveMakaBin() != null)
       || (id === 'omp' && resolveOmpBin() != null)
+      || (id === 'kimi' && resolveKimiBin() != null)
     return { id, installed, status }
   }))
   return {
@@ -6835,7 +7239,9 @@ export async function snapshotDetectedEngines(ids?: readonly EngineId[]): Promis
         ? (resolveMakaBin() ?? await resolveBinPath(bin))
         : id === 'omp'
           ? (resolveOmpBin() ?? await resolveBinPath(bin))
-          : await resolveBinPath(bin)
+          : id === 'kimi'
+            ? (resolveKimiBin() ?? await resolveBinPath(bin))
+            : await resolveBinPath(bin)
     return { id, bin, path }
   }))
 }
@@ -6972,11 +7378,13 @@ export async function runEngineDoctor(opts?: {
   const ids = opts?.engines ?? Object.keys(ADAPTERS) as EngineId[]
   return Promise.all(ids.map(async (id): Promise<EngineHealth> => {
     const adapter = ADAPTERS[id]
-    const path = (await resolveBinPath(adapter.bin))
-      ?? (id === 'grok' ? resolveGrokBin(env)
-        : id === 'maka' ? resolveMakaBin(env)
-        : id === 'omp' ? resolveOmpBin(env)
-        : null)
+    const path = id === 'kimi'
+      ? (resolveKimiBin(env) ?? await resolveBinPath(adapter.bin))
+      : (await resolveBinPath(adapter.bin))
+        ?? (id === 'grok' ? resolveGrokBin(env)
+          : id === 'maka' ? resolveMakaBin(env)
+          : id === 'omp' ? resolveOmpBin(env)
+          : null)
     if (!path) return { id, installed: false, path: null, big: null, small: null, wake: null }
     const probeTier = async (tier: 'big' | 'small'): Promise<BrainHealth> => {
       const controller = new AbortController()
