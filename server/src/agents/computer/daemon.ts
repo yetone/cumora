@@ -1035,6 +1035,9 @@ export function authFailureHint(engine: EngineId, detail: string): string {
   if (engine === 'omp') {
     return 'Open a terminal on that computer and run `omp` (or `omp login`) to refresh its provider credentials, then wake the agent again.'
   }
+  if (engine === 'kimi') {
+    return 'Open a terminal on that computer and run `kimi login` to refresh its Kimi Code credentials, then wake the agent again.'
+  }
   return 'Check the daemon terminal for details, then wake the agent again.'
 }
 
@@ -1059,6 +1062,7 @@ function missingEngineMessage(): string {
     '     CUMORA_ZCODE_ACP_BIN pins a specific bridge copy when needed)',
     '  - Maka: install the `maka` CLI, then run `maka` once to sign in',
     '  - omp: install the `omp` CLI, then run `omp` once to sign in to a provider',
+    '  - Kimi Code: install the `kimi` CLI, then run `kimi login` once',
     '',
     'After that, rerun:',
     '  npx cumora@latest agent computer --pair <code>',
@@ -1082,7 +1086,7 @@ function sandboxedEngineMessage(installed: readonly EngineId[], platform: NodeJS
     platform === 'win32'
       ? 'Use Codex on native Windows, or run Claude Code inside WSL2.'
       : 'Install and sign in to Claude Code or Codex.',
-    'Grok, Cursor, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude currently lack',
+    'Grok, Cursor, OpenCode, pi, Gemini, Qwen, Antigravity, ZCode, Maka, omp, Kimi Code, and native-Windows Claude currently lack',
     'a Cumora-verified fail-closed host boundary.',
     '',
     'Compatibility only (grants the model your host files, environment, and network):',
@@ -1107,7 +1111,7 @@ function helpText(): string {
     '',
     'The daemon talks to a Cumora server over HTTP and drives a local agent',
     'engine. Claude Code and Codex are sandboxed by default. Grok Build, Cursor',
-    'Agent, OpenCode, pi, Gemini, Qwen, Antigravity, and native-Windows Claude require the explicit',
+    'Agent, OpenCode, pi, Gemini, Qwen, Antigravity, ZCode, Maka, omp, Kimi Code, and native-Windows Claude require the explicit',
     'high-risk CUMORA_BYOA_ALLOW_UNSANDBOXED=1 compatibility switch.',
     'Pair once, then the daemon runs in the background.',
     '',
@@ -1961,6 +1965,13 @@ export function resolveTriageModel(
   return resolveEngineFastModel(configured, engineOverride)?.trim() || computerDefault?.trim() || undefined
 }
 
+export function shouldFallbackPersistentSession(
+  failure: EngineRunResult['failure'] | null,
+  sessionAlive: boolean,
+): boolean {
+  return !sessionAlive && failure?.kind === 'startup'
+}
+
 export class AgentRunner {
   /** Aborted once in stop(). Handed to every one-shot `adapter.run(...)` so the
    *  engine child dies with its runner, the way the persistent session already
@@ -2240,12 +2251,12 @@ export class AgentRunner {
       if (!session.alive) this.engineSession = null
       const persistentFailure = engineFailureOf(result, !!resumeSessionId)
       if (persistentFailure && !result.failure) result.failure = persistentFailure
-      // A dead persistent transport that never reached the model is safe to
-      // retry one-shot. Preserve the same resume target for continuity.
-      if (result.error && !result.usage && !session.alive && persistentFailure?.kind !== 'resume-not-found') {
+      // Only an explicit pre-launch failure proves the prompt never ran.
+      // Mid-turn death is ambiguous and must not replay tool side effects.
+      if (shouldFallbackPersistentSession(persistentFailure, session.alive)) {
         this.persistentUnusable = true
         this.engineSession = null
-        this.logEngineLine(`[engine] persistent session failed to produce a turn (${result.error.slice(0, 160)}) — falling back to one-shot for the rest of this process`)
+        this.logEngineLine(`[engine] persistent session failed to produce a turn (${(result.error ?? persistentFailure?.message ?? 'startup failure').slice(0, 160)}) — falling back to one-shot for the rest of this process`)
         result = await this.trackEngineRun(this.adapter.run({
           home: this.home,
           prompt: this.turnPrompt(null, delta),
@@ -2777,6 +2788,7 @@ export class AgentRunner {
     if (this.adapter.id === 'zcode') return this.agent.model ?? '<zcode-default>'
     if (this.adapter.id === 'maka') return '<maka-default>'
     if (this.adapter.id === 'omp') return this.agent.model ?? '<omp-default>'
+    if (this.adapter.id === 'kimi') return this.agent.model ?? '<kimi-default>'
     if (this.adapter.id === 'cursor') return this.agent.model ?? '<cursor-default>'
     return this.agent.model ?? '<cursor-default>'
   }
